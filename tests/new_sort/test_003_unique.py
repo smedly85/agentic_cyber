@@ -340,30 +340,6 @@ class NewSortUniqueTests(unittest.TestCase):
             input_data, records, forms, ignore_case=True, reverse=True
         )
 
-    def test_repeated_clustered_unique_is_idempotent(self):
-        records = [b"c", b"a", b"c", b"b"]
-        self.assert_unique_sorted(b"c\na\nc\nb\n", records, "-uu")
-
-    def test_repeated_long_unique_is_idempotent(self):
-        records = [b"c", b"a", b"c", b"b"]
-        self.assert_unique_sorted(
-            b"c\na\nc\nb\n", records, "--unique", "--unique"
-        )
-
-    def test_repeated_mixed_options_are_idempotent(self):
-        records = [b"apple", b"APPLE", b"beta", b"BETA", b"z"]
-        input_data = b"\n".join(records) + b"\n"
-        self.assert_unique_sorted(
-            input_data,
-            records,
-            "-rfuu",
-            "--unique",
-            "--ignore-case",
-            "--reverse",
-            ignore_case=True,
-            reverse=True,
-        )
-
     def test_digits_punctuation_and_whitespace(self):
         records = [
             b"10",

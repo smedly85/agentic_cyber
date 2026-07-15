@@ -192,24 +192,23 @@ Test all of these:
 50. Option order does not change representative rules.
 51. -RR is accepted.
 52. Repeated long options are accepted.
-53. Mixed repeated options are idempotent.
-54. --sort=random is rejected.
-55. --random-source is rejected.
-56. --random-source=value is rejected.
-57. --random-sort=value is rejected.
-58. Unknown short options fail.
-59. Unknown long options fail.
-60. Non-option operands fail.
-61. A single dash is rejected.
-62. A double-dash argument is rejected.
-63. Multiple invalid arguments fail.
-64. Invalid arguments exit with status 2.
-65. Invalid arguments produce no standard output.
-66. Invalid arguments write a usage diagnostic to standard error.
-67. Invalid arguments are rejected before standard input is processed.
-68. Successful commands exit with status 0.
-69. Successful commands write nothing to standard error.
-70. Repeated executions always satisfy all required properties.
+53. --sort=random is rejected.
+54. --random-source is rejected.
+55. --random-source=value is rejected.
+56. --random-sort=value is rejected.
+57. Unknown short options fail.
+58. Unknown long options fail.
+59. Non-option operands fail.
+60. A single dash is rejected.
+61. A double-dash argument is rejected.
+62. Multiple invalid arguments fail.
+63. Invalid arguments exit with status 2.
+64. Invalid arguments produce no standard output.
+65. Invalid arguments write a usage diagnostic to standard error.
+66. Invalid arguments are rejected before standard input is processed.
+67. Successful commands exit with status 0.
+68. Successful commands write nothing to standard error.
+69. Repeated executions always satisfy all required properties.
 
 ## Random-output validation
 

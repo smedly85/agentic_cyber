@@ -129,38 +129,36 @@ Test all of these:
 31. Long forms.
 32. Mixed short and long forms.
 33. -uu is accepted and acts like -u.
-34. Repeated long options are idempotent.
-35. Repeated mixed options are idempotent.
-36. Digits.
-37. Punctuation.
-38. Leading and trailing whitespace.
-39. Embedded NUL bytes.
-40. Multiple embedded NUL bytes.
-41. Bytes above ASCII.
-42. Mixed ASCII and non-ASCII bytes.
-43. A final record without a newline.
-44. A one-byte final record without a newline.
-45. Records longer than 4 KiB.
-46. Records with long common prefixes.
-47. A large number of duplicate groups.
-48. A large number of records in one group.
-49. Input records are not truncated.
-50. Selected representatives are not modified.
-51. Every successful output record ends with a newline.
-52. Unknown short options fail.
-53. Unknown long options fail.
-54. Non-option operands fail.
-55. A single dash is rejected.
-56. A double-dash argument is rejected.
-57. --unique=value fails.
-58. Multiple invalid arguments fail.
-59. Invalid arguments exit with status 2.
-60. Invalid arguments produce no standard output.
-61. Invalid arguments write a usage diagnostic to standard error.
-62. Invalid arguments are rejected before standard input is processed.
-63. Successful commands exit with status 0.
-64. Successful commands write nothing to standard error.
-65. Repeated executions do not depend on prior process state.
+34. Digits.
+35. Punctuation.
+36. Leading and trailing whitespace.
+37. Embedded NUL bytes.
+38. Multiple embedded NUL bytes.
+39. Bytes above ASCII.
+40. Mixed ASCII and non-ASCII bytes.
+41. A final record without a newline.
+42. A one-byte final record without a newline.
+43. Records longer than 4 KiB.
+44. Records with long common prefixes.
+45. A large number of duplicate groups.
+46. A large number of records in one group.
+47. Input records are not truncated.
+48. Selected representatives are not modified.
+49. Every successful output record ends with a newline.
+50. Unknown short options fail.
+51. Unknown long options fail.
+52. Non-option operands fail.
+53. A single dash is rejected.
+54. A double-dash argument is rejected.
+55. --unique=value fails.
+56. Multiple invalid arguments fail.
+57. Invalid arguments exit with status 2.
+58. Invalid arguments produce no standard output.
+59. Invalid arguments write a usage diagnostic to standard error.
+60. Invalid arguments are rejected before standard input is processed.
+61. Successful commands exit with status 0.
+62. Successful commands write nothing to standard error.
+63. Repeated executions do not depend on prior process state.
 
 ## Expected-output helpers
 

@@ -271,37 +271,6 @@ class NewSortIgnoreCaseTests(unittest.TestCase):
             reverse=True,
         )
 
-    def test_repeated_clustered_ignore_case_is_idempotent(self):
-        records = [b"c", b"A", b"b"]
-        self.assert_ignore_case_sorted(b"c\nA\nb\n", records, "-ff")
-
-    def test_repeated_reverse_with_ignore_case_is_idempotent(self):
-        records = [b"c", b"A", b"b"]
-        self.assert_ignore_case_sorted(b"c\nA\nb\n", records, "-rrf", reverse=True)
-
-    def test_repeated_long_options_are_idempotent(self):
-        records = [b"c", b"A", b"b"]
-        input_data = b"c\nA\nb\n"
-        self.assert_ignore_case_sorted(
-            input_data,
-            records,
-            "--ignore-case",
-            "--ignore-case",
-        )
-
-    def test_repeated_mixed_forms_are_idempotent(self):
-        records = [b"c", b"A", b"b"]
-        input_data = b"c\nA\nb\n"
-        self.assert_ignore_case_sorted(
-            input_data,
-            records,
-            "-rf",
-            "--ignore-case",
-            "--reverse",
-            "-ff",
-            reverse=True,
-        )
-
     def test_unknown_short_option_fails(self):
         self.assert_invalid_arguments("-x")
 

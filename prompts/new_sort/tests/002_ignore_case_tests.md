@@ -138,22 +138,20 @@ Test all of these:
 45. Mixed short and long option combinations are equivalent.
 46. -ff is accepted and acts like -f.
 47. -rrf is accepted and acts like -rf.
-48. Repeated long options are idempotent.
-49. Repeated mixed forms are idempotent.
-50. Unknown short options fail.
-51. Unknown long options fail.
-52. Non-option operands fail.
-53. A single dash is rejected.
-54. A double-dash argument is rejected.
-55. --ignore-case=value fails.
-56. Multiple invalid arguments fail.
-57. Invalid arguments exit with status 2.
-58. Invalid arguments produce no standard output.
-59. Invalid arguments write a usage diagnostic to standard error.
-60. Invalid arguments are rejected before standard input is processed.
-61. Successful commands exit with status 0.
-62. Successful commands write nothing to standard error.
-63. Repeated executions do not depend on prior process state.
+48. Unknown short options fail.
+49. Unknown long options fail.
+50. Non-option operands fail.
+51. A single dash is rejected.
+52. A double-dash argument is rejected.
+53. --ignore-case=value fails.
+54. Multiple invalid arguments fail.
+55. Invalid arguments exit with status 2.
+56. Invalid arguments produce no standard output.
+57. Invalid arguments write a usage diagnostic to standard error.
+58. Invalid arguments are rejected before standard input is processed.
+59. Successful commands exit with status 0.
+60. Successful commands write nothing to standard error.
+61. Repeated executions do not depend on prior process state.
 
 ## Expected output
 

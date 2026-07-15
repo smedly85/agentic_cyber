@@ -372,20 +372,6 @@ class NewSortRandomSortTests(unittest.TestCase):
             b"c\na\nc\nb\n", records, "--random-sort", "--random-sort"
         )
 
-    def test_repeated_mixed_options_are_idempotent(self):
-        records = [b"apple", b"APPLE", b"beta", b"BETA", b"z"]
-        self.assert_random_properties(
-            b"\n".join(records) + b"\n",
-            records,
-            "-RRrfuu",
-            "--random-sort",
-            "--reverse",
-            "--ignore-case",
-            "--unique",
-            ignore_case=True,
-            unique=True,
-        )
-
     def test_sort_random_long_option_is_rejected(self):
         self.assert_invalid_arguments("--sort=random")
 

@@ -110,21 +110,20 @@ Test all of these:
 37. -r -r is accepted and acts like -r.
 38. -rr is accepted and acts like -r.
 39. --reverse --reverse is accepted and acts like --reverse.
-40. Mixed repeated reverse forms are idempotent.
-41. Unknown short options fail.
-42. Unknown long options fail.
-43. Non-option operands fail.
-44. A single dash is rejected.
-45. A double-dash argument is rejected.
-46. --reverse=value fails.
-47. Multiple invalid arguments fail.
-48. Invalid arguments exit with status 2.
-49. Invalid arguments produce no standard output.
-50. Invalid arguments write a usage diagnostic to standard error.
-51. Invalid arguments are rejected before standard input is processed.
-52. Successful commands exit with status 0.
-53. Successful commands write nothing to standard error.
-54. Repeated executions do not depend on prior process state.
+40. Unknown short options fail.
+41. Unknown long options fail.
+42. Non-option operands fail.
+43. A single dash is rejected.
+44. A double-dash argument is rejected.
+45. --reverse=value fails.
+46. Multiple invalid arguments fail.
+47. Invalid arguments exit with status 2.
+48. Invalid arguments produce no standard output.
+49. Invalid arguments write a usage diagnostic to standard error.
+50. Invalid arguments are rejected before standard input is processed.
+51. Successful commands exit with status 0.
+52. Successful commands write nothing to standard error.
+53. Repeated executions do not depend on prior process state.
 
 Expected reverse output must be calculated independently using Python byte
 ordering.

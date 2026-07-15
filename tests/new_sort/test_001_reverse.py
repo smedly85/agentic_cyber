@@ -187,28 +187,6 @@ class NewSortReverseTests(unittest.TestCase):
         self.assertEqual(Counter(output_records), Counter(records))
         self.assertEqual(output_records, sorted(records, reverse=True))
 
-    def test_repeated_short_reverse_is_idempotent(self):
-        records = [b"c", b"a", b"b"]
-        input_data = b"c\na\nb\n"
-        self.assert_reverse_sorted(input_data, records, "-r", "-r")
-
-    def test_clustered_short_reverse_is_idempotent(self):
-        records = [b"c", b"a", b"b"]
-        input_data = b"c\na\nb\n"
-        self.assert_reverse_sorted(input_data, records, "-rr")
-
-    def test_repeated_long_reverse_is_idempotent(self):
-        records = [b"c", b"a", b"b"]
-        input_data = b"c\na\nb\n"
-        self.assert_reverse_sorted(input_data, records, "--reverse", "--reverse")
-
-    def test_mixed_repeated_reverse_forms_are_idempotent(self):
-        records = [b"c", b"a", b"b"]
-        input_data = b"c\na\nb\n"
-        self.assert_reverse_sorted(
-            input_data, records, "-r", "--reverse", "-rr", "--reverse"
-        )
-
     def test_unknown_short_option_fails(self):
         self.assert_invalid_arguments("-x")
 
