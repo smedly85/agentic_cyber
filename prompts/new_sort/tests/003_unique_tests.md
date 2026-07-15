@@ -1,4 +1,4 @@
-# Task: Create 003 unique tests for sort
+# Task: Create 003 unique tests for new_sort
 
 Create:
 
@@ -28,7 +28,7 @@ Do not modify:
     README.md
     src/new_sort/README.md
     prompts/
-    tests/test_new_sort.py
+    tests/new_sort/test_new_sort.py
     tests/new_sort/test_001_reverse.py
     tests/new_sort/test_002_ignore_case.py
     Makefile
@@ -43,21 +43,31 @@ report the failure.
 Without -f:
 
 - sort using bytewise ordering
-- group only byte-identical lines
-- output the first line from each group
+- group only byte-identical records
+- output one record from each group
 
 With -f:
 
-- group lines using ASCII case-insensitive equality
-- use original bytes for deterministic secondary ordering
-- output the first line from each completed sorted group
+- determine equality using ASCII case-insensitive values
+- order records within each equality group using original bytes
+- choose the first record in that normal deterministic order
+- remove the other records from the equality group
 
-With -r:
+With -r but without -f:
 
-- reverse the completed sorted order
-- output the first line from each group in that order
+- reverse the order of distinct bytewise groups
+- output one record from each group
 
-Implement expected behavior independently in Python.
+With -r and -f:
+
+- determine case-insensitive equality groups
+- choose each representative using the normal deterministic secondary order
+- remove the other members of each group
+- reverse the order of the surviving groups
+- do not change the representative because reverse is enabled
+
+Sorting and representative selection must be implemented independently in the
+test oracle.
 
 Keep ordering comparison separate from uniqueness equality.
 
@@ -71,7 +81,14 @@ Run:
 
 Use subprocess with byte input and byte output.
 
-Do not call sort, uniq, or another external utility.
+Do not call:
+
+    sort
+    uniq
+    shuf
+    another external utility
+
+Do not copy implementation logic from the C source.
 
 The test file must be self-contained.
 
@@ -83,65 +100,121 @@ Test all of these:
 2. --unique produces the same output as -u.
 3. No option still preserves duplicates.
 4. Input with no duplicates.
-5. Input containing only one repeated line.
+5. Input containing only one repeated record.
 6. Multiple duplicate groups.
 7. Nonadjacent duplicates before sorting.
-8. Empty input.
-9. One line.
-10. Multiple empty lines collapse to one empty line.
-11. Empty lines mixed with nonempty lines.
-12. Prefix-related lines remain distinct.
-13. Leading and trailing spaces remain significant without -f.
-14. Case variants remain distinct without -f.
-15. -f -u groups ASCII case variants.
-16. -u -f and -f -u are equivalent.
-17. The deterministic representative is retained for case-equivalent groups.
-18. -r -u reverses ordering and keeps one line per exact group.
-19. -r -f -u follows the specified representative rule.
-20. All supported option orders are equivalent where expected.
-21. Combined forms including -fu, -uf, -ru, -urf, and -rfu.
-22. Separate short forms.
-23. Long forms.
-24. Mixed short and long forms.
-25. -uu is accepted and acts like -u.
-26. Repeated long options are idempotent.
-27. Repeated mixed options are idempotent.
-28. Digits and punctuation.
-29. Embedded NUL bytes.
-30. Bytes above ASCII.
-31. A final line without a newline.
-32. Lines longer than 4 KiB.
-33. A large number of duplicate groups.
-34. Every successful output line ends in a newline.
-35. Unknown short options fail.
-36. Unknown long options fail.
-37. Non-option operands fail.
-38. --unique=value fails.
-39. Invalid arguments exit with status 2.
-40. Invalid arguments produce no standard output.
-41. Invalid arguments write a usage diagnostic to standard error.
-42. Successful commands exit with status 0.
-43. Successful commands write nothing to standard error.
+8. Duplicate groups of different sizes.
+9. Empty input.
+10. One empty record.
+11. Multiple empty records collapse to one empty record.
+12. Empty records mixed with nonempty records.
+13. Prefix-related records remain distinct.
+14. Records differing only in length remain distinct.
+15. Leading spaces remain significant.
+16. Trailing spaces remain significant.
+17. Tabs and spaces remain distinct.
+18. Case variants remain distinct without -f.
+19. -f -u groups ASCII case variants.
+20. -u -f and -f -u are equivalent.
+21. Three or more case variants form one equality group.
+22. The deterministic representative is retained.
+23. Input order does not determine the representative.
+24. -r -u reverses distinct exact-match groups.
+25. -r -f -u retains the same representative as -f -u.
+26. -r -f -u reverses the surviving group order.
+27. Reverse does not change the selected case-insensitive representative.
+28. All supported option orders are equivalent.
+29. Combined forms including -fu, -uf, -ru, -urf, and -rfu.
+30. Separate short forms.
+31. Long forms.
+32. Mixed short and long forms.
+33. -uu is accepted and acts like -u.
+34. Repeated long options are idempotent.
+35. Repeated mixed options are idempotent.
+36. Digits.
+37. Punctuation.
+38. Leading and trailing whitespace.
+39. Embedded NUL bytes.
+40. Multiple embedded NUL bytes.
+41. Bytes above ASCII.
+42. Mixed ASCII and non-ASCII bytes.
+43. A final record without a newline.
+44. A one-byte final record without a newline.
+45. Records longer than 4 KiB.
+46. Records with long common prefixes.
+47. A large number of duplicate groups.
+48. A large number of records in one group.
+49. Input records are not truncated.
+50. Selected representatives are not modified.
+51. Every successful output record ends with a newline.
+52. Unknown short options fail.
+53. Unknown long options fail.
+54. Non-option operands fail.
+55. A single dash is rejected.
+56. A double-dash argument is rejected.
+57. --unique=value fails.
+58. Multiple invalid arguments fail.
+59. Invalid arguments exit with status 2.
+60. Invalid arguments produce no standard output.
+61. Invalid arguments write a usage diagnostic to standard error.
+62. Invalid arguments are rejected before standard input is processed.
+63. Successful commands exit with status 0.
+64. Successful commands write nothing to standard error.
+65. Repeated executions do not depend on prior process state.
 
-Include groups with three or more case variants.
-
-Include groups where reverse mode changes which case variant appears first
-under the checkpoint specification.
-
-## Test quality
+## Expected-output helpers
 
 Create independent helpers for:
 
 - ASCII folding
-- expected ordering
-- equality grouping
-- unique representative selection
+- normal bytewise ordering
+- ignore-case ordering
+- exact equality
+- case-insensitive equality
+- equality-group construction
+- deterministic representative selection
+- reverse group ordering
+- output serialization
 
-Do not derive expected output from the program output.
+For -f -u:
 
-Do not copy implementation logic from the C source.
+- choose the first member in normal deterministic case-insensitive order
+
+For -r -f -u:
+
+- choose the same member as -f -u
+- reverse only the order of surviving groups
+
+Do not derive expected output from program output.
+
+## Invalid-argument checks
+
+For each invalid invocation:
+
+- provide input that would normally produce visible output
+- verify exit status is exactly 2
+- verify standard output is empty
+- verify standard error contains a usage diagnostic
+
+## Test quality
+
+Use clear helper functions.
+
+Use descriptive test names.
+
+Do not import helpers from another test file.
+
+Do not copy implementation internals.
+
+Do not decode records as text.
+
+Do not depend on locale.
 
 Do not weaken assertions to match current behavior.
+
+Do not use timing-based checks.
+
+Avoid unnecessarily slow test data.
 
 ## Validation
 
@@ -159,7 +232,3 @@ Report:
 3. Commands run.
 4. Test results.
 5. Any implementation failures found.
-
-Do not commit.
-Do not create a branch.
-Do not open a pull request.
