@@ -4,10 +4,6 @@ Modify:
 
     src/new_sort/new_sort.c
 
-Update:
-
-    src/new_sort/README.md
-
 The executable must remain:
 
     build/new_sort
