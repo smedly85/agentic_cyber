@@ -146,30 +146,6 @@ Do not call sort, shuf, or another external program.
 
 Do not make unrelated changes.
 
-## Documentation
-
-Update:
-
-    src/new_sort/README.md
-
-Document:
-
-    -R
-    --random-sort
-
-Explain:
-
-- uppercase -R versus lowercase -r
-- randomized group ordering
-- equal lines remaining together
-- interaction with -f, -u, and -r
-- separate runs may produce different results
-- unsupported random-source options
-
-Do not modify the root README.
-
-Do not modify files under prompts/.
-
 ## Build
 
 Run:

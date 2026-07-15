@@ -95,23 +95,6 @@ Do not call another sorting program.
 
 Do not make unrelated changes.
 
-## Documentation
-
-Update:
-
-    src/new_sort/README.md
-
-Document:
-
-    -r
-    --reverse
-
-Include one short example.
-
-Do not modify the root README.
-
-Do not modify files under prompts/.
-
 ## Build
 
 Run:

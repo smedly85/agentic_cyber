@@ -91,18 +91,6 @@ Do not call an external program to implement the feature.
 
 Do not make unrelated changes.
 
-## Documentation
-
-Update:
-
-    [README_PATH]
-
-Document the new behavior and supported arguments.
-
-Do not modify the root README.
-
-Do not modify files under prompts/.
-
 ## Build
 
 Run:

@@ -106,25 +106,6 @@ Do not call another sorting program.
 
 Do not make unrelated changes.
 
-## Documentation
-
-Update:
-
-    src/new_sort/README.md
-
-Document:
-
-    -f
-    --ignore-case
-
-State that the behavior is ASCII-only and locale-independent.
-
-Document interaction with reverse sorting.
-
-Do not modify the root README.
-
-Do not modify files under prompts/.
-
 ## Build
 
 Run:

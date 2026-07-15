@@ -136,27 +136,6 @@ Do not call sort, uniq, or another external program.
 
 Do not make unrelated changes.
 
-## Documentation
-
-Update:
-
-    src/new_sort/README.md
-
-Document:
-
-    -u
-    --unique
-
-Explain equality with and without -f.
-
-Explain which line is retained.
-
-Document interaction with reverse sorting.
-
-Do not modify the root README.
-
-Do not modify files under prompts/.
-
 ## Build
 
 Run:
