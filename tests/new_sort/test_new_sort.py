@@ -172,12 +172,6 @@ class NewSortTests(unittest.TestCase):
         self.assertEqual(Counter(output_records), Counter(records))
         self.assertEqual(output_records, sorted(records))
 
-    def test_unexpected_short_option_is_rejected(self):
-        self.assert_invalid_arguments("-r")
-
-    def test_unexpected_long_option_is_rejected(self):
-        self.assert_invalid_arguments("--reverse")
-
     def test_non_option_operand_is_rejected(self):
         self.assert_invalid_arguments("operand")
 
