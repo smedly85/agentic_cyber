@@ -105,10 +105,13 @@ With -r -u:
 
 With -r -f -u:
 
-- use case-insensitive equality
-- apply deterministic secondary ordering
-- reverse the final order
-- output the first line from each group
+- use ASCII case-insensitive equality
+- choose one representative using the normal deterministic secondary order
+- remove the other members of the equal group
+- apply reverse ordering after representative selection
+
+Reverse sorting must not change which member of a case-insensitive equal group
+is retained.
 
 ## Requirements
 
