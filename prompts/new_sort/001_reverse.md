@@ -107,9 +107,3 @@ Report:
 1. Files changed.
 2. Behavior added.
 3. Implementation approach.
-4. Commands run.
-5. Whether the build passed.
-
-Do not commit.
-Do not create a branch.
-Do not open a pull request.
