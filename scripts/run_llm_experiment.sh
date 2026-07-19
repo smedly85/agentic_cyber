@@ -261,17 +261,8 @@ write_metadata "$OUTPUT_DIR/experiment.json" \
     extra_test_command "$EXTRA_TEST_CMD" \
     created_at "$(date --iso-8601=seconds)"
 
-# OpenCode agent configuration with a model-independent temperature.
-OPENCODE_CONFIG_CONTENT="$(
-    "$PYTHON_BIN" - "$AGENT" "$TEMPERATURE" <<'PY'
-import json
-import sys
-
-agent = sys.argv[1]
-temperature = float(sys.argv[2])
-print(json.dumps({"agent": {agent: {"temperature": temperature}}}))
-PY
-)" || die "temperature must be numeric"
+"$PYTHON_BIN" -c 'import sys; float(sys.argv[1])' "$TEMPERATURE" ||
+    die "temperature must be numeric"
 
 printf 'Repository:  %s\n' "$REPO"
 printf 'Baseline:    %s (%s)\n' "$BASE_REF" "$BASE_COMMIT"
@@ -308,6 +299,7 @@ for attempt_number in $(seq 1 "$RUNS"); do
             model "$MODEL" \
             temperature "$TEMPERATURE" \
             setup_exit_code 1 \
+            opencode_permission_rejected false \
             overall_success false
         touch "$attempt_dir/COMPLETE"
         printf '  worktree creation failed; see %s\n' \
@@ -315,11 +307,45 @@ for attempt_number in $(seq 1 "$RUNS"); do
         continue
     fi
 
+    ATTEMPT_OPENCODE_CONFIG_CONTENT="$(
+        "$PYTHON_BIN" - "$AGENT" "$TEMPERATURE" "$attempt_dir" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+agent = sys.argv[1]
+temperature = float(sys.argv[2])
+attempt_dir = str(Path(sys.argv[3]).resolve())
+escaped_attempt_dir = attempt_dir.replace(" ", r"\ ")
+external_directory = {
+    "*": "deny",
+    attempt_dir: "allow",
+    f"{attempt_dir}/**": "allow",
+}
+if escaped_attempt_dir != attempt_dir:
+    # OpenCode 1.17.20 preserves backslash-escaped spaces in bash path checks.
+    external_directory[escaped_attempt_dir] = "allow"
+    external_directory[f"{escaped_attempt_dir}/**"] = "allow"
+config = {
+    "$schema": "https://opencode.ai/config.json",
+    "agent": {
+        agent: {
+            "temperature": temperature,
+            "permission": {
+                "external_directory": external_directory,
+            },
+        }
+    },
+}
+print(json.dumps(config))
+PY
+    )" || die "failed to build per-attempt OpenCode configuration"
+
     prompt_text="$(cat "$PROMPT")"
     opencode_start_ns="$(date +%s%N)"
 
     if [[ "$TIMEOUT_SECONDS" -gt 0 ]]; then
-        OPENCODE_CONFIG_CONTENT="$OPENCODE_CONFIG_CONTENT" \
+        OPENCODE_CONFIG_CONTENT="$ATTEMPT_OPENCODE_CONFIG_CONTENT" \
             timeout --signal=TERM --kill-after=30 \
             "$TIMEOUT_SECONDS" \
             "$OPENCODE_BIN" run \
@@ -328,7 +354,7 @@ for attempt_number in $(seq 1 "$RUNS"); do
                 --agent "$AGENT" \
                 "$prompt_text"
     else
-        OPENCODE_CONFIG_CONTENT="$OPENCODE_CONFIG_CONTENT" \
+        OPENCODE_CONFIG_CONTENT="$ATTEMPT_OPENCODE_CONFIG_CONTENT" \
             "$OPENCODE_BIN" run \
                 --dir "$worktree" \
                 --model "$MODEL" \
@@ -338,6 +364,13 @@ for attempt_number in $(seq 1 "$RUNS"); do
     opencode_exit=$?
     opencode_end_ns="$(date +%s%N)"
     opencode_ms=$(( (opencode_end_ns - opencode_start_ns) / 1000000 ))
+
+    opencode_permission_rejected=false
+    if grep -Eiq \
+            'permission requested:[[:space:]]*external_directory|auto-rejecting|user rejected permission|permission denied' \
+            "$attempt_dir/opencode.log"; then
+        opencode_permission_rejected=true
+    fi
 
     # Preserve the exact generated state before build/test commands can alter it.
     git -C "$worktree" status --short >"$attempt_dir/git-status.txt"
@@ -378,7 +411,8 @@ for attempt_number in $(seq 1 "$RUNS"); do
     total_ms=$((opencode_ms + build_ms + base_test_ms + feature_test_ms + extra_test_ms))
 
     overall_success=true
-    if [[ "$opencode_exit" -ne 0 ||
+    if [[ "$opencode_permission_rejected" == true ||
+          "$opencode_exit" -ne 0 ||
           "$build_exit" -ne 0 ||
           "$base_test_exit" -ne 0 ||
           "$feature_test_exit" -ne 0 ||
@@ -396,6 +430,7 @@ for attempt_number in $(seq 1 "$RUNS"); do
         base_commit "$BASE_COMMIT" \
         source_path "$SOURCE_PATH" \
         opencode_exit_code "$opencode_exit" \
+        opencode_permission_rejected "$opencode_permission_rejected" \
         build_exit_code "$build_exit" \
         base_test_exit_code "$base_test_exit" \
         feature_test_exit_code "$feature_test_exit" \

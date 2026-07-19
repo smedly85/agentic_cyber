@@ -109,7 +109,7 @@ def require_diagnostic_packages() -> tuple[Any, Any, Any, Any, Any]:
     return plt, levenshtein_ratio, linkage, dendrogram, squareform
 
 
-ANALYZER_VERSION = "3.1.0"
+ANALYZER_VERSION = "3.0.0"
 
 PAPER_METRICS_COLUMNS = [
     "Issue",
@@ -1049,7 +1049,8 @@ def opencode_permission_rejected(path: Path) -> bool:
     text = path.read_text(encoding="utf-8", errors="replace")
     return bool(
         re.search(
-            r"(?:auto-rejecting|user rejected permission|permission denied)",
+            r"(?:permission requested:\s*external_directory|auto-rejecting|"
+            r"user rejected permission|permission denied)",
             text,
             flags=re.I,
         )
@@ -2581,11 +2582,21 @@ def main() -> int:
             baseline.tree_sitter_node_count,
             candidate.tree_sitter_node_count,
         )
-        difftastic_error = run_difftastic(
-            baseline_source,
-            candidate_source,
-            run_output / "difftastic.txt" if run_output is not None else None,
-        )
+        # Difftastic is diagnostic-only; GumTree supplies structural metrics.
+        if args.diagnostic_output:
+            difftastic_error = run_difftastic(
+                baseline_source,
+                candidate_source,
+                (
+                    run_output / "difftastic.txt"
+                    if run_output is not None
+                    else None
+                ),
+            )
+            difftastic_available: bool | None = difftastic_error is None
+        else:
+            difftastic_error = None
+            difftastic_available = None
 
         function_metrics = function_change_metrics(
             baseline.tree_sitter_functions,
@@ -2781,7 +2792,8 @@ def main() -> int:
             "clang_available": candidate.clang_error is None,
             "tree_sitter_available": candidate.tree_sitter_error is None,
             "gumtree_available": gumtree_error is None,
-            "difftastic_available": difftastic_error is None,
+            "difftastic_requested": args.diagnostic_output,
+            "difftastic_available": difftastic_available,
             "lizard_available": candidate.lizard_error is None,
             "complete_architecture_measurement": (
                 complete_architecture_measurement
