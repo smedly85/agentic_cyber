@@ -47,7 +47,7 @@ from typing import Any, Iterable, Mapping, Sequence
 # ---------------------------------------------------------------------------
 
 
-def require_python_packages() -> tuple[Any, Any, Any, Any, Any, Any]:
+def require_python_packages() -> tuple[Any, Any, Any]:
     missing: list[str] = []
 
     try:
@@ -57,30 +57,11 @@ def require_python_packages() -> tuple[Any, Any, Any, Any, Any, Any]:
         np = None
 
     try:
-        from scipy.cluster.hierarchy import dendrogram, linkage
-        from scipy.spatial.distance import squareform
-    except ImportError:
-        missing.append("scipy")
-        dendrogram = linkage = squareform = None
-
-    try:
         from sklearn.cluster import AgglomerativeClustering
         from sklearn.metrics import silhouette_score
     except ImportError:
         missing.append("scikit-learn")
         AgglomerativeClustering = silhouette_score = None
-
-    try:
-        from rapidfuzz.fuzz import ratio as levenshtein_ratio
-    except ImportError:
-        missing.append("rapidfuzz")
-        levenshtein_ratio = None
-
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError:
-        missing.append("matplotlib")
-        plt = None
 
     if missing:
         raise SystemExit(
@@ -90,28 +71,45 @@ def require_python_packages() -> tuple[Any, Any, Any, Any, Any, Any]:
             + "  python3 -m pip install -r scripts/analysis-requirements.txt"
         )
 
-    return (
-        np,
-        AgglomerativeClustering,
-        silhouette_score,
-        levenshtein_ratio,
-        plt,
-        (linkage, dendrogram, squareform),
-    )
+    return np, AgglomerativeClustering, silhouette_score
 
 
-(
-    np,
-    AgglomerativeClustering,
-    silhouette_score,
-    levenshtein_ratio,
-    plt,
-    scipy_helpers,
-) = require_python_packages()
-scipy_linkage, scipy_dendrogram, squareform = scipy_helpers
+np: Any = None
+AgglomerativeClustering: Any = None
+silhouette_score: Any = None
 
 
-ANALYZER_VERSION = "3.0.0"
+def require_diagnostic_packages() -> tuple[Any, Any, Any, Any, Any]:
+    """Load packages used only by --diagnostic-output."""
+    missing: list[str] = []
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        missing.append("matplotlib")
+        plt = None
+    try:
+        from rapidfuzz.fuzz import ratio as levenshtein_ratio
+    except ImportError:
+        missing.append("rapidfuzz")
+        levenshtein_ratio = None
+    try:
+        from scipy.cluster.hierarchy import dendrogram, linkage
+        from scipy.spatial.distance import squareform
+    except ImportError:
+        missing.append("scipy")
+        dendrogram = linkage = squareform = None
+
+    if missing:
+        raise SystemExit(
+            "Diagnostic output requires missing Python packages: "
+            + ", ".join(missing)
+            + "\nInstall them with:\n"
+            + "  python3 -m pip install -r scripts/analysis-requirements.txt"
+        )
+    return plt, levenshtein_ratio, linkage, dendrogram, squareform
+
+
+ANALYZER_VERSION = "3.1.0"
 
 PAPER_METRICS_COLUMNS = [
     "Issue",
@@ -230,15 +228,19 @@ def parse_args() -> argparse.Namespace:
         "--thresholds",
         default=None,
         help=(
-            "Optional comma-separated thresholds for sensitivity tables. "
-            "When omitted, each population receives a data-derived grid."
+            "Optional comma-separated thresholds for sensitivity tables in "
+            "--diagnostic-output mode. When omitted, each population "
+            "receives a data-derived grid."
         ),
     )
     parser.add_argument(
         "--discovery-repetitions",
         type=int,
         default=2000,
-        help="Random permutations used for discovery curves. Default: 2000",
+        help=(
+            "Random permutations used for discovery curves in "
+            "--diagnostic-output mode. Default: 2000"
+        ),
     )
     parser.add_argument(
         "--strategy-exclude-regex",
@@ -267,6 +269,14 @@ def parse_args() -> argparse.Namespace:
         "--clean-output",
         action="store_true",
         help="Delete the output directory before writing the new analysis.",
+    )
+    parser.add_argument(
+        "--diagnostic-output",
+        action="store_true",
+        help=(
+            "Write detailed clustering tables, plots, and per-run tool "
+            "artifacts beneath analysis/diagnostics/."
+        ),
     )
     parser.add_argument(
         "--paper-issue-label",
@@ -1033,6 +1043,19 @@ def parse_llm_tokens(path: Path) -> dict[str, int | None]:
     return result
 
 
+def opencode_permission_rejected(path: Path) -> bool:
+    if not path.exists():
+        return False
+    text = path.read_text(encoding="utf-8", errors="replace")
+    return bool(
+        re.search(
+            r"(?:auto-rejecting|user rejected permission|permission denied)",
+            text,
+            flags=re.I,
+        )
+    )
+
+
 def pass_at_k(n: int, correct: int, k: int) -> float | None:
     if n <= 0 or k <= 0 or k > n:
         return None
@@ -1201,7 +1224,7 @@ def walk_clang(
 
 def parse_clang_ast(
     source: Path,
-    output_path: Path,
+    output_path: Path | None,
     extra_args: Sequence[str],
 ) -> tuple[Counter[str], int | None, str | None]:
     executable = shutil.which("clang")
@@ -1218,8 +1241,9 @@ def parse_clang_ast(
         str(source),
     ]
     result = run_command(command, timeout=300)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(result.stdout, encoding="utf-8")
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(result.stdout, encoding="utf-8")
 
     if result.returncode != 0:
         return (
@@ -1390,15 +1414,16 @@ def parse_tree_sitter(
 
 def lizard_metrics(
     source: Path,
-    output_path: Path,
+    output_path: Path | None,
 ) -> tuple[dict[str, float] | None, str | None]:
     executable = shutil.which("lizard")
     if executable is None:
         return None, "lizard not found"
 
     result = run_command([executable, "--csv", str(source)], timeout=180)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(result.stdout, encoding="utf-8")
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(result.stdout, encoding="utf-8")
     if result.returncode != 0:
         return None, result.stderr.strip() or "Lizard failed"
 
@@ -1448,7 +1473,7 @@ GUMTREE_OLD_ACTION_RE = re.compile(
 def run_gumtree(
     baseline: Path,
     candidate: Path,
-    output_path: Path,
+    output_path: Path | None,
     baseline_nodes: int | None,
     candidate_nodes: int | None,
 ) -> tuple[Counter[str], float | None, str | None]:
@@ -1463,8 +1488,9 @@ def run_gumtree(
     combined = result.stdout
     if result.stderr:
         combined += "\n--- STDERR ---\n" + result.stderr
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(combined, encoding="utf-8")
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(combined, encoding="utf-8")
 
     if result.returncode != 0:
         return (
@@ -1503,7 +1529,7 @@ def run_gumtree(
 def run_difftastic(
     baseline: Path,
     candidate: Path,
-    output_path: Path,
+    output_path: Path | None,
 ) -> str | None:
     executable = shutil.which("difft") or shutil.which("difftastic")
     if executable is None:
@@ -1516,8 +1542,9 @@ def run_difftastic(
     combined = result.stdout
     if result.stderr:
         combined += "\n--- STDERR ---\n" + result.stderr
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(combined, encoding="utf-8")
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(combined, encoding="utf-8")
 
     if result.returncode not in {0, 1}:
         return (
@@ -1534,12 +1561,12 @@ def run_difftastic(
 
 def analyze_source(
     source: Path,
-    output_dir: Path,
+    output_dir: Path | None,
     clang_extra_args: Sequence[str],
 ) -> ParsedSource:
     clang_counts, clang_nodes, clang_error = parse_clang_ast(
         source,
-        output_dir / "clang-ast.json",
+        output_dir / "clang-ast.json" if output_dir is not None else None,
         clang_extra_args,
     )
     (
@@ -1551,7 +1578,7 @@ def analyze_source(
     ) = parse_tree_sitter(source)
     candidate_lizard, lizard_error = lizard_metrics(
         source,
-        output_dir / "lizard.csv",
+        output_dir / "lizard.csv" if output_dir is not None else None,
     )
     return ParsedSource(
         clang_counts=clang_counts,
@@ -2211,10 +2238,12 @@ def plot_discovery_curve(
     rows: Sequence[Mapping[str, Any]],
     output_path: Path,
     title: str,
+    plt: Any,
 ) -> None:
     if not rows:
         return
 
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     x = [int(row["runs_sampled"]) for row in rows]
     observed = [float(row["observed_clusters"]) for row in rows]
     randomized_mean = [
@@ -2246,10 +2275,15 @@ def plot_dendrogram(
     threshold: float,
     output_path: Path,
     title: str,
+    plt: Any,
+    scipy_linkage: Any,
+    scipy_dendrogram: Any,
+    squareform: Any,
 ) -> None:
     if len(run_ids) < 2:
         return
 
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     condensed = squareform(distance, checks=False)
     linkage_matrix = scipy_linkage(condensed, method="average")
     plt.figure(figsize=(max(9, len(run_ids) * 0.13), 6))
@@ -2277,16 +2311,13 @@ def analyze_population(
     full_distance: Any,
     threshold: float,
     supplied_thresholds: str | None,
-    output_dir: Path,
+    diagnostic_data_dir: Path | None,
+    diagnostic_plot_dir: Path | None,
+    plotting_helpers: tuple[Any, Any, Any, Any] | None,
     discovery_repetitions: int,
 ) -> tuple[dict[str, Any], Any]:
     indices = [all_run_ids.index(run_id) for run_id in run_ids]
     distance = full_distance[np.ix_(indices, indices)]
-    threshold_grid = parse_threshold_grid(supplied_thresholds, distance)
-    sensitivity_rows, diagnostic_recommendation = threshold_sensitivity(
-        distance,
-        threshold_grid,
-    )
 
     labels = stabilize_labels(
         agglomerative_labels(distance, threshold),
@@ -2295,79 +2326,92 @@ def analyze_population(
     stats = cluster_statistics([int(value) for value in labels])
 
     prefix = f"{space_name}_{population_name}"
-    write_csv(
-        output_dir / f"threshold_sensitivity_{prefix}.csv",
-        sensitivity_rows,
-        [
-            "threshold",
-            "cluster_count",
-            "effective_cluster_count",
-            "dominant_cluster_share",
-            "singleton_rate",
-            "silhouette",
-        ],
-    )
-    write_csv(
-        output_dir / f"cluster_assignments_{prefix}.csv",
-        [
-            {
-                "run_id": run_id,
-                "cluster_id": int(label),
-                "space": space_name,
-                "population": population_name,
-            }
-            for run_id, label in zip(run_ids, labels)
-        ],
-        ["run_id", "cluster_id", "space", "population"],
-    )
-
     representative_rows = cluster_representatives(
         labels,
         distance,
         run_ids,
     )
-    write_csv(
-        output_dir / f"cluster_representatives_{prefix}.csv",
-        representative_rows,
-        [
-            "cluster_id",
-            "cluster_size",
-            "medoid_run_id",
-            "mean_intra_cluster_distance",
-            "maximum_intra_cluster_distance",
-            "members",
-        ],
-    )
-
-    discovery_rows = discovery_curve(
-        [int(value) for value in labels],
-        repetitions=discovery_repetitions,
-    )
-    write_csv(
-        output_dir / f"cluster_discovery_{prefix}.csv",
-        discovery_rows,
-        [
-            "runs_sampled",
-            "observed_clusters",
-            "randomized_mean_clusters",
-            "randomized_2_5_percentile",
-            "randomized_97_5_percentile",
-        ],
-    )
-    plot_discovery_curve(
-        discovery_rows,
-        output_dir / f"cluster_discovery_{prefix}.png",
-        f"{space_name.title()} cluster discovery — "
-        f"{population_name.replace('_', ' ')}",
-    )
-    plot_dendrogram(
-        distance,
-        run_ids,
-        threshold,
-        output_dir / f"cluster_dendrogram_{prefix}.png",
-        f"{space_name.title()} clustering — "
-        f"{population_name.replace('_', ' ')}",
-    )
+    diagnostic_recommendation = None
+    if diagnostic_data_dir is not None:
+        threshold_grid = parse_threshold_grid(supplied_thresholds, distance)
+        sensitivity_rows, diagnostic_recommendation = threshold_sensitivity(
+            distance,
+            threshold_grid,
+        )
+        write_csv(
+            diagnostic_data_dir / f"threshold_sensitivity_{prefix}.csv",
+            sensitivity_rows,
+            [
+                "threshold",
+                "cluster_count",
+                "effective_cluster_count",
+                "dominant_cluster_share",
+                "singleton_rate",
+                "silhouette",
+            ],
+        )
+        write_csv(
+            diagnostic_data_dir / f"cluster_assignments_{prefix}.csv",
+            [
+                {
+                    "run_id": run_id,
+                    "cluster_id": int(label),
+                    "space": space_name,
+                    "population": population_name,
+                }
+                for run_id, label in zip(run_ids, labels)
+            ],
+            ["run_id", "cluster_id", "space", "population"],
+        )
+        write_csv(
+            diagnostic_data_dir / f"cluster_representatives_{prefix}.csv",
+            representative_rows,
+            [
+                "cluster_id",
+                "cluster_size",
+                "medoid_run_id",
+                "mean_intra_cluster_distance",
+                "maximum_intra_cluster_distance",
+                "members",
+            ],
+        )
+        discovery_rows = discovery_curve(
+            [int(value) for value in labels],
+            repetitions=discovery_repetitions,
+        )
+        write_csv(
+            diagnostic_data_dir / f"cluster_discovery_{prefix}.csv",
+            discovery_rows,
+            [
+                "runs_sampled",
+                "observed_clusters",
+                "randomized_mean_clusters",
+                "randomized_2_5_percentile",
+                "randomized_97_5_percentile",
+            ],
+        )
+        if diagnostic_plot_dir is None or plotting_helpers is None:
+            raise RuntimeError("Diagnostic plotting was not initialized.")
+        plt, scipy_linkage, scipy_dendrogram, squareform = plotting_helpers
+        plot_discovery_curve(
+            discovery_rows,
+            diagnostic_plot_dir / f"cluster_discovery_{prefix}.png",
+            f"{space_name.title()} cluster discovery - "
+            f"{population_name.replace('_', ' ')}",
+            plt,
+        )
+        plot_dendrogram(
+            distance,
+            run_ids,
+            threshold,
+            diagnostic_plot_dir / f"cluster_dendrogram_{prefix}.png",
+            f"{space_name.title()} clustering - "
+            f"{population_name.replace('_', ' ')}",
+            plt,
+            scipy_linkage,
+            scipy_dendrogram,
+            squareform,
+        )
 
     return (
         {
@@ -2393,6 +2437,8 @@ def analyze_population(
 
 def main() -> int:
     args = parse_args()
+    global np, AgglomerativeClustering, silhouette_score
+    np, AgglomerativeClustering, silhouette_score = require_python_packages()
     experiment = args.experiment.resolve()
     if not experiment.exists():
         raise SystemExit(f"Experiment directory not found: {experiment}")
@@ -2407,9 +2453,29 @@ def main() -> int:
         if args.output_dir
         else experiment / "analysis"
     )
+    diagnostic_packages = (
+        require_diagnostic_packages() if args.diagnostic_output else None
+    )
     if args.clean_output and output_dir.exists():
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    diagnostic_root = (
+        output_dir / "diagnostics" if args.diagnostic_output else None
+    )
+    diagnostic_clustering_dir = (
+        diagnostic_root / "clustering" if diagnostic_root else None
+    )
+    diagnostic_plot_dir = diagnostic_root / "plots" if diagnostic_root else None
+    plotting_helpers = (
+        (
+            diagnostic_packages[0],
+            diagnostic_packages[2],
+            diagnostic_packages[3],
+            diagnostic_packages[4],
+        )
+        if diagnostic_packages is not None
+        else None
+    )
 
     source_path = Path(experiment_metadata["source_path"])
     baseline_source = experiment / "baseline" / source_path
@@ -2440,8 +2506,8 @@ def main() -> int:
         "lizard": shutil.which("lizard"),
         "python": sys.executable,
     }
-    write_json(output_dir / "tool_status.json", tool_paths)
-    write_json(output_dir / "tool_paths.json", tool_paths)
+    if diagnostic_root is not None:
+        write_json(diagnostic_root / "tool_paths.json", tool_paths)
 
     print(f"Experiment: {experiment}")
     print(f"Output:     {output_dir}")
@@ -2452,32 +2518,33 @@ def main() -> int:
         print(f"{name:11s} {path}")
 
     print("\nAnalyzing baseline...")
-    baseline_dir = output_dir / "baseline"
+    baseline_dir = diagnostic_root / "baseline" if diagnostic_root else None
     baseline = analyze_source(
         baseline_source,
         baseline_dir,
         args.clang_extra_arg,
     )
     baseline_functions = baseline.tree_sitter_functions or {}
-    write_json(
-        baseline_dir / "features.json",
-        {
-            "source": str(baseline_source),
-            "clang_counts": dict(baseline.clang_counts),
-            "clang_node_count": baseline.clang_node_count,
-            "clang_error": baseline.clang_error,
-            "tree_sitter_counts": dict(baseline.tree_sitter_counts),
-            "tree_sitter_leaf_tokens": baseline.tree_sitter_leaf_tokens,
-            "tree_sitter_node_count": baseline.tree_sitter_node_count,
-            "tree_sitter_functions": {
-                name: asdict(info)
-                for name, info in baseline_functions.items()
+    if baseline_dir is not None:
+        write_json(
+            baseline_dir / "features.json",
+            {
+                "source": str(baseline_source),
+                "clang_counts": dict(baseline.clang_counts),
+                "clang_node_count": baseline.clang_node_count,
+                "clang_error": baseline.clang_error,
+                "tree_sitter_counts": dict(baseline.tree_sitter_counts),
+                "tree_sitter_leaf_tokens": baseline.tree_sitter_leaf_tokens,
+                "tree_sitter_node_count": baseline.tree_sitter_node_count,
+                "tree_sitter_functions": {
+                    name: asdict(info)
+                    for name, info in baseline_functions.items()
+                },
+                "tree_sitter_error": baseline.tree_sitter_error,
+                "lizard_metrics": baseline.lizard_metrics,
+                "lizard_error": baseline.lizard_error,
             },
-            "tree_sitter_error": baseline.tree_sitter_error,
-            "lizard_metrics": baseline.lizard_metrics,
-            "lizard_error": baseline.lizard_error,
-        },
-    )
+        )
 
     rows: list[dict[str, Any]] = []
     architecture_blocks: dict[str, dict[str, dict[str, float]]] = {}
@@ -2489,8 +2556,11 @@ def main() -> int:
     for index, attempt in enumerate(attempts, start=1):
         metadata = read_json(attempt / "metadata.json")
         run_id = str(metadata.get("run_id", attempt.name))
-        run_output = output_dir / "runs" / run_id
-        run_output.mkdir(parents=True, exist_ok=True)
+        run_output = (
+            diagnostic_root / "runs" / attempt.name
+            if diagnostic_root
+            else None
+        )
 
         candidate_source = attempt / "candidate" / source_path
         candidate_missing = not candidate_source.exists()
@@ -2507,14 +2577,14 @@ def main() -> int:
         gumtree_actions, gumtree_distance, gumtree_error = run_gumtree(
             baseline_source,
             candidate_source,
-            run_output / "gumtree.txt",
+            run_output / "gumtree.txt" if run_output is not None else None,
             baseline.tree_sitter_node_count,
             candidate.tree_sitter_node_count,
         )
         difftastic_error = run_difftastic(
             baseline_source,
             candidate_source,
-            run_output / "difftastic.txt",
+            run_output / "difftastic.txt" if run_output is not None else None,
         )
 
         function_metrics = function_change_metrics(
@@ -2705,6 +2775,9 @@ def main() -> int:
             "llm_reasoning_tokens": llm_tokens["reasoning_tokens"],
             "llm_cache_read_tokens": llm_tokens["cache_read_tokens"],
             "llm_total_tokens": llm_tokens["total_tokens"],
+            "opencode_permission_rejected": opencode_permission_rejected(
+                attempt / "opencode.log"
+            ),
             "clang_available": candidate.clang_error is None,
             "tree_sitter_available": candidate.tree_sitter_error is None,
             "gumtree_available": gumtree_error is None,
@@ -2724,49 +2797,52 @@ def main() -> int:
                 candidate.lizard_metrics,
                 baseline.lizard_metrics,
             ),
+            **motifs,
         }
         rows.append(row)
-        source_texts[run_id] = candidate_source.read_text(
-            encoding="utf-8", errors="replace"
-        )
+        if args.diagnostic_output:
+            source_texts[run_id] = candidate_source.read_text(
+                encoding="utf-8", errors="replace"
+            )
         strategy_motif_rows.append({"run_id": run_id, **motifs})
 
-        write_json(
-            run_output / "features.json",
-            {
-                "run_id": run_id,
-                "function_metrics": function_metrics,
-                "function_name_mapping": {
-                    "architecture": architecture_mapping,
-                    "strategy": strategy_created_mapping,
+        if run_output is not None:
+            write_json(
+                run_output / "features.json",
+                {
+                    "run_id": run_id,
+                    "function_metrics": function_metrics,
+                    "function_name_mapping": {
+                        "architecture": architecture_mapping,
+                        "strategy": strategy_created_mapping,
+                    },
+                    "strategy_function_sets": {
+                        "baseline_behavior": sorted(baseline_behavior),
+                        "created_behavior": sorted(created_behavior),
+                        "edited_behavior": sorted(edited_behavior),
+                    },
+                    "architecture_clang_delta": architecture_clang_delta,
+                    "architecture_tree_sitter_delta": architecture_tree_delta,
+                    "strategy_clang_delta": strategy_clang_delta,
+                    "strategy_tree_sitter_delta": strategy_tree_delta,
+                    "gumtree_actions": dict(gumtree_actions),
+                    "gumtree_normalized_edit_distance": gumtree_distance,
+                    "architecture_blocks": architecture_blocks[run_id],
+                    "strategy_blocks": strategy_blocks[run_id],
+                    "strategy_motifs": motifs,
+                    "candidate_functions": {
+                        name: asdict(info)
+                        for name, info in candidate_functions.items()
+                    },
+                    "tool_errors": {
+                        "clang": candidate.clang_error,
+                        "tree_sitter": candidate.tree_sitter_error,
+                        "gumtree": gumtree_error,
+                        "difftastic": difftastic_error,
+                        "lizard": candidate.lizard_error,
+                    },
                 },
-                "strategy_function_sets": {
-                    "baseline_behavior": sorted(baseline_behavior),
-                    "created_behavior": sorted(created_behavior),
-                    "edited_behavior": sorted(edited_behavior),
-                },
-                "architecture_clang_delta": architecture_clang_delta,
-                "architecture_tree_sitter_delta": architecture_tree_delta,
-                "strategy_clang_delta": strategy_clang_delta,
-                "strategy_tree_sitter_delta": strategy_tree_delta,
-                "gumtree_actions": dict(gumtree_actions),
-                "gumtree_normalized_edit_distance": gumtree_distance,
-                "architecture_blocks": architecture_blocks[run_id],
-                "strategy_blocks": strategy_blocks[run_id],
-                "strategy_motifs": motifs,
-                "candidate_functions": {
-                    name: asdict(info)
-                    for name, info in candidate_functions.items()
-                },
-                "tool_errors": {
-                    "clang": candidate.clang_error,
-                    "tree_sitter": candidate.tree_sitter_error,
-                    "gumtree": gumtree_error,
-                    "difftastic": difftastic_error,
-                    "lizard": candidate.lizard_error,
-                },
-            },
-        )
+            )
 
         print(f"[{index:3d}/{len(attempts):3d}] {run_id}", flush=True)
 
@@ -2833,7 +2909,9 @@ def main() -> int:
             full_distance=architecture_distance,
             threshold=args.cluster_threshold,
             supplied_thresholds=args.thresholds,
-            output_dir=output_dir,
+            diagnostic_data_dir=diagnostic_clustering_dir,
+            diagnostic_plot_dir=diagnostic_plot_dir,
+            plotting_helpers=plotting_helpers,
             discovery_repetitions=args.discovery_repetitions,
         )
         architecture_summaries[population_name] = summary
@@ -2850,33 +2928,56 @@ def main() -> int:
             full_distance=strategy_distance,
             threshold=strategy_threshold,
             supplied_thresholds=args.thresholds,
-            output_dir=output_dir,
+            diagnostic_data_dir=diagnostic_clustering_dir,
+            diagnostic_plot_dir=diagnostic_plot_dir,
+            plotting_helpers=plotting_helpers,
             discovery_repetitions=args.discovery_repetitions,
         )
         strategy_summaries[population_name] = summary
         strategy_labels[population_name] = labels
 
-    # Compatibility aliases retained for earlier notebooks and scripts.
-    compatibility_files = {
-        "threshold_sensitivity_architecture_all_runs.csv":
-            "threshold_sensitivity_all_runs.csv",
-        "threshold_sensitivity_architecture_passing_runs.csv":
-            "threshold_sensitivity_passing_runs.csv",
-        "cluster_assignments_architecture_all_runs.csv":
-            "cluster_assignments_all_runs.csv",
-        "cluster_assignments_architecture_passing_runs.csv":
-            "cluster_assignments_passing_runs.csv",
-        "cluster_discovery_architecture_all_runs.csv":
-            "cluster_discovery_curve.csv",
-        "cluster_discovery_architecture_all_runs.png":
-            "cluster_discovery_curve.png",
-        "cluster_dendrogram_architecture_all_runs.png":
-            "cluster_dendrogram.png",
-    }
-    for source_name, destination_name in compatibility_files.items():
-        source_file = output_dir / source_name
-        if source_file.exists():
-            shutil.copyfile(source_file, output_dir / destination_name)
+    if diagnostic_clustering_dir is not None and diagnostic_plot_dir is not None:
+        compatibility_files = [
+            (
+                diagnostic_clustering_dir,
+                "threshold_sensitivity_architecture_all_runs.csv",
+                "threshold_sensitivity_all_runs.csv",
+            ),
+            (
+                diagnostic_clustering_dir,
+                "threshold_sensitivity_architecture_passing_runs.csv",
+                "threshold_sensitivity_passing_runs.csv",
+            ),
+            (
+                diagnostic_clustering_dir,
+                "cluster_assignments_architecture_all_runs.csv",
+                "cluster_assignments_all_runs.csv",
+            ),
+            (
+                diagnostic_clustering_dir,
+                "cluster_assignments_architecture_passing_runs.csv",
+                "cluster_assignments_passing_runs.csv",
+            ),
+            (
+                diagnostic_clustering_dir,
+                "cluster_discovery_architecture_all_runs.csv",
+                "cluster_discovery_curve.csv",
+            ),
+            (
+                diagnostic_plot_dir,
+                "cluster_discovery_architecture_all_runs.png",
+                "cluster_discovery_curve.png",
+            ),
+            (
+                diagnostic_plot_dir,
+                "cluster_dendrogram_architecture_all_runs.png",
+                "cluster_dendrogram.png",
+            ),
+        ]
+        for directory, source_name, destination_name in compatibility_files:
+            source_file = directory / source_name
+            if source_file.exists():
+                shutil.copyfile(source_file, directory / destination_name)
 
     def label_map(ids: Sequence[str], labels: Sequence[int]) -> dict[str, int]:
         return {
@@ -2917,32 +3018,95 @@ def main() -> int:
         strategy_labels["passing_complete_runs"],
     )
 
+    architecture_primary_name = (
+        "passing_complete_runs"
+        if passing_architecture_ids
+        else "passing_runs"
+    )
+    strategy_primary_name = (
+        "passing_complete_runs" if passing_strategy_ids else "passing_runs"
+    )
+    architecture_primary_map = label_map(
+        population_ids[architecture_primary_name],
+        architecture_labels[architecture_primary_name],
+    )
+    strategy_primary_map = label_map(
+        strategy_population_ids[strategy_primary_name],
+        strategy_labels[strategy_primary_name],
+    )
+
+    def primary_cluster_details(
+        population_summary: Mapping[str, Any],
+    ) -> tuple[Mapping[int, int], dict[int, str]]:
+        sizes = population_summary.get("cluster_sizes", {})
+        representatives = population_summary.get("representatives", [])
+        medoids = {
+            int(representative["cluster_id"]): str(
+                representative["medoid_run_id"]
+            )
+            for representative in representatives
+        }
+        return sizes, medoids
+
+    architecture_sizes, architecture_medoids = primary_cluster_details(
+        architecture_summaries[architecture_primary_name]
+    )
+    strategy_sizes, strategy_medoids = primary_cluster_details(
+        strategy_summaries[strategy_primary_name]
+    )
+
     for row in rows:
         run_id = str(row["run_id"])
-        row["architecture_cluster_all_runs"] = architecture_all_map.get(run_id)
-        row["architecture_cluster_complete_runs"] = (
-            architecture_complete_map.get(run_id)
+        architecture_cluster = architecture_primary_map.get(run_id)
+        strategy_cluster = strategy_primary_map.get(run_id)
+        row["architecture_cluster_id"] = architecture_cluster
+        row["strategy_cluster_id"] = strategy_cluster
+        row["architecture_cluster_size"] = (
+            architecture_sizes.get(architecture_cluster)
+            if architecture_cluster is not None
+            else None
         )
-        row["architecture_cluster_passing_runs"] = (
-            architecture_passing_map.get(run_id)
+        row["strategy_cluster_size"] = (
+            strategy_sizes.get(strategy_cluster)
+            if strategy_cluster is not None
+            else None
         )
-        row["architecture_cluster_passing_complete_runs"] = (
-            architecture_passing_complete_map.get(run_id)
+        row["architecture_cluster_medoid"] = (
+            run_id == architecture_medoids.get(architecture_cluster)
+            if architecture_cluster is not None
+            else None
         )
-        row["strategy_cluster_all_runs"] = strategy_all_map.get(run_id)
-        row["strategy_cluster_complete_runs"] = strategy_complete_map.get(run_id)
-        row["strategy_cluster_passing_runs"] = strategy_passing_map.get(run_id)
-        row["strategy_cluster_passing_complete_runs"] = (
-            strategy_passing_complete_map.get(run_id)
+        row["strategy_cluster_medoid"] = (
+            run_id == strategy_medoids.get(strategy_cluster)
+            if strategy_cluster is not None
+            else None
         )
+        if args.diagnostic_output:
+            row["architecture_cluster_all_runs"] = architecture_all_map.get(run_id)
+            row["architecture_cluster_complete_runs"] = (
+                architecture_complete_map.get(run_id)
+            )
+            row["architecture_cluster_passing_runs"] = (
+                architecture_passing_map.get(run_id)
+            )
+            row["architecture_cluster_passing_complete_runs"] = (
+                architecture_passing_complete_map.get(run_id)
+            )
+            row["strategy_cluster_all_runs"] = strategy_all_map.get(run_id)
+            row["strategy_cluster_complete_runs"] = strategy_complete_map.get(
+                run_id
+            )
+            row["strategy_cluster_passing_runs"] = strategy_passing_map.get(run_id)
+            row["strategy_cluster_passing_complete_runs"] = (
+                strategy_passing_complete_map.get(run_id)
+            )
 
     flattened_rows = [flatten_dict(row) for row in rows]
     fields = sorted({key for row in flattened_rows for key in row})
     write_csv(output_dir / "per_run_metrics.csv", flattened_rows, fields)
 
-    write_csv(
-        output_dir / "architecture_feature_matrix.csv",
-        [
+    if diagnostic_clustering_dir is not None:
+        architecture_feature_rows = [
             {
                 "run_id": run_id,
                 **{
@@ -2954,12 +3118,8 @@ def main() -> int:
                 },
             }
             for index, run_id in enumerate(run_ids)
-        ],
-        ["run_id", *architecture_features],
-    )
-    write_csv(
-        output_dir / "strategy_feature_matrix.csv",
-        [
+        ]
+        strategy_feature_rows = [
             {
                 "run_id": run_id,
                 **{
@@ -2971,158 +3131,160 @@ def main() -> int:
                 },
             }
             for index, run_id in enumerate(run_ids)
-        ],
-        ["run_id", *strategy_features],
-    )
-    # Backward-compatible filename: the original feature matrix now means the
-    # whole-patch architecture feature matrix.
-    write_csv(
-        output_dir / "feature_matrix.csv",
-        [
-            {
-                "run_id": run_id,
-                **{
-                    feature: float(value)
-                    for feature, value in zip(
-                        architecture_features,
-                        architecture_matrix[index],
-                    )
-                },
-            }
-            for index, run_id in enumerate(run_ids)
-        ],
-        ["run_id", *architecture_features],
-    )
-
-    motif_fields = sorted(
-        {key for row in strategy_motif_rows for key in row}
-    )
-    write_csv(
-        output_dir / "strategy_motifs.csv",
-        strategy_motif_rows,
-        motif_fields,
-    )
-
-    write_json(
-        output_dir / "feature_schema.json",
-        {
-            "architecture": {
-                "blocks": architecture_schema,
-                "description": (
-                    "Whole-patch architecture: non-duplicated Clang AST "
-                    "deltas, Tree-sitter C deltas, and GumTree actions."
-                ),
-            },
-            "strategy": {
-                "blocks": strategy_schema,
-                "description": (
-                    "Algorithmic strategy: Clang and Tree-sitter deltas from "
-                    "behavioral functions only; main and parser/usage helpers "
-                    "are excluded by the configured regex."
-                ),
-                "excluded_function_regex": args.strategy_exclude_regex,
-                "forced_includes": sorted(forced_strategy_functions),
-            },
-            "normalization": (
-                "Each tool block is L2-normalized per run; concatenated "
-                "vectors are L2-normalized again."
-            ),
-            "signed_delta_encoding": (
-                "Positive and negative baseline deltas are split into "
-                "separate added/removed non-negative features."
-            ),
-            "created_function_canonicalization": (
-                "New function names are replaced by ordered parser-helper or "
-                "behavior-helper placeholders so arbitrary names do not "
-                "create artificial distance."
-            ),
-            "excluded_from_clustering": [
-                "lines and files edited",
-                "source token count",
-                "Lizard metrics",
-                "runtime",
-                "test outcomes",
-                "Levenshtein ratio",
-                "LLM token usage",
-            ],
-        },
-    )
-
-    pairwise_rows: list[dict[str, Any]] = []
-    for left_index, right_index in itertools.combinations(
-        range(len(run_ids)), 2
-    ):
-        left = run_ids[left_index]
-        right = run_ids[right_index]
-        pairwise_rows.append(
-            {
-                "run_a": left,
-                "run_b": right,
-                "architecture_cosine_similarity": (
-                    1.0 - float(architecture_distance[left_index, right_index])
-                ),
-                "architecture_cosine_distance": float(
-                    architecture_distance[left_index, right_index]
-                ),
-                "strategy_cosine_similarity": (
-                    1.0 - float(strategy_distance[left_index, right_index])
-                ),
-                "strategy_cosine_distance": float(
-                    strategy_distance[left_index, right_index]
-                ),
-                "levenshtein_ratio": (
-                    levenshtein_ratio(
-                        source_texts[left], source_texts[right]
-                    )
-                    / 100.0
-                ),
-                "same_architecture_all_cluster": int(
-                    architecture_all_map[left] == architecture_all_map[right]
-                ),
-                "same_strategy_all_cluster": int(
-                    strategy_all_map[left] == strategy_all_map[right]
-                ),
-                "both_successful": int(
-                    left in passing_ids and right in passing_ids
-                ),
-                "same_architecture_passing_cluster": (
-                    int(
-                        architecture_passing_map[left]
-                        == architecture_passing_map[right]
-                    )
-                    if left in architecture_passing_map
-                    and right in architecture_passing_map
-                    else None
-                ),
-                "same_strategy_passing_cluster": (
-                    int(
-                        strategy_passing_map[left]
-                        == strategy_passing_map[right]
-                    )
-                    if left in strategy_passing_map
-                    and right in strategy_passing_map
-                    else None
-                ),
-            }
+        ]
+        write_csv(
+            diagnostic_clustering_dir / "architecture_feature_matrix.csv",
+            architecture_feature_rows,
+            ["run_id", *architecture_features],
         )
-    write_csv(
-        output_dir / "pairwise_similarity.csv",
-        pairwise_rows,
-        [
-            "run_a",
-            "run_b",
-            "architecture_cosine_similarity",
-            "architecture_cosine_distance",
-            "strategy_cosine_similarity",
-            "strategy_cosine_distance",
-            "levenshtein_ratio",
-            "same_architecture_all_cluster",
-            "same_strategy_all_cluster",
-            "both_successful",
-            "same_architecture_passing_cluster",
-            "same_strategy_passing_cluster",
-        ],
-    )
+        write_csv(
+            diagnostic_clustering_dir / "strategy_feature_matrix.csv",
+            strategy_feature_rows,
+            ["run_id", *strategy_features],
+        )
+        # The compatibility filename means the architecture feature matrix.
+        write_csv(
+            diagnostic_clustering_dir / "feature_matrix.csv",
+            architecture_feature_rows,
+            ["run_id", *architecture_features],
+        )
+
+        motif_fields = sorted(
+            {key for row in strategy_motif_rows for key in row}
+        )
+        write_csv(
+            diagnostic_clustering_dir / "strategy_motifs.csv",
+            strategy_motif_rows,
+            motif_fields,
+        )
+
+        write_json(
+            diagnostic_clustering_dir / "feature_schema.json",
+            {
+                "architecture": {
+                    "blocks": architecture_schema,
+                    "description": (
+                        "Whole-patch architecture: non-duplicated Clang AST "
+                        "deltas, Tree-sitter C deltas, and GumTree actions."
+                    ),
+                },
+                "strategy": {
+                    "blocks": strategy_schema,
+                    "description": (
+                        "Algorithmic strategy: Clang and Tree-sitter deltas "
+                        "from behavioral functions only; main and parser/usage "
+                        "helpers are excluded by the configured regex."
+                    ),
+                    "excluded_function_regex": args.strategy_exclude_regex,
+                    "forced_includes": sorted(forced_strategy_functions),
+                },
+                "normalization": (
+                    "Each tool block is L2-normalized per run; concatenated "
+                    "vectors are L2-normalized again."
+                ),
+                "signed_delta_encoding": (
+                    "Positive and negative baseline deltas are split into "
+                    "separate added/removed non-negative features."
+                ),
+                "created_function_canonicalization": (
+                    "New function names are replaced by ordered parser-helper "
+                    "or behavior-helper placeholders so arbitrary names do "
+                    "not create artificial distance."
+                ),
+                "excluded_from_clustering": [
+                    "lines and files edited",
+                    "source token count",
+                    "Lizard metrics",
+                    "runtime",
+                    "test outcomes",
+                    "Levenshtein ratio",
+                    "LLM token usage",
+                ],
+            },
+        )
+
+        if diagnostic_packages is None:
+            raise RuntimeError("Diagnostic packages were not initialized.")
+        levenshtein_ratio = diagnostic_packages[1]
+        pairwise_rows: list[dict[str, Any]] = []
+        for left_index, right_index in itertools.combinations(
+            range(len(run_ids)), 2
+        ):
+            left = run_ids[left_index]
+            right = run_ids[right_index]
+            pairwise_rows.append(
+                {
+                    "run_a": left,
+                    "run_b": right,
+                    "architecture_cosine_similarity": (
+                        1.0
+                        - float(
+                            architecture_distance[left_index, right_index]
+                        )
+                    ),
+                    "architecture_cosine_distance": float(
+                        architecture_distance[left_index, right_index]
+                    ),
+                    "strategy_cosine_similarity": (
+                        1.0 - float(strategy_distance[left_index, right_index])
+                    ),
+                    "strategy_cosine_distance": float(
+                        strategy_distance[left_index, right_index]
+                    ),
+                    "levenshtein_ratio": (
+                        levenshtein_ratio(
+                            source_texts[left], source_texts[right]
+                        )
+                        / 100.0
+                    ),
+                    "same_architecture_all_cluster": int(
+                        architecture_all_map[left]
+                        == architecture_all_map[right]
+                    ),
+                    "same_strategy_all_cluster": int(
+                        strategy_all_map[left] == strategy_all_map[right]
+                    ),
+                    "both_successful": int(
+                        left in passing_ids and right in passing_ids
+                    ),
+                    "same_architecture_passing_cluster": (
+                        int(
+                            architecture_passing_map[left]
+                            == architecture_passing_map[right]
+                        )
+                        if left in architecture_passing_map
+                        and right in architecture_passing_map
+                        else None
+                    ),
+                    "same_strategy_passing_cluster": (
+                        int(
+                            strategy_passing_map[left]
+                            == strategy_passing_map[right]
+                        )
+                        if left in strategy_passing_map
+                        and right in strategy_passing_map
+                        else None
+                    ),
+                }
+            )
+        write_csv(
+            diagnostic_clustering_dir / "pairwise_similarity.csv",
+            pairwise_rows,
+            [
+                "run_a",
+                "run_b",
+                "architecture_cosine_similarity",
+                "architecture_cosine_distance",
+                "strategy_cosine_similarity",
+                "strategy_cosine_distance",
+                "levenshtein_ratio",
+                "same_architecture_all_cluster",
+                "same_strategy_all_cluster",
+                "both_successful",
+                "same_architecture_passing_cluster",
+                "same_strategy_passing_cluster",
+            ],
+        )
 
     n = len(rows)
     successful = sum(bool(row.get("overall_success")) for row in rows)
