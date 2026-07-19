@@ -100,6 +100,19 @@ Run:
 
 Fix all compiler errors and warnings.
 
+## Tests
+
+Run:
+
+    [TEST_COMMAND]
+
+to check against every test in [TEST_PATH] — both the tests for this feature and
+every test from earlier checkpoints. If any test fails, fix the implementation,
+rebuild, and run the test command again. Keep iterating — fix, rebuild, retest —
+until every test passes.
+
+Do not modify, weaken, or delete any existing test.
+
 ## Final response
 
 Report:
@@ -109,7 +122,3 @@ Report:
 3. Implementation approach.
 4. Commands run.
 5. Whether the build passed.
-
-Do not commit.
-Do not create a branch.
-Do not open a pull request.
