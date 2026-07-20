@@ -118,6 +118,26 @@ no commits, no diffing, no `analyze_experiment.py` call. It's a separate,
 simpler alternative for prompts that don't need git-diff-based baseline
 comparison, not a replacement for the `new_sort` workflow above.
 
+## Measuring implementation diversity
+
+`scripts/measure_diversity.py` compares a set of independently generated
+implementations of the same utility (e.g. multiple `new_mkdir.c` samples
+under `runs/`) and reports how different they actually are, at several
+levels each grounded in an established code-similarity/clone-detection
+paradigm (lexical, AST, API/strategy, security-construct "attack surface",
+and optionally neural). See `docs/diversity_methodology.md` for the full
+methodology, citations, and interpretation guidance.
+
+```bash
+python3 -m pip install -r scripts/diversity-requirements.txt
+python3 scripts/measure_diversity.py "runs/**/new_mkdir.c" --out-dir runs/diversity
+python3 scripts/measure_diversity.py --calibrate   # sanity-check the tool itself
+```
+
+`tests/diversity-anchors/` vendors independently developed real-world
+implementations (GNU coreutils, BusyBox, toybox, FreeBSD, NetBSD `mkdir`)
+to use as a diversity reference point via `--reference`.
+
 ## Repository Structure
 
 ```text
@@ -152,10 +172,15 @@ agentic_cyber/
 │       └── 002_mode.md                     # Add -m / --mode
 │
 ├── scripts/
-│   ├── analysis-requirements.txt           # Python analysis dependencies
+│   ├── analysis-requirements.txt           # Python analysis dependencies (analyze_experiment.py)
 │   ├── analyze_experiment.py               # Metrics and clustering analyzer
+│   ├── diversity-requirements.txt          # Python dependencies (measure_diversity.py)
+│   ├── measure_diversity.py                # N-version implementation-diversity metrics
 │   ├── run_llm_experiment.sh               # Isolated multi-run experiment runner (Git worktrees)
 │   └── run_sandboxed_pipeline.sh           # No-Git temp-directory pipeline (mkdir checkpoints)
+│
+├── docs/
+│   └── diversity_methodology.md            # Methodology behind measure_diversity.py
 │
 ├── src/
 │   └── new_sort/
@@ -170,9 +195,15 @@ agentic_cyber/
     │   ├── test_003_unique.py              # Unique-output checkpoint tests
     │   └── test_004_random_sort.py         # Random-sort checkpoint tests
     │
-    └── mkdir-test-suite/                   # Standalone exhaustive golden/fuzz suite
-        ├── judge_candidate.sh              # Per-checkpoint harness entry point
-        └── ...                            # config.json, runner.py, suites/, etc.
+    ├── mkdir-test-suite/                   # Standalone exhaustive golden/fuzz suite
+    │   ├── judge_candidate.sh              # Per-checkpoint harness entry point
+    │   └── ...                            # config.json, runner.py, suites/, etc.
+    │
+    ├── diversity-anchors/mkdir/            # Vendored real-world mkdir implementations
+    │   ├── SOURCES.md                      # Provenance/license for each vendored file
+    │   └── *.c                             # GNU coreutils, BusyBox, toybox, FreeBSD, NetBSD
+    │
+    └── test_measure_diversity.py           # Unit tests for measure_diversity.py
 ```
 
 The `build/` and `runs/` directories are generated locally and are not stored

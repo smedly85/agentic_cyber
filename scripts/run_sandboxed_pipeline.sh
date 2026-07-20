@@ -46,11 +46,13 @@ Required:
 
 Options:
   --runs N                   Number of temperature points to sweep (default:
-                              10). Each point gets exactly one attempt -- no
-                              same-temperature repeats. Temperatures are N
-                              values equally spaced across
-                              [--temp-min, --temp-max] inclusive (N=1 uses
-                              --temp-min).
+                              10). Temperatures are N values equally spaced
+                              across [--temp-min, --temp-max] inclusive (N=1
+                              uses --temp-min).
+  --repeats N                 Number of attempts to run at each temperature
+                              point (default: 1). Use this to resample the
+                              same temperature N times, e.g. to gauge run-to-
+                              run variance at temp=0.
   --temp-min MIN              Default: 0
   --temp-max MAX              Default: 2
   --agent NAME                OpenCode agent (default: build)
@@ -87,7 +89,7 @@ Environment:
   OPENCODE_BIN                OpenCode executable (default: opencode)
   PYTHON_BIN                  Python executable (default: python3)
 
-Directory layout:
+Directory layout (--repeats 1, the default):
   <output-dir>/
     run.json
     temp-<temp-slug>/
@@ -96,6 +98,15 @@ Directory layout:
       test.log          (only if --test-cmd is given)
       metadata.json
       COMPLETE
+
+Directory layout (--repeats N > 1):
+  <output-dir>/
+    run.json
+    temp-<temp-slug>/
+      rep-1/{workdir,opencode.log,test.log,metadata.json,COMPLETE}
+      rep-2/...
+      ...
+      rep-N/...
 
 Every run passes --thinking to OpenCode, so opencode.log captures the model's
 thinking blocks and every tool call/result (bash commands, file edits) in
@@ -184,6 +195,7 @@ run_logged_command() {
 MODEL=""
 PROMPT=""
 RUNS=10
+REPEATS=1
 TEMP_MIN="0"
 TEMP_MAX="2"
 AGENT="build"
@@ -203,6 +215,7 @@ while [[ $# -gt 0 ]]; do
         --model) MODEL="${2:-}"; shift 2 ;;
         --prompt) PROMPT="${2:-}"; shift 2 ;;
         --runs) RUNS="${2:-}"; shift 2 ;;
+        --repeats) REPEATS="${2:-}"; shift 2 ;;
         --temp-min) TEMP_MIN="${2:-}"; shift 2 ;;
         --temp-max) TEMP_MAX="${2:-}"; shift 2 ;;
         --agent) AGENT="${2:-}"; shift 2 ;;
@@ -221,6 +234,7 @@ done
 [[ -n "$MODEL" ]] || die "--model is required"
 [[ -n "$PROMPT" ]] || die "--prompt is required"
 [[ "$RUNS" =~ ^[1-9][0-9]*$ ]] || die "--runs must be a positive integer"
+[[ "$REPEATS" =~ ^[1-9][0-9]*$ ]] || die "--repeats must be a positive integer"
 
 command -v "$OPENCODE_BIN" >/dev/null 2>&1 || die "$OPENCODE_BIN was not found"
 command -v "$PYTHON_BIN" >/dev/null 2>&1 || die "$PYTHON_BIN was not found"
@@ -289,6 +303,7 @@ write_metadata "$OUTPUT_DIR/run.json" \
     agent "$AGENT" \
     prompt "$PROMPT_ABS" \
     requested_runs "$RUNS" \
+    repeats "$REPEATS" \
     temp_min "$TEMP_MIN" \
     temp_max "$TEMP_MAX" \
     test_dirs "$TEST_DIRS_JOINED" \
@@ -315,7 +330,12 @@ else:
 printf 'Repository:  %s\n' "$REPO"
 printf 'Model:       %s\n' "$MODEL"
 printf 'Prompt:      %s\n' "$PROMPT_ABS"
-printf 'Runs:        %s (temperatures %s to %s)\n' "$RUNS" "$TEMP_MIN" "$TEMP_MAX"
+printf 'Runs:        %s (temperatures %s to %s)' "$RUNS" "$TEMP_MIN" "$TEMP_MAX"
+if [[ "$REPEATS" -gt 1 ]]; then
+    printf ' x %s repeats\n' "$REPEATS"
+else
+    printf '\n'
+fi
 printf 'Output:      %s\n\n' "$OUTPUT_DIR"
 
 TEMPERATURES_ARR=()
@@ -324,22 +344,31 @@ while IFS= read -r line; do
 done <<< "$TEMPERATURES"
 
 point_number=0
+total_points=$((RUNS * REPEATS))
 overall_status=0
 for temperature in "${TEMPERATURES_ARR[@]}"; do
     [[ -n "$temperature" ]] || continue
-    point_number=$((point_number + 1))
 
     temp_slug="$(slugify "$temperature" | sed 's/\./p/g')"
-    point_dir="$OUTPUT_DIR/temp-$temp_slug"
+
+    for (( repeat = 1; repeat <= REPEATS; repeat++ )); do
+    point_number=$((point_number + 1))
+
+    if [[ "$REPEATS" -gt 1 ]]; then
+        point_dir="$OUTPUT_DIR/temp-$temp_slug/rep-$repeat"
+    else
+        point_dir="$OUTPUT_DIR/temp-$temp_slug"
+    fi
     workdir="$point_dir/workdir"
 
     if [[ -f "$point_dir/COMPLETE" && "$FORCE" -eq 0 ]]; then
-        printf '[%s/%s] temp=%s already complete; skipping\n' \
-            "$point_number" "$RUNS" "$temperature"
+        printf '[%s/%s] temp=%s repeat=%s/%s already complete; skipping\n' \
+            "$point_number" "$total_points" "$temperature" "$repeat" "$REPEATS"
         continue
     fi
 
-    printf '[%s/%s] starting temp=%s\n' "$point_number" "$RUNS" "$temperature"
+    printf '[%s/%s] starting temp=%s repeat=%s/%s\n' \
+        "$point_number" "$total_points" "$temperature" "$repeat" "$REPEATS"
 
     rm -rf "$point_dir"
     mkdir -p "$workdir"
@@ -464,6 +493,7 @@ PY
         model "$MODEL" \
         agent "$AGENT" \
         temperature "$temperature" \
+        repeat "$repeat" \
         prompt "$PROMPT_ABS" \
         test_dirs "$TEST_DIRS_JOINED" \
         seed_files "$SEED_FILES_JOINED" \
@@ -482,6 +512,7 @@ PY
     printf '  OpenCode=%s test=%s result=%s time=%.2fs\n' \
         "$opencode_exit" "$test_exit" "$overall_success" \
         "$("$PYTHON_BIN" -c "print($total_ms / 1000)")"
+    done
 done
 
 printf '\nFinished: %s\n' "$OUTPUT_DIR"
