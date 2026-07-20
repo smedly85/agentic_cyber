@@ -54,7 +54,6 @@ Options:
                                confirmation only -- the prompt already tells the
                                agent to self-test and iterate). Empty/omitted
                                disables it (default).
-  --timeout SECONDS            OpenCode timeout per run; 0 disables (default: 1800)
   --output-dir DIR              Default: runs/sandboxed/<model-slug>/<prompt-slug>
   --force                      Delete and rerun completed temperature points
   --remote-base-url URL        Base URL of a self-hosted OpenAI-compatible
@@ -176,7 +175,6 @@ TEMP_MAX="2"
 AGENT="build"
 OUTPUT_DIR=""
 TEST_CMD=""
-TIMEOUT_SECONDS=1800
 FORCE=0
 REMOTE_BASE_URL=""
 REMOTE_API_KEY_ENV="OPENCODE_REMOTE_API_KEY"
@@ -197,7 +195,6 @@ while [[ $# -gt 0 ]]; do
         --test-dir) TEST_DIRS+=("${2:-}"); shift 2 ;;
         --seed-file) SEED_FILES+=("${2:-}"); shift 2 ;;
         --test-cmd) TEST_CMD="${2:-}"; shift 2 ;;
-        --timeout) TIMEOUT_SECONDS="${2:-}"; shift 2 ;;
         --output-dir) OUTPUT_DIR="${2:-}"; shift 2 ;;
         --remote-base-url) REMOTE_BASE_URL="${2:-}"; shift 2 ;;
         --remote-api-key-env) REMOTE_API_KEY_ENV="${2:-}"; shift 2 ;;
@@ -210,7 +207,6 @@ done
 [[ -n "$MODEL" ]] || die "--model is required"
 [[ -n "$PROMPT" ]] || die "--prompt is required"
 [[ "$RUNS" =~ ^[1-9][0-9]*$ ]] || die "--runs must be a positive integer"
-[[ "$TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || die "--timeout must be a non-negative integer"
 
 command -v "$OPENCODE_BIN" >/dev/null 2>&1 || die "$OPENCODE_BIN was not found"
 command -v "$PYTHON_BIN" >/dev/null 2>&1 || die "$PYTHON_BIN was not found"
@@ -308,9 +304,14 @@ printf 'Prompt:      %s\n' "$PROMPT_ABS"
 printf 'Runs:        %s (temperatures %s to %s)\n' "$RUNS" "$TEMP_MIN" "$TEMP_MAX"
 printf 'Output:      %s\n\n' "$OUTPUT_DIR"
 
+TEMPERATURES_ARR=()
+while IFS= read -r line; do
+    TEMPERATURES_ARR+=("$line")
+done <<< "$TEMPERATURES"
+
 point_number=0
 overall_status=0
-while IFS= read -r temperature; do
+for temperature in "${TEMPERATURES_ARR[@]}"; do
     [[ -n "$temperature" ]] || continue
     point_number=$((point_number + 1))
 
@@ -410,25 +411,13 @@ PY
 
     {
         printf '===== PROMPT SENT =====\n%s\n===== END PROMPT =====\n\n' "$prompt_text"
-        if [[ "$TIMEOUT_SECONDS" -gt 0 ]]; then
-            OPENCODE_CONFIG_CONTENT="$ATTEMPT_OPENCODE_CONFIG_CONTENT" \
-                timeout --signal=TERM --kill-after=30 \
-                "$TIMEOUT_SECONDS" \
-                "$OPENCODE_BIN" run \
-                    --dir "$workdir" \
-                    --model "$MODEL" \
-                    --agent "$AGENT" \
-                    --thinking \
-                    "$prompt_text"
-        else
-            OPENCODE_CONFIG_CONTENT="$ATTEMPT_OPENCODE_CONFIG_CONTENT" \
-                "$OPENCODE_BIN" run \
-                    --dir "$workdir" \
-                    --model "$MODEL" \
-                    --agent "$AGENT" \
-                    --thinking \
-                    "$prompt_text"
-        fi
+        OPENCODE_CONFIG_CONTENT="$ATTEMPT_OPENCODE_CONFIG_CONTENT" \
+            "$OPENCODE_BIN" run \
+                --dir "$workdir" \
+                --model "$MODEL" \
+                --agent "$AGENT" \
+                --thinking \
+                "$prompt_text" </dev/null
     } >"$point_dir/opencode.log" 2>&1
     opencode_exit=$?
     opencode_end_ns="$(date +%s%N)"
@@ -479,7 +468,7 @@ PY
     printf '  OpenCode=%s test=%s result=%s time=%.2fs\n' \
         "$opencode_exit" "$test_exit" "$overall_success" \
         "$("$PYTHON_BIN" -c "print($total_ms / 1000)")"
-done <<< "$TEMPERATURES"
+done
 
 printf '\nFinished: %s\n' "$OUTPUT_DIR"
 

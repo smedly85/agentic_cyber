@@ -287,13 +287,21 @@ def main():
 
     print("\n=== per-suite ===")
     for s in sorted(per_suite):
-        line = "  ".join(f"{k}={v}" for k, v in sorted(per_suite[s].items()))
+        counts_s = per_suite[s]
+        skipped_s = counts_s.get(SKIP, 0) + counts_s.get(XFAIL, 0)
+        scored_s = sum(counts_s.values()) - skipped_s
+        pass_s = counts_s.get(PASS, 0)
+        other = {k: v for k, v in counts_s.items()
+                if k not in (PASS, SKIP, XFAIL)}
+        line = f"{pass_s}/{scored_s} pass"
+        if other:
+            line += "  " + "  ".join(f"{k}={v}" for k, v in sorted(other.items()))
         print(f"  {s:28} {line}")
 
-    total = len(results)
+    skipped = counts.get(SKIP, 0) + counts.get(XFAIL, 0)
+    scored = len(results) - skipped
     ok = counts.get(PASS, 0)
-    print(f"\n{ok}/{total} pass  |  " + "  ".join(
-        f"{k}={counts[k]}" for k in sorted(counts) if k != PASS))
+    print(f"\n{ok}/{scored} pass")
 
     if args.json_report:
         with open(args.json_report, "w") as f:
