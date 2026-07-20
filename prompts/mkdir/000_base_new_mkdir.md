@@ -51,7 +51,7 @@ If the overall invocation created every requested directory successfully,
 exit with status 0 and write nothing to standard output or standard error.
 
 If one or more operands failed, write one diagnostic line per failed operand
-to standard error (in the style of `new_mkdir: cannot create directory
+to standard error (in the style of `mkdir: cannot create directory
 'PATH': REASON`) and exit with status 1 after attempting every operand.
 
 ## Arguments

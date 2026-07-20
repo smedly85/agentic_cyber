@@ -10,7 +10,11 @@
 # the working directory simply doesn't contain anything else, so there is
 # nothing for `bash` (or any other tool) to find outside it either.
 #
-# Example:
+# Not tied to any one target: --prompt/--test-dir/--test-cmd/--seed-file are
+# plain paths and commands, so the same script drives mkdir, sort, or any
+# other from-scratch-or-checkpoint coding prompt.
+#
+# Example (mkdir):
 #   scripts/run_sandboxed_pipeline.sh \
 #     --model school-ollama/qwen3-coder-next:latest \
 #     --runs 10 --temp-min 0 --temp-max 2 \
@@ -18,6 +22,15 @@
 #     --test-dir tests/mkdir-test-suite \
 #     --test-cmd "tests/mkdir-test-suite/judge_candidate.sh build/new_mkdir" \
 #     --output-dir runs/sandboxed/mkdir/milestone-1
+#
+# Example (sort):
+#   scripts/run_sandboxed_pipeline.sh \
+#     --model school-ollama/qwen3-coder-next:latest \
+#     --runs 10 --temp-min 0 --temp-max 2 \
+#     --prompt prompts/new_sort/000_base_new_sort.md \
+#     --test-dir tests/sort-test-suite \
+#     --test-cmd "tests/sort-test-suite/run_all.sh build/new_sort" \
+#     --output-dir runs/sandboxed/sort/milestone-1
 
 set -uo pipefail
 
@@ -43,8 +56,9 @@ Options:
   --agent NAME                OpenCode agent (default: build)
   --test-dir DIR               Repo-relative directory copied into the working
                                directory at the same relative path (repeatable),
-                               e.g. tests/mkdir-test-suite. Omit entirely if the
-                               prompt doesn't reference a test suite.
+                               e.g. tests/mkdir-test-suite or tests/sort-test-suite.
+                               Omit entirely if the prompt doesn't reference a
+                               test suite.
   --seed-file SRC[:DEST]       Existing file copied into the working directory
                                at DEST (default DEST = SRC's path relative to
                                the repository root, when SRC is repo-relative).
