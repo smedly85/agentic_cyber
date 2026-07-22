@@ -10,12 +10,6 @@ The executable must remain:
 
 Add only the feature described here. Do not add unrelated behavior.
 
-You are running non-interactively: no user is available to answer questions
-or approve next steps. Do not stop after editing the file and do not ask
-what to do next. Proceed yourself through every remaining step below —
-build, test, and fix/rebuild/retest — until the Tests section's pass
-condition is met, then give the Final response.
-
 ## Current program
 
 Source:
@@ -133,17 +127,20 @@ Compile directly, without a Makefile:
 
 Fix all compiler errors and warnings.
 
-## Tests
+## Visible tests
 
-Run:
+No checkpoint-visible base, `-p`, or `-m` test files are currently available
+for this checkpoint. Accordingly, there is no visible test path or visible test
+command to inspect or run for this task.
 
-    tests/mkdir-test-suite/judge_candidate.sh build/new_mkdir -p -m
+Do not use or inspect any hidden, comprehensive, or external evaluator.
+Do not modify, replace, weaken, disable, bypass, or delete any repository test.
 
-to check your implementation. This checkpoint must continue to pass every
-base-checkpoint and `-p` case in addition to every `-m` case. If any test
-fails, fix `src/new_mkdir/new_mkdir.c`, recompile with the command above, and
-run the test command again. Keep iterating — fix, recompile, retest — until
-every test passes.
+The experiment controller owns validation and any repair iterations.
+Do not perform an autonomous repair loop. If checkpoint-visible validation is
+added later and fails, the controller may provide its failure output in a
+subsequent repair invocation. Output from a hidden, comprehensive, or external
+evaluator is never repair feedback.
 
 ## Final response
 

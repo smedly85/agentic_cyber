@@ -12,12 +12,6 @@ Implement only the behavior described in this prompt.
 
 Do not add options, file operands, or unrelated features beyond what is listed here.
 
-You are running non-interactively: no user is available to answer questions
-or approve next steps. Do not stop after writing the file and do not ask
-what to do next. Proceed yourself through every remaining step below —
-build, test, and fix/rebuild/retest — until the Tests section's pass
-condition is met, then give the Final response.
-
 ## Program behavior
 
 [PROGRAM_BEHAVIOR]
@@ -67,17 +61,33 @@ Compile with:
 
 Fix all compiler errors and warnings.
 
-## Tests
+## Visible tests
 
-Run:
+The controller will evaluate this checkpoint using the following visible tests:
 
-    [TEST_COMMAND]
+    [VISIBLE_TEST_PATHS]
 
-to check your implementation against every test in [TEST_PATH]. If any test
-fails, fix the implementation, rebuild, and run the test command again. Keep
-iterating — fix, rebuild, retest — until every test passes.
+These are the base tests for checkpoint 000. Later checkpoints must include
+these tests as regression coverage together with each checkpoint's own visible
+tests. Future-checkpoint tests are not part of this checkpoint's visible
+population.
 
-Do not modify, weaken, or delete any existing test.
+You may inspect these visible tests while implementing the task.
+
+Do not modify, replace, weaken, disable, bypass, or delete any visible test.
+
+The controller will run:
+
+    [VISIBLE_TEST_COMMAND]
+
+after your implementation is returned.
+
+Do not perform an autonomous repair loop. If validation fails, the experiment
+controller will provide the failure output in a subsequent repair invocation.
+
+Only the tests listed above are visible. Any hidden, comprehensive, or external
+evaluation is controller-only, is not exposed here, and is not used as repair
+feedback.
 
 ## Final response
 
@@ -86,6 +96,6 @@ Report:
 1. Files created or changed.
 2. Program behavior implemented.
 3. Build commands run.
-4. Test results, and how many iterations it took to reach all-passing.
+4. Commands run.
 
 

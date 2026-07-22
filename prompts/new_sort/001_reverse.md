@@ -100,6 +100,37 @@ Run:
 
 Fix all compiler errors and warnings.
 
+## Visible tests
+
+The controller will evaluate this checkpoint using exactly these visible tests:
+
+    tests/new_sort/test_new_sort.py
+    tests/new_sort/test_001_reverse.py
+
+`tests/new_sort/test_new_sort.py` is regression coverage for the existing base
+behavior. `tests/new_sort/test_001_reverse.py` covers the reverse checkpoint
+added by this task. Both must pass.
+
+You may inspect these visible tests while implementing the task.
+
+Do not modify, replace, weaken, disable, bypass, or delete any visible test.
+
+The controller will run exactly:
+
+    PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
+        tests/new_sort/test_new_sort.py \
+        tests/new_sort/test_001_reverse.py \
+        -v
+
+after your implementation is returned.
+
+Do not perform an autonomous repair loop. If validation fails, the experiment
+controller will provide the failure output in a subsequent repair invocation.
+
+Only the tests listed above are visible. Any hidden, comprehensive, or external
+evaluation is controller-only, is not exposed here, and is not used as repair
+feedback.
+
 ## Final response
 
 Report:

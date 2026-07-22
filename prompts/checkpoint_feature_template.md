@@ -100,18 +100,32 @@ Run:
 
 Fix all compiler errors and warnings.
 
-## Tests
+## Visible tests
 
-Run:
+The controller will evaluate this checkpoint using the following visible tests:
 
-    [TEST_COMMAND]
+    [VISIBLE_TEST_PATHS]
 
-to check against every test in [TEST_PATH] — both the tests for this feature and
-every test from earlier checkpoints. If any test fails, fix the implementation,
-rebuild, and run the test command again. Keep iterating — fix, rebuild, retest —
-until every test passes.
+These include the current checkpoint tests and the visible tests from every
+earlier checkpoint, which are regression tests that must continue to pass.
+Future-checkpoint tests are not part of this checkpoint's visible population.
 
-Do not modify, weaken, or delete any existing test.
+You may inspect these visible tests while implementing the task.
+
+Do not modify, replace, weaken, disable, bypass, or delete any visible test.
+
+The controller will run:
+
+    [VISIBLE_TEST_COMMAND]
+
+after your implementation is returned.
+
+Do not perform an autonomous repair loop. If validation fails, the experiment
+controller will provide the failure output in a subsequent repair invocation.
+
+Only the tests listed above are visible. Any hidden, comprehensive, or external
+evaluation is controller-only, is not exposed here, and is not used as repair
+feedback.
 
 ## Final response
 

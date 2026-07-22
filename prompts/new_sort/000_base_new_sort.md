@@ -136,7 +136,6 @@ Create:
     Makefile
     README.md
     src/new_sort.c
-    tests/test_new_sort.py
 
 Create or update:
 
@@ -169,6 +168,11 @@ The build must create the build directory when needed.
 
 The clean target must remove generated build files and test caches.
 
+The controller will build with:
+
+    make clean
+    make
+
 ## Documentation
 
 Document:
@@ -185,43 +189,32 @@ Document:
 
 Do not describe unsupported features.
 
-## Tests
+## Visible tests
 
-Use Python unittest.
+The controller will evaluate this checkpoint using the following visible base
+test:
 
-Existing tests are located under:
+    tests/new_sort/test_new_sort.py
 
-    tests/new_sort/
+This test covers the checkpoint 000 base behavior and becomes regression
+coverage for every later checkpoint.
 
-Do not create, replace, weaken, or modify the existing tests.
+You may inspect this visible test while implementing the task.
 
-Build the program and run the existing test suite:
+Do not modify, replace, weaken, disable, bypass, or delete this visible test.
 
-    make clean
-    make
-    make test
+The controller will run exactly:
 
-The implementation must pass all existing tests.
+    PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/new_sort/test_new_sort.py -v
 
-If a test fails, fix the implementation. Do not change the test to match the
-implementation.
+after your implementation is returned.
 
-Report:
+Do not perform an autonomous repair loop. If validation fails, the experiment
+controller will provide the failure output in a subsequent repair invocation.
 
-- the exact validation commands run
-- the number of tests run
-- whether all tests passed
-- any remaining failures
-
-## Validation
-
-Run:
-
-    make clean
-    make
-    make test
-
-Fix all compiler errors and warnings.
+Only the test listed above is visible. Any hidden, comprehensive, or external
+evaluation is controller-only, is not exposed here, and is not used as repair
+feedback.
 
 ## Final response
 
