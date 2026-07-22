@@ -415,6 +415,150 @@ def test_sort_stdin_scope_and_implemented_flag_filtering():
     )[0]
 
 
+def test_sort_stdin_only_scope_uses_only_stdin_execution_modes():
+    runner = load_sort_runner()
+    case = {"flags": [], "stdin_b64": ""}
+
+    assert runner.modes_for(case, stdin_only=True) == [
+        ("pipe", ".p"),
+        ("redirect", ".r"),
+    ]
+    assert runner.modes_for(
+        {**case, "stdin_modes": ["file", "pipe", "redirect"]},
+        stdin_only=True,
+    ) == [("pipe", ".p"), ("redirect", ".r")]
+    assert runner.modes_for(
+        {**case, "stdin_modes": ["file"]}, stdin_only=True
+    ) == []
+
+
+def test_sort_obsolete_and_future_options_are_excluded():
+    runner = load_sort_runner()
+    manifest = {
+        "implemented": ["-r"],
+        "excluded_tags": ["obsolete"],
+        "scope": {"stdin_only": True},
+    }
+
+    selected, reason = runner.case_selected(
+        {"args": ["+1", "-2"], "flags": [], "stdin_b64": "", "tags": ["obsolete"]},
+        manifest,
+    )
+    assert selected is False
+    assert reason == "excluded tag ['obsolete']"
+
+    # Legacy frozen suites omitted the obsolete tag from GNU's -y[SIZE] case.
+    assert not runner.case_selected(
+        {"args": ["-y0"], "flags": [], "stdin_b64": "", "tags": ["curated"]},
+        manifest,
+    )[0]
+
+    selected, reason = runner.case_selected(
+        {"args": ["-f"], "flags": ["-f"], "stdin_b64": ""}, manifest
+    )
+    assert selected is False
+    assert reason == "unimplemented ['-f']"
+
+
+@pytest.mark.parametrize("target", ["/dev/full", "closed-pipe"])
+def test_sort_output_fault_accepts_non_gnu_diagnostic(monkeypatch, target: str):
+    runner = load_sort_runner()
+    result = runner.engine.Result(
+        exit_code=1,
+        signal=None,
+        signal_name=None,
+        stdout=b"",
+        stderr=b"new_sort: output error\n",
+    )
+    monkeypatch.setattr(runner.engine, "execute", lambda *args, **kwargs: result)
+    case = {
+        "faults": {"stdout": target},
+        "exit_code": 2,
+        "stderr": "sort: write failed: GNU-specific text\n",
+        "check": "none",
+    }
+
+    assert runner.run_one(case, ["candidate"], "pipe", False, False) == (
+        runner.PASS,
+        "",
+    )
+
+
+def test_sort_output_fault_rejects_silent_success(monkeypatch):
+    runner = load_sort_runner()
+    result = runner.engine.Result(
+        exit_code=0,
+        signal=None,
+        signal_name=None,
+        stdout=b"",
+        stderr=b"",
+    )
+    monkeypatch.setattr(runner.engine, "execute", lambda *args, **kwargs: result)
+    case = {
+        "faults": {"stdout": "/dev/full"},
+        "exit_code": 2,
+        "stderr_class": "nonempty",
+        "check": "none",
+    }
+
+    verdict, detail = runner.run_one(
+        case, ["candidate"], "pipe", False, False
+    )
+    assert verdict == runner.FAIL
+    assert "silently succeeded" in detail
+    assert "no diagnostic" in detail
+
+
+@pytest.mark.parametrize(
+    "result,sanitizer,expected",
+    [
+        (
+            {"exit_code": None, "signal": None, "signal_name": None,
+             "timed_out": True},
+            False,
+            "TIMEOUT",
+        ),
+        (
+            {"exit_code": None, "signal": 11, "signal_name": "SIGSEGV"},
+            False,
+            "CRASH",
+        ),
+        (
+            {"exit_code": 1, "signal": None, "signal_name": None,
+             "sanitizer": "AddressSanitizer: heap-buffer-overflow"},
+            True,
+            "SANITIZER",
+        ),
+        (
+            {"exit_code": None, "signal": 13, "signal_name": "SIGPIPE",
+             "sanitizer": "AddressSanitizer: deadly signal"},
+            True,
+            "SANITIZER",
+        ),
+    ],
+)
+def test_sort_output_fault_keeps_runtime_failures_strict(
+    monkeypatch, result: dict, sanitizer: bool, expected: str
+):
+    runner = load_sort_runner()
+    execution = runner.engine.Result(
+        stdout=b"",
+        stderr=b"diagnostic\n",
+        **result,
+    )
+    monkeypatch.setattr(runner.engine, "execute", lambda *args, **kwargs: execution)
+    case = {
+        "faults": {"stdout": "closed-pipe"},
+        "allow_signals": ["SIGPIPE"],
+        "check": "none",
+    }
+
+    verdict, _ = runner.run_one(
+        case, ["candidate"], "pipe", sanitizer, False
+    )
+    assert verdict == expected
+
+
 def test_sort_diff_fuzz_preserves_empty_and_restricted_manifests(tmp_path: Path):
     diff_fuzz = load_sort_diff_fuzz()
     missing = tmp_path / "missing.json"

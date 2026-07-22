@@ -80,6 +80,11 @@ def _open_suite(path: str):
 def case_selected(case: dict, manifest: dict) -> tuple[bool, str]:
     """(runnable, reason). implemented=None means run everything."""
     tags = set(case.get("tags", []))
+    # Older frozen corpora predate the obsolete tag on GNU's ignored
+    # -y[SIZE] compatibility option. Keep them on the existing tag-based
+    # exclusion path without coupling scoring to a particular case name.
+    if any(re.fullmatch(r"-y[0-9]*", arg) for arg in case.get("args", [])):
+        tags.add("obsolete")
     excl = set(manifest.get("excluded_tags", []))
     if tags & excl:
         return False, f"excluded tag {sorted(tags & excl)}"
@@ -139,14 +144,25 @@ def run_one(case: dict, cmd: list[str], stdin_mode: str,
         return SKIP, "unreadable fault needs non-root"
     if res.timed_out:
         return TIMEOUT, f"timed out after {case.get('timeout', 10)}s"
+    if sanitizer and res.sanitizer:
+        return SANITIZER, res.sanitizer
     if res.crashed:
         # An expected signal death (e.g. SIGPIPE on a closed output pipe) is
         # correct Unix behavior, not a defect.
         if res.signal_name in set(case.get("allow_signals", [])):
             return PASS, ""
         return CRASH, f"killed by {res.signal_name}"
-    if sanitizer and res.sanitizer:
-        return SANITIZER, res.sanitizer
+
+    if (case.get("faults") or {}).get("stdout") in {"/dev/full", "closed-pipe"}:
+        problems = []
+        if res.exit_code in {None, 0}:
+            problems.append("output failure silently succeeded")
+        if not res.stderr:
+            problems.append("output failure emitted no diagnostic")
+        if problems:
+            verdict = XFAIL if xfail else FAIL
+            return verdict, "; ".join(problems)
+        return PASS, ""
 
     problems = []
     if case.get("exit_code") is not None and res.exit_code != case["exit_code"]:
@@ -180,17 +196,18 @@ def run_one(case: dict, cmd: list[str], stdin_mode: str,
     return PASS, ""
 
 
-def modes_for(case: dict) -> list[tuple[str, str]]:
+def modes_for(case: dict, stdin_only: bool = False) -> list[tuple[str, str]]:
     """(stdin_mode, name_suffix) pairs to run, honoring stdin_modes.
     Cases that use file operands / faults / --files0-from typically pin a
     single mode to avoid meaningless duplication."""
     declared = case.get("stdin_modes")
     default = [("file", ""), ("pipe", ".p"), ("redirect", ".r")]
-    if declared is None:
-        return default
     m = {"file": ("file", ""), "pipe": ("pipe", ".p"),
          "redirect": ("redirect", ".r")}
-    return [m[x] for x in declared]
+    modes = default if declared is None else [m[x] for x in declared]
+    if stdin_only:
+        modes = [mode for mode in modes if mode[0] != "file"]
+    return modes
 
 
 def main():
@@ -250,7 +267,8 @@ def main():
             if not (xfail and reason.startswith("unimplemented")):
                 jobs.append((case, None, None, SKIP, reason))
                 continue
-        for mode, suffix in modes_for(case):
+        stdin_only = manifest.get("scope", {}).get("stdin_only", False)
+        for mode, suffix in modes_for(case, stdin_only=stdin_only):
             jobs.append((case, mode, suffix, None, None))
 
     results = []
