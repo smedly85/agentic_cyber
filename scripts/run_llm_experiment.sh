@@ -468,9 +468,6 @@ TEMP_SLUG="$(slugify "$TEMPERATURE" | sed 's/\./p/g')"
 
 if [[ -z "$OUTPUT_DIR" ]]; then
     OUTPUT_DIR="$REPO/runs/experiments/$MODEL_SLUG/$PROMPT_SLUG/temp-$TEMP_SLUG"
-    if [[ "$MAX_LOOPS" -gt 0 ]]; then
-        OUTPUT_DIR="${OUTPUT_DIR}-max-loops-$MAX_LOOPS"
-    fi
 elif [[ "$OUTPUT_DIR" != /* ]]; then
     OUTPUT_DIR="$REPO/$OUTPUT_DIR"
 fi
