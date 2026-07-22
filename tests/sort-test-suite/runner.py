@@ -83,6 +83,8 @@ def case_selected(case: dict, manifest: dict) -> tuple[bool, str]:
     excl = set(manifest.get("excluded_tags", []))
     if tags & excl:
         return False, f"excluded tag {sorted(tags & excl)}"
+    if manifest.get("scope", {}).get("stdin_only") and "stdin_b64" not in case:
+        return False, "outside stdin-only scope"
     impl = manifest.get("implemented")
     if impl is None:
         return True, ""

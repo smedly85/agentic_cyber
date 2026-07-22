@@ -23,6 +23,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RUNNER = REPO_ROOT / "scripts" / "run_llm_experiment.sh"
 ANALYZER = REPO_ROOT / "scripts" / "analyze_experiment.py"
+SORT_SUITE = REPO_ROOT / "tests" / "sort-test-suite"
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 import measure_diversity as md  # noqa: E402
@@ -197,8 +198,195 @@ def test_calibration_passes():
 
 
 # ---------------------------------------------------------------------------
-# Repair-loop runner and analyzer regressions
+# Sort evaluator, repair-loop runner, and analyzer regressions
 # ---------------------------------------------------------------------------
+
+
+def load_sort_runner():
+    spec = importlib.util.spec_from_file_location(
+        "sort_suite_runner", SORT_SUITE / "runner.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, str(SORT_SUITE))
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.pop(0)
+    return module
+
+
+def initialize_sort_suite_harness(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+    suite = tmp_path / "sort-suite"
+    (suite / "suites").mkdir(parents=True)
+    shutil.copy2(SORT_SUITE / "run_all.sh", suite / "run_all.sh")
+    shutil.copy2(SORT_SUITE / "config.py", suite / "config.py")
+    (suite / "suites" / "cases.json").write_text('{"cases": []}\n')
+
+    candidate = tmp_path / "candidate"
+    candidate.write_text("#!/bin/sh\ncat\n", encoding="utf-8")
+    candidate.chmod(0o755)
+    source = tmp_path / "candidate.c"
+    source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    config = suite / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "paths": {
+                    "oracle_bin": "/bin/true",
+                    "candidate_bin": "/tracked/example/candidate",
+                    "candidate_asan_bin": str(tmp_path / "unused-asan"),
+                    "candidate_src": "",
+                },
+                "implemented": ["-n", "-k"],
+                "excluded_tags": [],
+                "unimplemented_policy": "skip",
+                "fuzz": {"time_budget_s": 60},
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    (suite / "runner.py").write_text(
+        """\
+import json
+import os
+import sys
+
+config_path = sys.argv[sys.argv.index("--config") + 1]
+report_path = sys.argv[sys.argv.index("--json-report") + 1]
+with open(config_path, encoding="utf-8") as handle:
+    config = json.load(handle)
+with open(os.environ["CONFIG_CAPTURE"], "a", encoding="utf-8") as handle:
+    handle.write(json.dumps({
+        "config": config,
+        "config_path": config_path,
+        "candidate": sys.argv[sys.argv.index("--") + 1],
+        "sanitizer": "--sanitizer" in sys.argv,
+    }) + "\\n")
+with open(report_path, "w", encoding="utf-8") as handle:
+    json.dump({"counts": {"PASS": 1}, "per_suite": {}, "failures": []}, handle)
+""",
+        encoding="utf-8",
+    )
+    (suite / "diff_fuzz.py").write_text(
+        """\
+import json
+import os
+import sys
+
+budget = sys.argv[sys.argv.index("--time-budget") + 1]
+with open(os.environ["FUZZ_CAPTURE"], "w", encoding="utf-8") as handle:
+    handle.write(budget)
+report_path = sys.argv[sys.argv.index("--json-report") + 1]
+with open(report_path, "w", encoding="utf-8") as handle:
+    json.dump({
+        "rounds": 0, "pass": 0, "fail": 0,
+        "pass_pct": 100.0, "fail_pct": 0.0,
+        "distinct_issues": 0, "new_regressions": 0,
+    }, handle)
+raise SystemExit(0 if float(budget) == 0 else 1)
+""",
+        encoding="utf-8",
+    )
+    (suite / "report_summary.py").write_text("pass\n", encoding="utf-8")
+    (suite / "build_asan.sh").write_text(
+        """\
+#!/usr/bin/env bash
+set -eu
+out=$(python3 config.py "$1" paths.candidate_asan_bin)
+cp /bin/true "$out"
+""",
+        encoding="utf-8",
+    )
+    (suite / "build_asan.sh").chmod(0o755)
+    return suite, config, candidate, source
+
+
+@pytest.mark.parametrize(
+    "implemented_csv, expected",
+    [("-r", ["-r"]), ("-r,-f", ["-r", "-f"]), ("", [])],
+)
+def test_sort_runtime_overrides_use_temporary_config(
+    tmp_path: Path, implemented_csv: str, expected: list[str]
+):
+    suite, config, candidate, source = initialize_sort_suite_harness(tmp_path)
+    original_config = config.read_bytes()
+    config_capture = tmp_path / "captured-configs.jsonl"
+    fuzz_capture = tmp_path / "fuzz-seconds.txt"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "CONFIG_CAPTURE": str(config_capture),
+            "FUZZ_CAPTURE": str(fuzz_capture),
+        }
+    )
+
+    result = subprocess.run(
+        [
+            "bash",
+            str(suite / "run_all.sh"),
+            "--candidate",
+            str(candidate),
+            "--candidate-src",
+            str(source),
+            f"--implemented-flags={implemented_csv}",
+            "--stdin-only",
+            "--fuzz-seconds",
+            "0",
+        ],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=20,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert config.read_bytes() == original_config
+    records = [json.loads(line) for line in config_capture.read_text().splitlines()]
+    assert len(records) == 2
+    assert [record["sanitizer"] for record in records] == [False, True]
+    assert records[0]["candidate"] == str(candidate)
+    for record in records:
+        runtime_config = record["config"]
+        assert not Path(record["config_path"]).exists()
+        assert runtime_config["paths"]["candidate_bin"] == str(candidate)
+        assert runtime_config["paths"]["candidate_src"] == str(source)
+        assert runtime_config["implemented"] == expected
+        assert runtime_config["scope"] == {"stdin_only": True}
+    assert not Path(records[1]["candidate"]).exists()
+    assert fuzz_capture.read_text() == "0"
+
+
+def test_sort_stdin_scope_and_implemented_flag_filtering():
+    runner = load_sort_runner()
+    manifest = {
+        "implemented": ["-r"],
+        "excluded_tags": [],
+        "scope": {"stdin_only": True},
+    }
+
+    assert runner.case_selected({"flags": [], "stdin_b64": "YQo="}, manifest)[0]
+    assert runner.case_selected({"flags": [], "stdin_b64": ""}, manifest)[0]
+    selected, reason = runner.case_selected({"flags": []}, manifest)
+    assert selected is False
+    assert reason == "outside stdin-only scope"
+    selected, reason = runner.case_selected(
+        {"flags": ["-f"], "stdin_b64": ""}, manifest
+    )
+    assert selected is False
+    assert reason == "unimplemented ['-f']"
+
+    empty_manifest = {**manifest, "implemented": []}
+    assert runner.case_selected({"flags": [], "stdin_b64": ""}, empty_manifest)[0]
+    assert not runner.case_selected(
+        {"flags": ["-r"], "stdin_b64": ""}, empty_manifest
+    )[0]
 
 
 def load_analyzer():
@@ -295,6 +483,7 @@ def run_experiment(
     *,
     scenario: str,
     max_loops: int | str | None,
+    extra_test_cmd: str = 'printf x >> "$EXTRA_COUNT"',
 ) -> tuple[Path, subprocess.CompletedProcess[str], int, str]:
     repository, fake_opencode = initialize_experiment_repo(tmp_path)
     counter = tmp_path / "counter.txt"
@@ -323,7 +512,7 @@ def run_experiment(
         "--feature-test-cmd",
         "true",
         "--extra-test-cmd",
-        'printf x >> "$EXTRA_COUNT"',
+        extra_test_cmd,
         "--timeout",
         "0",
     ]
@@ -408,6 +597,31 @@ def test_successful_repair_stops_and_captures_final_candidate(tmp_path: Path):
     assert (output / "analysis" / "AUTOMATIC").exists()
     forbidden = {"loop-001", "repair", "initial", "final"}
     assert forbidden.isdisjoint(path.name for path in attempt.iterdir() if path.is_dir())
+
+
+def test_hidden_evaluator_failure_is_final_and_never_repairs(tmp_path: Path):
+    marker = "HIDDEN-EVALUATOR-OUTPUT"
+    output, result, invocations, prompts = run_experiment(
+        tmp_path,
+        scenario="repair-success",
+        max_loops=3,
+        extra_test_cmd=(
+            f'printf x >> "$EXTRA_COUNT"; printf "{marker}\\n"; exit 7'
+        ),
+    )
+
+    assert result.returncode == 0, result.stderr
+    attempt = output / "attempt-001"
+    metadata = json.loads((attempt / "metadata.json").read_text(encoding="utf-8"))
+    assert invocations == 2
+    assert metadata["repair_loops"] == 1
+    assert metadata["llm_invocations"] == 2
+    assert metadata["public_validation_success"] is True
+    assert metadata["extra_test_exit_code"] == 7
+    assert metadata["overall_success"] is False
+    assert (tmp_path / "extra-count.txt").read_text() == "x"
+    assert marker in (attempt / "extra-tests.log").read_text()
+    assert marker not in prompts
 
 
 def test_repair_budget_exhaustion_is_recorded(tmp_path: Path):
