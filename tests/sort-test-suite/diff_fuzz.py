@@ -60,17 +60,17 @@ def load_manifest(config_path):
         return None
     cfg = cfgmod.load(config_path)
     impl = cfgmod.get(cfg, "implemented")
-    return set(impl) if impl else None
+    return None if impl is None else set(impl)
 
 
 def sample_combo(rng, implemented):
     """Sample a VALID combo. With a manifest, draw ONLY from implemented
     flags so every stdout deviation is a genuine correctness bug (not an
     unimplemented-feature artifact); crashes are caught either way."""
-    pool = [f for f in FUZZ_POOL if f in implemented] if implemented \
-        else list(FUZZ_POOL)
+    pool = ([f for f in FUZZ_POOL if f in implemented]
+            if implemented is not None else list(FUZZ_POOL))
     if not pool:
-        pool = list(FUZZ_POOL)
+        return [], []
     for _ in range(50):
         k = rng.randint(1, min(6, len(pool)))
         chosen = []

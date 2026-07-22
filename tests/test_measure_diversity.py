@@ -24,6 +24,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 RUNNER = REPO_ROOT / "scripts" / "run_llm_experiment.sh"
 ANALYZER = REPO_ROOT / "scripts" / "analyze_experiment.py"
 SORT_SUITE = REPO_ROOT / "tests" / "sort-test-suite"
+SORT_SANITIZER_CC_FLAGS = [
+    "-std=c11",
+    "-Wall",
+    "-Wextra",
+    "-Werror",
+    "-pedantic",
+    "-O1",
+    "-g",
+    "-D_POSIX_C_SOURCE=200809L",
+]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 import measure_diversity as md  # noqa: E402
@@ -216,6 +226,20 @@ def load_sort_runner():
     return module
 
 
+def load_sort_diff_fuzz():
+    spec = importlib.util.spec_from_file_location(
+        "sort_suite_diff_fuzz", SORT_SUITE / "diff_fuzz.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, str(SORT_SUITE))
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.pop(0)
+    return module
+
+
 def initialize_sort_suite_harness(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
     suite = tmp_path / "sort-suite"
     (suite / "suites").mkdir(parents=True)
@@ -229,23 +253,18 @@ def initialize_sort_suite_harness(tmp_path: Path) -> tuple[Path, Path, Path, Pat
     source = tmp_path / "candidate.c"
     source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
     config = suite / "config.json"
+    runtime_config = json.loads((SORT_SUITE / "config.json").read_text())
+    runtime_config["paths"].update(
+        {
+            "oracle_bin": "/bin/true",
+            "candidate_bin": "/tracked/example/candidate",
+            "candidate_asan_bin": str(tmp_path / "unused-asan"),
+            "candidate_src": "",
+        }
+    )
+    runtime_config["implemented"] = ["-n", "-k"]
     config.write_text(
-        json.dumps(
-            {
-                "paths": {
-                    "oracle_bin": "/bin/true",
-                    "candidate_bin": "/tracked/example/candidate",
-                    "candidate_asan_bin": str(tmp_path / "unused-asan"),
-                    "candidate_src": "",
-                },
-                "implemented": ["-n", "-k"],
-                "excluded_tags": [],
-                "unimplemented_policy": "skip",
-                "fuzz": {"time_budget_s": 60},
-            },
-            indent=2,
-        )
-        + "\n",
+        json.dumps(runtime_config, indent=2) + "\n",
         encoding="utf-8",
     )
 
@@ -305,6 +324,12 @@ cp /bin/true "$out"
     return suite, config, candidate, source
 
 
+def test_sort_sanitizer_config_uses_strict_c11_contract():
+    config = json.loads((SORT_SUITE / "config.json").read_text())
+    assert config["paths"]["cc_flags"] == SORT_SANITIZER_CC_FLAGS
+    assert "-std=c99" not in config["paths"]["cc_flags"]
+
+
 @pytest.mark.parametrize(
     "implemented_csv, expected",
     [("-r", ["-r"]), ("-r,-f", ["-r", "-f"]), ("", [])],
@@ -357,6 +382,7 @@ def test_sort_runtime_overrides_use_temporary_config(
         assert not Path(record["config_path"]).exists()
         assert runtime_config["paths"]["candidate_bin"] == str(candidate)
         assert runtime_config["paths"]["candidate_src"] == str(source)
+        assert runtime_config["paths"]["cc_flags"] == SORT_SANITIZER_CC_FLAGS
         assert runtime_config["implemented"] == expected
         assert runtime_config["scope"] == {"stdin_only": True}
     assert not Path(records[1]["candidate"]).exists()
@@ -387,6 +413,29 @@ def test_sort_stdin_scope_and_implemented_flag_filtering():
     assert not runner.case_selected(
         {"flags": ["-r"], "stdin_b64": ""}, empty_manifest
     )[0]
+
+
+def test_sort_diff_fuzz_preserves_empty_and_restricted_manifests(tmp_path: Path):
+    diff_fuzz = load_sort_diff_fuzz()
+    missing = tmp_path / "missing.json"
+    null = tmp_path / "null.json"
+    empty = tmp_path / "empty.json"
+    reverse = tmp_path / "reverse.json"
+    missing.write_text("{}\n", encoding="utf-8")
+    null.write_text('{"implemented": null}\n', encoding="utf-8")
+    empty.write_text('{"implemented": []}\n', encoding="utf-8")
+    reverse.write_text('{"implemented": ["-r"]}\n', encoding="utf-8")
+
+    assert diff_fuzz.load_manifest(missing) is None
+    assert diff_fuzz.load_manifest(null) is None
+    assert diff_fuzz.load_manifest(empty) == set()
+    assert diff_fuzz.load_manifest(reverse) == {"-r"}
+    assert diff_fuzz.sample_combo(diff_fuzz.random.Random(1), set()) == ([], [])
+    chosen, argv = diff_fuzz.sample_combo(
+        diff_fuzz.random.Random(1), {"-r"}
+    )
+    assert chosen == ["-r"]
+    assert argv == ["-r"]
 
 
 def load_analyzer():
