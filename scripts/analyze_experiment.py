@@ -109,7 +109,7 @@ def require_diagnostic_packages() -> tuple[Any, Any, Any, Any, Any]:
     return plt, levenshtein_ratio, linkage, dendrogram, squareform
 
 
-ANALYZER_VERSION = "3.0.0"
+ANALYZER_VERSION = "3.1.0"
 
 PAPER_METRICS_COLUMNS = [
     "Issue",
@@ -119,6 +119,15 @@ PAPER_METRICS_COLUMNS = [
     "N Runs",
     "Successful Runs",
     "Success Rate",
+    "Initial Success Rate",
+    "Repair-Assisted Public Success Rate",
+    "Mean Repair Loops",
+    "Median Repair Loops",
+    "Max Repair Loops",
+    "Mean LLM Invocations",
+    "Mean Repair Loops - Successful Runs",
+    "Mean Repair Loops - Failed Runs",
+    "Mean Repair LLM Runtime (s)",
     "Pass@1",
     "Pass@5",
     "Pass@10",
@@ -404,6 +413,169 @@ def safe_numeric_mean(values: Iterable[Any]) -> float | None:
     return statistics.fmean(numeric) if numeric else None
 
 
+def public_validation_succeeded(metadata: Mapping[str, Any]) -> bool:
+    explicit = metadata.get("public_validation_success")
+    if isinstance(explicit, bool):
+        return explicit
+    return all(
+        metadata.get(key) == 0
+        for key in (
+            "build_exit_code",
+            "base_test_exit_code",
+            "feature_test_exit_code",
+        )
+    )
+
+
+def normalize_repair_metadata(
+    metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Add repair fields without changing metadata from newer experiments."""
+    normalized = dict(metadata)
+    public_success = public_validation_succeeded(normalized)
+    repair_loops = normalized.get("repair_loops", 0)
+    if not isinstance(repair_loops, int) or isinstance(repair_loops, bool):
+        repair_loops = 0
+    setup_failed_before_invocation = (
+        normalized.get("setup_exit_code") not in (None, 0)
+        and normalized.get("opencode_exit_code") is None
+    )
+    default_invocations = 0 if setup_failed_before_invocation else repair_loops + 1
+    llm_invocations = normalized.get("llm_invocations", default_invocations)
+    if not isinstance(llm_invocations, int) or isinstance(llm_invocations, bool):
+        llm_invocations = default_invocations
+
+    initial_success = normalized.get("initial_success")
+    if not isinstance(initial_success, bool):
+        initial_success = public_success if repair_loops == 0 else False
+    success_loop = normalized.get("success_loop")
+    if not isinstance(success_loop, int) or isinstance(success_loop, bool):
+        success_loop = 0 if initial_success else None
+
+    old_opencode_runtime = normalized.get("opencode_runtime_ms", 0)
+    if not isinstance(old_opencode_runtime, (int, float)) or isinstance(
+        old_opencode_runtime, bool
+    ):
+        old_opencode_runtime = 0
+    initial_runtime = normalized.get(
+        "initial_opencode_runtime_ms",
+        old_opencode_runtime if repair_loops == 0 else 0,
+    )
+    repair_runtime = normalized.get("repair_opencode_runtime_ms", 0)
+    total_runtime = normalized.get(
+        "total_opencode_runtime_ms",
+        old_opencode_runtime,
+    )
+
+    normalized.update(
+        {
+            "initial_success": initial_success,
+            "repair_loops": repair_loops,
+            "llm_invocations": llm_invocations,
+            "success_loop": success_loop,
+            "loop_limit_reached": bool(
+                normalized.get(
+                    "loop_limit_reached",
+                    not public_success and not setup_failed_before_invocation,
+                )
+            ),
+            "public_validation_success": public_success,
+            "initial_opencode_runtime_ms": initial_runtime,
+            "repair_opencode_runtime_ms": repair_runtime,
+            "total_opencode_runtime_ms": total_runtime,
+            "loops": normalized.get("loops", []),
+        }
+    )
+    return normalized
+
+
+def build_repair_summary(
+    rows: Sequence[Mapping[str, Any]],
+    configured_max_loops: int | None = None,
+) -> dict[str, Any]:
+    n = len(rows)
+    repair_loops = [int(row.get("repair_loops", 0)) for row in rows]
+    llm_invocations = [int(row.get("llm_invocations", 1)) for row in rows]
+    initial_successes = sum(bool(row.get("initial_success")) for row in rows)
+    public_success_rows = [
+        row for row in rows if bool(row.get("public_validation_success"))
+    ]
+    public_failed_rows = [
+        row for row in rows if not bool(row.get("public_validation_success"))
+    ]
+    repair_assisted_successes = sum(
+        bool(row.get("public_validation_success"))
+        and not bool(row.get("initial_success"))
+        for row in rows
+    )
+    repair_runtimes = [
+        float(row.get("repair_opencode_runtime_ms", 0)) / 1000.0
+        for row in rows
+    ]
+
+    observed_loops = max(repair_loops, default=0)
+    curve_limit = max(observed_loops, configured_max_loops or 0)
+    success_curve = []
+    for loop in range(curve_limit + 1):
+        successes = sum(
+            isinstance(row.get("success_loop"), int)
+            and not isinstance(row.get("success_loop"), bool)
+            and int(row["success_loop"]) <= loop
+            for row in rows
+        )
+        success_curve.append(
+            {
+                "loop": loop,
+                "successful_runs": successes,
+                "success_rate": successes / n if n else None,
+            }
+        )
+
+    initially_failed = n - initial_successes
+    return {
+        "initial_successes": initial_successes,
+        "initial_success_rate": initial_successes / n if n else None,
+        "public_validation_successes": len(public_success_rows),
+        "public_validation_success_rate": (
+            len(public_success_rows) / n if n else None
+        ),
+        "repair_assisted_public_successes": repair_assisted_successes,
+        "repair_assisted_public_success_rate": (
+            repair_assisted_successes / n if n else None
+        ),
+        "repair_recovery_rate": (
+            repair_assisted_successes / initially_failed
+            if initially_failed
+            else None
+        ),
+        "mean_repair_loops": (
+            statistics.fmean(repair_loops) if repair_loops else None
+        ),
+        "median_repair_loops": (
+            statistics.median(repair_loops) if repair_loops else None
+        ),
+        "max_repair_loops": max(repair_loops) if repair_loops else None,
+        "mean_llm_invocations": (
+            statistics.fmean(llm_invocations) if llm_invocations else None
+        ),
+        "mean_repair_loops_successful_runs": safe_numeric_mean(
+            row.get("repair_loops") for row in public_success_rows
+        ),
+        "mean_repair_loops_failed_runs": safe_numeric_mean(
+            row.get("repair_loops") for row in public_failed_rows
+        ),
+        "mean_repair_llm_runtime_seconds": (
+            statistics.fmean(repair_runtimes) if repair_runtimes else None
+        ),
+        "success_curve": success_curve,
+        "note": (
+            "Repair metrics use independent attempt-* directories as runs. "
+            "The success curve is cumulative public-validation success by "
+            "repair-loop budget and is not Pass@k."
+        ),
+    }
+
+
 def infer_paper_issue(
     experiment_metadata: Mapping[str, Any],
     explicit_label: str | None = None,
@@ -510,6 +682,9 @@ def build_paper_metrics_row(
     llm_usage = summary.get("llm_token_usage")
     if not isinstance(llm_usage, Mapping):
         llm_usage = {}
+    repair = summary.get("repair")
+    if not isinstance(repair, Mapping):
+        repair = {}
 
     patch_fields = {
         "Mean Lines Edited": "lines_edited",
@@ -542,6 +717,23 @@ def build_paper_metrics_row(
             len(passing_rows),
         ),
         "Success Rate": summary.get("success_ratio"),
+        "Initial Success Rate": repair.get("initial_success_rate"),
+        "Repair-Assisted Public Success Rate": repair.get(
+            "public_validation_success_rate"
+        ),
+        "Mean Repair Loops": repair.get("mean_repair_loops"),
+        "Median Repair Loops": repair.get("median_repair_loops"),
+        "Max Repair Loops": repair.get("max_repair_loops"),
+        "Mean LLM Invocations": repair.get("mean_llm_invocations"),
+        "Mean Repair Loops - Successful Runs": repair.get(
+            "mean_repair_loops_successful_runs"
+        ),
+        "Mean Repair Loops - Failed Runs": repair.get(
+            "mean_repair_loops_failed_runs"
+        ),
+        "Mean Repair LLM Runtime (s)": repair.get(
+            "mean_repair_llm_runtime_seconds"
+        ),
         "Pass@1": pass_at_k_values.get("pass@1"),
         "Pass@5": pass_at_k_values.get("pass@5"),
         "Pass@10": pass_at_k_values.get("pass@10"),
@@ -622,6 +814,51 @@ def paper_metrics_schema() -> dict[str, Any]:
         "Success Rate": {
             "description": "Fraction of attempted runs that passed all stages.",
             "direction": "higher means greater correctness success",
+            "population": all_attempted,
+        },
+        "Initial Success Rate": {
+            "description": "Fraction passing public validation on initial generation.",
+            "direction": "higher means greater one-shot correctness",
+            "population": all_attempted,
+        },
+        "Repair-Assisted Public Success Rate": {
+            "description": "Fraction passing public validation after the repair trajectory.",
+            "direction": "higher means greater final public correctness",
+            "population": all_attempted,
+        },
+        "Mean Repair Loops": {
+            "description": "Mean repair invocations per independent attempt.",
+            "direction": "higher means more repair invocations",
+            "population": all_attempted,
+        },
+        "Median Repair Loops": {
+            "description": "Median repair invocations per independent attempt.",
+            "direction": "higher means more repair invocations",
+            "population": all_attempted,
+        },
+        "Max Repair Loops": {
+            "description": "Maximum repair invocations in an independent attempt.",
+            "direction": "higher means more repair invocations",
+            "population": all_attempted,
+        },
+        "Mean LLM Invocations": {
+            "description": "Mean initial plus repair LLM invocations per attempt.",
+            "direction": "higher means more model invocations",
+            "population": all_attempted,
+        },
+        "Mean Repair Loops - Successful Runs": {
+            "description": "Mean repair invocations among public-validation successes.",
+            "direction": "higher means more repair invocations",
+            "population": "public-validation successful runs",
+        },
+        "Mean Repair Loops - Failed Runs": {
+            "description": "Mean repair invocations among public-validation failures.",
+            "direction": "higher means more repair invocations",
+            "population": "public-validation failed runs",
+        },
+        "Mean Repair LLM Runtime (s)": {
+            "description": "Mean summed repair-invocation OpenCode runtime.",
+            "direction": "higher means more repair runtime cost",
             "population": all_attempted,
         },
         "Pass@1": {
@@ -735,7 +972,7 @@ def paper_metrics_schema() -> dict[str, Any]:
         }
     )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "compact_csv_columns": PAPER_METRICS_COLUMNS,
         "json_only_columns": PAPER_ALL_RUN_COLUMNS,
         "columns": columns,
@@ -808,9 +1045,12 @@ def rebuild_paper_metrics_aggregate(repository_root: Path) -> None:
             except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
                 continue
             if not isinstance(row, dict) or not all(
-                column in row for column in PAPER_METRICS_COLUMNS
+                column in row
+                for column in ("Issue", "Checkpoint", "Model", "Temp")
             ):
                 continue
+            for column in PAPER_METRICS_COLUMNS:
+                row.setdefault(column, None)
             canonical_experiment = row_path.parent.parent.resolve()
             rows_by_experiment.setdefault(canonical_experiment, row)
 
@@ -897,6 +1137,11 @@ def parse_test_log(path: Path) -> dict[str, int | None]:
         return result
 
     text = path.read_text(encoding="utf-8", errors="replace")
+    validation_markers = list(
+        re.finditer(r"^===== VALIDATION LOOP \d+:[^\n]*=====\s*$", text, re.M)
+    )
+    if validation_markers:
+        text = text[validation_markers[-1].end() :]
     run_match = re.search(r"\bRan\s+(\d+)\s+tests?\b", text)
     if run_match:
         result["tests_run"] = int(run_match.group(1))
@@ -980,7 +1225,7 @@ def collect_token_values(
             collect_token_values(item, collected)
 
 
-def parse_llm_tokens(path: Path) -> dict[str, int | None]:
+def parse_llm_tokens_text(text: str) -> dict[str, int | None]:
     result: dict[str, int | None] = {
         "input_tokens": None,
         "output_tokens": None,
@@ -988,10 +1233,6 @@ def parse_llm_tokens(path: Path) -> dict[str, int | None]:
         "cache_read_tokens": None,
         "total_tokens": None,
     }
-    if not path.exists():
-        return result
-
-    text = path.read_text(encoding="utf-8", errors="replace")
     collected = {key: [] for key in TOKEN_ALIASES}
 
     possible_json = [text]
@@ -1041,6 +1282,38 @@ def parse_llm_tokens(path: Path) -> dict[str, int | None]:
             result["input_tokens"] + result["output_tokens"]
         )
     return result
+
+
+def parse_llm_tokens(path: Path) -> dict[str, int | None]:
+    empty = {key: None for key in TOKEN_ALIASES}
+    if not path.exists():
+        return empty
+
+    text = path.read_text(encoding="utf-8", errors="replace")
+    invocation_marker = re.compile(
+        r"^===== LLM INVOCATION \d+:[^\n]*=====\s*$",
+        re.M,
+    )
+    sections = invocation_marker.split(text)
+    if len(sections) == 1:
+        return parse_llm_tokens_text(text)
+
+    parsed_sections = [
+        parse_llm_tokens_text(section)
+        for section in sections[1:]
+    ]
+    return {
+        key: (
+            sum(
+                int(section[key])
+                for section in parsed_sections
+                if section[key] is not None
+            )
+            if any(section[key] is not None for section in parsed_sections)
+            else None
+        )
+        for key in TOKEN_ALIASES
+    }
 
 
 def opencode_permission_rejected(path: Path) -> bool:
@@ -2555,7 +2828,9 @@ def main() -> int:
 
     print("\nAnalyzing candidates...")
     for index, attempt in enumerate(attempts, start=1):
-        metadata = read_json(attempt / "metadata.json")
+        metadata = normalize_repair_metadata(
+            read_json(attempt / "metadata.json")
+        )
         run_id = str(metadata.get("run_id", attempt.name))
         run_output = (
             diagnostic_root / "runs" / attempt.name
@@ -3300,6 +3575,12 @@ def main() -> int:
 
     n = len(rows)
     successful = sum(bool(row.get("overall_success")) for row in rows)
+    configured_max_loops = experiment_metadata.get("max_loops")
+    if not isinstance(configured_max_loops, int) or isinstance(
+        configured_max_loops, bool
+    ):
+        configured_max_loops = None
+    repair_summary = build_repair_summary(rows, configured_max_loops)
     runtime_seconds = [
         float(row["total_runtime_ms"]) / 1000.0
         for row in rows
@@ -3339,7 +3620,7 @@ def main() -> int:
         )
 
     summary = {
-        "schema_version": 3,
+        "schema_version": 4,
         "analyzer_version": ANALYZER_VERSION,
         "experiment": str(experiment),
         "output_directory": str(output_dir),
@@ -3349,6 +3630,7 @@ def main() -> int:
         "successful_runs": successful,
         "success_ratio": successful / n if n else None,
         "stage_success_ratios": stage_success_ratios,
+        "repair": repair_summary,
         "pass_at_k": {
             f"pass@{k}": pass_at_k(n, successful, k)
             for k in (1, 5, 10, 20, 50, 100)
@@ -3460,6 +3742,21 @@ def main() -> int:
 
     print("\nAnalysis complete")
     print(f"Success: {successful}/{n} ({successful / n:.1%})")
+    print(
+        "Initial public success: "
+        f"{repair_summary['initial_successes']}/{n} "
+        f"({repair_summary['initial_success_rate']:.1%})"
+    )
+    print(
+        "Final public success:   "
+        f"{repair_summary['public_validation_successes']}/{n} "
+        f"({repair_summary['public_validation_success_rate']:.1%})"
+    )
+    for curve_point in repair_summary["success_curve"]:
+        print(
+            f"Success by loop {curve_point['loop']}: "
+            f"{curve_point['success_rate']:.1%}"
+        )
     architecture_primary_name = (
         "passing_complete_runs"
         if passing_architecture_ids

@@ -6,6 +6,7 @@
 #     --model school-ollama/qwen3-coder-next:latest \
 #     --temperature 0.0 \
 #     --runs 25 \
+#     --max-loops 3 \
 #     --prompt prompts/new_sort/001_reverse.md \
 #     --feature-test-cmd "python3 -m unittest tests/new_sort/test_001_reverse.py -v"
 #
@@ -27,6 +28,8 @@ Required:
 
 Options:
   --runs N                   Number of attempts (default: 100)
+  --max-loops N              Maximum repair invocations after the initial
+                             generation (default: 0)
   --agent NAME               OpenCode agent (default: build)
   --base-ref REF             Commit/tag/branch used for every attempt (default: HEAD)
   --source PATH              Primary source file to preserve (default:
@@ -63,6 +66,9 @@ Directory layout:
       feature-tests.log
       extra-tests.log
     analysis/
+
+Repair prompts include only failing validation output. Each included output is
+deterministically limited to its final 16000 characters.
 EOF
 }
 
@@ -98,6 +104,9 @@ if len(pairs) % 2:
 data = {}
 for i in range(0, len(pairs), 2):
     key, value = pairs[i], pairs[i + 1]
+    if value.startswith("__JSON__:"):
+        data[key] = json.loads(value.removeprefix("__JSON__:"))
+        continue
     if value in {"true", "false"}:
         data[key] = value == "true"
         continue
@@ -132,14 +141,68 @@ copy_changed_files() {
     done
 }
 
+capture_candidate_artifacts() {
+    local worktree="$1"
+    local attempt_dir="$2"
+    local base_commit="$3"
+    local source_path="$4"
+
+    git -C "$worktree" status --short >"$attempt_dir/git-status.txt"
+    git -C "$worktree" diff --binary "$base_commit" -- >"$attempt_dir/patch.diff"
+    git -C "$worktree" diff --numstat "$base_commit" -- \
+        >"$attempt_dir/diff-numstat.txt"
+    git -C "$worktree" diff --name-status "$base_commit" -- \
+        >"$attempt_dir/changed-files.txt"
+    git -C "$worktree" diff --stat "$base_commit" -- \
+        >"$attempt_dir/diff-stat.txt"
+    git -C "$worktree" ls-files --others --exclude-standard \
+        >"$attempt_dir/untracked-files.txt"
+
+    rm -rf "$attempt_dir/candidate"
+    copy_changed_files "$worktree" "$attempt_dir/candidate" "$base_commit"
+
+    # Always preserve the primary source, even if OpenCode did not modify it.
+    mkdir -p "$attempt_dir/candidate/$(dirname "$source_path")"
+    if [[ -f "$worktree/$source_path" ]]; then
+        cp -p "$worktree/$source_path" \
+            "$attempt_dir/candidate/$source_path"
+    fi
+}
+
 run_logged_command() {
-    # Usage: run_logged_command LOGFILE COMMAND
+    # Usage: run_logged_command LOGFILE COMMAND LOOP STAGE
+    local logfile="$1"
+    local command="$2"
+    local loop="$3"
+    local stage="$4"
+    local start_ns end_ns status
+
+    printf '\n===== VALIDATION LOOP %s: %s =====\n\n' \
+        "$loop" "$stage" >>"$logfile"
+    if [[ -z "$command" ]]; then
+        printf '%s %s\n' 0 0
+        return
+    fi
+
+    start_ns="$(date +%s%N)"
+    (
+        set +e
+        eval "$command"
+    ) >>"$logfile" 2>&1
+    status=$?
+    end_ns="$(date +%s%N)"
+
+    printf '%s %s\n' "$status" "$(( (end_ns - start_ns) / 1000000 ))"
+}
+
+run_final_command() {
+    # Usage: run_final_command LOGFILE COMMAND
     local logfile="$1"
     local command="$2"
     local start_ns end_ns status
 
     if [[ -z "$command" ]]; then
-        : > "$logfile"
+        : >"$logfile"
         printf '%s %s\n' 0 0
         return
     fi
@@ -155,10 +218,174 @@ run_logged_command() {
     printf '%s %s\n' "$status" "$(( (end_ns - start_ns) / 1000000 ))"
 }
 
+run_opencode() {
+    # Usage: run_opencode LOGFILE WORKTREE PROMPT INVOCATION KIND
+    local logfile="$1"
+    local worktree="$2"
+    local prompt="$3"
+    local invocation="$4"
+    local kind="$5"
+    local current_log start_ns end_ns status runtime_ms permission_rejected
+
+    current_log="$attempt_dir/.opencode-current.log"
+    printf '\n===== LLM INVOCATION %s: %s =====\n\n' \
+        "$invocation" "$kind" >>"$logfile"
+    start_ns="$(date +%s%N)"
+    if [[ "$TIMEOUT_SECONDS" -gt 0 ]]; then
+        OPENCODE_CONFIG_CONTENT="$ATTEMPT_OPENCODE_CONFIG_CONTENT" \
+            timeout --signal=TERM --kill-after=30 \
+            "$TIMEOUT_SECONDS" \
+            "$OPENCODE_BIN" run \
+                --dir "$worktree" \
+                --model "$MODEL" \
+                --agent "$AGENT" \
+                "$prompt"
+    else
+        OPENCODE_CONFIG_CONTENT="$ATTEMPT_OPENCODE_CONFIG_CONTENT" \
+            "$OPENCODE_BIN" run \
+                --dir "$worktree" \
+                --model "$MODEL" \
+                --agent "$AGENT" \
+                "$prompt"
+    fi >"$current_log" 2>&1
+    status=$?
+    end_ns="$(date +%s%N)"
+    runtime_ms=$(( (end_ns - start_ns) / 1000000 ))
+
+    permission_rejected=false
+    if grep -Eiq \
+            'permission requested:[[:space:]]*external_directory|auto-rejecting|user rejected permission|permission denied' \
+            "$current_log"; then
+        permission_rejected=true
+    fi
+    cat "$current_log" >>"$logfile"
+    rm -f "$current_log"
+    printf '%s %s %s\n' "$status" "$runtime_ms" "$permission_rejected"
+}
+
+build_repair_prompt() {
+    local validation_loop="$1"
+    local build_exit="$2"
+    local base_test_exit="$3"
+    local feature_test_exit="$4"
+
+    "$PYTHON_BIN" - \
+        "$validation_loop" \
+        "$build_exit" "$attempt_dir/build.log" \
+        "$base_test_exit" "$attempt_dir/base-tests.log" \
+        "$feature_test_exit" "$attempt_dir/feature-tests.log" \
+        "$prompt_text" <<'PY'
+import sys
+from pathlib import Path
+
+loop = int(sys.argv[1])
+stages = [
+    ("Build", int(sys.argv[2]), Path(sys.argv[3])),
+    ("Base-test", int(sys.argv[4]), Path(sys.argv[5])),
+    ("Checkpoint-test", int(sys.argv[6]), Path(sys.argv[7])),
+]
+original_prompt = sys.argv[8]
+limit = 16_000
+
+
+def failure_output(name: str, exit_code: int, path: Path) -> str:
+    if exit_code == 0:
+        return "(passed; output omitted)"
+    text = path.read_text(encoding="utf-8", errors="replace")
+    marker = f"===== VALIDATION LOOP {loop}:"
+    marker_index = text.rfind(marker)
+    if marker_index >= 0:
+        section = text[marker_index:].split("\n", 2)
+        text = section[2] if len(section) == 3 else ""
+    if len(text) > limit:
+        text = (
+            f"[truncated deterministically to final {limit} characters]\n"
+            + text[-limit:]
+        )
+    return text.rstrip() or f"({name.lower()} failed without output)"
+
+
+outputs = {
+    name: failure_output(name, exit_code, path)
+    for name, exit_code, path in stages
+}
+print(
+    f"""Your previous implementation for the original task did not pass the required validation.
+
+Continue working on the CURRENT implementation in this worktree.
+
+Do not restart the task.
+Do not revert to the baseline.
+Do not modify, weaken, disable, or delete the tests.
+Make only changes necessary to satisfy the original task.
+
+Original task:
+{original_prompt}
+
+Build exit code:
+{stages[0][1]}
+
+Base-test exit code:
+{stages[1][1]}
+
+Checkpoint-test exit code:
+{stages[2][1]}
+
+Build output:
+{outputs['Build']}
+
+Base-test output:
+{outputs['Base-test']}
+
+Checkpoint-test output:
+{outputs['Checkpoint-test']}
+
+Repair the current implementation so that it builds successfully and all required base and checkpoint tests pass."""
+)
+PY
+}
+
+make_loop_record() {
+    "$PYTHON_BIN" - "$@" <<'PY'
+import json
+import sys
+
+(
+    loop,
+    kind,
+    opencode_exit,
+    permission_rejected,
+    build_exit,
+    base_test_exit,
+    feature_test_exit,
+    opencode_ms,
+    build_ms,
+    base_test_ms,
+    feature_test_ms,
+    validation_success,
+) = sys.argv[1:]
+print(json.dumps({
+    "loop": int(loop),
+    "kind": kind,
+    "opencode_exit_code": int(opencode_exit),
+    "opencode_permission_rejected": permission_rejected == "true",
+    "build_exit_code": int(build_exit),
+    "base_test_exit_code": int(base_test_exit),
+    "feature_test_exit_code": int(feature_test_exit),
+    "opencode_runtime_ms": int(opencode_ms),
+    "build_runtime_ms": int(build_ms),
+    "base_test_runtime_ms": int(base_test_ms),
+    "feature_test_runtime_ms": int(feature_test_ms),
+    "validation_success": validation_success == "true",
+}, separators=(",", ":")))
+PY
+}
+
 MODEL=""
 TEMPERATURE=""
 PROMPT=""
 RUNS=100
+MAX_LOOPS=0
 AGENT="build"
 BASE_REF="HEAD"
 SOURCE_PATH="src/new_sort/new_sort.c"
@@ -180,6 +407,11 @@ while [[ $# -gt 0 ]]; do
         --temperature) TEMPERATURE="${2:-}"; shift 2 ;;
         --prompt) PROMPT="${2:-}"; shift 2 ;;
         --runs) RUNS="${2:-}"; shift 2 ;;
+        --max-loops)
+            [[ $# -ge 2 ]] || die "--max-loops requires a value"
+            MAX_LOOPS="$2"
+            shift 2
+            ;;
         --agent) AGENT="${2:-}"; shift 2 ;;
         --base-ref) BASE_REF="${2:-}"; shift 2 ;;
         --source) SOURCE_PATH="${2:-}"; shift 2 ;;
@@ -200,11 +432,21 @@ done
 [[ -n "$TEMPERATURE" ]] || die "--temperature is required"
 [[ -n "$PROMPT" ]] || die "--prompt is required"
 [[ "$RUNS" =~ ^[1-9][0-9]*$ ]] || die "--runs must be a positive integer"
+[[ "$MAX_LOOPS" =~ ^[0-9]+$ ]] || die "--max-loops must be a non-negative integer"
 [[ "$TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || die "--timeout must be a non-negative integer"
 
 command -v git >/dev/null 2>&1 || die "git is required"
 command -v "$OPENCODE_BIN" >/dev/null 2>&1 || die "$OPENCODE_BIN was not found"
 command -v "$PYTHON_BIN" >/dev/null 2>&1 || die "$PYTHON_BIN was not found"
+MAX_LOOPS="$("$PYTHON_BIN" - "$MAX_LOOPS" <<'PY'
+import sys
+
+value = int(sys.argv[1], 10)
+if value > sys.maxsize:
+    raise SystemExit(1)
+print(value)
+PY
+)" || die "--max-loops is too large for this platform"
 
 REPO="$(git rev-parse --show-toplevel 2>/dev/null)" ||
     die "run this script inside a Git repository"
@@ -226,11 +468,29 @@ TEMP_SLUG="$(slugify "$TEMPERATURE" | sed 's/\./p/g')"
 
 if [[ -z "$OUTPUT_DIR" ]]; then
     OUTPUT_DIR="$REPO/runs/experiments/$MODEL_SLUG/$PROMPT_SLUG/temp-$TEMP_SLUG"
+    if [[ "$MAX_LOOPS" -gt 0 ]]; then
+        OUTPUT_DIR="${OUTPUT_DIR}-max-loops-$MAX_LOOPS"
+    fi
 elif [[ "$OUTPUT_DIR" != /* ]]; then
     OUTPUT_DIR="$REPO/$OUTPUT_DIR"
 fi
 mkdir -p "$OUTPUT_DIR"
 OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd -P)"
+
+if [[ -f "$OUTPUT_DIR/experiment.json" ]]; then
+    EXISTING_MAX_LOOPS="$(
+        "$PYTHON_BIN" - "$OUTPUT_DIR/experiment.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(data.get("max_loops", 0))
+PY
+    )" || die "cannot read existing experiment metadata"
+    [[ "$EXISTING_MAX_LOOPS" == "$MAX_LOOPS" ]] ||
+        die "output directory already contains an experiment with max_loops=$EXISTING_MAX_LOOPS"
+fi
 
 BASELINE_DIR="$OUTPUT_DIR/baseline"
 mkdir -p "$BASELINE_DIR/$(dirname "$SOURCE_PATH")"
@@ -244,7 +504,7 @@ ANALYZER_PATH="$REPO/scripts/analyze_experiment.py"
 [[ -f "$ANALYZER_PATH" ]] || die "analyzer not found: $ANALYZER_PATH"
 
 write_metadata "$OUTPUT_DIR/experiment.json" \
-    schema_version 1 \
+    schema_version 2 \
     repository "$REPO" \
     base_ref "$BASE_REF" \
     base_commit "$BASE_COMMIT" \
@@ -255,6 +515,7 @@ write_metadata "$OUTPUT_DIR/experiment.json" \
     prompt_copy "$PROMPT_COPY" \
     source_path "$SOURCE_PATH" \
     requested_runs "$RUNS" \
+    max_loops "$MAX_LOOPS" \
     build_command "$BUILD_CMD" \
     base_test_command "$BASE_TEST_CMD" \
     feature_test_command "$FEATURE_TEST_CMD" \
@@ -270,6 +531,7 @@ printf 'Model:       %s\n' "$MODEL"
 printf 'Temperature: %s\n' "$TEMPERATURE"
 printf 'Prompt:      %s\n' "$PROMPT"
 printf 'Runs:        %s\n' "$RUNS"
+printf 'Max loops:   %s\n' "$MAX_LOOPS"
 printf 'Output:      %s\n\n' "$OUTPUT_DIR"
 
 for attempt_number in $(seq 1 "$RUNS"); do
@@ -295,11 +557,24 @@ for attempt_number in $(seq 1 "$RUNS"); do
     if ! git -C "$REPO" worktree add --detach "$worktree" "$BASE_COMMIT" \
             >"$attempt_dir/worktree-add.log" 2>&1; then
         write_metadata "$attempt_dir/metadata.json" \
+            schema_version 2 \
             run_id "$attempt_id" \
             model "$MODEL" \
             temperature "$TEMPERATURE" \
             setup_exit_code 1 \
             opencode_permission_rejected false \
+            max_loops "$MAX_LOOPS" \
+            initial_success false \
+            repair_loops 0 \
+            llm_invocations 0 \
+            success_loop "__JSON__:null" \
+            loop_limit_reached false \
+            public_validation_success false \
+            initial_opencode_runtime_ms 0 \
+            repair_opencode_runtime_ms 0 \
+            total_opencode_runtime_ms 0 \
+            total_runtime_ms 0 \
+            loops "__JSON__:[]" \
             overall_success false
         touch "$attempt_dir/COMPLETE"
         printf '  worktree creation failed; see %s\n' \
@@ -342,86 +617,153 @@ PY
     )" || die "failed to build per-attempt OpenCode configuration"
 
     prompt_text="$(cat "$PROMPT")"
-    opencode_start_ns="$(date +%s%N)"
+    : >"$attempt_dir/opencode.log"
+    : >"$attempt_dir/build.log"
+    : >"$attempt_dir/base-tests.log"
+    : >"$attempt_dir/feature-tests.log"
 
-    if [[ "$TIMEOUT_SECONDS" -gt 0 ]]; then
-        OPENCODE_CONFIG_CONTENT="$ATTEMPT_OPENCODE_CONFIG_CONTENT" \
-            timeout --signal=TERM --kill-after=30 \
-            "$TIMEOUT_SECONDS" \
-            "$OPENCODE_BIN" run \
-                --dir "$worktree" \
-                --model "$MODEL" \
-                --agent "$AGENT" \
-                "$prompt_text"
-    else
-        OPENCODE_CONFIG_CONTENT="$ATTEMPT_OPENCODE_CONFIG_CONTENT" \
-            "$OPENCODE_BIN" run \
-                --dir "$worktree" \
-                --model "$MODEL" \
-                --agent "$AGENT" \
-                "$prompt_text"
-    fi >"$attempt_dir/opencode.log" 2>&1
-    opencode_exit=$?
-    opencode_end_ns="$(date +%s%N)"
-    opencode_ms=$(( (opencode_end_ns - opencode_start_ns) / 1000000 ))
-
+    validation_loop=0
+    current_prompt="$prompt_text"
+    repair_loops=0
+    total_opencode_ms=0
+    initial_opencode_ms=0
+    repair_opencode_ms=0
+    total_build_ms=0
+    total_base_test_ms=0
+    total_feature_test_ms=0
     opencode_permission_rejected=false
-    if grep -Eiq \
-            'permission requested:[[:space:]]*external_directory|auto-rejecting|user rejected permission|permission denied' \
-            "$attempt_dir/opencode.log"; then
-        opencode_permission_rejected=true
+    initial_success=false
+    public_validation_success=false
+    success_loop_json=null
+    infrastructure_failed=false
+    loop_records=()
+
+    while true; do
+        if [[ "$validation_loop" -eq 0 ]]; then
+            invocation_kind="INITIAL"
+            loop_kind="initial"
+        else
+            invocation_kind="REPAIR LOOP $validation_loop"
+            loop_kind="repair"
+            repair_loops=$((repair_loops + 1))
+        fi
+
+        read -r opencode_exit opencode_ms invocation_permission_rejected < <(
+            run_opencode \
+                "$attempt_dir/opencode.log" \
+                "$worktree" \
+                "$current_prompt" \
+                "$validation_loop" \
+                "$invocation_kind"
+        )
+        total_opencode_ms=$((total_opencode_ms + opencode_ms))
+        if [[ "$validation_loop" -eq 0 ]]; then
+            initial_opencode_ms="$opencode_ms"
+        else
+            repair_opencode_ms=$((repair_opencode_ms + opencode_ms))
+        fi
+        if [[ "$invocation_permission_rejected" == true ]]; then
+            opencode_permission_rejected=true
+        fi
+
+        # Snapshot after each invocation. The last snapshot is the final model
+        # implementation and excludes subsequent build/test side effects.
+        capture_candidate_artifacts \
+            "$worktree" "$attempt_dir" "$BASE_COMMIT" "$SOURCE_PATH"
+
+        read -r build_exit build_ms < <(
+            cd "$worktree" &&
+            run_logged_command \
+                "$attempt_dir/build.log" "$BUILD_CMD" \
+                "$validation_loop" "BUILD"
+        )
+        read -r base_test_exit base_test_ms < <(
+            cd "$worktree" &&
+            run_logged_command \
+                "$attempt_dir/base-tests.log" "$BASE_TEST_CMD" \
+                "$validation_loop" "BASE TESTS"
+        )
+        read -r feature_test_exit feature_test_ms < <(
+            cd "$worktree" &&
+            run_logged_command \
+                "$attempt_dir/feature-tests.log" "$FEATURE_TEST_CMD" \
+                "$validation_loop" "CHECKPOINT TESTS"
+        )
+        total_build_ms=$((total_build_ms + build_ms))
+        total_base_test_ms=$((total_base_test_ms + base_test_ms))
+        total_feature_test_ms=$((total_feature_test_ms + feature_test_ms))
+
+        validation_success=false
+        if [[ "$build_exit" -eq 0 &&
+              "$base_test_exit" -eq 0 &&
+              "$feature_test_exit" -eq 0 ]]; then
+            validation_success=true
+        fi
+        if [[ "$validation_loop" -eq 0 ]]; then
+            initial_success="$validation_success"
+        fi
+
+        loop_records+=("$(make_loop_record \
+            "$validation_loop" "$loop_kind" \
+            "$opencode_exit" "$invocation_permission_rejected" \
+            "$build_exit" "$base_test_exit" "$feature_test_exit" \
+            "$opencode_ms" "$build_ms" "$base_test_ms" \
+            "$feature_test_ms" "$validation_success")")
+
+        if [[ "$validation_success" == true ]]; then
+            public_validation_success=true
+            success_loop_json="$validation_loop"
+            break
+        fi
+
+        # Infrastructure failures end the attempt and never trigger repair.
+        if [[ "$opencode_exit" -ne 0 ||
+              "$invocation_permission_rejected" == true ]]; then
+            infrastructure_failed=true
+            break
+        fi
+        if [[ "$validation_loop" -ge "$MAX_LOOPS" ]]; then
+            break
+        fi
+
+        current_prompt="$(build_repair_prompt \
+            "$validation_loop" "$build_exit" \
+            "$base_test_exit" "$feature_test_exit")"
+        validation_loop=$((validation_loop + 1))
+    done
+
+    llm_invocations=${#loop_records[@]}
+    loops_json="$("$PYTHON_BIN" - "${loop_records[@]}" <<'PY'
+import json
+import sys
+
+print(json.dumps([json.loads(record) for record in sys.argv[1:]], separators=(",", ":")))
+PY
+    )"
+    loop_limit_reached=false
+    if [[ "$public_validation_success" == false &&
+          "$infrastructure_failed" == false &&
+          "$repair_loops" -eq "$MAX_LOOPS" ]]; then
+        loop_limit_reached=true
     fi
 
-    # Preserve the exact generated state before build/test commands can alter it.
-    git -C "$worktree" status --short >"$attempt_dir/git-status.txt"
-    git -C "$worktree" diff --binary "$BASE_COMMIT" -- >"$attempt_dir/patch.diff"
-    git -C "$worktree" diff --numstat "$BASE_COMMIT" -- >"$attempt_dir/diff-numstat.txt"
-    git -C "$worktree" diff --name-status "$BASE_COMMIT" -- \
-        >"$attempt_dir/changed-files.txt"
-    git -C "$worktree" diff --stat "$BASE_COMMIT" -- >"$attempt_dir/diff-stat.txt"
-    git -C "$worktree" ls-files --others --exclude-standard \
-        >"$attempt_dir/untracked-files.txt"
-
-    copy_changed_files "$worktree" "$attempt_dir/candidate" "$BASE_COMMIT"
-
-    # Always preserve the primary source, even if OpenCode did not modify it.
-    mkdir -p "$attempt_dir/candidate/$(dirname "$SOURCE_PATH")"
-    if [[ -f "$worktree/$SOURCE_PATH" ]]; then
-        cp -p "$worktree/$SOURCE_PATH" \
-            "$attempt_dir/candidate/$SOURCE_PATH"
-    fi
-
-    read -r build_exit build_ms < <(
-        cd "$worktree" &&
-        run_logged_command "$attempt_dir/build.log" "$BUILD_CMD"
-    )
-    read -r base_test_exit base_test_ms < <(
-        cd "$worktree" &&
-        run_logged_command "$attempt_dir/base-tests.log" "$BASE_TEST_CMD"
-    )
-    read -r feature_test_exit feature_test_ms < <(
-        cd "$worktree" &&
-        run_logged_command "$attempt_dir/feature-tests.log" "$FEATURE_TEST_CMD"
-    )
     read -r extra_test_exit extra_test_ms < <(
         cd "$worktree" &&
-        run_logged_command "$attempt_dir/extra-tests.log" "$EXTRA_TEST_CMD"
+        run_final_command "$attempt_dir/extra-tests.log" "$EXTRA_TEST_CMD"
     )
 
-    total_ms=$((opencode_ms + build_ms + base_test_ms + feature_test_ms + extra_test_ms))
+    total_ms=$((total_opencode_ms + total_build_ms + total_base_test_ms + total_feature_test_ms + extra_test_ms))
 
     overall_success=true
     if [[ "$opencode_permission_rejected" == true ||
           "$opencode_exit" -ne 0 ||
-          "$build_exit" -ne 0 ||
-          "$base_test_exit" -ne 0 ||
-          "$feature_test_exit" -ne 0 ||
+          "$public_validation_success" == false ||
           "$extra_test_exit" -ne 0 ]]; then
         overall_success=false
     fi
 
     write_metadata "$attempt_dir/metadata.json" \
-        schema_version 1 \
+        schema_version 2 \
         run_id "$attempt_id" \
         attempt_number "$attempt_number" \
         model "$MODEL" \
@@ -429,18 +771,29 @@ PY
         agent "$AGENT" \
         base_commit "$BASE_COMMIT" \
         source_path "$SOURCE_PATH" \
+        max_loops "$MAX_LOOPS" \
         opencode_exit_code "$opencode_exit" \
         opencode_permission_rejected "$opencode_permission_rejected" \
         build_exit_code "$build_exit" \
         base_test_exit_code "$base_test_exit" \
         feature_test_exit_code "$feature_test_exit" \
         extra_test_exit_code "$extra_test_exit" \
-        opencode_runtime_ms "$opencode_ms" \
-        build_runtime_ms "$build_ms" \
-        base_test_runtime_ms "$base_test_ms" \
-        feature_test_runtime_ms "$feature_test_ms" \
+        opencode_runtime_ms "$total_opencode_ms" \
+        build_runtime_ms "$total_build_ms" \
+        base_test_runtime_ms "$total_base_test_ms" \
+        feature_test_runtime_ms "$total_feature_test_ms" \
         extra_test_runtime_ms "$extra_test_ms" \
+        initial_opencode_runtime_ms "$initial_opencode_ms" \
+        repair_opencode_runtime_ms "$repair_opencode_ms" \
+        total_opencode_runtime_ms "$total_opencode_ms" \
         total_runtime_ms "$total_ms" \
+        initial_success "$initial_success" \
+        repair_loops "$repair_loops" \
+        llm_invocations "$llm_invocations" \
+        success_loop "__JSON__:$success_loop_json" \
+        loop_limit_reached "$loop_limit_reached" \
+        public_validation_success "$public_validation_success" \
+        loops "__JSON__:$loops_json" \
         overall_success "$overall_success" \
         completed_at "$(date --iso-8601=seconds)"
 
@@ -449,8 +802,8 @@ PY
     git -C "$REPO" worktree prune
     touch "$attempt_dir/COMPLETE"
 
-    printf '  OpenCode=%s build=%s base-tests=%s feature-tests=%s extra=%s result=%s time=%.2fs\n' \
-        "$opencode_exit" "$build_exit" "$base_test_exit" \
+    printf '  OpenCode=%s loops=%s build=%s base-tests=%s feature-tests=%s extra=%s result=%s time=%.2fs\n' \
+        "$opencode_exit" "$repair_loops" "$build_exit" "$base_test_exit" \
         "$feature_test_exit" "$extra_test_exit" \
         "$overall_success" \
         "$("$PYTHON_BIN" -c "print($total_ms / 1000)")"

@@ -10,12 +10,19 @@ Run with: python3 -m pytest tests/test_measure_diversity.py -v
 
 from __future__ import annotations
 
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+RUNNER = REPO_ROOT / "scripts" / "run_llm_experiment.sh"
+ANALYZER = REPO_ROOT / "scripts" / "analyze_experiment.py"
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 import measure_diversity as md  # noqa: E402
@@ -187,3 +194,529 @@ def test_load_variants_derives_temp_dir_label(tmp_path):
 
 def test_calibration_passes():
     assert md.run_calibration() is True
+
+
+# ---------------------------------------------------------------------------
+# Repair-loop runner and analyzer regressions
+# ---------------------------------------------------------------------------
+
+
+def load_analyzer():
+    spec = importlib.util.spec_from_file_location("analyze_experiment", ANALYZER)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture(scope="module")
+def analyzer():
+    return load_analyzer()
+
+
+def initialize_experiment_repo(tmp_path: Path) -> tuple[Path, Path]:
+    repository = tmp_path / "repository"
+    (repository / "scripts").mkdir(parents=True)
+    (repository / "src").mkdir()
+    shutil.copy2(RUNNER, repository / "scripts" / RUNNER.name)
+    (repository / "scripts" / "analyze_experiment.py").write_text(
+        """\
+import argparse
+from pathlib import Path
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--experiment", type=Path, required=True)
+args, _ = parser.parse_known_args()
+(args.experiment / "analysis").mkdir(exist_ok=True)
+(args.experiment / "analysis" / "AUTOMATIC").write_text("ran\\n")
+""",
+        encoding="utf-8",
+    )
+    (repository / "src" / "tool.c").write_text("baseline\n", encoding="utf-8")
+    (repository / "prompt.md").write_text("Implement the checkpoint.\n", encoding="utf-8")
+    (repository / ".gitignore").write_text("runs/\n", encoding="utf-8")
+
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "add", "."],
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "baseline",
+        ],
+        cwd=repository,
+        check=True,
+    )
+
+    fake_opencode = tmp_path / "fake-opencode"
+    fake_opencode.write_text(
+        """\
+#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+counter = Path(os.environ["FAKE_COUNTER"])
+invocation = int(counter.read_text()) if counter.exists() else 0
+counter.write_text(str(invocation + 1))
+prompt = sys.argv[-1]
+with Path(os.environ["FAKE_PROMPTS"]).open("a", encoding="utf-8") as handle:
+    handle.write(f"\\n===== PROMPT {invocation} =====\\n{prompt}\\n")
+worktree = Path(sys.argv[sys.argv.index("--dir") + 1])
+scenario = os.environ["FAKE_SCENARIO"]
+if scenario == "repair-success" and invocation > 0:
+    value = "repaired"
+else:
+    value = "broken"
+(worktree / "src" / "tool.c").write_text(value + "\\n")
+print(json.dumps({"total_tokens": invocation + 10}))
+if scenario == "infrastructure-failure":
+    raise SystemExit(42)
+""",
+        encoding="utf-8",
+    )
+    fake_opencode.chmod(0o755)
+    return repository, fake_opencode
+
+
+def run_experiment(
+    tmp_path: Path,
+    *,
+    scenario: str,
+    max_loops: int | str | None,
+) -> tuple[Path, subprocess.CompletedProcess[str], int, str]:
+    repository, fake_opencode = initialize_experiment_repo(tmp_path)
+    counter = tmp_path / "counter.txt"
+    prompts = tmp_path / "prompts.txt"
+    extra_count = tmp_path / "extra-count.txt"
+    output = repository / "runs" / "experiment"
+    command = [
+        "bash",
+        str(repository / "scripts" / "run_llm_experiment.sh"),
+        "--model",
+        "fake/model",
+        "--temperature",
+        "0",
+        "--runs",
+        "1",
+        "--prompt",
+        "prompt.md",
+        "--source",
+        "src/tool.c",
+        "--output-dir",
+        str(output),
+        "--build-cmd",
+        "if test \"$(tr -d '\\n' < src/tool.c)\" = repaired; then exit 0; else echo broken-build; exit 1; fi",
+        "--base-test-cmd",
+        "true",
+        "--feature-test-cmd",
+        "true",
+        "--extra-test-cmd",
+        'printf x >> "$EXTRA_COUNT"',
+        "--timeout",
+        "0",
+    ]
+    if max_loops is not None:
+        command.extend(["--max-loops", str(max_loops)])
+
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "OPENCODE_BIN": str(fake_opencode),
+            "PYTHON_BIN": sys.executable,
+            "FAKE_COUNTER": str(counter),
+            "FAKE_PROMPTS": str(prompts),
+            "FAKE_SCENARIO": scenario,
+            "EXTRA_COUNT": str(extra_count),
+        }
+    )
+    result = subprocess.run(
+        command,
+        cwd=repository,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+        check=False,
+    )
+    invocations = int(counter.read_text())
+    return output, result, invocations, prompts.read_text(encoding="utf-8")
+
+
+def test_default_max_loops_is_one_shot(tmp_path: Path):
+    output, result, invocations, _ = run_experiment(
+        tmp_path,
+        scenario="always-fail",
+        max_loops=None,
+    )
+
+    assert result.returncode == 0, result.stderr
+    metadata = json.loads(
+        (output / "attempt-001" / "metadata.json").read_text(encoding="utf-8")
+    )
+    assert json.loads((output / "experiment.json").read_text())["max_loops"] == 0
+    assert invocations == 1
+    assert metadata["repair_loops"] == 0
+    assert metadata["llm_invocations"] == 1
+    assert metadata["loop_limit_reached"] is True
+    assert len(metadata["loops"]) == 1
+
+
+def test_successful_repair_stops_and_captures_final_candidate(tmp_path: Path):
+    output, result, invocations, prompts = run_experiment(
+        tmp_path,
+        scenario="repair-success",
+        max_loops="03",
+    )
+
+    assert result.returncode == 0, result.stderr
+    attempt = output / "attempt-001"
+    metadata = json.loads((attempt / "metadata.json").read_text(encoding="utf-8"))
+    assert json.loads((output / "experiment.json").read_text())["max_loops"] == 3
+    assert invocations == 2
+    assert metadata["initial_success"] is False
+    assert metadata["repair_loops"] == 1
+    assert metadata["llm_invocations"] == 2
+    assert metadata["success_loop"] == 1
+    assert metadata["loop_limit_reached"] is False
+    assert metadata["public_validation_success"] is True
+    assert [loop["validation_success"] for loop in metadata["loops"]] == [
+        False,
+        True,
+    ]
+    assert (attempt / "candidate" / "src" / "tool.c").read_text() == "repaired\n"
+    assert "+repaired" in (attempt / "patch.diff").read_text()
+    assert "LLM INVOCATION 0: INITIAL" in (attempt / "opencode.log").read_text()
+    assert "LLM INVOCATION 1: REPAIR LOOP 1" in (attempt / "opencode.log").read_text()
+    assert "VALIDATION LOOP 0" in (attempt / "build.log").read_text()
+    assert "VALIDATION LOOP 1" in (attempt / "build.log").read_text()
+    assert "Continue working on the CURRENT implementation" in prompts
+    assert "broken-build" in prompts
+    assert (tmp_path / "extra-count.txt").read_text() == "x"
+    assert (output / "analysis" / "AUTOMATIC").exists()
+    forbidden = {"loop-001", "repair", "initial", "final"}
+    assert forbidden.isdisjoint(path.name for path in attempt.iterdir() if path.is_dir())
+
+
+def test_repair_budget_exhaustion_is_recorded(tmp_path: Path):
+    output, result, invocations, _ = run_experiment(
+        tmp_path,
+        scenario="always-fail",
+        max_loops=2,
+    )
+
+    assert result.returncode == 0, result.stderr
+    metadata = json.loads(
+        (output / "attempt-001" / "metadata.json").read_text(encoding="utf-8")
+    )
+    assert invocations == 3
+    assert metadata["repair_loops"] == 2
+    assert metadata["llm_invocations"] == 3
+    assert metadata["success_loop"] is None
+    assert metadata["loop_limit_reached"] is True
+    assert metadata["public_validation_success"] is False
+    assert len(metadata["loops"]) == 3
+
+
+def test_infrastructure_failure_does_not_trigger_or_exhaust_repairs(tmp_path: Path):
+    output, result, invocations, _ = run_experiment(
+        tmp_path,
+        scenario="infrastructure-failure",
+        max_loops=3,
+    )
+
+    assert result.returncode == 0, result.stderr
+    metadata = json.loads(
+        (output / "attempt-001" / "metadata.json").read_text(encoding="utf-8")
+    )
+    assert invocations == 1
+    assert metadata["opencode_exit_code"] == 42
+    assert metadata["repair_loops"] == 0
+    assert metadata["loop_limit_reached"] is False
+    assert metadata["overall_success"] is False
+
+
+def test_max_loops_requires_a_value():
+    result = subprocess.run(
+        [
+            "bash",
+            str(RUNNER),
+            "--model",
+            "fake/model",
+            "--temperature",
+            "0",
+            "--prompt",
+            "prompts/new_sort/001_reverse.md",
+            "--max-loops",
+        ],
+        cwd=REPO_ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "--max-loops requires a value" in result.stderr
+
+
+def test_max_loops_rejects_arithmetic_overflow():
+    result = subprocess.run(
+        [
+            "bash",
+            str(RUNNER),
+            "--model",
+            "fake/model",
+            "--temperature",
+            "0",
+            "--prompt",
+            "prompts/new_sort/001_reverse.md",
+            "--max-loops",
+            "999999999999999999999999999999999999999",
+        ],
+        cwd=REPO_ROOT,
+        env={**os.environ, "OPENCODE_BIN": "true", "PYTHON_BIN": sys.executable},
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "--max-loops is too large" in result.stderr
+
+
+def test_analyzer_normalizes_old_and_new_metadata(analyzer):
+    old = analyzer.normalize_repair_metadata(
+        {
+            "build_exit_code": 0,
+            "base_test_exit_code": 0,
+            "feature_test_exit_code": 0,
+            "opencode_runtime_ms": 125,
+            "overall_success": True,
+        }
+    )
+    new = analyzer.normalize_repair_metadata(
+        {
+            "initial_success": False,
+            "repair_loops": 2,
+            "llm_invocations": 3,
+            "success_loop": 2,
+            "public_validation_success": True,
+            "repair_opencode_runtime_ms": 250,
+        }
+    )
+
+    assert old["repair_loops"] == 0
+    assert old["llm_invocations"] == 1
+    assert old["initial_success"] is True
+    assert old["success_loop"] == 0
+    assert old["total_opencode_runtime_ms"] == 125
+    assert new["repair_loops"] == 2
+    assert new["llm_invocations"] == 3
+    assert new["success_loop"] == 2
+
+    old_setup_failure = analyzer.normalize_repair_metadata(
+        {"setup_exit_code": 1, "overall_success": False}
+    )
+    assert old_setup_failure["llm_invocations"] == 0
+    assert old_setup_failure["loop_limit_reached"] is False
+
+
+def test_repair_summary_and_pass_at_k_use_attempts(analyzer):
+    rows = [
+        analyzer.normalize_repair_metadata(
+            {
+                "initial_success": True,
+                "repair_loops": 0,
+                "llm_invocations": 1,
+                "success_loop": 0,
+                "public_validation_success": True,
+                "repair_opencode_runtime_ms": 0,
+            }
+        ),
+        analyzer.normalize_repair_metadata(
+            {
+                "initial_success": False,
+                "repair_loops": 2,
+                "llm_invocations": 3,
+                "success_loop": 2,
+                "public_validation_success": True,
+                "repair_opencode_runtime_ms": 4000,
+            }
+        ),
+        analyzer.normalize_repair_metadata(
+            {
+                "initial_success": False,
+                "repair_loops": 3,
+                "llm_invocations": 4,
+                "success_loop": None,
+                "public_validation_success": False,
+                "repair_opencode_runtime_ms": 5000,
+            }
+        ),
+    ]
+    summary = analyzer.build_repair_summary(rows, configured_max_loops=3)
+
+    assert summary["initial_success_rate"] == pytest.approx(1 / 3)
+    assert summary["public_validation_success_rate"] == pytest.approx(2 / 3)
+    assert summary["mean_repair_loops"] == pytest.approx(5 / 3)
+    assert summary["median_repair_loops"] == 2
+    assert summary["max_repair_loops"] == 3
+    assert summary["mean_llm_invocations"] == pytest.approx(8 / 3)
+    assert [point["successful_runs"] for point in summary["success_curve"]] == [
+        1,
+        1,
+        2,
+        2,
+    ]
+    assert analyzer.pass_at_k(3, 2, 1) == pytest.approx(2 / 3)
+
+
+def test_analyzer_reads_final_appended_tests_and_sums_invocation_tokens(
+    analyzer,
+    tmp_path: Path,
+):
+    test_log = tmp_path / "tests.log"
+    test_log.write_text(
+        """\
+===== VALIDATION LOOP 0: BASE TESTS =====
+Ran 2 tests
+FAILED (failures=1)
+===== VALIDATION LOOP 1: BASE TESTS =====
+Ran 3 tests
+OK
+""",
+        encoding="utf-8",
+    )
+    opencode_log = tmp_path / "opencode.log"
+    opencode_log.write_text(
+        """\
+===== LLM INVOCATION 0: INITIAL =====
+{"total_tokens": 10}
+===== LLM INVOCATION 1: REPAIR LOOP 1 =====
+{"total_tokens": 7}
+""",
+        encoding="utf-8",
+    )
+
+    tests = analyzer.parse_test_log(test_log)
+    tokens = analyzer.parse_llm_tokens(opencode_log)
+    assert tests == {
+        "tests_run": 3,
+        "failures": 0,
+        "errors": 0,
+        "tests_passed": 3,
+    }
+    assert tokens["total_tokens"] == 17
+
+
+def test_full_analyzer_accepts_mixed_old_and_repair_metadata(tmp_path: Path):
+    pytest.importorskip("numpy")
+    pytest.importorskip("sklearn")
+    repository = tmp_path / "repository"
+    experiment = tmp_path / "experiment"
+    source_path = Path("src/tool.c")
+    repository.mkdir()
+    (experiment / "baseline" / source_path.parent).mkdir(parents=True)
+    baseline_source = "int main(void) { return 0; }\n"
+    (experiment / "baseline" / source_path).write_text(baseline_source)
+    (experiment / "experiment.json").write_text(
+        json.dumps(
+            {
+                "repository": str(repository),
+                "source_path": str(source_path),
+                "model": "fake/model",
+                "temperature": 0,
+                "max_loops": 3,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    metadata_rows = [
+        {
+            "run_id": "attempt-001",
+            "build_exit_code": 0,
+            "base_test_exit_code": 0,
+            "feature_test_exit_code": 0,
+            "extra_test_exit_code": 0,
+            "opencode_runtime_ms": 100,
+            "total_runtime_ms": 200,
+            "overall_success": True,
+        },
+        {
+            "run_id": "attempt-002",
+            "build_exit_code": 0,
+            "base_test_exit_code": 0,
+            "feature_test_exit_code": 0,
+            "extra_test_exit_code": 1,
+            "initial_success": False,
+            "repair_loops": 2,
+            "llm_invocations": 3,
+            "success_loop": 2,
+            "loop_limit_reached": False,
+            "public_validation_success": True,
+            "initial_opencode_runtime_ms": 100,
+            "repair_opencode_runtime_ms": 200,
+            "total_opencode_runtime_ms": 300,
+            "total_runtime_ms": 500,
+            "overall_success": False,
+            "loops": [],
+        },
+    ]
+    for index, metadata in enumerate(metadata_rows, start=1):
+        attempt = experiment / f"attempt-{index:03d}"
+        (attempt / "candidate" / source_path.parent).mkdir(parents=True)
+        candidate = (
+            baseline_source
+            if index == 1
+            else "int main(void) { int repaired = 1; return repaired - 1; }\n"
+        )
+        (attempt / "candidate" / source_path).write_text(candidate)
+        (attempt / "metadata.json").write_text(json.dumps(metadata))
+        for name in (
+            "diff-numstat.txt",
+            "untracked-files.txt",
+            "base-tests.log",
+            "feature-tests.log",
+            "extra-tests.log",
+            "opencode.log",
+        ):
+            (attempt / name).write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ANALYZER),
+            "--experiment",
+            str(experiment),
+            "--clean-output",
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    summary = json.loads(
+        (experiment / "analysis" / "summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["runs_analyzed"] == 2
+    assert summary["pass_at_k"]["pass@1"] == pytest.approx(0.5)
+    assert summary["repair"]["initial_success_rate"] == pytest.approx(0.5)
+    assert summary["repair"]["public_validation_success_rate"] == 1.0
+    assert summary["repair"]["mean_llm_invocations"] == 2.0
