@@ -135,9 +135,13 @@ def derive_label(path: Path, all_paths: Sequence[Path]) -> str:
     it is more informative than a repeated parent directory name.
     """
     parts = path.parts
-    temp_dirs = [p for p in parts if re.match(r"^temp-[0-9p]+$", p)]
-    if temp_dirs:
-        return temp_dirs[-1]
+    run_dirs = [p for p in parts if re.match(r"^(temp|rep)-[0-9a-zA-Z]+$", p)]
+    if run_dirs:
+        # Last match is the deepest/most specific ancestor - e.g. for
+        # .../temp-0p2/rep-3/... both "temp-0p2" and "rep-3" match, but
+        # "rep-3" is what actually distinguishes this file from its
+        # siblings under the same temp-0p2 batch.
+        return run_dirs[-1]
 
     stems = [p.stem for p in all_paths]
     if len(set(stems)) == len(stems):
