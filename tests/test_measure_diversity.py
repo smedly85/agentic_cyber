@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import importlib.util
+import ast
+import csv
 import json
 import os
 import shutil
 import subprocess
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import pytest
@@ -93,26 +96,41 @@ class CanonicalAnalysisUnitTests(unittest.TestCase):
         self.assertEqual(sum(clustered["family_sizes"].values()), 3)
         self.assertIn(2, clustered["family_sizes"].values())
 
-    def test_exact_da_at_k(self):
+    def test_distinct_families_at_k(self):
         labels = [0, 0, 1, 1]
-        self.assertEqual(dm.da_at_k(labels, 1), 1.0)
-        self.assertAlmostEqual(dm.da_at_k(labels, 2), 5 / 3)
-        self.assertEqual(dm.da_at_k(labels, 4), 2.0)
-        self.assertTrue(all(dm.da_at_k([0, 0, 0], k) == 1 for k in range(1, 4)))
-        self.assertEqual([dm.da_at_k(range(4), k) for k in range(1, 5)], [1, 2, 3, 4])
+        self.assertEqual(dm.distinct_families_at_k(labels, 1), 1.0)
+        self.assertAlmostEqual(dm.distinct_families_at_k(labels, 2), 5 / 3)
+        self.assertEqual(dm.distinct_families_at_k(labels, 4), 2.0)
+        self.assertTrue(
+            all(
+                dm.distinct_families_at_k([0, 0, 0], k) == 1
+                for k in range(1, 4)
+            )
+        )
+        self.assertEqual(
+            [dm.distinct_families_at_k(range(4), k) for k in range(1, 5)],
+            [1, 2, 3, 4],
+        )
         with self.assertRaises(ValueError):
-            dm.da_at_k(labels, 0)
+            dm.distinct_families_at_k(labels, 0)
         with self.assertRaises(ValueError):
-            dm.da_at_k(labels, 5)
+            dm.distinct_families_at_k(labels, 5)
+        curve = dm.family_discovery_curve(labels)
+        self.assertEqual(
+            list(curve[0]), ["k", "expected_distinct_families"]
+        )
 
-    def test_nauadc_fixed_budget(self):
-        self.assertEqual(dm.nauadc([1, 1, 1, 1]), 1.0)
-        self.assertEqual(dm.nauadc([1, 2, 3, 4]), 2.5)
-        curve = dm.da_curve([0, 1, 2, 3])
-        self.assertEqual(dm.nauadc_summary(curve, 3)["nauadc_at_kmax"], 2.0)
-        insufficient = dm.nauadc_summary(curve[:2], 3)
-        self.assertIsNone(insufficient["nauadc_at_kmax"])
-        self.assertIn("smaller", insufficient["nauadc_at_kmax_reason"])
+    def test_family_discovery_auc_fixed_budget(self):
+        self.assertEqual(dm.normalized_family_discovery_auc([1, 1, 1, 1]), 1.0)
+        self.assertEqual(dm.normalized_family_discovery_auc([1, 2, 3, 4]), 2.5)
+        curve = dm.family_discovery_curve([0, 1, 2, 3])
+        summary = dm.family_discovery_auc_summary(curve, 3)
+        self.assertEqual(summary["family_discovery_auc_at_kmax"], 2.0)
+        insufficient = dm.family_discovery_auc_summary(curve[:2], 3)
+        self.assertIsNone(insufficient["family_discovery_auc_at_kmax"])
+        self.assertIn(
+            "smaller", insufficient["family_discovery_auc_at_kmax_reason"]
+        )
 
     def test_exact_repetition(self):
         result = dm.exact_repetition_summary(["A", "A", "B", "C"])
@@ -124,6 +142,22 @@ class CanonicalAnalysisUnitTests(unittest.TestCase):
         self.assertEqual(dm.vendi_score(np.array([[1.0, 0.0]])), 1.0)
         self.assertAlmostEqual(dm.vendi_score(np.array([[1.0, 0.0], [1.0, 0.0]])), 1.0)
         self.assertAlmostEqual(dm.vendi_score(np.eye(4)), 4.0)
+        self.assertEqual(dm.vendi_score(np.array([[0.0, 0.0]])), 1.0)
+        self.assertEqual(dm.vendi_score(np.zeros((1, 0))), 1.0)
+        self.assertAlmostEqual(
+            dm.vendi_score(np.array([[0.0, 0.0], [0.0, 0.0]])), 1.0
+        )
+        self.assertAlmostEqual(
+            dm.vendi_score(np.array([[0.0, 0.0], [1.0, 0.0]])), 2.0
+        )
+        self.assertAlmostEqual(
+            dm.vendi_score(
+                np.array(
+                    [[0.0, 0.0], [0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]
+                )
+            ),
+            2.0 * 2.0**0.5,
+        )
         self.assertIsNone(dm.vendi_score(np.empty((0, 0))))
 
     def test_ari_and_threshold_grid(self):
@@ -207,6 +241,203 @@ class CanonicalAnalysisUnitTests(unittest.TestCase):
         }
         self.assertTrue(forbidden_columns.isdisjoint(module.PAPER_METRICS_COLUMNS))
         self.assertTrue(forbidden_columns.isdisjoint(module.PAPER_DESCRIPTIVE_COLUMNS))
+
+    def test_primary_strategy_includes_main_and_excludes_helpers(self):
+        module = load_analyzer()
+        regex = module.re.compile(module.DEFAULT_STRATEGY_EXCLUDE_REGEX, module.re.I)
+        self.assertIsNone(regex.search("main"))
+        for name in (
+            "parse_args",
+            "argument_parser",
+            "process_argv",
+            "read_options",
+            "print_usage",
+            "show_help",
+            "set_flag",
+            "report_error",
+            "emit_diagnostic",
+        ):
+            self.assertIsNotNone(regex.search(name), name)
+
+        baseline_functions = {
+            "main": module.FunctionInfo("main", 1, 1, 0, 1, "old", ()),
+            "parse_args": module.FunctionInfo(
+                "parse_args", 2, 2, 2, 3, "old-parser", ()
+            ),
+        }
+        candidate_functions = {
+            "main": module.FunctionInfo("main", 1, 2, 0, 2, "new", ()),
+            "parse_args": module.FunctionInfo(
+                "parse_args", 3, 3, 3, 4, "new-parser", ()
+            ),
+        }
+        baseline_behavior, _, edited = module.strategy_function_names(
+            baseline_functions, candidate_functions, regex, set()
+        )
+        self.assertEqual(baseline_behavior, {"main"})
+        self.assertEqual(edited, {"main"})
+
+        main_delta = module.filter_strategy_delta(
+            {"function.main.kind.IfStmt": 1.0},
+            baseline_behavior,
+            {},
+        )
+        excluded_delta = module.filter_strategy_delta(
+            {"function.main.kind.IfStmt": 1.0},
+            baseline_behavior - {"main"},
+            {},
+        )
+        self.assertEqual(main_delta, {"function.main.kind.IfStmt": 1.0})
+        self.assertEqual(excluded_delta, {})
+
+        np = pytest.importorskip("numpy")
+        module.np = np
+        blocks = {
+            "unchanged": {"clang": {}, "tree_sitter": {}},
+            "changed": {
+                "clang": module.split_signed_delta(main_delta, "clang"),
+                "tree_sitter": {},
+            },
+        }
+        matrix, _, _ = module.build_feature_matrix(
+            ["unchanged", "changed"], blocks, ("clang", "tree_sitter")
+        )
+        distance = dm.cosine_distance_matrix(matrix)
+        self.assertGreater(distance[0, 1], 0.0)
+
+    def test_distance_and_clustering_have_one_canonical_implementation(self):
+        tree = ast.parse(ANALYZER.read_text(encoding="utf-8"))
+        local_functions = {
+            node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+        }
+        self.assertNotIn("cosine_distance_matrix", local_functions)
+        self.assertNotIn("agglomerative_labels", local_functions)
+        analyzer_text = ANALYZER.read_text(encoding="utf-8")
+        self.assertIn(
+            "diversity_metrics.cosine_distance_matrix(\n        architecture_matrix",
+            analyzer_text,
+        )
+        self.assertIn(
+            "diversity_metrics.agglomerative_labels(distance, threshold)",
+            analyzer_text,
+        )
+
+        np = pytest.importorskip("numpy")
+        features = np.array([[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+        primary_distance = dm.cosine_distance_matrix(features)
+        primary_labels = dm.agglomerative_labels(primary_distance, 0.3)
+        with mock.patch.object(
+            dm,
+            "cosine_distance_matrix",
+            wraps=dm.cosine_distance_matrix,
+        ) as distance_mock, mock.patch.object(
+            dm,
+            "agglomerative_labels",
+            wraps=dm.agglomerative_labels,
+        ) as cluster_mock:
+            dm.bootstrap_diversity_ci(features, 0.3, 2, 7)
+        self.assertTrue(distance_mock.called)
+        self.assertTrue(cluster_mock.called)
+        self.assertEqual(
+            primary_labels.tolist(),
+            dm.agglomerative_labels(primary_distance, 0.3).tolist(),
+        )
+
+    def test_representation_ablation_uses_fixed_population_and_threshold(self):
+        module = load_analyzer()
+        module.np = pytest.importorskip("numpy")
+        run_ids = ["a", "b", "c"]
+        blocks = {
+            "a": {"clang": {"x": 1.0}, "tree_sitter": {"y": 1.0}},
+            "b": {"clang": {"x": 1.0}, "tree_sitter": {"z": 1.0}},
+            "c": {"clang": {"q": 1.0}, "tree_sitter": {"z": 1.0}},
+        }
+        without_main_blocks = {
+            run_id: {"clang": {}, "tree_sitter": {}} for run_id in run_ids
+        }
+        rows = module.representation_ablation_rows(
+            space_name="strategy",
+            population_run_ids=run_ids,
+            all_run_ids=run_ids,
+            representations=(
+                ("clang_only", blocks, ("clang",)),
+                ("tree_sitter_only", blocks, ("tree_sitter",)),
+                ("clang_plus_tree_sitter", blocks, ("clang", "tree_sitter")),
+                (
+                    "clang_plus_tree_sitter_without_main",
+                    without_main_blocks,
+                    ("clang", "tree_sitter"),
+                ),
+            ),
+            primary_representation="clang_plus_tree_sitter",
+            threshold=0.37,
+        )
+        self.assertEqual(
+            [row["representation"] for row in rows],
+            [
+                "clang_only",
+                "tree_sitter_only",
+                "clang_plus_tree_sitter",
+                "clang_plus_tree_sitter_without_main",
+            ],
+        )
+        self.assertEqual({row["population_n"] for row in rows}, {3})
+        self.assertEqual({row["threshold_used"] for row in rows}, {0.37})
+        primary = next(
+            row for row in rows if row["representation"] == "clang_plus_tree_sitter"
+        )
+        self.assertEqual(primary["adjusted_rand_vs_primary"], 1.0)
+        without_main = next(
+            row
+            for row in rows
+            if row["representation"] == "clang_plus_tree_sitter_without_main"
+        )
+        self.assertNotEqual(
+            primary["raw_family_count"], without_main["raw_family_count"]
+        )
+        self.assertRegex(
+            ANALYZER.read_text(encoding="utf-8"),
+            r'"clang_plus_tree_sitter_without_main",\s*strategy_without_main_blocks',
+        )
+
+        architecture_blocks = {
+            run_id: {**run_blocks, "gumtree": {f"g-{run_id}": 1.0}}
+            for run_id, run_blocks in blocks.items()
+        }
+        architecture_rows = module.representation_ablation_rows(
+            space_name="architecture",
+            population_run_ids=run_ids,
+            all_run_ids=run_ids,
+            representations=(
+                ("clang_only", architecture_blocks, ("clang",)),
+                ("tree_sitter_only", architecture_blocks, ("tree_sitter",)),
+                ("gumtree_only", architecture_blocks, ("gumtree",)),
+                (
+                    "clang_plus_tree_sitter",
+                    architecture_blocks,
+                    ("clang", "tree_sitter"),
+                ),
+                (
+                    "clang_plus_tree_sitter_plus_gumtree",
+                    architecture_blocks,
+                    ("clang", "tree_sitter", "gumtree"),
+                ),
+            ),
+            primary_representation="clang_plus_tree_sitter_plus_gumtree",
+            threshold=0.29,
+        )
+        self.assertEqual(
+            [row["representation"] for row in architecture_rows],
+            [
+                "clang_only",
+                "tree_sitter_only",
+                "gumtree_only",
+                "clang_plus_tree_sitter",
+                "clang_plus_tree_sitter_plus_gumtree",
+            ],
+        )
+        self.assertEqual({row["population_n"] for row in architecture_rows}, {3})
+        self.assertEqual({row["threshold_used"] for row in architecture_rows}, {0.29})
 
 
 # ---------------------------------------------------------------------------
@@ -613,6 +844,9 @@ parser.add_argument("--experiment", type=Path, required=True)
 args, _ = parser.parse_known_args()
 (args.experiment / "analysis").mkdir(exist_ok=True)
 (args.experiment / "analysis" / "AUTOMATIC").write_text("ran\\n")
+(args.experiment / "analysis" / "ARGS.json").write_text(
+    __import__("json").dumps(__import__("sys").argv[1:])
+)
 """,
         encoding="utf-8",
     )
@@ -658,14 +892,19 @@ with Path(os.environ["FAKE_PROMPTS"]).open("a", encoding="utf-8") as handle:
     handle.write(f"\\n===== PROMPT {invocation} =====\\n{prompt}\\n")
 worktree = Path(sys.argv[sys.argv.index("--dir") + 1])
 scenario = os.environ["FAKE_SCENARIO"]
-if scenario == "repair-success" and invocation > 0:
+source = worktree / os.environ.get("FAKE_SOURCE", "src/tool.c")
+Path(os.environ["FAKE_PREEXISTED"]).write_text(str(source.exists()).lower())
+if (scenario == "repair-success" and invocation > 0) or scenario in {"valid", "permission"}:
     value = "repaired"
 else:
     value = "broken"
-(worktree / "src" / "tool.c").write_text(value + "\\n")
+source.parent.mkdir(parents=True, exist_ok=True)
+source.write_text(value + "\\n")
 print(json.dumps({"total_tokens": invocation + 10}))
 if scenario == "infrastructure-failure":
     raise SystemExit(42)
+if scenario == "permission":
+    print("permission denied")
 """,
         encoding="utf-8",
     )
@@ -679,6 +918,10 @@ def run_experiment(
     scenario: str,
     max_loops: int | str | None,
     extra_test_cmd: str = 'printf x >> "$EXTRA_COUNT"',
+    source_mode: str = "existing",
+    source_path: str = "src/tool.c",
+    base_test_cmd: str = "true",
+    analysis_args: list[str] | None = None,
 ) -> tuple[Path, subprocess.CompletedProcess[str], int, str]:
     repository, fake_opencode = initialize_experiment_repo(tmp_path)
     counter = tmp_path / "counter.txt"
@@ -697,13 +940,15 @@ def run_experiment(
         "--prompt",
         "prompt.md",
         "--source",
-        "src/tool.c",
+        source_path,
+        "--source-mode",
+        source_mode,
         "--output-dir",
         str(output),
         "--build-cmd",
-        "if test \"$(tr -d '\\n' < src/tool.c)\" = repaired; then exit 0; else echo broken-build; exit 1; fi",
+        f"if test \"$(tr -d '\\n' < {source_path})\" = repaired; then exit 0; else echo broken-build; exit 1; fi",
         "--base-test-cmd",
-        "true",
+        base_test_cmd,
         "--feature-test-cmd",
         "true",
         "--extra-test-cmd",
@@ -713,6 +958,8 @@ def run_experiment(
     ]
     if max_loops is not None:
         command.extend(["--max-loops", str(max_loops)])
+    if analysis_args:
+        command.extend(analysis_args)
 
     environment = os.environ.copy()
     environment.update(
@@ -722,6 +969,8 @@ def run_experiment(
             "FAKE_COUNTER": str(counter),
             "FAKE_PROMPTS": str(prompts),
             "FAKE_SCENARIO": scenario,
+            "FAKE_SOURCE": source_path,
+            "FAKE_PREEXISTED": str(tmp_path / "source-preexisted.txt"),
             "EXTRA_COUNT": str(extra_count),
         }
     )
@@ -855,6 +1104,177 @@ def test_infrastructure_failure_does_not_trigger_or_exhaust_repairs(tmp_path: Pa
     assert metadata["repair_loops"] == 0
     assert metadata["loop_limit_reached"] is False
     assert metadata["overall_success"] is False
+    assert metadata["infrastructure_failure"] is True
+    assert metadata["infrastructure_failure_stage"] == "opencode"
+
+
+def test_permission_rejection_is_infrastructure_failure(tmp_path: Path):
+    output, result, invocations, _ = run_experiment(
+        tmp_path,
+        scenario="permission",
+        max_loops=3,
+    )
+    assert result.returncode == 0, result.stderr
+    metadata = json.loads(
+        (output / "attempt-001" / "metadata.json").read_text(encoding="utf-8")
+    )
+    assert invocations == 1
+    assert metadata["infrastructure_failure"] is True
+    assert metadata["infrastructure_failure_stage"] == "permission"
+    assert metadata["loop_limit_reached"] is False
+
+
+def test_candidate_validation_failures_are_not_infrastructure(tmp_path: Path):
+    build_output, result, _, _ = run_experiment(
+        tmp_path / "build",
+        scenario="always-fail",
+        max_loops=0,
+    )
+    assert result.returncode == 0, result.stderr
+    build_metadata = json.loads(
+        (build_output / "attempt-001" / "metadata.json").read_text()
+    )
+    assert build_metadata["build_exit_code"] != 0
+    assert build_metadata["infrastructure_failure"] is False
+
+    public_output, result, _, _ = run_experiment(
+        tmp_path / "public",
+        scenario="valid",
+        max_loops=0,
+        base_test_cmd="false",
+    )
+    assert result.returncode == 0, result.stderr
+    public_metadata = json.loads(
+        (public_output / "attempt-001" / "metadata.json").read_text()
+    )
+    assert public_metadata["base_test_exit_code"] != 0
+    assert public_metadata["infrastructure_failure"] is False
+
+    hidden_output, result, _, _ = run_experiment(
+        tmp_path / "hidden",
+        scenario="valid",
+        max_loops=0,
+        extra_test_cmd="false",
+    )
+    assert result.returncode == 0, result.stderr
+    hidden_metadata = json.loads(
+        (hidden_output / "attempt-001" / "metadata.json").read_text()
+    )
+    assert hidden_metadata["extra_test_exit_code"] != 0
+    assert hidden_metadata["infrastructure_failure"] is False
+
+
+def test_runner_existing_and_new_source_modes(tmp_path: Path):
+    existing_output, result, _, _ = run_experiment(
+        tmp_path / "existing",
+        scenario="valid",
+        max_loops=0,
+    )
+    assert result.returncode == 0, result.stderr
+    existing = json.loads((existing_output / "experiment.json").read_text())
+    assert existing["source_mode"] == "existing"
+    assert existing["baseline_source_kind"] == "existing_source_snapshot"
+    assert (existing_output / "baseline" / "src" / "tool.c").read_text() == "baseline\n"
+
+    new_output, result, _, _ = run_experiment(
+        tmp_path / "new",
+        scenario="valid",
+        max_loops=0,
+        source_mode="new",
+        source_path="src/new_tool.c",
+    )
+    assert result.returncode == 0, result.stderr
+    experiment = json.loads((new_output / "experiment.json").read_text())
+    attempt = new_output / "attempt-001"
+    assert experiment["source_mode"] == "new"
+    assert experiment["baseline_source_kind"] == "empty_new_source"
+    assert (new_output / "baseline" / "src" / "new_tool.c").read_bytes() == b""
+    assert (tmp_path / "new" / "source-preexisted.txt").read_text() == "false"
+    assert (attempt / "candidate" / "src" / "new_tool.c").read_text() == "repaired\n"
+    assert "src/new_tool.c" in (attempt / "untracked-files.txt").read_text()
+
+
+@pytest.mark.parametrize(
+    "source_mode,source_path,expected",
+    [
+        ("new", "src/tool.c", "already exists in baseline commit"),
+        ("existing", "src/missing.c", "not found in baseline commit"),
+    ],
+)
+def test_runner_source_mode_rejects_baseline_mismatch(
+    tmp_path: Path, source_mode: str, source_path: str, expected: str
+):
+    repository, fake_opencode = initialize_experiment_repo(tmp_path)
+    result = subprocess.run(
+        [
+            "bash",
+            str(repository / "scripts" / "run_llm_experiment.sh"),
+            "--model",
+            "fake/model",
+            "--temperature",
+            "0",
+            "--prompt",
+            "prompt.md",
+            "--source",
+            source_path,
+            "--source-mode",
+            source_mode,
+            "--runs",
+            "1",
+        ],
+        cwd=repository,
+        env={
+            **os.environ,
+            "OPENCODE_BIN": str(fake_opencode),
+            "PYTHON_BIN": sys.executable,
+        },
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=20,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert expected in result.stderr
+
+
+def test_runner_resolves_and_passes_analysis_configuration(tmp_path: Path):
+    output, result, _, _ = run_experiment(
+        tmp_path,
+        scenario="valid",
+        max_loops=0,
+        analysis_args=[
+            "--analysis-threshold",
+            "0.41",
+            "--analysis-architecture-threshold",
+            "0.23",
+            "--analysis-diversity-k-max",
+            "7",
+        ],
+    )
+    assert result.returncode == 0, result.stderr
+    experiment = json.loads((output / "experiment.json").read_text())
+    assert experiment["analysis_architecture_threshold"] == 0.23
+    assert experiment["analysis_strategy_threshold"] == 0.41
+    assert experiment["analysis_diversity_k_max"] == 7
+    analyzer_args = json.loads((output / "analysis" / "ARGS.json").read_text())
+    assert analyzer_args[analyzer_args.index("--cluster-threshold") + 1] == "0.23"
+    assert analyzer_args[analyzer_args.index("--strategy-threshold") + 1] == "0.41"
+    assert analyzer_args[analyzer_args.index("--diversity-k-max") + 1] == "7"
+
+    default_output, result, _, _ = run_experiment(
+        tmp_path / "default",
+        scenario="valid",
+        max_loops=0,
+        analysis_args=["--analysis-architecture-threshold", "0.27"],
+    )
+    assert result.returncode == 0, result.stderr
+    default_experiment = json.loads((default_output / "experiment.json").read_text())
+    assert default_experiment["analysis_architecture_threshold"] == 0.27
+    assert default_experiment["analysis_strategy_threshold"] == 0.27
+    assert default_experiment["analysis_diversity_k_max"] is None
+    default_args = json.loads((default_output / "analysis" / "ARGS.json").read_text())
+    assert "--diversity-k-max" not in default_args
 
 
 def test_max_loops_requires_a_value():
@@ -879,6 +1299,70 @@ def test_max_loops_requires_a_value():
     )
     assert result.returncode == 2
     assert "--max-loops requires a value" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        "--source",
+        "--source-mode",
+        "--analysis-threshold",
+        "--analysis-architecture-threshold",
+        "--analysis-strategy-threshold",
+        "--analysis-diversity-k-max",
+    ],
+)
+def test_new_runner_options_require_values(option: str):
+    result = subprocess.run(
+        [
+            "bash",
+            str(RUNNER),
+            "--model",
+            "fake/model",
+            "--temperature",
+            "0",
+            "--prompt",
+            "prompts/new_sort/001_reverse.md",
+            option,
+        ],
+        cwd=REPO_ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert f"{option} requires a value" in result.stderr
+
+
+@pytest.mark.parametrize("source", ["/tmp/tool.c", "../tool.c", "src/../tool.c"])
+def test_runner_rejects_unsafe_source_paths(source: str):
+    result = subprocess.run(
+        [
+            "bash",
+            str(RUNNER),
+            "--model",
+            "fake/model",
+            "--temperature",
+            "0",
+            "--prompt",
+            "prompts/new_sort/001_reverse.md",
+            "--source",
+            source,
+            "--source-mode",
+            "new",
+        ],
+        cwd=REPO_ROOT,
+        env={**os.environ, "OPENCODE_BIN": "true", "PYTHON_BIN": sys.executable},
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "normalized repository-relative path" in result.stderr
 
 
 def test_max_loops_rejects_arithmetic_overflow():
@@ -942,6 +1426,31 @@ def test_analyzer_normalizes_old_and_new_metadata(analyzer):
     )
     assert old_setup_failure["llm_invocations"] == 0
     assert old_setup_failure["loop_limit_reached"] is False
+    assert old_setup_failure["infrastructure_failure"] is True
+    assert old_setup_failure["infrastructure_failure_stage"] == "setup"
+    assert old_setup_failure["infrastructure_failure_classification_inferred"] is True
+
+    old_opencode_failure = analyzer.normalize_repair_metadata(
+        {"opencode_exit_code": 42, "overall_success": False}
+    )
+    assert old_opencode_failure["infrastructure_failure"] is True
+    assert old_opencode_failure["infrastructure_failure_stage"] == "opencode"
+    old_permission_failure = analyzer.normalize_repair_metadata(
+        {
+            "opencode_exit_code": 0,
+            "opencode_permission_rejected": True,
+            "overall_success": False,
+        }
+    )
+    assert old_permission_failure["infrastructure_failure"] is True
+    assert old_permission_failure["infrastructure_failure_stage"] == "permission"
+    for candidate_failure in (
+        {"opencode_exit_code": 0, "build_exit_code": 1},
+        {"opencode_exit_code": 0, "base_test_exit_code": 1},
+        {"opencode_exit_code": 0, "extra_test_exit_code": 1},
+    ):
+        normalized = analyzer.normalize_repair_metadata(candidate_failure)
+        assert normalized["infrastructure_failure"] is False
 
 
 def test_repair_summary_and_pass_at_k_use_attempts(analyzer):
@@ -993,6 +1502,118 @@ def test_repair_summary_and_pass_at_k_use_attempts(analyzer):
         2,
     ]
     assert analyzer.pass_at_k(3, 2, 1) == pytest.approx(2 / 3)
+
+
+def test_reliability_denominators_exclude_infrastructure_trials(analyzer):
+    rows = [
+        analyzer.normalize_repair_metadata(
+            {
+                "initial_success": True,
+                "public_validation_success": True,
+                "overall_success": True,
+                "infrastructure_failure": False,
+            }
+        ),
+        analyzer.normalize_repair_metadata(
+            {
+                "initial_success": False,
+                "public_validation_success": False,
+                "overall_success": False,
+                "infrastructure_failure": False,
+            }
+        ),
+        analyzer.normalize_repair_metadata(
+            {
+                "setup_exit_code": 1,
+                "overall_success": False,
+                "infrastructure_failure": True,
+                "infrastructure_failure_stage": "setup",
+            }
+        ),
+    ]
+    reliability = analyzer.build_reliability_summary(rows)
+    repair = analyzer.build_repair_summary(rows)
+    assert reliability["n_attempts"] == 3
+    assert reliability["n_valid_agent_trials"] == 2
+    assert reliability["n_infrastructure_failures"] == 1
+    assert reliability["infrastructure_attrition_rate"] == pytest.approx(1 / 3)
+    assert reliability["end_to_end_success_rate"] == pytest.approx(1 / 3)
+    assert reliability["conditional_agent_success_rate"] == pytest.approx(1 / 2)
+    assert analyzer.pass_at_k(
+        reliability["n_valid_agent_trials"],
+        reliability["successful_valid_agent_trials"],
+        1,
+    ) == pytest.approx(1 / 2)
+    assert repair["initial_public_success_rate"] == pytest.approx(1 / 2)
+    assert repair["final_public_success_rate"] == pytest.approx(1 / 2)
+    assert repair["repair_recovery_rate"] == 0.0
+
+
+def test_schema_v5_aggregate_skips_v4_rows(analyzer, tmp_path: Path, capsys):
+    root = tmp_path / "repository"
+    old_path = root / "runs" / "experiments" / "old" / "analysis"
+    new_path = root / "runs" / "experiments" / "new" / "analysis"
+    malformed_path = root / "runs" / "experiments" / "malformed" / "analysis"
+    old_path.mkdir(parents=True)
+    new_path.mkdir(parents=True)
+    malformed_path.mkdir(parents=True)
+    common = {"Issue": "sort", "Checkpoint": "base", "Model": "m", "Temp": 0}
+    (old_path / "paper_metrics_row.json").write_text(
+        json.dumps({**common, "_schema_version": 4}), encoding="utf-8"
+    )
+    valid_row = {column: None for column in analyzer.PAPER_METRICS_COLUMNS}
+    valid_row.update(common)
+    (new_path / "paper_metrics_row.json").write_text(
+        json.dumps(
+            {
+                **valid_row,
+                "Checkpoint": "new",
+                "_schema_version": 5,
+                "_analyzer_version": "4.1.0",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (malformed_path / "paper_metrics_row.json").write_text(
+        json.dumps(
+            {
+                **common,
+                "_schema_version": 5,
+                "_analyzer_version": "4.1.0",
+            }
+        ),
+        encoding="utf-8",
+    )
+    skipped = analyzer.rebuild_paper_metrics_aggregate(root)
+    aggregate = json.loads(
+        (root / "runs" / "experiments" / "paper_metrics.json").read_text()
+    )
+    assert skipped == 2
+    assert len(aggregate) == 1
+    assert aggregate[0]["Checkpoint"] == "new"
+    assert "skipped 2" in capsys.readouterr().out
+
+
+def test_schema_v5_paper_columns(analyzer):
+    assert analyzer.ANALYZER_VERSION == "4.1.0"
+    assert analyzer.PAPER_SCHEMA_VERSION == 5
+    assert "Exact Unique Rate" not in analyzer.PAPER_METRICS_COLUMNS
+    assert "Exact Modal Share" not in analyzer.PAPER_METRICS_COLUMNS
+    assert "Exact Unique Rate" in analyzer.PAPER_DESCRIPTIVE_COLUMNS
+    assert "Exact Modal Share" in analyzer.PAPER_DESCRIPTIVE_COLUMNS
+    assert (
+        "Mean Normalized GumTree Edit-Action Magnitude"
+        in analyzer.PAPER_DESCRIPTIVE_COLUMNS
+    )
+    assert "Architecture Family-Discovery AUC@K" in analyzer.PAPER_METRICS_COLUMNS
+    assert "Strategy Family-Discovery AUC@K" in analyzer.PAPER_METRICS_COLUMNS
+    public_text = (
+        ANALYZER.read_text(encoding="utf-8")
+        + (REPO_ROOT / "scripts" / "analysis" / "diversity_metrics.py").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert "Diversity Awareness" not in public_text
 
 
 def test_analyzer_reads_final_appended_tests_and_sums_invocation_tokens(
@@ -1126,6 +1747,8 @@ def test_full_analyzer_accepts_mixed_old_and_repair_metadata(tmp_path: Path):
         (experiment / "analysis" / "summary.json").read_text(encoding="utf-8")
     )
     assert summary["runs_analyzed"] == 2
+    assert summary["schema_version"] == 5
+    assert summary["analyzer_version"] == "4.1.0"
     assert summary["pass_at_k"]["pass@1"] == pytest.approx(0.5)
     assert summary["repair"]["initial_public_success_rate"] == pytest.approx(0.5)
     assert summary["repair"]["final_public_success_rate"] == 1.0
@@ -1140,8 +1763,8 @@ def test_full_analyzer_accepts_mixed_old_and_repair_metadata(tmp_path: Path):
         "runs.csv",
         "paper_metrics.csv",
         "paper_descriptive_metrics.csv",
-        "diversity/architecture_da_curve.csv",
-        "diversity/strategy_da_curve.csv",
+        "diversity/architecture_family_discovery_curve.csv",
+        "diversity/strategy_family_discovery_curve.csv",
         "diversity/exact_repetition.csv",
         "diagnostics/uncertainty.csv",
     ):
@@ -1150,6 +1773,73 @@ def test_full_analyzer_accepts_mixed_old_and_repair_metadata(tmp_path: Path):
     assert "Mean LLM Total Tokens" not in primary_header
     assert "entropy" not in primary_header.lower()
     assert "singleton" not in primary_header.lower()
+    assert "Exact Unique Rate" not in primary_header
+    descriptive_header = (
+        experiment / "analysis" / "paper_descriptive_metrics.csv"
+    ).read_text().splitlines()[0]
+    assert "Exact Unique Rate" in descriptive_header
+    assert "Mean Normalized GumTree Edit-Action Magnitude" in descriptive_header
+    paper_row = json.loads(
+        (experiment / "analysis" / "paper_metrics_row.json").read_text()
+    )
+    assert paper_row["_schema_version"] == 5
+    assert paper_row["_analyzer_version"] == "4.1.0"
+    assert not (experiment / "analysis" / "diagnostics" / "representation_ablation.csv").exists()
+
+    diagnostic_result = subprocess.run(
+        [
+            sys.executable,
+            str(ANALYZER),
+            "--experiment",
+            str(experiment),
+            "--diagnostic-output",
+            "--bootstrap-repetitions",
+            "2",
+            "--clean-output",
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=90,
+        check=False,
+    )
+    assert diagnostic_result.returncode == 0, diagnostic_result.stderr
+    with (
+        experiment / "analysis" / "diagnostics" / "representation_ablation.csv"
+    ).open(newline="", encoding="utf-8") as handle:
+        ablations = list(csv.DictReader(handle))
+    assert {
+        row["representation"]
+        for row in ablations
+        if row["space"] == "architecture"
+    } == {
+        "clang_only",
+        "tree_sitter_only",
+        "gumtree_only",
+        "clang_plus_tree_sitter",
+        "clang_plus_tree_sitter_plus_gumtree",
+    }
+    assert {
+        row["representation"] for row in ablations if row["space"] == "strategy"
+    } == {
+        "clang_only",
+        "tree_sitter_only",
+        "clang_plus_tree_sitter",
+        "clang_plus_tree_sitter_without_main",
+    }
+    for space in ("architecture", "strategy"):
+        space_rows = [row for row in ablations if row["space"] == space]
+        assert len({row["population_n"] for row in space_rows}) == 1
+        assert len({row["threshold_used"] for row in space_rows}) == 1
+        primary_name = (
+            "clang_plus_tree_sitter_plus_gumtree"
+            if space == "architecture"
+            else "clang_plus_tree_sitter"
+        )
+        primary = next(
+            row for row in space_rows if row["representation"] == primary_name
+        )
+        assert primary["adjusted_rand_vs_primary"] == "1.0"
 
 
 def test_full_analyzer_accepts_sandbox_run_metadata(tmp_path: Path):

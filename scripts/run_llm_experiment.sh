@@ -34,6 +34,8 @@ Options:
   --base-ref REF             Commit/tag/branch used for every attempt (default: HEAD)
   --source PATH              Primary source file to preserve (default:
                              src/new_sort/new_sort.c)
+  --source-mode MODE         existing requires the source at the baseline;
+                             new requires it to be absent (default: existing)
   --output-dir DIR           Experiment directory. If omitted, a deterministic
                              directory is derived from model, prompt, and temperature.
   --build-cmd CMD            Build command (default: make clean && make)
@@ -42,8 +44,14 @@ Options:
   --extra-test-cmd CMD       Optional sanitizer/hidden/property-test command.
   --timeout SECONDS          OpenCode timeout per run; 0 disables (default: 1800)
   --force                    Delete and rerun completed attempt directories
-  --analysis-threshold X     Agglomerative-clustering distance threshold
-                             (default: 0.30)
+  --analysis-threshold X     Compatibility shorthand setting both analysis
+                             thresholds unless a specific option overrides it
+  --analysis-architecture-threshold X
+                             Architecture clustering threshold (default: 0.30)
+  --analysis-strategy-threshold X
+                             Strategy threshold (default: architecture threshold)
+  --analysis-diversity-k-max K
+                             Fixed family-discovery sampling budget (default: unset)
   -h, --help                 Show this help
 
 Environment:
@@ -389,6 +397,7 @@ MAX_LOOPS=0
 AGENT="build"
 BASE_REF="HEAD"
 SOURCE_PATH="src/new_sort/new_sort.c"
+SOURCE_MODE="existing"
 OUTPUT_DIR=""
 BUILD_CMD="make clean && make"
 BASE_TEST_CMD="PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/new_sort/test_new_sort.py -v"
@@ -396,7 +405,10 @@ FEATURE_TEST_CMD=""
 EXTRA_TEST_CMD=""
 TIMEOUT_SECONDS=1800
 FORCE=0
-ANALYSIS_THRESHOLD="0.30"
+ANALYSIS_THRESHOLD=""
+ANALYSIS_ARCHITECTURE_THRESHOLD=""
+ANALYSIS_STRATEGY_THRESHOLD=""
+ANALYSIS_DIVERSITY_K_MAX=""
 
 OPENCODE_BIN="${OPENCODE_BIN:-opencode}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
@@ -414,14 +426,45 @@ while [[ $# -gt 0 ]]; do
             ;;
         --agent) AGENT="${2:-}"; shift 2 ;;
         --base-ref) BASE_REF="${2:-}"; shift 2 ;;
-        --source) SOURCE_PATH="${2:-}"; shift 2 ;;
+        --source)
+            [[ $# -ge 2 ]] || die "--source requires a value"
+            SOURCE_PATH="$2"
+            shift 2
+            ;;
+        --source-mode)
+            [[ $# -ge 2 ]] || die "--source-mode requires a value"
+            SOURCE_MODE="$2"
+            shift 2
+            ;;
         --output-dir) OUTPUT_DIR="${2:-}"; shift 2 ;;
         --build-cmd) BUILD_CMD="${2:-}"; shift 2 ;;
         --base-test-cmd) BASE_TEST_CMD="${2:-}"; shift 2 ;;
         --feature-test-cmd) FEATURE_TEST_CMD="${2:-}"; shift 2 ;;
         --extra-test-cmd) EXTRA_TEST_CMD="${2:-}"; shift 2 ;;
         --timeout) TIMEOUT_SECONDS="${2:-}"; shift 2 ;;
-        --analysis-threshold) ANALYSIS_THRESHOLD="${2:-}"; shift 2 ;;
+        --analysis-threshold)
+            [[ $# -ge 2 ]] || die "--analysis-threshold requires a value"
+            ANALYSIS_THRESHOLD="$2"
+            shift 2
+            ;;
+        --analysis-architecture-threshold)
+            [[ $# -ge 2 ]] ||
+                die "--analysis-architecture-threshold requires a value"
+            ANALYSIS_ARCHITECTURE_THRESHOLD="$2"
+            shift 2
+            ;;
+        --analysis-strategy-threshold)
+            [[ $# -ge 2 ]] ||
+                die "--analysis-strategy-threshold requires a value"
+            ANALYSIS_STRATEGY_THRESHOLD="$2"
+            shift 2
+            ;;
+        --analysis-diversity-k-max)
+            [[ $# -ge 2 ]] ||
+                die "--analysis-diversity-k-max requires a value"
+            ANALYSIS_DIVERSITY_K_MAX="$2"
+            shift 2
+            ;;
         --force) FORCE=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown argument: $1" ;;
@@ -434,10 +477,47 @@ done
 [[ "$RUNS" =~ ^[1-9][0-9]*$ ]] || die "--runs must be a positive integer"
 [[ "$MAX_LOOPS" =~ ^[0-9]+$ ]] || die "--max-loops must be a non-negative integer"
 [[ "$TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || die "--timeout must be a non-negative integer"
+[[ "$SOURCE_MODE" == "existing" || "$SOURCE_MODE" == "new" ]] ||
+    die "--source-mode must be existing or new"
 
 command -v git >/dev/null 2>&1 || die "git is required"
 command -v "$OPENCODE_BIN" >/dev/null 2>&1 || die "$OPENCODE_BIN was not found"
 command -v "$PYTHON_BIN" >/dev/null 2>&1 || die "$PYTHON_BIN was not found"
+"$PYTHON_BIN" - "$SOURCE_PATH" <<'PY' ||
+import sys
+from pathlib import PurePosixPath
+
+raw = sys.argv[1]
+path = PurePosixPath(raw)
+valid = bool(raw) and not path.is_absolute() and ".." not in path.parts
+valid = valid and str(path) == raw and "\\" not in raw
+raise SystemExit(0 if valid else 1)
+PY
+    die "--source must be a normalized repository-relative path without '..'"
+
+if [[ -n "$ANALYSIS_ARCHITECTURE_THRESHOLD" ]]; then
+    RESOLVED_ANALYSIS_ARCHITECTURE_THRESHOLD="$ANALYSIS_ARCHITECTURE_THRESHOLD"
+elif [[ -n "$ANALYSIS_THRESHOLD" ]]; then
+    RESOLVED_ANALYSIS_ARCHITECTURE_THRESHOLD="$ANALYSIS_THRESHOLD"
+else
+    RESOLVED_ANALYSIS_ARCHITECTURE_THRESHOLD="0.30"
+fi
+if [[ -n "$ANALYSIS_STRATEGY_THRESHOLD" ]]; then
+    RESOLVED_ANALYSIS_STRATEGY_THRESHOLD="$ANALYSIS_STRATEGY_THRESHOLD"
+elif [[ -n "$ANALYSIS_THRESHOLD" ]]; then
+    RESOLVED_ANALYSIS_STRATEGY_THRESHOLD="$ANALYSIS_THRESHOLD"
+else
+    RESOLVED_ANALYSIS_STRATEGY_THRESHOLD="$RESOLVED_ANALYSIS_ARCHITECTURE_THRESHOLD"
+fi
+"$PYTHON_BIN" -c 'import math,sys; values=map(float,sys.argv[1:]); sys.exit(0 if all(math.isfinite(v) and v > 0 for v in values) else 1)' \
+    "$RESOLVED_ANALYSIS_ARCHITECTURE_THRESHOLD" \
+    "$RESOLVED_ANALYSIS_STRATEGY_THRESHOLD" ||
+    die "analysis thresholds must be positive numbers"
+if [[ -n "$ANALYSIS_DIVERSITY_K_MAX" &&
+      ! "$ANALYSIS_DIVERSITY_K_MAX" =~ ^[1-9][0-9]*$ ]]; then
+    die "--analysis-diversity-k-max must be a positive integer"
+fi
+
 MAX_LOOPS="$("$PYTHON_BIN" - "$MAX_LOOPS" <<'PY'
 import sys
 
@@ -459,8 +539,20 @@ fi
 
 BASE_COMMIT="$(git -C "$REPO" rev-parse "$BASE_REF^{commit}")" ||
     die "cannot resolve base ref: $BASE_REF"
-[[ -f "$REPO/$SOURCE_PATH" ]] ||
-    die "source file not found at baseline checkout: $SOURCE_PATH"
+BASELINE_SOURCE_EXISTS=false
+BASELINE_SOURCE_TYPE=""
+if BASELINE_SOURCE_TYPE="$(git -C "$REPO" cat-file -t "$BASE_COMMIT:$SOURCE_PATH" 2>/dev/null)"; then
+    BASELINE_SOURCE_EXISTS=true
+fi
+if [[ "$SOURCE_MODE" == "existing" && "$BASELINE_SOURCE_EXISTS" == false ]]; then
+    die "source file not found in baseline commit for --source-mode existing: $SOURCE_PATH"
+fi
+if [[ "$SOURCE_MODE" == "existing" && "$BASELINE_SOURCE_TYPE" != "blob" ]]; then
+    die "baseline source is not a file blob: $SOURCE_PATH"
+fi
+if [[ "$SOURCE_MODE" == "new" && "$BASELINE_SOURCE_EXISTS" == true ]]; then
+    die "source file already exists in baseline commit for --source-mode new: $SOURCE_PATH"
+fi
 
 MODEL_SLUG="$(slugify "$MODEL")"
 PROMPT_SLUG="$(slugify "$(basename "${PROMPT%.*}")")"
@@ -475,24 +567,72 @@ mkdir -p "$OUTPUT_DIR"
 OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd -P)"
 
 if [[ -f "$OUTPUT_DIR/experiment.json" ]]; then
-    EXISTING_MAX_LOOPS="$(
-        "$PYTHON_BIN" - "$OUTPUT_DIR/experiment.json" <<'PY'
+    EXISTING_MISMATCHES="$(
+        "$PYTHON_BIN" - "$OUTPUT_DIR/experiment.json" \
+            "$BASE_COMMIT" "$MODEL" "$TEMPERATURE" "$AGENT" "$PROMPT" \
+            "$SOURCE_PATH" "$SOURCE_MODE" "$MAX_LOOPS" "$BUILD_CMD" \
+            "$BASE_TEST_CMD" "$FEATURE_TEST_CMD" "$EXTRA_TEST_CMD" \
+            "$RESOLVED_ANALYSIS_ARCHITECTURE_THRESHOLD" \
+            "$RESOLVED_ANALYSIS_STRATEGY_THRESHOLD" \
+            "${ANALYSIS_DIVERSITY_K_MAX:-__NONE__}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-print(data.get("max_loops", 0))
+(
+    base_commit,
+    model,
+    temperature,
+    agent,
+    prompt,
+    source_path,
+    source_mode,
+    max_loops,
+    build_command,
+    base_test_command,
+    feature_test_command,
+    extra_test_command,
+    architecture_threshold,
+    strategy_threshold,
+    diversity_k_max,
+) = sys.argv[2:]
+expected = {
+    "base_commit": base_commit,
+    "model": model,
+    "temperature": float(temperature),
+    "agent": agent,
+    "prompt": prompt,
+    "source_path": source_path,
+    "source_mode": source_mode,
+    "max_loops": int(max_loops),
+    "build_command": build_command,
+    "base_test_command": base_test_command,
+    "feature_test_command": feature_test_command,
+    "extra_test_command": extra_test_command,
+    "analysis_architecture_threshold": float(architecture_threshold),
+    "analysis_strategy_threshold": float(strategy_threshold),
+    "analysis_diversity_k_max": (
+        None if diversity_k_max == "__NONE__" else int(diversity_k_max)
+    ),
+}
+print(", ".join(key for key, value in expected.items() if data.get(key) != value))
 PY
     )" || die "cannot read existing experiment metadata"
-    [[ "$EXISTING_MAX_LOOPS" == "$MAX_LOOPS" ]] ||
-        die "output directory already contains an experiment with max_loops=$EXISTING_MAX_LOOPS"
+    [[ -z "$EXISTING_MISMATCHES" ]] ||
+        die "output directory experiment configuration differs: $EXISTING_MISMATCHES"
 fi
 
 BASELINE_DIR="$OUTPUT_DIR/baseline"
 mkdir -p "$BASELINE_DIR/$(dirname "$SOURCE_PATH")"
-git -C "$REPO" show "$BASE_COMMIT:$SOURCE_PATH" \
-    > "$BASELINE_DIR/$SOURCE_PATH"
+if [[ "$SOURCE_MODE" == "existing" ]]; then
+    git -C "$REPO" show "$BASE_COMMIT:$SOURCE_PATH" \
+        > "$BASELINE_DIR/$SOURCE_PATH"
+    BASELINE_SOURCE_KIND="existing_source_snapshot"
+else
+    : > "$BASELINE_DIR/$SOURCE_PATH"
+    BASELINE_SOURCE_KIND="empty_new_source"
+fi
 
 PROMPT_COPY="$OUTPUT_DIR/prompt.md"
 cp "$PROMPT" "$PROMPT_COPY"
@@ -511,12 +651,17 @@ write_metadata "$OUTPUT_DIR/experiment.json" \
     prompt "$PROMPT" \
     prompt_copy "$PROMPT_COPY" \
     source_path "$SOURCE_PATH" \
+    source_mode "$SOURCE_MODE" \
+    baseline_source_kind "$BASELINE_SOURCE_KIND" \
     requested_runs "$RUNS" \
     max_loops "$MAX_LOOPS" \
     build_command "$BUILD_CMD" \
     base_test_command "$BASE_TEST_CMD" \
     feature_test_command "$FEATURE_TEST_CMD" \
     extra_test_command "$EXTRA_TEST_CMD" \
+    analysis_architecture_threshold "$RESOLVED_ANALYSIS_ARCHITECTURE_THRESHOLD" \
+    analysis_strategy_threshold "$RESOLVED_ANALYSIS_STRATEGY_THRESHOLD" \
+    analysis_diversity_k_max "$([[ -n "$ANALYSIS_DIVERSITY_K_MAX" ]] && printf '%s' "$ANALYSIS_DIVERSITY_K_MAX" || printf '__JSON__:null')" \
     created_at "$(date --iso-8601=seconds)"
 
 "$PYTHON_BIN" -c 'import sys; float(sys.argv[1])' "$TEMPERATURE" ||
@@ -559,6 +704,9 @@ for attempt_number in $(seq 1 "$RUNS"); do
             model "$MODEL" \
             temperature "$TEMPERATURE" \
             setup_exit_code 1 \
+            infrastructure_failure true \
+            infrastructure_failure_stage setup \
+            infrastructure_failure_classification_inferred false \
             opencode_permission_rejected false \
             max_loops "$MAX_LOOPS" \
             initial_success false \
@@ -633,6 +781,7 @@ PY
     public_validation_success=false
     success_loop_json=null
     infrastructure_failed=false
+    infrastructure_failure_stage_json=null
     loop_records=()
 
     while true; do
@@ -707,16 +856,20 @@ PY
             "$opencode_ms" "$build_ms" "$base_test_ms" \
             "$feature_test_ms" "$validation_success")")
 
-        if [[ "$validation_success" == true ]]; then
-            public_validation_success=true
-            success_loop_json="$validation_loop"
-            break
-        fi
-
         # Infrastructure failures end the attempt and never trigger repair.
         if [[ "$opencode_exit" -ne 0 ||
               "$invocation_permission_rejected" == true ]]; then
             infrastructure_failed=true
+            if [[ "$invocation_permission_rejected" == true ]]; then
+                infrastructure_failure_stage_json='"permission"'
+            else
+                infrastructure_failure_stage_json='"opencode"'
+            fi
+            break
+        fi
+        if [[ "$validation_success" == true ]]; then
+            public_validation_success=true
+            success_loop_json="$validation_loop"
             break
         fi
         if [[ "$validation_loop" -ge "$MAX_LOOPS" ]]; then
@@ -768,6 +921,7 @@ PY
         agent "$AGENT" \
         base_commit "$BASE_COMMIT" \
         source_path "$SOURCE_PATH" \
+        source_mode "$SOURCE_MODE" \
         max_loops "$MAX_LOOPS" \
         opencode_exit_code "$opencode_exit" \
         opencode_permission_rejected "$opencode_permission_rejected" \
@@ -790,6 +944,9 @@ PY
         success_loop "__JSON__:$success_loop_json" \
         loop_limit_reached "$loop_limit_reached" \
         public_validation_success "$public_validation_success" \
+        infrastructure_failure "$infrastructure_failed" \
+        infrastructure_failure_stage "__JSON__:$infrastructure_failure_stage_json" \
+        infrastructure_failure_classification_inferred false \
         loops "__JSON__:$loops_json" \
         overall_success "$overall_success" \
         completed_at "$(date --iso-8601=seconds)"
@@ -808,11 +965,16 @@ done
 
 printf '\nRunning analysis...\n'
 
-"$PYTHON_BIN" "$ANALYZER_PATH" \
-    --experiment "$OUTPUT_DIR" \
-    --cluster-threshold "$ANALYSIS_THRESHOLD" \
-    --strategy-threshold "$ANALYSIS_THRESHOLD" \
-    --clean-output \
+ANALYZER_ARGS=(
+    --experiment "$OUTPUT_DIR"
+    --cluster-threshold "$RESOLVED_ANALYSIS_ARCHITECTURE_THRESHOLD"
+    --strategy-threshold "$RESOLVED_ANALYSIS_STRATEGY_THRESHOLD"
+    --clean-output
+)
+if [[ -n "$ANALYSIS_DIVERSITY_K_MAX" ]]; then
+    ANALYZER_ARGS+=(--diversity-k-max "$ANALYSIS_DIVERSITY_K_MAX")
+fi
+"$PYTHON_BIN" "$ANALYZER_PATH" "${ANALYZER_ARGS[@]}" \
     2>&1 | tee "$OUTPUT_DIR/analysis.log"
 
 analysis_exit=${PIPESTATUS[0]}

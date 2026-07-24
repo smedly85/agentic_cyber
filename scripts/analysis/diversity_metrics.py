@@ -51,7 +51,7 @@ def cluster_statistics(labels: Sequence[int]) -> dict[str, Any]:
     }
 
 
-def da_at_k(labels: Sequence[int], k: int) -> float:
+def distinct_families_at_k(labels: Sequence[int], k: int) -> float:
     """Exact expected families discovered by a size-k sample without replacement."""
     n = len(labels)
     if n == 0 or k < 1 or k > n:
@@ -64,45 +64,54 @@ def da_at_k(labels: Sequence[int], k: int) -> float:
     )
 
 
-def da_curve(labels: Sequence[int]) -> list[dict[str, float | int]]:
-    return [{"k": k, "da_at_k": da_at_k(labels, k)} for k in range(1, len(labels) + 1)]
+def family_discovery_curve(labels: Sequence[int]) -> list[dict[str, float | int]]:
+    return [
+        {"k": k, "expected_distinct_families": distinct_families_at_k(labels, k)}
+        for k in range(1, len(labels) + 1)
+    ]
 
 
-def nauadc(values: Sequence[float], kmax: int | None = None) -> float | None:
-    """Width-normalized trapezoidal area over DA@1,...,DA@Kmax."""
+def normalized_family_discovery_auc(
+    values: Sequence[float], kmax: int | None = None
+) -> float | None:
+    """Width-normalized trapezoidal area over DF@1,...,DF@Kmax."""
     if not values:
         return None
     selected_kmax = len(values) if kmax is None else kmax
     if selected_kmax < 1 or selected_kmax > len(values):
-        raise ValueError("kmax must be within the available DA curve")
+        raise ValueError("kmax must be within the available family-discovery curve")
     selected = np.asarray(values[:selected_kmax], dtype=float)
     if selected_kmax == 1:
         return float(selected[0])
     return float(np.trapezoid(selected, dx=1.0) / (selected_kmax - 1))
 
 
-def nauadc_summary(
+def family_discovery_auc_summary(
     curve: Sequence[Mapping[str, Any]], requested_kmax: int | None
 ) -> dict[str, Any]:
-    values = [float(point["da_at_k"]) for point in curve]
+    values = [float(point["expected_distinct_families"]) for point in curve]
     full_kmax = len(values) if values else None
     result: dict[str, Any] = {
-        "nauadc_full": nauadc(values),
-        "nauadc_full_kmax": full_kmax,
+        "family_discovery_auc_full": normalized_family_discovery_auc(values),
+        "family_discovery_auc_full_kmax": full_kmax,
         "requested_kmax": requested_kmax,
-        "nauadc_at_kmax": None,
-        "nauadc_at_kmax_reason": None,
+        "family_discovery_auc_at_kmax": None,
+        "family_discovery_auc_at_kmax_reason": None,
     }
     if requested_kmax is None:
-        result["nauadc_at_kmax_reason"] = "--diversity-k-max was not supplied"
+        result["family_discovery_auc_at_kmax_reason"] = (
+            "--diversity-k-max was not supplied"
+        )
     elif requested_kmax < 1:
         raise ValueError("--diversity-k-max must be positive")
     elif len(values) < requested_kmax:
-        result["nauadc_at_kmax_reason"] = (
+        result["family_discovery_auc_at_kmax_reason"] = (
             f"population N={len(values)} is smaller than requested K={requested_kmax}"
         )
     else:
-        result["nauadc_at_kmax"] = nauadc(values, requested_kmax)
+        result["family_discovery_auc_at_kmax"] = normalized_family_discovery_auc(
+            values, requested_kmax
+        )
     return result
 
 
@@ -146,12 +155,20 @@ def primary_population(
 
 def compute_vendi_score(matrix: Any, negative_tolerance: float = 1e-8) -> dict[str, Any]:
     features = np.asarray(matrix, dtype=float)
-    if features.ndim != 2 or features.shape[0] == 0 or features.shape[1] == 0:
+    if features.ndim != 2 or features.shape[0] == 0:
         return {"score": None, "reason": "empty structural representation"}
     if not np.isfinite(features).all():
         return {"score": None, "reason": "non-finite structural representation"}
 
-    gram = features @ features.T
+    # Cosine distance treats all zero rows as identical to one another and
+    # orthogonal to nonzero rows. This Vendi-only coordinate realizes exactly
+    # that normalized, positive-semidefinite similarity without changing the
+    # structural feature matrix used by clustering.
+    augmented = np.zeros((features.shape[0], features.shape[1] + 1), dtype=float)
+    zero_rows = np.linalg.norm(features, axis=1) == 0
+    augmented[~zero_rows, :-1] = features[~zero_rows]
+    augmented[zero_rows, -1] = 1.0
+    gram = augmented @ augmented.T
     gram = (gram + gram.T) / 2.0
     eigenvalues = np.linalg.eigvalsh(gram)
     minimum = float(eigenvalues.min(initial=0.0))
@@ -291,10 +308,10 @@ def bootstrap_diversity_ci(
         "effective_family_count",
         "dominant_family_share",
         "mean_pairwise_distance",
-        "nauadc_at_kmax",
+        "family_discovery_auc_at_kmax",
         "vendi_score",
     )
-    if n == 0 or features.ndim != 2 or features.shape[1] == 0 or repetitions <= 0:
+    if n == 0 or features.ndim != 2 or repetitions <= 0:
         return {name: None for name in metric_names} | {
             "repetitions": repetitions,
             "seed": seed,
@@ -314,8 +331,13 @@ def bootstrap_diversity_ci(
         pairwise = distance[np.triu_indices(n, k=1)]
         values["mean_pairwise_distance"].append(float(pairwise.mean()) if len(pairwise) else 0.0)
         if diversity_k_max is not None and diversity_k_max <= n:
-            curve = [float(point["da_at_k"]) for point in da_curve(labels)]
-            values["nauadc_at_kmax"].append(float(nauadc(curve, diversity_k_max)))
+            curve = [
+                float(point["expected_distinct_families"])
+                for point in family_discovery_curve(labels)
+            ]
+            values["family_discovery_auc_at_kmax"].append(
+                float(normalized_family_discovery_auc(curve, diversity_k_max))
+            )
         vendi = vendi_score(sampled)
         if vendi is not None:
             values["vendi_score"].append(vendi)

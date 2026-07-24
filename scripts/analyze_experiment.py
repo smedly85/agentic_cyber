@@ -12,8 +12,8 @@ providing two distinct structural analyses:
 
 2. Implementation-strategy clustering
    Uses only baseline-relative Clang and Tree-sitter features from behavioral
-   functions.  ``main`` and parser/usage helpers are excluded by default so
-   argument-parsing structure does not dominate the strategy result.
+   functions. ``main`` is included because generated maintenance code need not
+   decompose behavior into helpers; parser/usage helpers remain excluded.
 
 Patch size, tests, runtime, construct-validation distances, and security
 diagnostics are reported separately and cannot determine either clustering.
@@ -41,14 +41,15 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from analysis import diversity_metrics
 from analysis.diversity_metrics import (
     bootstrap_diversity_ci,
     cluster_statistics as family_statistics,
     compute_vendi_score,
-    da_curve,
     deterministic_threshold_grid,
     exact_repetition_summary,
-    nauadc_summary,
+    family_discovery_auc_summary,
+    family_discovery_curve,
     threshold_sensitivity as family_threshold_sensitivity,
     wilson_interval,
 )
@@ -126,16 +127,21 @@ def require_diagnostic_packages() -> tuple[Any, Any, Any, Any, Any]:
     return plt, levenshtein_ratio, linkage, dendrogram, squareform
 
 
-ANALYZER_VERSION = "4.0.0"
+ANALYZER_VERSION = "4.1.0"
+PAPER_SCHEMA_VERSION = 5
 
 PAPER_METRICS_COLUMNS = [
     "Issue",
     "Checkpoint",
     "Model",
     "Temp",
-    "N Runs",
+    "N Attempts",
+    "Valid Agent Trials",
+    "Infrastructure Failures",
+    "Infrastructure Attrition Rate",
     "Successful Runs",
-    "Overall Success Rate",
+    "End-to-End Success Rate",
+    "Conditional Agent Success Rate",
     "Initial Public Success Rate",
     "Final Public Success Rate",
     "Repair Recovery Rate",
@@ -145,13 +151,11 @@ PAPER_METRICS_COLUMNS = [
     "Architecture Population N",
     "Effective Architecture Families",
     "Dominant Architecture Family Share",
-    "Architecture NAUADC@K",
+    "Architecture Family-Discovery AUC@K",
     "Strategy Population N",
     "Effective Strategy Families",
     "Dominant Strategy Family Share",
-    "Strategy NAUADC@K",
-    "Exact Unique Rate",
-    "Exact Modal Share",
+    "Strategy Family-Discovery AUC@K",
     "Diversity K Max",
 ]
 
@@ -166,6 +170,8 @@ PAPER_DESCRIPTIVE_COLUMNS = [
     "Raw Strategy Families",
     "Mean Pairwise Strategy Distance",
     "Strategy Vendi Score",
+    "Exact Unique Rate",
+    "Exact Modal Share",
     "Mean Repair Loops",
     "Median Repair Loops",
     "Max Repair Loops",
@@ -178,7 +184,7 @@ PAPER_DESCRIPTIVE_COLUMNS = [
     "Mean Functions Edited",
     "Mean Functions Created",
     "Mean Functions Deleted",
-    "Mean GumTree/AST Edit Magnitude",
+    "Mean Normalized GumTree Edit-Action Magnitude",
 ]
 
 
@@ -216,7 +222,7 @@ class ParsedSource:
 
 
 DEFAULT_STRATEGY_EXCLUDE_REGEX = (
-    r"^(?:main|.*(?:parse|parser|argument|arguments|argv|option|options|"
+    r"^(?:.*(?:parse|parser|argument|arguments|argv|option|options|"
     r"usage|help|flag|error|report|diagnostic).*)$"
 )
 
@@ -281,8 +287,8 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help=(
-            "Optional common fixed sampling budget K for comparable NAUADC@K. "
-            "The complete DA curve is always calculated."
+            "Optional common fixed sampling budget K for comparable normalized "
+            "family-discovery AUC@K. The complete DF@K curve is always calculated."
         ),
     )
     parser.add_argument(
@@ -302,7 +308,7 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_STRATEGY_EXCLUDE_REGEX,
         help=(
             "Function-name regex excluded from strategy clustering. The "
-            "default excludes main and parser/usage helpers."
+            "default includes main and excludes parser/usage helpers."
         ),
     )
     parser.add_argument(
@@ -398,7 +404,7 @@ def read_json(path: Path) -> dict[str, Any]:
 def json_safe(value: Any) -> Any:
     if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
         return None
-    if isinstance(value, np.generic):
+    if np is not None and isinstance(value, np.generic):
         return value.item()
     if isinstance(value, dict):
         return {str(key): json_safe(item) for key, item in value.items()}
@@ -518,6 +524,31 @@ def normalize_repair_metadata(
         old_opencode_runtime,
     )
 
+    explicit_infrastructure = normalized.get("infrastructure_failure")
+    explicit_stage = normalized.get("infrastructure_failure_stage")
+    if isinstance(explicit_infrastructure, bool):
+        infrastructure_failure = explicit_infrastructure
+        infrastructure_stage = (
+            str(explicit_stage)
+            if infrastructure_failure and explicit_stage is not None
+            else None
+        )
+        infrastructure_inferred = False
+    else:
+        infrastructure_inferred = True
+        if setup_failed_before_invocation:
+            infrastructure_failure = True
+            infrastructure_stage = "setup"
+        elif bool(normalized.get("opencode_permission_rejected")):
+            infrastructure_failure = True
+            infrastructure_stage = "permission"
+        elif normalized.get("opencode_exit_code") not in (None, 0):
+            infrastructure_failure = True
+            infrastructure_stage = "opencode"
+        else:
+            infrastructure_failure = False
+            infrastructure_stage = None
+
     normalized.update(
         {
             "initial_success": initial_success,
@@ -535,6 +566,11 @@ def normalize_repair_metadata(
             "repair_opencode_runtime_ms": repair_runtime,
             "total_opencode_runtime_ms": total_runtime,
             "loops": normalized.get("loops", []),
+            "infrastructure_failure": infrastructure_failure,
+            "infrastructure_failure_stage": infrastructure_stage,
+            "infrastructure_failure_classification_inferred": (
+                infrastructure_inferred
+            ),
         }
     )
     return normalized
@@ -544,24 +580,25 @@ def build_repair_summary(
     rows: Sequence[Mapping[str, Any]],
     configured_max_loops: int | None = None,
 ) -> dict[str, Any]:
-    n = len(rows)
-    repair_loops = [int(row.get("repair_loops", 0)) for row in rows]
-    llm_invocations = [int(row.get("llm_invocations", 1)) for row in rows]
-    initial_successes = sum(bool(row.get("initial_success")) for row in rows)
+    valid_rows = [row for row in rows if not bool(row.get("infrastructure_failure"))]
+    n = len(valid_rows)
+    repair_loops = [int(row.get("repair_loops", 0)) for row in valid_rows]
+    llm_invocations = [int(row.get("llm_invocations", 1)) for row in valid_rows]
+    initial_successes = sum(bool(row.get("initial_success")) for row in valid_rows)
     public_success_rows = [
-        row for row in rows if bool(row.get("public_validation_success"))
+        row for row in valid_rows if bool(row.get("public_validation_success"))
     ]
     public_failed_rows = [
-        row for row in rows if not bool(row.get("public_validation_success"))
+        row for row in valid_rows if not bool(row.get("public_validation_success"))
     ]
     repair_assisted_successes = sum(
         bool(row.get("public_validation_success"))
         and not bool(row.get("initial_success"))
-        for row in rows
+        for row in valid_rows
     )
     repair_runtimes = [
         float(row.get("repair_opencode_runtime_ms", 0)) / 1000.0
-        for row in rows
+        for row in valid_rows
     ]
 
     observed_loops = max(repair_loops, default=0)
@@ -572,7 +609,7 @@ def build_repair_summary(
             isinstance(row.get("success_loop"), int)
             and not isinstance(row.get("success_loop"), bool)
             and int(row["success_loop"]) <= loop
-            for row in rows
+            for row in valid_rows
         )
         success_curve.append(
             {
@@ -585,6 +622,7 @@ def build_repair_summary(
     initially_failed = n - initial_successes
     return {
         "initial_public_successes": initial_successes,
+        "valid_agent_trials": n,
         "initial_public_success_rate": initial_successes / n if n else None,
         "final_public_successes": len(public_success_rows),
         "final_public_success_rate": (
@@ -617,9 +655,50 @@ def build_repair_summary(
         ),
         "success_curve": success_curve,
         "note": (
-            "Repair metrics use independent attempt-* directories as runs. "
-            "The success curve is cumulative public-validation success by "
-            "repair-loop budget and is not Pass@k."
+            "Repair rates use valid agent trials and exclude infrastructure "
+            "attrition. The success curve is cumulative public-validation "
+            "success by repair-loop budget and is not Pass@k."
+        ),
+    }
+
+
+def build_reliability_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    attempts = len(rows)
+    infrastructure_failures = sum(
+        bool(row.get("infrastructure_failure")) for row in rows
+    )
+    valid_agent_trials = attempts - infrastructure_failures
+    successes = sum(bool(row.get("overall_success")) for row in rows)
+    successful_valid_trials = sum(
+        bool(row.get("overall_success"))
+        for row in rows
+        if not bool(row.get("infrastructure_failure"))
+    )
+    failure_stages = Counter(
+        str(row.get("infrastructure_failure_stage"))
+        for row in rows
+        if bool(row.get("infrastructure_failure"))
+        and row.get("infrastructure_failure_stage") is not None
+    )
+    return {
+        "n_attempts": attempts,
+        "n_infrastructure_failures": infrastructure_failures,
+        "n_valid_agent_trials": valid_agent_trials,
+        "successful_runs": successes,
+        "successful_valid_agent_trials": successful_valid_trials,
+        "infrastructure_failure_stages": dict(sorted(failure_stages.items())),
+        "infrastructure_classifications_inferred": sum(
+            bool(row.get("infrastructure_failure_classification_inferred"))
+            for row in rows
+        ),
+        "infrastructure_attrition_rate": (
+            infrastructure_failures / attempts if attempts else None
+        ),
+        "end_to_end_success_rate": successes / attempts if attempts else None,
+        "conditional_agent_success_rate": (
+            successful_valid_trials / valid_agent_trials
+            if valid_agent_trials
+            else None
         ),
     }
 
@@ -686,15 +765,25 @@ def build_paper_metrics_row(
     _, strategy_primary = select_primary_cluster_population(strategy.get("populations", {}))
     pass_values = summary.get("pass_at_k", {})
     repair = summary.get("repair", {})
-    exact = summary.get("exact_generation_convergence", {})
+    reliability = summary.get("reliability", {})
     return {
+        "_schema_version": PAPER_SCHEMA_VERSION,
+        "_analyzer_version": ANALYZER_VERSION,
         "Issue": infer_paper_issue(experiment_metadata, issue_label),
         "Checkpoint": infer_paper_checkpoint(experiment_metadata, checkpoint_label),
         "Model": experiment_metadata.get("model", summary.get("model")),
         "Temp": experiment_metadata.get("temperature", summary.get("temperature")),
-        "N Runs": summary.get("runs_analyzed", len(rows)),
+        "N Attempts": reliability.get("n_attempts", len(rows)),
+        "Valid Agent Trials": reliability.get("n_valid_agent_trials"),
+        "Infrastructure Failures": reliability.get("n_infrastructure_failures"),
+        "Infrastructure Attrition Rate": reliability.get(
+            "infrastructure_attrition_rate"
+        ),
         "Successful Runs": summary.get("successful_runs"),
-        "Overall Success Rate": summary.get("success_ratio"),
+        "End-to-End Success Rate": reliability.get("end_to_end_success_rate"),
+        "Conditional Agent Success Rate": reliability.get(
+            "conditional_agent_success_rate"
+        ),
         "Initial Public Success Rate": repair.get("initial_public_success_rate"),
         "Final Public Success Rate": repair.get("final_public_success_rate"),
         "Repair Recovery Rate": repair.get("repair_recovery_rate"),
@@ -704,13 +793,15 @@ def build_paper_metrics_row(
         "Architecture Population N": architecture_primary.get("run_count"),
         "Effective Architecture Families": architecture_primary.get("effective_family_count"),
         "Dominant Architecture Family Share": architecture_primary.get("dominant_family_share"),
-        "Architecture NAUADC@K": architecture_primary.get("nauadc_at_kmax"),
+        "Architecture Family-Discovery AUC@K": architecture_primary.get(
+            "family_discovery_auc_at_kmax"
+        ),
         "Strategy Population N": strategy_primary.get("run_count"),
         "Effective Strategy Families": strategy_primary.get("effective_family_count"),
         "Dominant Strategy Family Share": strategy_primary.get("dominant_family_share"),
-        "Strategy NAUADC@K": strategy_primary.get("nauadc_at_kmax"),
-        "Exact Unique Rate": exact.get("exact_unique_rate"),
-        "Exact Modal Share": exact.get("exact_modal_share"),
+        "Strategy Family-Discovery AUC@K": strategy_primary.get(
+            "family_discovery_auc_at_kmax"
+        ),
         "Diversity K Max": summary.get("diversity_k_max"),
     }
 
@@ -729,6 +820,7 @@ def build_paper_descriptive_row(
     _, architecture_primary = select_primary_cluster_population(architecture.get("populations", {}))
     _, strategy_primary = select_primary_cluster_population(strategy.get("populations", {}))
     repair = summary.get("repair", {})
+    exact = summary.get("exact_generation_convergence", {})
     runtime = summary.get("runtime_seconds", {})
     successful_rows = [row for row in rows if bool(row.get("overall_success"))]
     return {
@@ -742,6 +834,8 @@ def build_paper_descriptive_row(
         "Raw Strategy Families": strategy_primary.get("raw_family_count"),
         "Mean Pairwise Strategy Distance": strategy_primary.get("mean_pairwise_distance"),
         "Strategy Vendi Score": strategy_primary.get("vendi_score"),
+        "Exact Unique Rate": exact.get("exact_unique_rate"),
+        "Exact Modal Share": exact.get("exact_modal_share"),
         "Mean Repair Loops": repair.get("mean_repair_loops"),
         "Median Repair Loops": repair.get("median_repair_loops"),
         "Max Repair Loops": repair.get("max_repair_loops"),
@@ -754,7 +848,7 @@ def build_paper_descriptive_row(
         "Mean Functions Edited": safe_numeric_mean(row.get("functions_edited_count") for row in successful_rows),
         "Mean Functions Created": safe_numeric_mean(row.get("functions_created_count") for row in successful_rows),
         "Mean Functions Deleted": safe_numeric_mean(row.get("functions_deleted_count") for row in successful_rows),
-        "Mean GumTree/AST Edit Magnitude": safe_numeric_mean(
+        "Mean Normalized GumTree Edit-Action Magnitude": safe_numeric_mean(
             row.get("gumtree_normalized_edit_distance") for row in successful_rows
         ),
     }
@@ -762,13 +856,14 @@ def build_paper_descriptive_row(
 
 def paper_metrics_schema() -> dict[str, Any]:
     return {
-        "schema_version": 4,
+        "schema_version": PAPER_SCHEMA_VERSION,
+        "analyzer_version": ANALYZER_VERSION,
         "primary_csv_columns": PAPER_METRICS_COLUMNS,
         "descriptive_csv_columns": PAPER_DESCRIPTIVE_COLUMNS,
         "notes": {
             "primary_population": "successful final candidates with complete measurement for that representation; no fallback",
             "effective_families": "exp(Shannon entropy) of empirical family shares",
-            "fixed_budget_nauadc": "null unless --diversity-k-max is supplied and supported by the population",
+            "fixed_budget_family_discovery_auc": "null unless --diversity-k-max is supplied and supported by the population",
             "excluded_from_clustering": "lexical, APTED, API-call, security, complexity, runtime, and patch-size information",
             "missing_values": "Unavailable measurements are null in JSON and blank in CSV.",
         },
@@ -811,9 +906,10 @@ def paper_metrics_sort_key(row: Mapping[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def rebuild_paper_metrics_aggregate(repository_root: Path) -> None:
+def rebuild_paper_metrics_aggregate(repository_root: Path) -> int:
     experiments_root = repository_root / "runs" / "experiments"
     rows_by_experiment: dict[Path, dict[str, Any]] = {}
+    skipped_older_rows = 0
     if experiments_root.is_dir():
         for row_path in sorted(
             experiments_root.rglob("analysis/paper_metrics_row.json")
@@ -827,8 +923,13 @@ def rebuild_paper_metrics_aggregate(repository_root: Path) -> None:
                 for column in ("Issue", "Checkpoint", "Model", "Temp")
             ):
                 continue
-            for column in PAPER_METRICS_COLUMNS:
-                row.setdefault(column, None)
+            if (
+                row.get("_schema_version") != PAPER_SCHEMA_VERSION
+                or row.get("_analyzer_version") != ANALYZER_VERSION
+                or not all(column in row for column in PAPER_METRICS_COLUMNS)
+            ):
+                skipped_older_rows += 1
+                continue
             canonical_experiment = row_path.parent.parent.resolve()
             rows_by_experiment.setdefault(canonical_experiment, row)
 
@@ -842,6 +943,12 @@ def rebuild_paper_metrics_aggregate(repository_root: Path) -> None:
         PAPER_METRICS_COLUMNS,
     )
     write_json(experiments_root / "paper_metrics.json", aggregate_rows)
+    print(
+        "Repository paper aggregate: "
+        f"included {len(aggregate_rows)} schema-v{PAPER_SCHEMA_VERSION} rows; "
+        f"skipped {skipped_older_rows} older/incompatible rows"
+    )
+    return skipped_older_rows
 
 
 # ---------------------------------------------------------------------------
@@ -1862,54 +1969,9 @@ def build_feature_matrix(
     return normalize_rows(combined), feature_names, schema
 
 
-def cosine_distance_matrix(matrix: Any) -> Any:
-    n = len(matrix)
-    if matrix.shape[1] == 0:
-        return np.zeros((n, n), dtype=float)
-
-    similarity = np.clip(matrix @ matrix.T, -1.0, 1.0)
-    distance = 1.0 - similarity
-    zero_rows = np.linalg.norm(matrix, axis=1) == 0
-
-    for i in range(n):
-        for j in range(n):
-            if zero_rows[i] and zero_rows[j]:
-                distance[i, j] = 0.0
-            elif zero_rows[i] or zero_rows[j]:
-                distance[i, j] = 1.0
-
-    np.fill_diagonal(distance, 0.0)
-    return np.clip(distance, 0.0, 2.0)
-
-
 # ---------------------------------------------------------------------------
 # Clustering
 # ---------------------------------------------------------------------------
-
-
-def agglomerative_labels(distance: Any, threshold: float) -> Any:
-    n = len(distance)
-    if n == 0:
-        return np.array([], dtype=int)
-    if n == 1:
-        return np.array([0], dtype=int)
-
-    kwargs = {
-        "n_clusters": None,
-        "linkage": "average",
-        "distance_threshold": threshold,
-    }
-    try:
-        model = AgglomerativeClustering(
-            metric="precomputed",
-            **kwargs,
-        )
-    except TypeError:
-        model = AgglomerativeClustering(
-            affinity="precomputed",
-            **kwargs,
-        )
-    return model.fit_predict(distance)
 
 
 def stabilize_labels(labels: Sequence[int], run_ids: Sequence[str]) -> Any:
@@ -2058,7 +2120,7 @@ def analyze_population(
     feature_matrix = full_feature_matrix[indices]
 
     labels = stabilize_labels(
-        agglomerative_labels(distance, threshold),
+        diversity_metrics.agglomerative_labels(distance, threshold),
         run_ids,
     )
     stats = cluster_statistics([int(value) for value in labels])
@@ -2072,8 +2134,8 @@ def analyze_population(
         distance,
         run_ids,
     )
-    curve = da_curve([int(value) for value in labels])
-    area = nauadc_summary(curve, diversity_k_max)
+    curve = family_discovery_curve([int(value) for value in labels])
+    area = family_discovery_auc_summary(curve, diversity_k_max)
     vendi = compute_vendi_score(feature_matrix)
     bootstrap = bootstrap_diversity_ci(
         feature_matrix,
@@ -2154,7 +2216,7 @@ def analyze_population(
             "unavailable_reason": None if run_ids else "no successful candidates with complete measurement",
             "mean_pairwise_distance": mean_pairwise_distance(distance) if run_ids else None,
             "representatives": representative_rows,
-            "da_curve": curve,
+            "family_discovery_curve": curve,
             **area,
             "vendi_score": vendi["score"],
             "vendi_diagnostic": vendi,
@@ -2164,6 +2226,71 @@ def analyze_population(
     )
 
 
+def representation_ablation_rows(
+    *,
+    space_name: str,
+    population_run_ids: Sequence[str],
+    all_run_ids: Sequence[str],
+    representations: Sequence[
+        tuple[
+            str,
+            Mapping[str, Mapping[str, Mapping[str, float]]],
+            Sequence[str],
+        ]
+    ],
+    primary_representation: str,
+    threshold: float,
+) -> list[dict[str, Any]]:
+    """Compare fixed-threshold tool-block representations on one population."""
+    from sklearn.metrics import adjusted_rand_score
+
+    indices = [all_run_ids.index(run_id) for run_id in population_run_ids]
+    partitions: dict[str, Any] = {}
+    distances: dict[str, Any] = {}
+    for name, blocks, block_order in representations:
+        matrix, _, _ = build_feature_matrix(all_run_ids, blocks, block_order)
+        population_matrix = matrix[indices]
+        distance = diversity_metrics.cosine_distance_matrix(population_matrix)
+        partitions[name] = diversity_metrics.agglomerative_labels(
+            distance, threshold
+        )
+        distances[name] = distance
+
+    primary_labels = partitions[primary_representation]
+    output: list[dict[str, Any]] = []
+    for name, _, _ in representations:
+        labels = partitions[name]
+        stats = family_statistics([int(label) for label in labels])
+        output.append(
+            {
+                "space": space_name,
+                "representation": name,
+                "population_n": len(population_run_ids),
+                "raw_family_count": (
+                    stats["raw_family_count"] if population_run_ids else None
+                ),
+                "effective_family_count": stats["effective_family_count"],
+                "dominant_family_share": stats["dominant_family_share"],
+                "mean_pairwise_distance": (
+                    mean_pairwise_distance(distances[name])
+                    if population_run_ids
+                    else None
+                ),
+                "adjusted_rand_vs_primary": (
+                    1.0
+                    if name == primary_representation
+                    else (
+                        float(adjusted_rand_score(primary_labels, labels))
+                        if population_run_ids
+                        else None
+                    )
+                ),
+                "threshold_used": threshold,
+            }
+        )
+    return output
+
+
 # ---------------------------------------------------------------------------
 # Main analysis
 # ---------------------------------------------------------------------------
@@ -2171,6 +2298,12 @@ def analyze_population(
 
 def main() -> int:
     args = parse_args()
+    if not math.isfinite(args.cluster_threshold) or args.cluster_threshold <= 0:
+        raise SystemExit("--cluster-threshold must be a positive finite number")
+    if args.strategy_threshold is not None and (
+        not math.isfinite(args.strategy_threshold) or args.strategy_threshold <= 0
+    ):
+        raise SystemExit("--strategy-threshold must be a positive finite number")
     if args.diversity_k_max is not None and args.diversity_k_max < 1:
         raise SystemExit("--diversity-k-max must be positive")
     if args.bootstrap_repetitions < 0:
@@ -2238,7 +2371,11 @@ def main() -> int:
             if args.baseline_source is not None
             else experiment / "baseline" / source_path
         )
-        baseline_kind = "experiment_snapshot"
+        baseline_kind = str(
+            experiment_metadata.get(
+                "baseline_source_kind", "experiment_snapshot"
+            )
+        )
         attempts = sorted(
             path
             for path in experiment.glob("attempt-*")
@@ -2321,6 +2458,7 @@ def main() -> int:
     rows: list[dict[str, Any]] = []
     architecture_blocks: dict[str, dict[str, dict[str, float]]] = {}
     strategy_blocks: dict[str, dict[str, dict[str, float]]] = {}
+    strategy_without_main_blocks: dict[str, dict[str, dict[str, float]]] = {}
     candidate_sources: dict[str, Path] = {}
 
     print("\nAnalyzing candidates...")
@@ -2346,6 +2484,8 @@ def main() -> int:
                     "total_opencode_runtime_ms": raw_metadata.get("opencode_runtime_ms", 0),
                 }
             )
+        if opencode_permission_rejected(attempt / "opencode.log"):
+            raw_metadata["opencode_permission_rejected"] = True
         metadata = normalize_repair_metadata(raw_metadata)
         run_id = str(metadata.get("run_id", attempt.name))
         run_output = (
@@ -2437,6 +2577,21 @@ def main() -> int:
             baseline_behavior,
             strategy_created_mapping,
         )
+        strategy_without_main_mapping = {
+            name: canonical
+            for name, canonical in strategy_created_mapping.items()
+            if name != "main"
+        }
+        strategy_without_main_clang_delta = filter_strategy_delta(
+            raw_clang_delta,
+            baseline_behavior - {"main"},
+            strategy_without_main_mapping,
+        )
+        strategy_without_main_tree_delta = filter_strategy_delta(
+            raw_tree_delta,
+            baseline_behavior - {"main"},
+            strategy_without_main_mapping,
+        )
 
         architecture_blocks[run_id] = {
             "clang": split_signed_delta(
@@ -2470,6 +2625,22 @@ def main() -> int:
             else {},
             "tree_sitter": split_signed_delta(
                 strategy_tree_delta,
+                "tree_sitter",
+            )
+            if candidate.tree_sitter_error is None
+            and baseline.tree_sitter_error is None
+            else {},
+        }
+        strategy_without_main_blocks[run_id] = {
+            "clang": split_signed_delta(
+                strategy_without_main_clang_delta,
+                "clang",
+            )
+            if candidate.clang_error is None
+            and baseline.clang_error is None
+            else {},
+            "tree_sitter": split_signed_delta(
+                strategy_without_main_tree_delta,
                 "tree_sitter",
             )
             if candidate.tree_sitter_error is None
@@ -2544,8 +2715,8 @@ def main() -> int:
             "llm_reasoning_tokens": llm_tokens["reasoning_tokens"],
             "llm_cache_read_tokens": llm_tokens["cache_read_tokens"],
             "llm_total_tokens": llm_tokens["total_tokens"],
-            "opencode_permission_rejected": opencode_permission_rejected(
-                attempt / "opencode.log"
+            "opencode_permission_rejected": metadata.get(
+                "opencode_permission_rejected", False
             ),
             "clang_available": candidate.clang_error is None,
             "tree_sitter_available": candidate.tree_sitter_error is None,
@@ -2581,6 +2752,12 @@ def main() -> int:
                     "architecture_tree_sitter_delta": architecture_tree_delta,
                     "strategy_clang_delta": strategy_clang_delta,
                     "strategy_tree_sitter_delta": strategy_tree_delta,
+                    "strategy_without_main_clang_delta": (
+                        strategy_without_main_clang_delta
+                    ),
+                    "strategy_without_main_tree_sitter_delta": (
+                        strategy_without_main_tree_delta
+                    ),
                     "gumtree_actions": dict(gumtree_actions),
                     "gumtree_normalized_edit_distance": gumtree_distance,
                     "architecture_blocks": architecture_blocks[run_id],
@@ -2613,8 +2790,10 @@ def main() -> int:
         strategy_blocks,
         ("clang", "tree_sitter"),
     )
-    architecture_distance = cosine_distance_matrix(architecture_matrix)
-    strategy_distance = cosine_distance_matrix(strategy_matrix)
+    architecture_distance = diversity_metrics.cosine_distance_matrix(
+        architecture_matrix
+    )
+    strategy_distance = diversity_metrics.cosine_distance_matrix(strategy_matrix)
 
     complete_architecture_ids = [
         str(row["run_id"])
@@ -2783,14 +2962,16 @@ def main() -> int:
         ["run_id", "family_id"],
     )
     write_csv(
-        diversity_dir / "architecture_da_curve.csv",
-        architecture_summaries[architecture_primary_name]["da_curve"],
-        ["k", "da_at_k"],
+        diversity_dir / "architecture_family_discovery_curve.csv",
+        architecture_summaries[architecture_primary_name][
+            "family_discovery_curve"
+        ],
+        ["k", "expected_distinct_families"],
     )
     write_csv(
-        diversity_dir / "strategy_da_curve.csv",
-        strategy_summaries[strategy_primary_name]["da_curve"],
-        ["k", "da_at_k"],
+        diversity_dir / "strategy_family_discovery_curve.csv",
+        strategy_summaries[strategy_primary_name]["family_discovery_curve"],
+        ["k", "expected_distinct_families"],
     )
 
     successful_candidate_rows = [row for row in rows if bool(row.get("overall_success"))]
@@ -2859,6 +3040,67 @@ def main() -> int:
         uncertainty_rows,
         ["space", "metric", "lower", "upper", "replicates"],
     )
+    if diagnostic_root is not None:
+        ablation_rows = representation_ablation_rows(
+            space_name="architecture",
+            population_run_ids=passing_architecture_ids,
+            all_run_ids=run_ids,
+            representations=(
+                ("clang_only", architecture_blocks, ("clang",)),
+                ("tree_sitter_only", architecture_blocks, ("tree_sitter",)),
+                ("gumtree_only", architecture_blocks, ("gumtree",)),
+                (
+                    "clang_plus_tree_sitter",
+                    architecture_blocks,
+                    ("clang", "tree_sitter"),
+                ),
+                (
+                    "clang_plus_tree_sitter_plus_gumtree",
+                    architecture_blocks,
+                    ("clang", "tree_sitter", "gumtree"),
+                ),
+            ),
+            primary_representation="clang_plus_tree_sitter_plus_gumtree",
+            threshold=args.cluster_threshold,
+        )
+        ablation_rows.extend(
+            representation_ablation_rows(
+                space_name="strategy",
+                population_run_ids=passing_strategy_ids,
+                all_run_ids=run_ids,
+                representations=(
+                    ("clang_only", strategy_blocks, ("clang",)),
+                    ("tree_sitter_only", strategy_blocks, ("tree_sitter",)),
+                    (
+                        "clang_plus_tree_sitter",
+                        strategy_blocks,
+                        ("clang", "tree_sitter"),
+                    ),
+                    (
+                        "clang_plus_tree_sitter_without_main",
+                        strategy_without_main_blocks,
+                        ("clang", "tree_sitter"),
+                    ),
+                ),
+                primary_representation="clang_plus_tree_sitter",
+                threshold=strategy_threshold,
+            )
+        )
+        write_csv(
+            diagnostic_root / "representation_ablation.csv",
+            ablation_rows,
+            [
+                "space",
+                "representation",
+                "population_n",
+                "raw_family_count",
+                "effective_family_count",
+                "dominant_family_share",
+                "mean_pairwise_distance",
+                "adjusted_rand_vs_primary",
+                "threshold_used",
+            ],
+        )
     security_summary: dict[str, Any] = {"status": "not_requested"}
     if args.security_diagnostics:
         security_rows = []
@@ -3007,8 +3249,8 @@ def main() -> int:
                     "blocks": strategy_schema,
                     "description": (
                         "Implementation strategy: Clang and Tree-sitter deltas "
-                        "from behavioral functions only; main and parser/usage "
-                        "helpers are excluded by the configured regex."
+                        "from behavioral functions; main is included while "
+                        "parser/usage helpers are excluded by the configured regex."
                     ),
                     "excluded_function_regex": args.strategy_exclude_regex,
                     "forced_includes": sorted(forced_strategy_functions),
@@ -3096,6 +3338,11 @@ def main() -> int:
 
     n = len(rows)
     successful = sum(bool(row.get("overall_success")) for row in rows)
+    reliability_summary = build_reliability_summary(rows)
+    valid_agent_trials = reliability_summary["n_valid_agent_trials"]
+    successful_valid_trials = reliability_summary[
+        "successful_valid_agent_trials"
+    ]
     configured_max_loops = experiment_metadata.get("max_loops")
     if not isinstance(configured_max_loops, int) or isinstance(
         configured_max_loops, bool
@@ -3135,7 +3382,7 @@ def main() -> int:
         )
 
     summary = {
-        "schema_version": 4,
+        "schema_version": PAPER_SCHEMA_VERSION,
         "analyzer_version": ANALYZER_VERSION,
         "experiment_format": experiment_format,
         "baseline_kind": baseline_kind,
@@ -3146,6 +3393,7 @@ def main() -> int:
         "temperature": experiment_metadata.get("temperature"),
         "runs_analyzed": n,
         "successful_runs": successful,
+        "reliability": reliability_summary,
         "architecture_population_n": len(passing_architecture_ids),
         "architecture_measurement_coverage": (
             len(passing_architecture_ids) / successful if successful else None
@@ -3156,21 +3404,35 @@ def main() -> int:
         ),
         "success_ratio": successful / n if n else None,
         "diversity_k_max": args.diversity_k_max,
+        "analysis_configuration": {
+            "architecture_threshold": args.cluster_threshold,
+            "strategy_threshold": strategy_threshold,
+            "diversity_k_max": args.diversity_k_max,
+            "strategy_exclude_regex": args.strategy_exclude_regex,
+            "strategy_include_functions": sorted(forced_strategy_functions),
+        },
         "exact_generation_convergence": exact_repetition,
         "stage_success_ratios": stage_success_ratios,
         "repair": repair_summary,
         "uncertainty": {
             "wilson_95_percent": {
-                "overall_success_rate": wilson_interval(successful, n),
+                "infrastructure_attrition_rate": wilson_interval(
+                    reliability_summary["n_infrastructure_failures"], n
+                ),
+                "end_to_end_success_rate": wilson_interval(successful, n),
+                "conditional_agent_success_rate": wilson_interval(
+                    successful_valid_trials, valid_agent_trials
+                ),
                 "initial_public_success_rate": wilson_interval(
-                    repair_summary["initial_public_successes"], n
+                    repair_summary["initial_public_successes"], valid_agent_trials
                 ),
                 "final_public_success_rate": wilson_interval(
-                    repair_summary["final_public_successes"], n
+                    repair_summary["final_public_successes"], valid_agent_trials
                 ),
                 "repair_recovery_rate": wilson_interval(
                     repair_summary["recovered_initially_failed_runs"],
-                    n - repair_summary["initial_public_successes"],
+                    valid_agent_trials
+                    - repair_summary["initial_public_successes"],
                 ),
             },
             "diversity_bootstrap": {
@@ -3179,9 +3441,11 @@ def main() -> int:
             },
         },
         "pass_at_k": {
-            f"pass@{k}": pass_at_k(n, successful, k)
+            f"pass@{k}": pass_at_k(
+                valid_agent_trials, successful_valid_trials, k
+            )
             for k in (1, 5, 10, 20, 50, 100)
-            if k <= n
+            if k <= valid_agent_trials
         },
         "runtime_seconds": {
             "mean": statistics.fmean(runtime_seconds)
@@ -3290,22 +3554,38 @@ def main() -> int:
             infer_repository_root(experiment, experiment_metadata)
         )
 
+    def percentage(value: Any) -> str:
+        return f"{float(value):.1%}" if value is not None else "unavailable"
+
     print("\nAnalysis complete")
-    print(f"Success: {successful}/{n} ({successful / n:.1%})")
+    print(
+        f"End-to-end success: {successful}/{n} "
+        f"({percentage(reliability_summary['end_to_end_success_rate'])})"
+    )
+    print(
+        "Infrastructure attrition: "
+        f"{reliability_summary['n_infrastructure_failures']}/{n} "
+        f"({percentage(reliability_summary['infrastructure_attrition_rate'])})"
+    )
+    print(
+        "Conditional agent success: "
+        f"{successful_valid_trials}/{valid_agent_trials} "
+        f"({percentage(reliability_summary['conditional_agent_success_rate'])})"
+    )
     print(
         "Initial public success: "
-        f"{repair_summary['initial_public_successes']}/{n} "
-        f"({repair_summary['initial_public_success_rate']:.1%})"
+        f"{repair_summary['initial_public_successes']}/{valid_agent_trials} "
+        f"({percentage(repair_summary['initial_public_success_rate'])})"
     )
     print(
         "Final public success:   "
-        f"{repair_summary['final_public_successes']}/{n} "
-        f"({repair_summary['final_public_success_rate']:.1%})"
+        f"{repair_summary['final_public_successes']}/{valid_agent_trials} "
+        f"({percentage(repair_summary['final_public_success_rate'])})"
     )
     for curve_point in repair_summary["success_curve"]:
         print(
             f"Success by loop {curve_point['loop']}: "
-            f"{curve_point['success_rate']:.1%}"
+            f"{percentage(curve_point['success_rate'])}"
         )
     architecture_primary_name = "passing_complete_runs"
     strategy_primary_name = "passing_complete_runs"

@@ -37,11 +37,19 @@ bash scripts/run_llm_experiment.sh \
     --max-loops 3 \
     --prompt "$PROMPT" \
     --source "$SOURCE" \
+    --source-mode existing \
     --build-cmd "<build command>" \
     --base-test-cmd "<baseline test command>" \
     --feature-test-cmd "<checkpoint test command>" \
     --extra-test-cmd "<optional independent test command>"
 ```
+
+Use `--source-mode existing` when the source is present in the selected baseline
+commit. Use `--source-mode new` when the source must be absent. New-source mode
+records an empty `baseline/<source_path>` snapshot but does not create the file
+in the agent worktree; the model must create it. Existing-source sort and
+new-source mkdir tasks can therefore use the same Git controller, bounded
+repair loop, one-time hidden/extra evaluation, and canonical analyzer.
 
 For example, the reverse-sort checkpoint is:
 
@@ -81,6 +89,16 @@ prompt, model, temperature, validation commands, and repair budget. It also
 stores the baseline at `baseline/<source_path>` and each final candidate at
 `attempt-*/candidate/<source_path>`. These metadata and source paths make the
 same analysis invocation applicable to sort, mkdir, and future utilities.
+Each attempt also records setup, OpenCode, or permission infrastructure failure
+separately from generated-code build and evaluator outcomes.
+
+Automatic analysis accepts `--analysis-architecture-threshold`,
+`--analysis-strategy-threshold`, and optional `--analysis-diversity-k-max`.
+The compatibility option `--analysis-threshold` sets both thresholds unless a
+corresponding specific option overrides it. Without the shorthand, strategy
+defaults to the resolved architecture threshold. K remains unset unless
+explicitly supplied and is never inferred from successful-run count. Resolved
+values are recorded in `experiment.json` and `analysis/summary.json`.
 
 ## Canonical Analysis
 
@@ -101,8 +119,9 @@ python3 scripts/analyze_experiment.py \
 ```
 
 Use a common `--diversity-k-max` supported by every compared population for
-cross-condition NAUADC@K. Omit it when only complete within-population curves
-are needed. Detailed construct-validation artifacts and plots are opt-in:
+cross-condition normalized family-discovery AUC@K. Omit it when only complete
+within-population DF@K curves are needed. Detailed construct-validation,
+representation-ablation artifacts, and plots are opt-in:
 
 ```bash
 python3 scripts/analyze_experiment.py \
@@ -115,17 +134,29 @@ python3 scripts/analyze_experiment.py \
     --clean-output
 ```
 
-The analyzer writes schema-v4 results under `<experiment>/analysis/`. The main
+The analyzer writes schema-v5 results under `<experiment>/analysis/`. The main
 files are `summary.json`, `per_run_metrics.csv`, `paper_metrics.csv`,
-`paper_descriptive_metrics.csv`, diversity family assignments and DA curves,
+`paper_descriptive_metrics.csv`, diversity family assignments and DF@K curves,
 robustness tables, and uncertainty intervals. It rebuilds the repository-level
-`runs/experiments/paper_metrics.csv` and `paper_metrics.json` from valid
-per-experiment v4 rows. See `docs/diversity_methodology.md` for metric roles,
-population rules, formulas, output layout, and interpretation.
+`runs/experiments/paper_metrics.csv` and `paper_metrics.json` only from valid
+schema-v5 rows, logging older rows that were skipped. Historical experiments
+must be re-analyzed with analyzer v4.1 before entering the final aggregate.
 
-## No-Git Sandbox Runner
+One complete generation/repair trajectory is one independent attempt.
+Infrastructure attrition remains visible in end-to-end reliability but is
+excluded from valid-agent denominators for initial/final public success, repair
+recovery, and Pass@k. Failed generated implementations remain reliability
+failures but do not enter primary diversity. Repeated byte-identical successful
+outputs remain separate diversity observations. Architecture means structural
+organization of the configured primary C source, not repository- or system-wide
+architecture; implementation strategy is separate. Primary strategy includes
+`main`; excluding `main` is a diagnostic robustness ablation only. See
+`docs/diversity_methodology.md` for formulas and interpretation.
 
-`scripts/run_sandboxed_pipeline.sh` is a separate runner for from-scratch or
+## Exploratory No-Git Sandbox Runner
+
+`scripts/run_sandboxed_pipeline.sh` is retained as an exploratory/legacy runner
+for pilot and historical work. It is a separate runner for from-scratch or
 seeded prompts that do not need a Git baseline. It creates a fresh plain
 directory for each equally spaced temperature point, copies the prompt and any
 `--test-dir` paths, applies any `--seed-file SRC[:DEST]` inputs, runs OpenCode,
@@ -181,6 +212,12 @@ Analyze each `temp-*` condition separately. The analyzer rejects a sandbox root
 containing multiple temperatures rather than pooling different experimental
 conditions. `--baseline-source` can explicitly override baseline discovery.
 
+The Git-backed `run_llm_experiment.sh` workflow is the intended confirmatory
+workflow for cross-utility conference comparisons. Sandbox results remain
+analyzable, but runs generated under materially different agent-feedback or
+controller protocols must not be pooled as one condition. Sandbox rows are not
+automatically added to the repository-level confirmatory paper aggregate.
+
 ## Repository Structure
 
 ```text
@@ -188,14 +225,14 @@ agentic_cyber/
 ├── Makefile
 ├── README.md
 ├── docs/
-│   └── diversity_methodology.md          # Canonical v4 methodology
+│   └── diversity_methodology.md          # Canonical v4.1/schema-v5 methodology
 ├── prompts/
 │   ├── checkpoint_base_template.md
 │   ├── checkpoint_feature_template.md
 │   ├── mkdir/                             # mkdir checkpoints
 │   └── new_sort/                          # sort checkpoints and prompt tests
 ├── scripts/
-│   ├── analysis/                          # v4 metric and validation modules
+│   ├── analysis/                          # Canonical metric and validation modules
 │   ├── analysis-requirements.txt
 │   ├── analyze_experiment.py              # Sole analysis entry point
 │   ├── run_llm_experiment.sh              # Git-worktree experiment runner
