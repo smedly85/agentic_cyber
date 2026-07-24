@@ -118,7 +118,7 @@ def require_diagnostic_packages() -> tuple[Any, Any, Any, Any, Any]:
     return plt, levenshtein_ratio, linkage, dendrogram, squareform
 
 
-ANALYZER_VERSION = "4.1.1"
+ANALYZER_VERSION = "4.1.2"
 PAPER_SCHEMA_VERSION = 5
 
 PAPER_METRICS_COLUMNS = [
@@ -676,6 +676,53 @@ def normalize_repair_metadata(
     return normalized
 
 
+def initial_agent_invocation_status(row: Mapping[str, Any]) -> str:
+    """Classify whether the initial agent invocation completed confidently."""
+    if bool(row.get("infrastructure_failure")):
+        return "infrastructure_failure"
+
+    loops = row.get("loops")
+    if isinstance(loops, Sequence) and not isinstance(loops, (str, bytes)) and loops:
+        initial = loops[0]
+        if isinstance(initial, Mapping):
+            if bool(initial.get("opencode_permission_rejected")):
+                return "permission_rejection"
+            exit_code = initial.get("opencode_exit_code")
+            if isinstance(exit_code, (int, float)) and not isinstance(exit_code, bool):
+                if exit_code == 0:
+                    return "completed"
+                return "timeout" if exit_code == 124 else "opencode_error"
+        # Reaching a later invocation proves that the initial invocation
+        # completed and produced validation feedback.
+        if len(loops) > 1:
+            return "completed"
+        return "unknown_initial_invocation"
+
+    repair_loops = row.get("repair_loops")
+    if (
+        isinstance(repair_loops, int)
+        and not isinstance(repair_loops, bool)
+        and repair_loops > 0
+    ):
+        return "completed"
+
+    if bool(row.get("opencode_permission_rejected")):
+        return "permission_rejection"
+    exit_code = row.get("opencode_exit_code")
+    if isinstance(exit_code, (int, float)) and not isinstance(exit_code, bool):
+        if exit_code == 0:
+            return "completed"
+        return "timeout" if exit_code == 124 else "opencode_error"
+    if bool(row.get("agent_execution_failure")):
+        stage = row.get("agent_execution_failure_stage")
+        if stage == "permission":
+            return "permission_rejection"
+        if stage == "timeout":
+            return "timeout"
+        return "opencode_error"
+    return "unknown_initial_invocation"
+
+
 def build_repair_summary(
     rows: Sequence[Mapping[str, Any]],
     configured_max_loops: int | None = None,
@@ -691,10 +738,40 @@ def build_repair_summary(
     public_failed_rows = [
         row for row in valid_rows if not bool(row.get("public_validation_success"))
     ]
-    repair_assisted_successes = sum(
-        bool(row.get("public_validation_success"))
-        and not bool(row.get("initial_success"))
-        for row in valid_rows
+    initially_failed_rows = [
+        row for row in valid_rows if not bool(row.get("initial_success"))
+    ]
+    initially_failed_with_status = [
+        (row, initial_agent_invocation_status(row))
+        for row in initially_failed_rows
+    ]
+    repair_eligible_rows = [
+        row
+        for row, status in initially_failed_with_status
+        if status == "completed"
+    ]
+    recovered_repair_eligible_rows = [
+        row
+        for row in repair_eligible_rows
+        if bool(row.get("public_validation_success"))
+        and (
+            (
+                isinstance(row.get("success_loop"), int)
+                and not isinstance(row.get("success_loop"), bool)
+                and int(row["success_loop"]) > 0
+            )
+            or (
+                row.get("success_loop") is None
+                and isinstance(row.get("repair_loops"), int)
+                and not isinstance(row.get("repair_loops"), bool)
+                and int(row["repair_loops"]) > 0
+            )
+        )
+    ]
+    ineligible_stages = Counter(
+        status
+        for _, status in initially_failed_with_status
+        if status != "completed"
     )
     repair_runtimes = [
         float(row.get("repair_opencode_runtime_ms", 0)) / 1000.0
@@ -719,7 +796,8 @@ def build_repair_summary(
             }
         )
 
-    initially_failed = n - initial_successes
+    repair_eligible_failures = len(repair_eligible_rows)
+    recovered_repair_eligible_failures = len(recovered_repair_eligible_rows)
     return {
         "initial_public_successes": initial_successes,
         "valid_agent_trials": n,
@@ -728,10 +806,20 @@ def build_repair_summary(
         "final_public_success_rate": (
             len(public_success_rows) / n if n else None
         ),
-        "recovered_initially_failed_runs": repair_assisted_successes,
+        "repair_eligible_initial_failures": repair_eligible_failures,
+        "recovered_repair_eligible_failures": (
+            recovered_repair_eligible_failures
+        ),
+        "repair_ineligible_initial_failures": (
+            len(initially_failed_rows) - repair_eligible_failures
+        ),
+        "repair_ineligible_initial_failure_stages": dict(
+            sorted(ineligible_stages.items())
+        ),
+        "recovered_initially_failed_runs": recovered_repair_eligible_failures,
         "repair_recovery_rate": (
-            repair_assisted_successes / initially_failed
-            if initially_failed
+            recovered_repair_eligible_failures / repair_eligible_failures
+            if repair_eligible_failures
             else None
         ),
         "mean_repair_loops": (
@@ -755,9 +843,10 @@ def build_repair_summary(
         ),
         "success_curve": success_curve,
         "note": (
-            "Repair rates use valid agent trials and exclude infrastructure "
-            "attrition. The success curve is cumulative public-validation "
-            "success by repair-loop budget and is not Pass@k."
+            "Repair recovery uses valid initial failures whose initial agent "
+            "invocation completed and produced a candidate eligible for "
+            "validation-feedback repair. The success curve is cumulative "
+            "public-validation success by repair-loop budget and is not Pass@k."
         ),
     }
 
@@ -819,6 +908,36 @@ def build_reliability_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, An
     }
 
 
+def build_reliability_wilson_intervals(
+    reliability: Mapping[str, Any],
+    repair: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    attempts = int(reliability["n_attempts"])
+    valid_agent_trials = int(reliability["n_valid_agent_trials"])
+    return {
+        "infrastructure_attrition_rate": wilson_interval(
+            int(reliability["n_infrastructure_failures"]), attempts
+        ),
+        "end_to_end_success_rate": wilson_interval(
+            int(reliability["successful_runs"]), attempts
+        ),
+        "conditional_agent_success_rate": wilson_interval(
+            int(reliability["successful_valid_agent_trials"]),
+            valid_agent_trials,
+        ),
+        "initial_public_success_rate": wilson_interval(
+            int(repair["initial_public_successes"]), valid_agent_trials
+        ),
+        "final_public_success_rate": wilson_interval(
+            int(repair["final_public_successes"]), valid_agent_trials
+        ),
+        "repair_recovery_rate": wilson_interval(
+            int(repair["recovered_repair_eligible_failures"]),
+            int(repair["repair_eligible_initial_failures"]),
+        ),
+    }
+
+
 def infer_paper_issue(
     experiment_metadata: Mapping[str, Any],
     explicit_label: str | None = None,
@@ -873,6 +992,7 @@ ANALYSIS_SIGNATURE_KEYS = (
     "strategy_exclude_regex",
     "strategy_include_functions",
     "strategy_main_included",
+    "clang_extra_args",
 )
 
 
@@ -899,6 +1019,10 @@ def build_analysis_signature(
         "strategy_main_included": bool(
             analysis_configuration["strategy_main_included"]
         ),
+        "clang_extra_args": [
+            str(argument)
+            for argument in analysis_configuration.get("clang_extra_args", [])
+        ],
     }
 
 
@@ -912,6 +1036,58 @@ def paper_row_analysis_signature(row: Mapping[str, Any]) -> dict[str, Any] | Non
         return build_analysis_signature(signature)
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def confirmatory_configuration_status(
+    experiment_metadata: Mapping[str, Any],
+    analysis_configuration: Mapping[str, Any],
+) -> tuple[bool, list[dict[str, Any]]]:
+    """Compare resolved analysis settings with the Git experiment record."""
+    mismatches: list[dict[str, Any]] = []
+
+    def compare(setting: str, metadata_key: str, expected_default: Any = ...) -> None:
+        if metadata_key in experiment_metadata:
+            recorded = experiment_metadata[metadata_key]
+        elif expected_default is not ...:
+            recorded = expected_default
+        else:
+            mismatches.append(
+                {
+                    "setting": setting,
+                    "metadata_key": metadata_key,
+                    "recorded": None,
+                    "resolved": analysis_configuration.get(setting),
+                    "reason": "missing recorded configuration",
+                }
+            )
+            return
+        resolved = analysis_configuration.get(setting)
+        if recorded != resolved:
+            mismatches.append(
+                {
+                    "setting": setting,
+                    "metadata_key": metadata_key,
+                    "recorded": recorded,
+                    "resolved": resolved,
+                }
+            )
+
+    compare("architecture_threshold", "analysis_architecture_threshold")
+    compare("strategy_threshold", "analysis_strategy_threshold")
+    compare("diversity_k_max", "analysis_diversity_k_max")
+    compare(
+        "strategy_exclude_regex",
+        "analysis_strategy_exclude_regex",
+        DEFAULT_STRATEGY_EXCLUDE_REGEX,
+    )
+    compare(
+        "strategy_include_functions",
+        "analysis_strategy_include_functions",
+        [],
+    )
+    compare("strategy_main_included", "analysis_strategy_main_included", True)
+    compare("clang_extra_args", "analysis_clang_extra_args", [])
+    return not mismatches, mismatches
 
 
 def build_paper_metrics_row(
@@ -930,12 +1106,30 @@ def build_paper_metrics_row(
     pass_values = summary.get("pass_at_k", {})
     repair = summary.get("repair", {})
     reliability = summary.get("reliability", {})
+    if summary.get("experiment_format") == "git_experiment":
+        confirmatory_match, confirmatory_mismatches = (
+            confirmatory_configuration_status(
+                experiment_metadata,
+                summary["analysis_configuration"],
+            )
+        )
+    else:
+        confirmatory_match = False
+        confirmatory_mismatches = [
+            {
+                "setting": "experiment_format",
+                "recorded": summary.get("experiment_format"),
+                "resolved": "git_experiment",
+            }
+        ]
     return {
         "_schema_version": PAPER_SCHEMA_VERSION,
         "_analyzer_version": ANALYZER_VERSION,
         "_analysis_signature": build_analysis_signature(
             summary["analysis_configuration"]
         ),
+        "_confirmatory_configuration_match": confirmatory_match,
+        "_confirmatory_configuration_mismatches": confirmatory_mismatches,
         "Issue": infer_paper_issue(experiment_metadata, issue_label),
         "Checkpoint": infer_paper_checkpoint(experiment_metadata, checkpoint_label),
         "Model": experiment_metadata.get("model", summary.get("model")),
@@ -1077,6 +1271,7 @@ def rebuild_paper_metrics_aggregate(repository_root: Path) -> dict[str, Any]:
     experiments_root = repository_root / "runs" / "experiments"
     rows_by_experiment: dict[Path, dict[str, Any]] = {}
     skipped_older_rows = 0
+    skipped_nonconfirmatory_rows = 0
     skipped_configuration_rows = 0
     aggregate_signature: dict[str, Any] | None = None
     if experiments_root.is_dir():
@@ -1105,6 +1300,9 @@ def rebuild_paper_metrics_aggregate(repository_root: Path) -> dict[str, Any]:
             if signature is None:
                 skipped_older_rows += 1
                 continue
+            if row.get("_confirmatory_configuration_match") is not True:
+                skipped_nonconfirmatory_rows += 1
+                continue
             if aggregate_signature is None:
                 aggregate_signature = signature
             elif signature != aggregate_signature:
@@ -1129,6 +1327,7 @@ def rebuild_paper_metrics_aggregate(repository_root: Path) -> dict[str, Any]:
         "analysis_signature": aggregate_signature,
         "included_rows": len(aggregate_rows),
         "skipped_old_rows": skipped_older_rows,
+        "skipped_nonconfirmatory_rows": skipped_nonconfirmatory_rows,
         "skipped_configuration_mismatch_rows": skipped_configuration_rows,
     }
     write_json(
@@ -1139,8 +1338,9 @@ def rebuild_paper_metrics_aggregate(repository_root: Path) -> dict[str, Any]:
         "Repository paper aggregate:\n"
         f"  included {len(aggregate_rows)} schema-v{PAPER_SCHEMA_VERSION} rows\n"
         f"  skipped {skipped_older_rows} older/incompatible rows\n"
+        f"  skipped {skipped_nonconfirmatory_rows} exploratory/nonconfirmatory rows\n"
         "  skipped "
-        f"{skipped_configuration_rows} rows with incompatible analysis configuration"
+        f"{skipped_configuration_rows} rows with incompatible confirmatory configuration"
     )
     return aggregate_metadata
 
@@ -2613,6 +2813,7 @@ def main() -> int:
             "strategy_exclude_regex": args.strategy_exclude_regex,
             "strategy_include_functions": sorted(forced_strategy_functions),
             "strategy_main_included": strategy_main_included,
+            "clang_extra_args": list(args.clang_extra_arg),
         }
     )
 
@@ -3615,26 +3816,9 @@ def main() -> int:
         "stage_success_ratios": stage_success_ratios,
         "repair": repair_summary,
         "uncertainty": {
-            "wilson_95_percent": {
-                "infrastructure_attrition_rate": wilson_interval(
-                    reliability_summary["n_infrastructure_failures"], n
-                ),
-                "end_to_end_success_rate": wilson_interval(successful, n),
-                "conditional_agent_success_rate": wilson_interval(
-                    successful_valid_trials, valid_agent_trials
-                ),
-                "initial_public_success_rate": wilson_interval(
-                    repair_summary["initial_public_successes"], valid_agent_trials
-                ),
-                "final_public_success_rate": wilson_interval(
-                    repair_summary["final_public_successes"], valid_agent_trials
-                ),
-                "repair_recovery_rate": wilson_interval(
-                    repair_summary["recovered_initially_failed_runs"],
-                    valid_agent_trials
-                    - repair_summary["initial_public_successes"],
-                ),
-            },
+            "wilson_95_percent": build_reliability_wilson_intervals(
+                reliability_summary, repair_summary
+            ),
             "diversity_bootstrap": {
                 "architecture": architecture_summaries[architecture_primary_name]["bootstrap_95_percent_ci"],
                 "strategy": strategy_summaries[strategy_primary_name]["bootstrap_95_percent_ci"],

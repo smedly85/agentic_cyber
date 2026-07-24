@@ -1654,6 +1654,8 @@ def test_repair_summary_and_pass_at_k_use_attempts(analyzer):
 
     assert summary["initial_public_success_rate"] == pytest.approx(1 / 3)
     assert summary["final_public_success_rate"] == pytest.approx(2 / 3)
+    assert summary["repair_eligible_initial_failures"] == 2
+    assert summary["recovered_repair_eligible_failures"] == 1
     assert summary["repair_recovery_rate"] == pytest.approx(1 / 2)
     assert summary["mean_repair_loops"] == pytest.approx(5 / 3)
     assert summary["median_repair_loops"] == 2
@@ -1666,6 +1668,207 @@ def test_repair_summary_and_pass_at_k_use_attempts(analyzer):
         2,
     ]
     assert analyzer.pass_at_k(3, 2, 1) == pytest.approx(2 / 3)
+
+
+def test_repair_recovery_uses_only_repair_eligible_failures(analyzer):
+    rows = [
+        analyzer.normalize_repair_metadata(
+            {
+                "initial_success": True,
+                "success_loop": 0,
+                "public_validation_success": True,
+                "overall_success": True,
+                "opencode_exit_code": 0,
+                "loops": [
+                    {
+                        "opencode_exit_code": 0,
+                        "opencode_permission_rejected": False,
+                        "validation_success": True,
+                    }
+                ],
+            }
+        ),
+        analyzer.normalize_repair_metadata(
+            {
+                "initial_success": False,
+                "repair_loops": 1,
+                "success_loop": 1,
+                "public_validation_success": True,
+                "overall_success": True,
+                "opencode_exit_code": 0,
+                "loops": [
+                    {
+                        "opencode_exit_code": 0,
+                        "opencode_permission_rejected": False,
+                        "validation_success": False,
+                    },
+                    {
+                        "opencode_exit_code": 0,
+                        "opencode_permission_rejected": False,
+                        "validation_success": True,
+                    },
+                ],
+            }
+        ),
+        analyzer.normalize_repair_metadata(
+            {
+                "initial_success": False,
+                "repair_loops": 1,
+                "success_loop": None,
+                "public_validation_success": False,
+                "overall_success": False,
+                "opencode_exit_code": 0,
+                "loops": [
+                    {
+                        "opencode_exit_code": 0,
+                        "opencode_permission_rejected": False,
+                        "validation_success": False,
+                    },
+                    {
+                        "opencode_exit_code": 0,
+                        "opencode_permission_rejected": False,
+                        "validation_success": False,
+                    },
+                ],
+            }
+        ),
+        analyzer.normalize_repair_metadata(
+            {
+                "initial_success": False,
+                "public_validation_success": False,
+                "overall_success": False,
+                "opencode_exit_code": 124,
+                "loops": [
+                    {
+                        "opencode_exit_code": 124,
+                        "opencode_permission_rejected": False,
+                        "validation_success": False,
+                    }
+                ],
+            }
+        ),
+    ]
+
+    summary = analyzer.build_repair_summary(rows)
+    reliability = analyzer.build_reliability_summary(rows)
+    intervals = analyzer.build_reliability_wilson_intervals(reliability, summary)
+
+    assert summary["initial_public_success_rate"] == pytest.approx(1 / 4)
+    assert summary["final_public_success_rate"] == pytest.approx(2 / 4)
+    assert summary["repair_eligible_initial_failures"] == 2
+    assert summary["recovered_repair_eligible_failures"] == 1
+    assert summary["repair_ineligible_initial_failures"] == 1
+    assert summary["repair_ineligible_initial_failure_stages"] == {"timeout": 1}
+    assert summary["repair_recovery_rate"] == pytest.approx(1 / 2)
+    assert intervals["repair_recovery_rate"]["estimate"] == pytest.approx(1 / 2)
+    assert intervals["repair_recovery_rate"]["n"] == 2
+    assert analyzer.pass_at_k(4, 2, 1) == pytest.approx(1 / 2)
+
+
+@pytest.mark.parametrize(
+    "failure_metadata, expected_stage",
+    [
+        (
+            {
+                "opencode_exit_code": 0,
+                "opencode_permission_rejected": True,
+                "loops": [
+                    {
+                        "opencode_exit_code": 0,
+                        "opencode_permission_rejected": True,
+                    }
+                ],
+            },
+            "permission_rejection",
+        ),
+        (
+            {
+                "opencode_exit_code": 42,
+                "loops": [
+                    {
+                        "opencode_exit_code": 42,
+                        "opencode_permission_rejected": False,
+                    }
+                ],
+            },
+            "opencode_error",
+        ),
+        (
+            {
+                "setup_exit_code": 1,
+                "infrastructure_failure": True,
+                "infrastructure_failure_stage": "setup",
+            },
+            "infrastructure_failure",
+        ),
+    ],
+)
+def test_agent_and_infrastructure_failures_are_not_repair_eligible(
+    analyzer, failure_metadata: dict, expected_stage: str
+):
+    row = analyzer.normalize_repair_metadata(
+        {
+            "initial_success": False,
+            "public_validation_success": False,
+            "overall_success": False,
+            **failure_metadata,
+        }
+    )
+    summary = analyzer.build_repair_summary([row])
+
+    assert analyzer.initial_agent_invocation_status(row) == expected_stage
+    assert summary["repair_eligible_initial_failures"] == 0
+    assert summary["recovered_repair_eligible_failures"] == 0
+    assert summary["repair_recovery_rate"] is None
+
+
+def test_completed_generation_with_public_failure_is_repair_eligible(analyzer):
+    row = analyzer.normalize_repair_metadata(
+        {
+            "initial_success": False,
+            "public_validation_success": False,
+            "overall_success": False,
+            "opencode_exit_code": 0,
+            "build_exit_code": 1,
+            "loops": [
+                {
+                    "opencode_exit_code": 0,
+                    "opencode_permission_rejected": False,
+                    "build_exit_code": 1,
+                    "validation_success": False,
+                }
+            ],
+        }
+    )
+    summary = analyzer.build_repair_summary([row])
+
+    assert analyzer.initial_agent_invocation_status(row) == "completed"
+    assert summary["repair_eligible_initial_failures"] == 1
+    assert summary["recovered_repair_eligible_failures"] == 0
+    assert summary["repair_recovery_rate"] == 0.0
+
+
+def test_loop_zero_success_is_not_a_repair_recovery(analyzer):
+    row = analyzer.normalize_repair_metadata(
+        {
+            "initial_success": False,
+            "public_validation_success": True,
+            "success_loop": 0,
+            "opencode_exit_code": 0,
+            "loops": [
+                {
+                    "opencode_exit_code": 0,
+                    "opencode_permission_rejected": False,
+                    "validation_success": False,
+                }
+            ],
+        }
+    )
+    summary = analyzer.build_repair_summary([row])
+
+    assert summary["repair_eligible_initial_failures"] == 1
+    assert summary["recovered_repair_eligible_failures"] == 0
+    assert summary["repair_recovery_rate"] == 0.0
 
 
 def test_reliability_denominators_exclude_infrastructure_trials(analyzer):
@@ -1720,7 +1923,7 @@ def test_reliability_denominators_exclude_infrastructure_trials(analyzer):
     ) == pytest.approx(1 / 3)
     assert repair["initial_public_success_rate"] == pytest.approx(1 / 3)
     assert repair["final_public_success_rate"] == pytest.approx(1 / 3)
-    assert repair["repair_recovery_rate"] == 0.0
+    assert repair["repair_recovery_rate"] is None
 
     population = dm.primary_population(
         [
@@ -1805,6 +2008,7 @@ def test_analysis_signature_changes_with_primary_configuration(analyzer):
         "strategy_exclude_regex": analyzer.DEFAULT_STRATEGY_EXCLUDE_REGEX,
         "strategy_include_functions": ["worker"],
         "strategy_main_included": True,
+        "clang_extra_args": [],
     }
     signature = analyzer.build_analysis_signature(base)
     assert signature == analyzer.build_analysis_signature(dict(base))
@@ -1814,6 +2018,7 @@ def test_analysis_signature_changes_with_primary_configuration(analyzer):
     assert signature["strategy_exclude_regex"] == analyzer.DEFAULT_STRATEGY_EXCLUDE_REGEX
     assert signature["strategy_include_functions"] == ["worker"]
     assert signature["strategy_main_included"] is True
+    assert signature["clang_extra_args"] == []
 
     for key, value in (
         ("architecture_threshold", 0.25),
@@ -1824,18 +2029,74 @@ def test_analysis_signature_changes_with_primary_configuration(analyzer):
         changed = {**base, key: value}
         assert analyzer.build_analysis_signature(changed) != signature
 
+    clang_signature = analyzer.build_analysis_signature(
+        {**base, "clang_extra_args": ["-DVALUE=1", "-Iinclude"]}
+    )
+    assert clang_signature["clang_extra_args"] == ["-DVALUE=1", "-Iinclude"]
+    assert clang_signature == analyzer.build_analysis_signature(
+        {**base, "clang_extra_args": ["-DVALUE=1", "-Iinclude"]}
+    )
+    assert clang_signature != analyzer.build_analysis_signature(
+        {**base, "clang_extra_args": ["-Iinclude", "-DVALUE=1"]}
+    )
+
+
+@pytest.mark.parametrize(
+    "setting, value",
+    [
+        ("architecture_threshold", 0.25),
+        ("strategy_threshold", 0.25),
+        ("diversity_k_max", 7),
+        ("strategy_exclude_regex", "^parse"),
+        ("strategy_include_functions", ["worker"]),
+        ("strategy_main_included", False),
+        ("clang_extra_args", ["-DVALUE=1"]),
+    ],
+)
+def test_confirmatory_configuration_matches_recorded_primary_settings(
+    analyzer, setting: str, value: object
+):
+    experiment = {
+        "analysis_architecture_threshold": 0.30,
+        "analysis_strategy_threshold": 0.30,
+        "analysis_diversity_k_max": 10,
+    }
+    configuration = {
+        "architecture_threshold": 0.30,
+        "strategy_threshold": 0.30,
+        "diversity_k_max": 10,
+        "strategy_exclude_regex": analyzer.DEFAULT_STRATEGY_EXCLUDE_REGEX,
+        "strategy_include_functions": [],
+        "strategy_main_included": True,
+        "clang_extra_args": [],
+    }
+
+    matches, mismatches = analyzer.confirmatory_configuration_status(
+        experiment, configuration
+    )
+    assert matches is True
+    assert mismatches == []
+
+    matches, mismatches = analyzer.confirmatory_configuration_status(
+        experiment, {**configuration, setting: value}
+    )
+    assert matches is False
+    assert [mismatch["setting"] for mismatch in mismatches] == [setting]
+
 
 def test_schema_v5_aggregate_skips_v4_rows(analyzer, tmp_path: Path, capsys):
     root = tmp_path / "repository"
-    base_path = root / "runs" / "experiments" / "a-base" / "analysis"
-    match_path = root / "runs" / "experiments" / "b-match" / "analysis"
-    threshold_path = root / "runs" / "experiments" / "c-threshold" / "analysis"
-    k_path = root / "runs" / "experiments" / "d-k" / "analysis"
+    exploratory_path = root / "runs" / "experiments" / "a-exploratory" / "analysis"
+    base_path = root / "runs" / "experiments" / "b-base" / "analysis"
+    match_path = root / "runs" / "experiments" / "c-match" / "analysis"
+    threshold_path = root / "runs" / "experiments" / "d-threshold" / "analysis"
+    k_path = root / "runs" / "experiments" / "e-k" / "analysis"
     old_path = root / "runs" / "experiments" / "z-old" / "analysis"
     old_analyzer_path = (
         root / "runs" / "experiments" / "y-old-analyzer" / "analysis"
     )
     malformed_path = root / "runs" / "experiments" / "malformed" / "analysis"
+    exploratory_path.mkdir(parents=True)
     base_path.mkdir(parents=True)
     match_path.mkdir(parents=True)
     threshold_path.mkdir(parents=True)
@@ -1857,23 +2118,40 @@ def test_schema_v5_aggregate_skips_v4_rows(analyzer, tmp_path: Path, capsys):
             "strategy_exclude_regex": analyzer.DEFAULT_STRATEGY_EXCLUDE_REGEX,
             "strategy_include_functions": [],
             "strategy_main_included": True,
+            "clang_extra_args": [],
         }
     )
 
-    def write_row(path: Path, checkpoint: str, row_signature: dict) -> None:
+    def write_row(
+        path: Path,
+        checkpoint: str,
+        row_signature: dict,
+        *,
+        confirmatory: bool = True,
+    ) -> None:
         (path / "paper_metrics_row.json").write_text(
             json.dumps(
                 {
                     **valid_row,
                     "Checkpoint": checkpoint,
                     "_schema_version": 5,
-                    "_analyzer_version": "4.1.1",
+                    "_analyzer_version": "4.1.2",
                     "_analysis_signature": row_signature,
+                    "_confirmatory_configuration_match": confirmatory,
+                    "_confirmatory_configuration_mismatches": (
+                        [] if confirmatory else [{"setting": "architecture_threshold"}]
+                    ),
                 }
             ),
             encoding="utf-8",
         )
 
+    write_row(
+        exploratory_path,
+        "exploratory",
+        {**signature, "architecture_threshold": 0.25},
+        confirmatory=False,
+    )
     write_row(base_path, "base", signature)
     write_row(match_path, "match", dict(signature))
     write_row(
@@ -1888,8 +2166,9 @@ def test_schema_v5_aggregate_skips_v4_rows(analyzer, tmp_path: Path, capsys):
                 **valid_row,
                 "Checkpoint": "old-analyzer",
                 "_schema_version": 5,
-                "_analyzer_version": "4.1.0",
+                "_analyzer_version": "4.1.1",
                 "_analysis_signature": signature,
+                "_confirmatory_configuration_match": True,
             }
         ),
         encoding="utf-8",
@@ -1899,7 +2178,7 @@ def test_schema_v5_aggregate_skips_v4_rows(analyzer, tmp_path: Path, capsys):
             {
                 **common,
                 "_schema_version": 5,
-                "_analyzer_version": "4.1.1",
+                "_analyzer_version": "4.1.2",
             }
         ),
         encoding="utf-8",
@@ -1920,15 +2199,17 @@ def test_schema_v5_aggregate_skips_v4_rows(analyzer, tmp_path: Path, capsys):
     )
     assert aggregate_metadata["included_rows"] == 2
     assert aggregate_metadata["skipped_old_rows"] == 3
+    assert aggregate_metadata["skipped_nonconfirmatory_rows"] == 1
     assert aggregate_metadata["skipped_configuration_mismatch_rows"] == 2
     assert aggregate_metadata["analysis_signature"] == signature
     output = capsys.readouterr().out
     assert "skipped 3 older/incompatible rows" in output
-    assert "skipped 2 rows with incompatible analysis configuration" in output
+    assert "skipped 1 exploratory/nonconfirmatory rows" in output
+    assert "skipped 2 rows with incompatible confirmatory configuration" in output
 
 
 def test_schema_v5_paper_columns(analyzer):
-    assert analyzer.ANALYZER_VERSION == "4.1.1"
+    assert analyzer.ANALYZER_VERSION == "4.1.2"
     assert analyzer.PAPER_SCHEMA_VERSION == 5
     assert "Exact Unique Rate" not in analyzer.PAPER_METRICS_COLUMNS
     assert "Exact Modal Share" not in analyzer.PAPER_METRICS_COLUMNS
@@ -2084,7 +2365,7 @@ def test_full_analyzer_accepts_mixed_old_and_repair_metadata(tmp_path: Path):
     )
     assert summary["runs_analyzed"] == 2
     assert summary["schema_version"] == 5
-    assert summary["analyzer_version"] == "4.1.1"
+    assert summary["analyzer_version"] == "4.1.2"
     assert summary["analysis_configuration"]["architecture_threshold"] == 0.25
     assert (
         summary["analysis_configuration"]["architecture_threshold_source"]
@@ -2100,6 +2381,7 @@ def test_full_analyzer_accepts_mixed_old_and_repair_metadata(tmp_path: Path):
         summary["analysis_configuration"]["diversity_k_max_source"]
         == "experiment_metadata"
     )
+    assert summary["analysis_configuration"]["clang_extra_args"] == []
     assert summary["pass_at_k"]["pass@1"] == pytest.approx(0.5)
     assert summary["repair"]["initial_public_success_rate"] == pytest.approx(0.5)
     assert summary["repair"]["final_public_success_rate"] == 1.0
@@ -2134,7 +2416,9 @@ def test_full_analyzer_accepts_mixed_old_and_repair_metadata(tmp_path: Path):
         (experiment / "analysis" / "paper_metrics_row.json").read_text()
     )
     assert paper_row["_schema_version"] == 5
-    assert paper_row["_analyzer_version"] == "4.1.1"
+    assert paper_row["_analyzer_version"] == "4.1.2"
+    assert paper_row["_confirmatory_configuration_match"] is True
+    assert paper_row["_confirmatory_configuration_mismatches"] == []
     assert paper_row["_analysis_signature"] == {
         "architecture_threshold": 0.25,
         "strategy_threshold": 0.35,
@@ -2142,6 +2426,7 @@ def test_full_analyzer_accepts_mixed_old_and_repair_metadata(tmp_path: Path):
         "strategy_exclude_regex": load_analyzer().DEFAULT_STRATEGY_EXCLUDE_REGEX,
         "strategy_include_functions": [],
         "strategy_main_included": True,
+        "clang_extra_args": [],
     }
     assert not (experiment / "analysis" / "diagnostics" / "representation_ablation.csv").exists()
 
@@ -2154,6 +2439,8 @@ def test_full_analyzer_accepts_mixed_old_and_repair_metadata(tmp_path: Path):
             "--diagnostic-output",
             "--bootstrap-repetitions",
             "2",
+            "--clang-extra-arg=-DVALUE=1",
+            "--clang-extra-arg=-Irelative/include",
             "--clean-output",
         ],
         text=True,
@@ -2163,6 +2450,23 @@ def test_full_analyzer_accepts_mixed_old_and_repair_metadata(tmp_path: Path):
         check=False,
     )
     assert diagnostic_result.returncode == 0, diagnostic_result.stderr
+    diagnostic_summary = json.loads(
+        (experiment / "analysis" / "summary.json").read_text(encoding="utf-8")
+    )
+    assert diagnostic_summary["analysis_configuration"]["clang_extra_args"] == [
+        "-DVALUE=1",
+        "-Irelative/include",
+    ]
+    diagnostic_paper_row = json.loads(
+        (experiment / "analysis" / "paper_metrics_row.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert diagnostic_paper_row["_analysis_signature"]["clang_extra_args"] == [
+        "-DVALUE=1",
+        "-Irelative/include",
+    ]
+    assert diagnostic_paper_row["_confirmatory_configuration_match"] is False
     with (
         experiment / "analysis" / "diagnostics" / "representation_ablation.csv"
     ).open(newline="", encoding="utf-8") as handle:

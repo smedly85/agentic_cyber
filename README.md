@@ -147,19 +147,31 @@ The analyzer writes schema-v5 results under `<experiment>/analysis/`. The main
 files are `summary.json`, `per_run_metrics.csv`, `paper_metrics.csv`,
 `paper_descriptive_metrics.csv`, diversity family assignments and DF@K curves,
 robustness tables, and uncertainty intervals. It rebuilds the repository-level
-`runs/experiments/paper_metrics.csv` and `paper_metrics.json` only from valid,
-mutually compatible schema-v5 rows. A readable analysis signature covers both
-thresholds, K, strategy scope, and `main` inclusion. Mixed signatures are
-skipped and audited in `paper_metrics_metadata.json`. Historical experiments
-must be re-analyzed with analyzer v4.1.1 before entering the final aggregate.
+`runs/experiments/paper_metrics.csv` and `paper_metrics.json` only from complete
+analyzer-v4.1.2/schema-v5 rows that match each Git experiment's recorded
+confirmatory configuration and are mutually signature-compatible. Explicit CLI
+overrides remain valid for exploratory analysis, but a row that changes the
+recorded thresholds, K, strategy scope, or default Clang arguments cannot enter
+or anchor the confirmatory aggregate. A readable analysis signature covers both
+thresholds, K, strategy scope, `main` inclusion, and ordered Clang extra
+arguments. Old, exploratory/nonconfirmatory, and incompatible confirmatory rows
+are counted separately in `paper_metrics_metadata.json`. Historical experiments
+must be re-analyzed with analyzer v4.1.2 before entering the final aggregate.
 
 One complete generation/repair trajectory is one independent attempt.
 Infrastructure attrition remains visible in end-to-end reliability but is
-excluded from valid-agent denominators for initial/final public success, repair
-recovery, and Pass@k. Agent-execution failures remain in those valid-agent
-denominators: in particular, a timeout is a failed generated sample for Pass@k.
-End-to-end success uses every analyzed attempt. Failed generated implementations
-remain reliability failures but do not enter primary diversity. Repeated byte-identical successful
+excluded from valid-agent denominators for initial/final public success and
+Pass@k. Agent-execution failures remain in those valid-agent denominators: in
+particular, a timeout counts against initial/final agent reliability and is a
+failed generated sample for Pass@k. Repair Recovery Rate instead asks: among
+initial generated implementations that completed generation but failed public
+validation and were therefore eligible for feedback-based repair, what fraction
+were recovered? Initial timeouts, permission rejections, and OpenCode execution
+errors do not enter that repair-efficacy denominator because no repairable
+initial implementation was produced. Completed generations that fail public
+build/base/checkpoint validation are repair eligible. End-to-end success uses
+every analyzed attempt. Failed generated implementations remain reliability
+failures but do not enter primary diversity. Repeated byte-identical successful
 outputs remain separate diversity observations. Architecture means structural
 organization of the configured primary C source, not repository- or system-wide
 architecture; implementation strategy is separate. Primary strategy includes
@@ -238,7 +250,7 @@ agentic_cyber/
 ├── Makefile
 ├── README.md
 ├── docs/
-│   └── diversity_methodology.md          # Canonical v4.1.1/schema-v5 methodology
+│   └── diversity_methodology.md          # Canonical v4.1.2/schema-v5 methodology
 ├── prompts/
 │   ├── checkpoint_base_template.md
 │   ├── checkpoint_feature_template.md

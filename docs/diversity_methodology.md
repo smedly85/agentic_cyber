@@ -1,4 +1,4 @@
-# Canonical v4.1.1 diversity methodology
+# Canonical v4.1.2 diversity methodology
 
 This document defines schema-v5 analysis for repeated, baseline-backed software
 generation experiments. `scripts/analyze_experiment.py` is the sole analysis
@@ -138,11 +138,14 @@ Let `N_attempts` include every analyzed independent attempt,
 `N_valid_agent_trials = N_attempts - N_infrastructure_failures`. The analyzer
 reports infrastructure attrition and end-to-end success over all attempts, and
 conditional agent success over valid trials. Initial-public and final-public
-success also use valid trials. Repair recovery divides recovered initial
-failures by valid initially failed trials. Build, public-test, and hidden/extra-
-evaluator failures after a valid invocation are candidate/workflow failures,
-not infrastructure failures. Overall success additionally requires the optional
-extra test, when configured.
+success also use valid trials. Repair Recovery Rate asks: among initial generated
+implementations that completed generation but failed public validation and were
+therefore eligible for feedback-based repair, what fraction were recovered?
+Its denominator excludes setup attrition and initial agent-execution failures.
+Build, public-test, and hidden/extra-evaluator failures after a completed initial
+invocation are candidate/workflow failures; public build/base/checkpoint failure
+is repair eligible. Overall success additionally requires the optional extra
+test, when configured.
 
 The failure taxonomy is deliberately conservative:
 
@@ -156,10 +159,13 @@ The failure taxonomy is deliberately conservative:
 
 The analyzer does not infer provider or network outages from arbitrary error
 text. Agent-execution failures remain in conditional-agent, initial/final
-public-success, repair, and Pass@k denominators. Exit 124 is classified as an
-agent timeout and contributes a failed generated sample. Infrastructure
-attrition is excluded from generated-sample denominators, while end-to-end
-success still uses every analyzed attempt.
+public-success, and Pass@k denominators. Exit 124 is classified as an agent
+timeout and contributes a failed generated sample to those reliability
+outcomes, but it is not repair eligible because no completed initial
+implementation was produced. Initial permission rejection and nonzero OpenCode
+execution failure are excluded from the repair-efficacy denominator for the
+same reason. Infrastructure attrition is excluded from generated-sample
+denominators, while end-to-end success still uses every analyzed attempt.
 
 Following Chen et al. (2021), Pass@k uses `n = N_valid_agent_trials` and `c`
 equal to successful valid trials:
@@ -185,7 +191,7 @@ structural organization** of the complete primary C source file. It does not
 measure repository-wide, module, or system architecture. Other changed files
 remain visible through descriptive patch metrics but do not enter the
 structural vector.
-For each candidate, v4.1.1 constructs three non-duplicated feature blocks:
+For each candidate, v4.1.2 constructs three non-duplicated feature blocks:
 
 1. Clang AST count deltas for source-file and function contexts.
 2. Tree-sitter C node-kind and call-count deltas for source-file and function
@@ -229,7 +235,7 @@ as for architecture. GumTree actions are omitted because they are whole-patch
 rather than reliably function-scoped. This representation operationalizes
 implementation decisions without claiming that every discovered family is a
 named or classical algorithm. Lee et al. (2025) motivates measuring diversity
-beyond correctness; v4.1.1 uses a broader, explicitly structural strategy
+beyond correctness; v4.1.2 uses a broader, explicitly structural strategy
 construct suitable for maintenance patches.
 
 ## Fixed clustering thresholds
@@ -248,9 +254,14 @@ preregistration before all pilot inspection. There is no condition-specific
 optimization, silhouette maximization, or post-hoc replacement of the
 configured cut. `summary.json` records every resolved value and whether it came
 from CLI, experiment metadata, an analyzer default, or the architecture cut.
+CLI overrides remain valid for exploratory or sensitivity analysis. A Git
+paper row is confirmatory only when its thresholds, K, strategy scope, and
+Clang arguments match the configuration recorded with that experiment; an
+override that changes those settings cannot enter or anchor the repository
+confirmatory aggregate.
 
 Threshold sensitivity is robustness analysis only. Unless `--thresholds`
-provides an exact comma-separated positive grid, v4.1.1 evaluates positive members
+provides an exact comma-separated positive grid, v4.1.2 evaluates positive members
 of `t + {-0.10, -0.05, -0.025, 0, 0.025, 0.05, 0.10}` around each primary cut.
 For every cut it reports raw and effective family counts, dominant share,
 singleton rate, silhouette when `2 <= families < N`, and ARI against the
@@ -304,7 +315,7 @@ fixed `K` supported by every compared architecture and strategy population.
 Exact convergence is calculated over successful candidates. Complete SHA-256
 coverage is required; otherwise the rates are null and hash coverage plus the
 reason are reported rather than silently shrinking the population. For
-population size `N_s`, v4.1.1 reports:
+population size `N_s`, v4.1.2 reports:
 
 ```text
 exact unique rate = distinct SHA-256 hashes / N_s
@@ -328,7 +339,7 @@ assignments and are not alternative correctness measures.
 
 ### Vendi score
 
-For normalized structural feature matrix `X`, v4.1.1 augments only the Vendi
+For normalized structural feature matrix `X`, v4.1.2 augments only the Vendi
 representation. A nonzero row becomes `[x, 0]`, while a zero row becomes a new
 unit basis vector `[0, ..., 0, 1]`. Thus zero-zero similarity is one,
 zero-nonzero similarity is zero, every diagonal is one, nonzero similarities
@@ -479,12 +490,16 @@ Mean Normalized GumTree Edit-Action Magnitude
 
 `paper_metrics_row.json` records `_schema_version`, `_analyzer_version`, and a
 readable `_analysis_signature`. The signature contains architecture and strategy
-thresholds, fixed K, the strategy exclusion regex, sorted forced includes, and
-whether `main` is included. Repository-level aggregation includes only current
-schema-v5/analyzer-v4.1.1 rows sharing the first accepted row's exact signature.
-Older/incompatible rows and configuration mismatches are counted separately.
+thresholds, fixed K, the strategy exclusion regex, sorted forced includes,
+whether `main` is included, and Clang extra arguments in supplied order. Because
+argument order is preserved and treated as significant, differently ordered
+Clang arguments are different signatures. Repository-level aggregation includes
+only current schema-v5/analyzer-v4.1.2 complete rows that individually match
+their owning Git experiment's recorded configuration and share the first such
+row's exact signature. Older/incompatible, exploratory/nonconfirmatory, and
+incompatible-confirmatory-configuration rows are counted separately.
 `runs/experiments/paper_metrics_metadata.json` records the accepted signature
-and all three row counts. Historical analyses must be rerun with analyzer v4.1.1
+and all four row counts. Historical analyses must be rerun with analyzer v4.1.2
 before inclusion; historical analysis directories are not rewritten
 automatically.
 
@@ -519,9 +534,11 @@ unset K stays unset.
 
 Manual reanalysis uses CLI > recorded experiment metadata > analyzer default
 for architecture threshold, strategy threshold, and K. Omitting those CLI
-arguments reproduces the stored Git experiment configuration. Repository-level
-confirmatory aggregation rejects rows with mixed thresholds, K, or strategy
-scope rather than silently pooling them.
+arguments reproduces the stored Git experiment configuration. Exploratory CLI
+overrides are allowed, but rows that change the recorded primary settings are
+excluded from repository-level confirmatory aggregation. Among individually
+confirmatory rows, mixed thresholds, K, strategy scope, or Clang arguments are
+rejected rather than silently pooled.
 
 Optional diagnostics and controlled overrides are:
 
@@ -532,7 +549,8 @@ Optional diagnostics and controlled overrides are:
 - `--thresholds`: exact sensitivity cuts; never changes the primary cut.
 - `--strategy-exclude-regex` and repeatable `--strategy-include-function`:
   pre-specified strategy scope adjustments.
-- Repeatable `--clang-extra-arg`: compilation-context arguments for parsing.
+- Repeatable `--clang-extra-arg`: compilation-context arguments for parsing;
+  supplied order is preserved in the reproducibility signature.
 - `--paper-issue-label` and `--paper-checkpoint-label`: reporting labels only.
 - `--output-dir`: alternate output location; default is
   `<experiment>/analysis`.
