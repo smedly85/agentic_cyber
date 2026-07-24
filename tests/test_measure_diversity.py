@@ -305,6 +305,76 @@ class CanonicalAnalysisUnitTests(unittest.TestCase):
         distance = dm.cosine_distance_matrix(matrix)
         self.assertGreater(distance[0, 1], 0.0)
 
+    def test_new_source_main_identity_is_not_helper_canonicalized(self):
+        module = load_analyzer()
+        regex = module.re.compile(module.DEFAULT_STRATEGY_EXCLUDE_REGEX, module.re.I)
+
+        def function(name: str, start: int) -> object:
+            return module.FunctionInfo(name, 1, 1, start, start + 1, name, ())
+
+        candidate_helper_first = {
+            "worker_alpha": function("worker_alpha", 0),
+            "main": function("main", 100),
+            "parse_args": function("parse_args", 200),
+        }
+        candidate_main_first = {
+            "main": function("main", 0),
+            "worker_beta": function("worker_beta", 100),
+            "parse_options": function("parse_options", 200),
+        }
+        first_architecture, first_strategy = module.created_function_mapping(
+            {}, candidate_helper_first, regex, set()
+        )
+        second_architecture, second_strategy = module.created_function_mapping(
+            {}, candidate_main_first, regex, set()
+        )
+
+        self.assertEqual(first_architecture["main"], "main")
+        self.assertEqual(first_strategy["main"], "main")
+        self.assertEqual(second_architecture["main"], "main")
+        self.assertEqual(second_strategy["main"], "main")
+        self.assertEqual(
+            first_architecture["worker_alpha"], "created_behavior_helper_1"
+        )
+        self.assertEqual(
+            second_architecture["worker_beta"], "created_behavior_helper_1"
+        )
+        self.assertEqual(
+            first_architecture["parse_args"], "created_parser_helper_1"
+        )
+        self.assertEqual(
+            second_architecture["parse_options"], "created_parser_helper_1"
+        )
+
+        raw_delta = {
+            "function.main.kind.CompoundStmt": 1.0,
+            "function.worker_alpha.kind.ReturnStmt": 1.0,
+        }
+        _, created_behavior, _ = module.strategy_function_names(
+            {}, candidate_helper_first, regex, set()
+        )
+        included = module.filter_strategy_delta(
+            raw_delta, created_behavior, first_strategy
+        )
+        self.assertIn("function.main.kind.CompoundStmt", included)
+
+        exclude_main = module.re.compile(r"^main$", module.re.I)
+        main_excluded_architecture, main_excluded_strategy = (
+            module.created_function_mapping(
+                {}, candidate_helper_first, exclude_main, set()
+            )
+        )
+        _, created_without_main, _ = module.strategy_function_names(
+            {}, candidate_helper_first, exclude_main, set()
+        )
+        excluded = module.filter_strategy_delta(
+            raw_delta, created_without_main, main_excluded_strategy
+        )
+        self.assertEqual(main_excluded_architecture["main"], "main")
+        self.assertEqual(main_excluded_strategy["main"], "main")
+        self.assertNotIn("function.main.kind.CompoundStmt", excluded)
+        self.assertIn("function.created_behavior_helper_1.kind.ReturnStmt", excluded)
+
     def test_distance_and_clustering_have_one_canonical_implementation(self):
         tree = ast.parse(ANALYZER.read_text(encoding="utf-8"))
         local_functions = {
@@ -313,6 +383,8 @@ class CanonicalAnalysisUnitTests(unittest.TestCase):
         self.assertNotIn("cosine_distance_matrix", local_functions)
         self.assertNotIn("agglomerative_labels", local_functions)
         analyzer_text = ANALYZER.read_text(encoding="utf-8")
+        self.assertNotIn("AgglomerativeClustering", analyzer_text)
+        self.assertNotIn("silhouette_score", analyzer_text)
         self.assertIn(
             "diversity_metrics.cosine_distance_matrix(\n        architecture_matrix",
             analyzer_text,
@@ -901,10 +973,12 @@ else:
 source.parent.mkdir(parents=True, exist_ok=True)
 source.write_text(value + "\\n")
 print(json.dumps({"total_tokens": invocation + 10}))
-if scenario == "infrastructure-failure":
+if scenario in {"agent-error", "infrastructure-failure"}:
     raise SystemExit(42)
+if scenario == "timeout":
+    raise SystemExit(124)
 if scenario == "permission":
-    print("permission denied")
+    print("permission requested: external_directory")
 """,
         encoding="utf-8",
     )
@@ -1088,10 +1162,10 @@ def test_repair_budget_exhaustion_is_recorded(tmp_path: Path):
     assert len(metadata["loops"]) == 3
 
 
-def test_infrastructure_failure_does_not_trigger_or_exhaust_repairs(tmp_path: Path):
+def test_opencode_error_is_failed_valid_agent_trial(tmp_path: Path):
     output, result, invocations, _ = run_experiment(
         tmp_path,
-        scenario="infrastructure-failure",
+        scenario="agent-error",
         max_loops=3,
     )
 
@@ -1104,11 +1178,34 @@ def test_infrastructure_failure_does_not_trigger_or_exhaust_repairs(tmp_path: Pa
     assert metadata["repair_loops"] == 0
     assert metadata["loop_limit_reached"] is False
     assert metadata["overall_success"] is False
-    assert metadata["infrastructure_failure"] is True
-    assert metadata["infrastructure_failure_stage"] == "opencode"
+    assert metadata["infrastructure_failure"] is False
+    assert metadata["infrastructure_failure_stage"] is None
+    assert metadata["agent_execution_failure"] is True
+    assert metadata["agent_execution_failure_stage"] == "opencode"
 
 
-def test_permission_rejection_is_infrastructure_failure(tmp_path: Path):
+def test_timeout_is_failed_valid_agent_trial(tmp_path: Path):
+    output, result, invocations, _ = run_experiment(
+        tmp_path,
+        scenario="timeout",
+        max_loops=3,
+    )
+    assert result.returncode == 0, result.stderr
+    metadata = json.loads(
+        (output / "attempt-001" / "metadata.json").read_text(encoding="utf-8")
+    )
+    assert invocations == 1
+    assert metadata["opencode_exit_code"] == 124
+    assert metadata["infrastructure_failure"] is False
+    assert metadata["agent_execution_failure"] is True
+    assert metadata["agent_execution_failure_stage"] == "timeout"
+    assert metadata["loop_limit_reached"] is False
+    assert metadata["initial_success"] is False
+    assert metadata["public_validation_success"] is False
+    assert metadata["overall_success"] is False
+
+
+def test_permission_rejection_is_agent_execution_failure(tmp_path: Path):
     output, result, invocations, _ = run_experiment(
         tmp_path,
         scenario="permission",
@@ -1119,9 +1216,14 @@ def test_permission_rejection_is_infrastructure_failure(tmp_path: Path):
         (output / "attempt-001" / "metadata.json").read_text(encoding="utf-8")
     )
     assert invocations == 1
-    assert metadata["infrastructure_failure"] is True
-    assert metadata["infrastructure_failure_stage"] == "permission"
+    assert metadata["infrastructure_failure"] is False
+    assert metadata["infrastructure_failure_stage"] is None
+    assert metadata["agent_execution_failure"] is True
+    assert metadata["agent_execution_failure_stage"] == "permission"
     assert metadata["loop_limit_reached"] is False
+    assert metadata["initial_success"] is False
+    assert metadata["public_validation_success"] is False
+    assert metadata["overall_success"] is False
 
 
 def test_candidate_validation_failures_are_not_infrastructure(tmp_path: Path):
@@ -1136,6 +1238,7 @@ def test_candidate_validation_failures_are_not_infrastructure(tmp_path: Path):
     )
     assert build_metadata["build_exit_code"] != 0
     assert build_metadata["infrastructure_failure"] is False
+    assert build_metadata["agent_execution_failure"] is False
 
     public_output, result, _, _ = run_experiment(
         tmp_path / "public",
@@ -1149,6 +1252,7 @@ def test_candidate_validation_failures_are_not_infrastructure(tmp_path: Path):
     )
     assert public_metadata["base_test_exit_code"] != 0
     assert public_metadata["infrastructure_failure"] is False
+    assert public_metadata["agent_execution_failure"] is False
 
     hidden_output, result, _, _ = run_experiment(
         tmp_path / "hidden",
@@ -1162,6 +1266,7 @@ def test_candidate_validation_failures_are_not_infrastructure(tmp_path: Path):
     )
     assert hidden_metadata["extra_test_exit_code"] != 0
     assert hidden_metadata["infrastructure_failure"] is False
+    assert hidden_metadata["agent_execution_failure"] is False
 
 
 def test_runner_existing_and_new_source_modes(tmp_path: Path):
@@ -1422,28 +1527,87 @@ def test_analyzer_normalizes_old_and_new_metadata(analyzer):
     assert new["success_loop"] == 2
 
     old_setup_failure = analyzer.normalize_repair_metadata(
-        {"setup_exit_code": 1, "overall_success": False}
+        {
+            "setup_exit_code": 1,
+            "public_validation_success": True,
+            "overall_success": True,
+        }
     )
     assert old_setup_failure["llm_invocations"] == 0
     assert old_setup_failure["loop_limit_reached"] is False
     assert old_setup_failure["infrastructure_failure"] is True
     assert old_setup_failure["infrastructure_failure_stage"] == "setup"
     assert old_setup_failure["infrastructure_failure_classification_inferred"] is True
+    assert old_setup_failure["agent_execution_failure"] is False
+    assert old_setup_failure["public_validation_success"] is False
+    assert old_setup_failure["overall_success"] is False
+    new_setup_failure = analyzer.normalize_repair_metadata(
+        {
+            "setup_exit_code": 1,
+            "overall_success": False,
+            "infrastructure_failure": True,
+            "infrastructure_failure_stage": "setup",
+            "infrastructure_failure_classification_inferred": False,
+            "agent_execution_failure": False,
+            "agent_execution_failure_stage": None,
+            "agent_execution_failure_classification_inferred": False,
+        }
+    )
+    assert new_setup_failure["infrastructure_failure"] is True
+    assert new_setup_failure["agent_execution_failure"] is False
+    assert new_setup_failure["llm_invocations"] == 0
 
     old_opencode_failure = analyzer.normalize_repair_metadata(
-        {"opencode_exit_code": 42, "overall_success": False}
+        {
+            "opencode_exit_code": 42,
+            "overall_success": False,
+            "infrastructure_failure": True,
+            "infrastructure_failure_stage": "opencode",
+        }
     )
-    assert old_opencode_failure["infrastructure_failure"] is True
-    assert old_opencode_failure["infrastructure_failure_stage"] == "opencode"
+    assert old_opencode_failure["infrastructure_failure"] is False
+    assert old_opencode_failure["infrastructure_failure_stage"] is None
+    assert old_opencode_failure["agent_execution_failure"] is True
+    assert old_opencode_failure["agent_execution_failure_stage"] == "opencode"
+    assert old_opencode_failure["agent_execution_failure_classification_inferred"] is True
+    old_timeout = analyzer.normalize_repair_metadata(
+        {"opencode_exit_code": 124, "overall_success": False}
+    )
+    assert old_timeout["infrastructure_failure"] is False
+    assert old_timeout["agent_execution_failure"] is True
+    assert old_timeout["agent_execution_failure_stage"] == "timeout"
     old_permission_failure = analyzer.normalize_repair_metadata(
         {
             "opencode_exit_code": 0,
             "opencode_permission_rejected": True,
             "overall_success": False,
+            "infrastructure_failure": True,
+            "infrastructure_failure_stage": "permission",
         }
     )
-    assert old_permission_failure["infrastructure_failure"] is True
-    assert old_permission_failure["infrastructure_failure_stage"] == "permission"
+    assert old_permission_failure["infrastructure_failure"] is False
+    assert old_permission_failure["agent_execution_failure"] is True
+    assert old_permission_failure["agent_execution_failure_stage"] == "permission"
+    contradictory_timeout = analyzer.normalize_repair_metadata(
+        {
+            "opencode_exit_code": 124,
+            "infrastructure_failure": True,
+            "infrastructure_failure_stage": "opencode",
+            "agent_execution_failure": False,
+            "agent_execution_failure_stage": None,
+            "public_validation_success": True,
+            "overall_success": True,
+        }
+    )
+    assert contradictory_timeout["infrastructure_failure"] is False
+    assert contradictory_timeout["agent_execution_failure"] is True
+    assert contradictory_timeout["agent_execution_failure_stage"] == "timeout"
+    assert contradictory_timeout["public_validation_success"] is False
+    assert contradictory_timeout["overall_success"] is False
+    assert (
+        contradictory_timeout["agent_execution_failure_classification_inferred"]
+        is True
+    )
     for candidate_failure in (
         {"opencode_exit_code": 0, "build_exit_code": 1},
         {"opencode_exit_code": 0, "base_test_exit_code": 1},
@@ -1524,6 +1688,14 @@ def test_reliability_denominators_exclude_infrastructure_trials(analyzer):
         ),
         analyzer.normalize_repair_metadata(
             {
+                "opencode_exit_code": 124,
+                "initial_success": False,
+                "public_validation_success": False,
+                "overall_success": False,
+            }
+        ),
+        analyzer.normalize_repair_metadata(
+            {
                 "setup_exit_code": 1,
                 "overall_success": False,
                 "infrastructure_failure": True,
@@ -1533,29 +1705,143 @@ def test_reliability_denominators_exclude_infrastructure_trials(analyzer):
     ]
     reliability = analyzer.build_reliability_summary(rows)
     repair = analyzer.build_repair_summary(rows)
-    assert reliability["n_attempts"] == 3
-    assert reliability["n_valid_agent_trials"] == 2
+    assert reliability["n_attempts"] == 4
+    assert reliability["n_valid_agent_trials"] == 3
     assert reliability["n_infrastructure_failures"] == 1
-    assert reliability["infrastructure_attrition_rate"] == pytest.approx(1 / 3)
-    assert reliability["end_to_end_success_rate"] == pytest.approx(1 / 3)
-    assert reliability["conditional_agent_success_rate"] == pytest.approx(1 / 2)
+    assert reliability["n_agent_execution_failures"] == 1
+    assert reliability["agent_execution_failure_stages"] == {"timeout": 1}
+    assert reliability["infrastructure_attrition_rate"] == pytest.approx(1 / 4)
+    assert reliability["end_to_end_success_rate"] == pytest.approx(1 / 4)
+    assert reliability["conditional_agent_success_rate"] == pytest.approx(1 / 3)
     assert analyzer.pass_at_k(
         reliability["n_valid_agent_trials"],
         reliability["successful_valid_agent_trials"],
         1,
-    ) == pytest.approx(1 / 2)
-    assert repair["initial_public_success_rate"] == pytest.approx(1 / 2)
-    assert repair["final_public_success_rate"] == pytest.approx(1 / 2)
+    ) == pytest.approx(1 / 3)
+    assert repair["initial_public_success_rate"] == pytest.approx(1 / 3)
+    assert repair["final_public_success_rate"] == pytest.approx(1 / 3)
     assert repair["repair_recovery_rate"] == 0.0
+
+    population = dm.primary_population(
+        [
+            {"run_id": "success", "overall_success": True, "complete": True},
+            {"run_id": "timeout", "overall_success": False, "complete": True},
+        ],
+        "complete",
+    )
+    assert population["run_ids"] == ["success"]
+
+
+def test_analysis_configuration_precedence(analyzer):
+    metadata = {
+        "analysis_architecture_threshold": 0.25,
+        "analysis_strategy_threshold": 0.35,
+        "analysis_diversity_k_max": 5,
+    }
+
+    inherited = analyzer.resolve_analysis_configuration(
+        cli_architecture_threshold=None,
+        cli_strategy_threshold=None,
+        cli_diversity_k_max=None,
+        experiment_metadata=metadata,
+        inherit_experiment_metadata=True,
+    )
+    assert inherited == {
+        "architecture_threshold": 0.25,
+        "architecture_threshold_source": "experiment_metadata",
+        "strategy_threshold": 0.35,
+        "strategy_threshold_source": "experiment_metadata",
+        "diversity_k_max": 5,
+        "diversity_k_max_source": "experiment_metadata",
+    }
+
+    cli = analyzer.resolve_analysis_configuration(
+        cli_architecture_threshold=0.20,
+        cli_strategy_threshold=0.40,
+        cli_diversity_k_max=7,
+        experiment_metadata=metadata,
+        inherit_experiment_metadata=True,
+    )
+    assert cli["architecture_threshold"] == 0.20
+    assert cli["architecture_threshold_source"] == "cli"
+    assert cli["strategy_threshold"] == 0.40
+    assert cli["strategy_threshold_source"] == "cli"
+    assert cli["diversity_k_max"] == 7
+    assert cli["diversity_k_max_source"] == "cli"
+
+    defaults = analyzer.resolve_analysis_configuration(
+        cli_architecture_threshold=None,
+        cli_strategy_threshold=None,
+        cli_diversity_k_max=None,
+        experiment_metadata={},
+        inherit_experiment_metadata=True,
+    )
+    assert defaults["architecture_threshold"] == 0.30
+    assert defaults["architecture_threshold_source"] == "default"
+    assert defaults["strategy_threshold"] == 0.30
+    assert defaults["strategy_threshold_source"] == "architecture_threshold"
+    assert defaults["diversity_k_max"] is None
+    assert defaults["diversity_k_max_source"] == "default"
+
+    architecture_fallback = analyzer.resolve_analysis_configuration(
+        cli_architecture_threshold=0.27,
+        cli_strategy_threshold=None,
+        cli_diversity_k_max=None,
+        experiment_metadata={},
+        inherit_experiment_metadata=True,
+    )
+    assert architecture_fallback["strategy_threshold"] == 0.27
+    assert (
+        architecture_fallback["strategy_threshold_source"]
+        == "architecture_threshold"
+    )
+
+
+def test_analysis_signature_changes_with_primary_configuration(analyzer):
+    base = {
+        "architecture_threshold": 0.30,
+        "strategy_threshold": 0.35,
+        "diversity_k_max": 10,
+        "strategy_exclude_regex": analyzer.DEFAULT_STRATEGY_EXCLUDE_REGEX,
+        "strategy_include_functions": ["worker"],
+        "strategy_main_included": True,
+    }
+    signature = analyzer.build_analysis_signature(base)
+    assert signature == analyzer.build_analysis_signature(dict(base))
+    assert signature["architecture_threshold"] == 0.30
+    assert signature["strategy_threshold"] == 0.35
+    assert signature["diversity_k_max"] == 10
+    assert signature["strategy_exclude_regex"] == analyzer.DEFAULT_STRATEGY_EXCLUDE_REGEX
+    assert signature["strategy_include_functions"] == ["worker"]
+    assert signature["strategy_main_included"] is True
+
+    for key, value in (
+        ("architecture_threshold", 0.25),
+        ("strategy_threshold", 0.40),
+        ("diversity_k_max", 20),
+        ("strategy_exclude_regex", "^parse"),
+    ):
+        changed = {**base, key: value}
+        assert analyzer.build_analysis_signature(changed) != signature
 
 
 def test_schema_v5_aggregate_skips_v4_rows(analyzer, tmp_path: Path, capsys):
     root = tmp_path / "repository"
-    old_path = root / "runs" / "experiments" / "old" / "analysis"
-    new_path = root / "runs" / "experiments" / "new" / "analysis"
+    base_path = root / "runs" / "experiments" / "a-base" / "analysis"
+    match_path = root / "runs" / "experiments" / "b-match" / "analysis"
+    threshold_path = root / "runs" / "experiments" / "c-threshold" / "analysis"
+    k_path = root / "runs" / "experiments" / "d-k" / "analysis"
+    old_path = root / "runs" / "experiments" / "z-old" / "analysis"
+    old_analyzer_path = (
+        root / "runs" / "experiments" / "y-old-analyzer" / "analysis"
+    )
     malformed_path = root / "runs" / "experiments" / "malformed" / "analysis"
+    base_path.mkdir(parents=True)
+    match_path.mkdir(parents=True)
+    threshold_path.mkdir(parents=True)
+    k_path.mkdir(parents=True)
     old_path.mkdir(parents=True)
-    new_path.mkdir(parents=True)
+    old_analyzer_path.mkdir(parents=True)
     malformed_path.mkdir(parents=True)
     common = {"Issue": "sort", "Checkpoint": "base", "Model": "m", "Temp": 0}
     (old_path / "paper_metrics_row.json").write_text(
@@ -1563,13 +1849,47 @@ def test_schema_v5_aggregate_skips_v4_rows(analyzer, tmp_path: Path, capsys):
     )
     valid_row = {column: None for column in analyzer.PAPER_METRICS_COLUMNS}
     valid_row.update(common)
-    (new_path / "paper_metrics_row.json").write_text(
+    signature = analyzer.build_analysis_signature(
+        {
+            "architecture_threshold": 0.30,
+            "strategy_threshold": 0.35,
+            "diversity_k_max": 10,
+            "strategy_exclude_regex": analyzer.DEFAULT_STRATEGY_EXCLUDE_REGEX,
+            "strategy_include_functions": [],
+            "strategy_main_included": True,
+        }
+    )
+
+    def write_row(path: Path, checkpoint: str, row_signature: dict) -> None:
+        (path / "paper_metrics_row.json").write_text(
+            json.dumps(
+                {
+                    **valid_row,
+                    "Checkpoint": checkpoint,
+                    "_schema_version": 5,
+                    "_analyzer_version": "4.1.1",
+                    "_analysis_signature": row_signature,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    write_row(base_path, "base", signature)
+    write_row(match_path, "match", dict(signature))
+    write_row(
+        threshold_path,
+        "threshold",
+        {**signature, "architecture_threshold": 0.25},
+    )
+    write_row(k_path, "k", {**signature, "diversity_k_max": 20})
+    (old_analyzer_path / "paper_metrics_row.json").write_text(
         json.dumps(
             {
                 **valid_row,
-                "Checkpoint": "new",
+                "Checkpoint": "old-analyzer",
                 "_schema_version": 5,
                 "_analyzer_version": "4.1.0",
+                "_analysis_signature": signature,
             }
         ),
         encoding="utf-8",
@@ -1579,23 +1899,36 @@ def test_schema_v5_aggregate_skips_v4_rows(analyzer, tmp_path: Path, capsys):
             {
                 **common,
                 "_schema_version": 5,
-                "_analyzer_version": "4.1.0",
+                "_analyzer_version": "4.1.1",
             }
         ),
         encoding="utf-8",
     )
-    skipped = analyzer.rebuild_paper_metrics_aggregate(root)
+    aggregate_metadata = analyzer.rebuild_paper_metrics_aggregate(root)
     aggregate = json.loads(
         (root / "runs" / "experiments" / "paper_metrics.json").read_text()
     )
-    assert skipped == 2
-    assert len(aggregate) == 1
-    assert aggregate[0]["Checkpoint"] == "new"
-    assert "skipped 2" in capsys.readouterr().out
+    assert len(aggregate) == 2
+    assert {row["Checkpoint"] for row in aggregate} == {"base", "match"}
+    assert aggregate_metadata == json.loads(
+        (
+            root
+            / "runs"
+            / "experiments"
+            / "paper_metrics_metadata.json"
+        ).read_text()
+    )
+    assert aggregate_metadata["included_rows"] == 2
+    assert aggregate_metadata["skipped_old_rows"] == 3
+    assert aggregate_metadata["skipped_configuration_mismatch_rows"] == 2
+    assert aggregate_metadata["analysis_signature"] == signature
+    output = capsys.readouterr().out
+    assert "skipped 3 older/incompatible rows" in output
+    assert "skipped 2 rows with incompatible analysis configuration" in output
 
 
 def test_schema_v5_paper_columns(analyzer):
-    assert analyzer.ANALYZER_VERSION == "4.1.0"
+    assert analyzer.ANALYZER_VERSION == "4.1.1"
     assert analyzer.PAPER_SCHEMA_VERSION == 5
     assert "Exact Unique Rate" not in analyzer.PAPER_METRICS_COLUMNS
     assert "Exact Modal Share" not in analyzer.PAPER_METRICS_COLUMNS
@@ -1672,6 +2005,9 @@ def test_full_analyzer_accepts_mixed_old_and_repair_metadata(tmp_path: Path):
                 "model": "fake/model",
                 "temperature": 0,
                 "max_loops": 3,
+                "analysis_architecture_threshold": 0.25,
+                "analysis_strategy_threshold": 0.35,
+                "analysis_diversity_k_max": 5,
             }
         ),
         encoding="utf-8",
@@ -1748,7 +2084,22 @@ def test_full_analyzer_accepts_mixed_old_and_repair_metadata(tmp_path: Path):
     )
     assert summary["runs_analyzed"] == 2
     assert summary["schema_version"] == 5
-    assert summary["analyzer_version"] == "4.1.0"
+    assert summary["analyzer_version"] == "4.1.1"
+    assert summary["analysis_configuration"]["architecture_threshold"] == 0.25
+    assert (
+        summary["analysis_configuration"]["architecture_threshold_source"]
+        == "experiment_metadata"
+    )
+    assert summary["analysis_configuration"]["strategy_threshold"] == 0.35
+    assert (
+        summary["analysis_configuration"]["strategy_threshold_source"]
+        == "experiment_metadata"
+    )
+    assert summary["analysis_configuration"]["diversity_k_max"] == 5
+    assert (
+        summary["analysis_configuration"]["diversity_k_max_source"]
+        == "experiment_metadata"
+    )
     assert summary["pass_at_k"]["pass@1"] == pytest.approx(0.5)
     assert summary["repair"]["initial_public_success_rate"] == pytest.approx(0.5)
     assert summary["repair"]["final_public_success_rate"] == 1.0
@@ -1783,7 +2134,15 @@ def test_full_analyzer_accepts_mixed_old_and_repair_metadata(tmp_path: Path):
         (experiment / "analysis" / "paper_metrics_row.json").read_text()
     )
     assert paper_row["_schema_version"] == 5
-    assert paper_row["_analyzer_version"] == "4.1.0"
+    assert paper_row["_analyzer_version"] == "4.1.1"
+    assert paper_row["_analysis_signature"] == {
+        "architecture_threshold": 0.25,
+        "strategy_threshold": 0.35,
+        "diversity_k_max": 5,
+        "strategy_exclude_regex": load_analyzer().DEFAULT_STRATEGY_EXCLUDE_REGEX,
+        "strategy_include_functions": [],
+        "strategy_main_included": True,
+    }
     assert not (experiment / "analysis" / "diagnostics" / "representation_ablation.csv").exists()
 
     diagnostic_result = subprocess.run(

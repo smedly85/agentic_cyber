@@ -1,4 +1,4 @@
-# Canonical v4.1 diversity methodology
+# Canonical v4.1.1 diversity methodology
 
 This document defines schema-v5 analysis for repeated, baseline-backed software
 generation experiments. `scripts/analyze_experiment.py` is the sole analysis
@@ -24,8 +24,7 @@ from being presented as confirmatory outcomes.
 1. **Functional reliability.** Infrastructure attrition, end-to-end and
    conditional-agent success, initial-public and final-public success, repair
    recovery, and the unbiased pass@k estimator quantify the workflow. An
-   attempt is successful
-   only when OpenCode exits normally without a recorded permission rejection,
+   attempt is successful only when no agent-execution failure is recorded,
    the final public build/base/checkpoint validation succeeds, and the optional
    final extra test succeeds. Infrastructure failures remain in end-to-end
    counts but are separated from valid generated-agent trials.
@@ -102,11 +101,11 @@ experiments before making security-effect claims.
 ## Experimental unit and populations
 
 One complete generation/repair trajectory is one independent attempt and the
-implementation is the sampling and inference unit. A valid agent trial has a
-completed candidate-generating model invocation; provider, setup, OpenCode, or
-permission failure before that point is infrastructure attrition. One valid
-trial contributes its final candidate after the configured process. Repeated
-source
+implementation is the sampling and inference unit. Only high-confidence
+pre-invocation worktree/setup failure is infrastructure attrition. Once an
+OpenCode invocation is attempted, the attempt is a valid agent trial even if it
+times out, encounters a permission rejection, or exits nonzero. One valid trial
+contributes its final candidate after the configured process. Repeated source
 or feature-identical candidates are retained as separate observations because
 their frequency is part of the model's output distribution. Deduplicating first
 would inflate effective diversity and erase convergence. Exact duplicates are
@@ -145,6 +144,23 @@ evaluator failures after a valid invocation are candidate/workflow failures,
 not infrastructure failures. Overall success additionally requires the optional
 extra test, when configured.
 
+The failure taxonomy is deliberately conservative:
+
+- **Infrastructure attrition:** experiment worktree/setup failed before a
+  usable agent invocation was attempted.
+- **Agent-execution failure:** timeout, configured-policy permission rejection,
+  or another nonzero attempted OpenCode invocation. These are valid failed
+  generated-agent trials.
+- **Candidate/workflow failure:** build, public-test, or hidden/extra-evaluator
+  failure after generation.
+
+The analyzer does not infer provider or network outages from arbitrary error
+text. Agent-execution failures remain in conditional-agent, initial/final
+public-success, repair, and Pass@k denominators. Exit 124 is classified as an
+agent timeout and contributes a failed generated sample. Infrastructure
+attrition is excluded from generated-sample denominators, while end-to-end
+success still uses every analyzed attempt.
+
 Following Chen et al. (2021), Pass@k uses `n = N_valid_agent_trials` and `c`
 equal to successful valid trials:
 
@@ -169,7 +185,7 @@ structural organization** of the complete primary C source file. It does not
 measure repository-wide, module, or system architecture. Other changed files
 remain visible through descriptive patch metrics but do not enter the
 structural vector.
-For each candidate, v4.1 constructs three non-duplicated feature blocks:
+For each candidate, v4.1.1 constructs three non-duplicated feature blocks:
 
 1. Clang AST count deltas for source-file and function contexts.
 2. Tree-sitter C node-kind and call-count deltas for source-file and function
@@ -180,7 +196,10 @@ For each candidate, v4.1 constructs three non-duplicated feature blocks:
 Positive and negative baseline deltas are split into distinct non-negative
 added and removed features. Newly created function names are canonicalized to
 ordered parser-helper or behavior-helper placeholders, preventing arbitrary
-names from creating distance. Each tool block is L2-normalized per candidate;
+names from creating distance. The known C entry point `main` always retains the
+literal identity `main` in both architecture and strategy representations,
+including an empty-baseline new-source task; only arbitrary helper names are
+canonicalized. Each tool block is L2-normalized per candidate;
 the blocks are concatenated and L2-normalized again. This gives each available
 tool block controlled scale without counting the same syntax extractor twice.
 
@@ -210,23 +229,28 @@ as for architecture. GumTree actions are omitted because they are whole-patch
 rather than reliably function-scoped. This representation operationalizes
 implementation decisions without claiming that every discovered family is a
 named or classical algorithm. Lee et al. (2025) motivates measuring diversity
-beyond correctness; v4.1 uses a broader, explicitly structural strategy
+beyond correctness; v4.1.1 uses a broader, explicitly structural strategy
 construct suitable for maintenance patches.
 
 ## Fixed clustering thresholds
 
 The clustering thresholds are calibrated using pilot experiments and then
 frozen before the confirmatory cross-model analysis. They are reused across the
-checkpoints, models, and temperatures in that comparison. The CLI defaults
-architecture to `0.30` and strategy to the architecture threshold for backward
-convenience; these are defaults/calibration values, not a claim of
-preregistration before all pilot inspection. Architecture and strategy cuts may
-be specified separately with `--cluster-threshold` and `--strategy-threshold`.
-There is no condition-specific optimization, silhouette maximization, or
-post-hoc replacement of the configured cut.
+checkpoints, models, and temperatures in that comparison. For Git experiments,
+each setting resolves by explicit CLI value, then the value recorded in
+`experiment.json`, then analyzer default. Architecture finally defaults to
+`0.30`; strategy finally inherits the resolved architecture threshold; K
+finally remains unset. Thus a manual analyzer invocation without threshold/K
+arguments reproduces the recorded runner configuration, while explicit
+`--cluster-threshold`, `--strategy-threshold`, or `--diversity-k-max` values
+override it. These defaults/calibration values are not a claim of
+preregistration before all pilot inspection. There is no condition-specific
+optimization, silhouette maximization, or post-hoc replacement of the
+configured cut. `summary.json` records every resolved value and whether it came
+from CLI, experiment metadata, an analyzer default, or the architecture cut.
 
 Threshold sensitivity is robustness analysis only. Unless `--thresholds`
-provides an exact comma-separated positive grid, v4.1 evaluates positive members
+provides an exact comma-separated positive grid, v4.1.1 evaluates positive members
 of `t + {-0.10, -0.05, -0.025, 0, 0.025, 0.05, 0.10}` around each primary cut.
 For every cut it reports raw and effective family counts, dominant share,
 singleton rate, silhouette when `2 <= families < N`, and ARI against the
@@ -280,7 +304,7 @@ fixed `K` supported by every compared architecture and strategy population.
 Exact convergence is calculated over successful candidates. Complete SHA-256
 coverage is required; otherwise the rates are null and hash coverage plus the
 reason are reported rather than silently shrinking the population. For
-population size `N_s`, v4.1 reports:
+population size `N_s`, v4.1.1 reports:
 
 ```text
 exact unique rate = distinct SHA-256 hashes / N_s
@@ -304,7 +328,7 @@ assignments and are not alternative correctness measures.
 
 ### Vendi score
 
-For normalized structural feature matrix `X`, v4.1 augments only the Vendi
+For normalized structural feature matrix `X`, v4.1.1 augments only the Vendi
 representation. A nonzero row becomes `[x, 0]`, while a zero row becomes a new
 unit basis vector `[0, ..., 0, 1]`. Thus zero-zero similarity is one,
 zero-nonzero similarity is zero, every diagonal is one, nonzero similarities
@@ -453,11 +477,16 @@ Mean Functions Created, Mean Functions Deleted,
 Mean Normalized GumTree Edit-Action Magnitude
 ```
 
-`paper_metrics_row.json` records `_schema_version` and `_analyzer_version`.
-Repository-level aggregation includes only current schema-v5/analyzer-v4.1 rows
-and reports how many older or incompatible rows were skipped. Historical v4 analyses must be rerun with
-analyzer v4.1 before inclusion; historical analysis directories are not
-rewritten automatically.
+`paper_metrics_row.json` records `_schema_version`, `_analyzer_version`, and a
+readable `_analysis_signature`. The signature contains architecture and strategy
+thresholds, fixed K, the strategy exclusion regex, sorted forced includes, and
+whether `main` is included. Repository-level aggregation includes only current
+schema-v5/analyzer-v4.1.1 rows sharing the first accepted row's exact signature.
+Older/incompatible rows and configuration mismatches are counted separately.
+`runs/experiments/paper_metrics_metadata.json` records the accepted signature
+and all three row counts. Historical analyses must be rerun with analyzer v4.1.1
+before inclusion; historical analysis directories are not rewritten
+automatically.
 
 ## Reproducible usage and optional flags
 
@@ -487,6 +516,12 @@ options are `--analysis-architecture-threshold`,
 Legacy `--analysis-threshold` sets both thresholds unless a corresponding
 specific option overrides it; otherwise strategy defaults to architecture. An
 unset K stays unset.
+
+Manual reanalysis uses CLI > recorded experiment metadata > analyzer default
+for architecture threshold, strategy threshold, and K. Omitting those CLI
+arguments reproduces the stored Git experiment configuration. Repository-level
+confirmatory aggregation rejects rows with mixed thresholds, K, or strategy
+scope rather than silently pooling them.
 
 Optional diagnostics and controlled overrides are:
 

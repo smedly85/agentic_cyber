@@ -65,7 +65,7 @@ from analysis.security_diagnostics import flawfinder_crosscheck, security_profil
 # ---------------------------------------------------------------------------
 
 
-def require_python_packages() -> tuple[Any, Any, Any]:
+def require_python_packages() -> Any:
     missing: list[str] = []
 
     try:
@@ -73,13 +73,6 @@ def require_python_packages() -> tuple[Any, Any, Any]:
     except ImportError:
         missing.append("numpy")
         np = None
-
-    try:
-        from sklearn.cluster import AgglomerativeClustering
-        from sklearn.metrics import silhouette_score
-    except ImportError:
-        missing.append("scikit-learn")
-        AgglomerativeClustering = silhouette_score = None
 
     if missing:
         raise SystemExit(
@@ -89,12 +82,10 @@ def require_python_packages() -> tuple[Any, Any, Any]:
             + "  python3 -m pip install -r scripts/analysis-requirements.txt"
         )
 
-    return np, AgglomerativeClustering, silhouette_score
+    return np
 
 
 np: Any = None
-AgglomerativeClustering: Any = None
-silhouette_score: Any = None
 
 
 def require_diagnostic_packages() -> tuple[Any, Any, Any, Any, Any]:
@@ -127,7 +118,7 @@ def require_diagnostic_packages() -> tuple[Any, Any, Any, Any, Any]:
     return plt, levenshtein_ratio, linkage, dendrogram, squareform
 
 
-ANALYZER_VERSION = "4.1.0"
+ANALYZER_VERSION = "4.1.1"
 PAPER_SCHEMA_VERSION = 5
 
 PAPER_METRICS_COLUMNS = [
@@ -258,10 +249,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cluster-threshold",
         type=float,
-        default=0.30,
+        default=None,
         help=(
-            "Architecture cosine-distance cut. This preserves the "
-            "argument used by run_llm_experiment.sh. Default: 0.30"
+            "Architecture cosine-distance cut. Defaults to the recorded Git "
+            "experiment value, then 0.30."
         ),
     )
     parser.add_argument(
@@ -269,8 +260,8 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help=(
-            "Implementation-strategy cosine-distance cut. Defaults to the value "
-            "of --cluster-threshold."
+            "Implementation-strategy cosine-distance cut. Defaults to the "
+            "recorded Git experiment value, then the architecture threshold."
         ),
     )
     parser.add_argument(
@@ -288,7 +279,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Optional common fixed sampling budget K for comparable normalized "
-            "family-discovery AUC@K. The complete DF@K curve is always calculated."
+            "family-discovery AUC@K. Defaults to the recorded Git experiment "
+            "value; the complete DF@K curve is always calculated."
         ),
     )
     parser.add_argument(
@@ -470,6 +462,80 @@ def safe_numeric_mean(values: Iterable[Any]) -> float | None:
     return statistics.fmean(numeric) if numeric else None
 
 
+def resolve_analysis_configuration(
+    *,
+    cli_architecture_threshold: float | None,
+    cli_strategy_threshold: float | None,
+    cli_diversity_k_max: int | None,
+    experiment_metadata: Mapping[str, Any],
+    inherit_experiment_metadata: bool,
+) -> dict[str, Any]:
+    """Resolve primary analysis settings without obscuring CLI provenance."""
+
+    def positive_threshold(value: Any, label: str) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise SystemExit(f"{label} must be a positive finite number")
+        resolved = float(value)
+        if not math.isfinite(resolved) or resolved <= 0:
+            raise SystemExit(f"{label} must be a positive finite number")
+        return resolved
+
+    if cli_architecture_threshold is not None:
+        architecture_threshold = positive_threshold(
+            cli_architecture_threshold, "--cluster-threshold"
+        )
+        architecture_source = "cli"
+    elif inherit_experiment_metadata and "analysis_architecture_threshold" in experiment_metadata:
+        architecture_threshold = positive_threshold(
+            experiment_metadata["analysis_architecture_threshold"],
+            "experiment analysis_architecture_threshold",
+        )
+        architecture_source = "experiment_metadata"
+    else:
+        architecture_threshold = 0.30
+        architecture_source = "default"
+
+    if cli_strategy_threshold is not None:
+        strategy_threshold = positive_threshold(
+            cli_strategy_threshold, "--strategy-threshold"
+        )
+        strategy_source = "cli"
+    elif inherit_experiment_metadata and "analysis_strategy_threshold" in experiment_metadata:
+        strategy_threshold = positive_threshold(
+            experiment_metadata["analysis_strategy_threshold"],
+            "experiment analysis_strategy_threshold",
+        )
+        strategy_source = "experiment_metadata"
+    else:
+        strategy_threshold = architecture_threshold
+        strategy_source = "architecture_threshold"
+
+    if cli_diversity_k_max is not None:
+        diversity_k_max = cli_diversity_k_max
+        diversity_source = "cli"
+    elif inherit_experiment_metadata and "analysis_diversity_k_max" in experiment_metadata:
+        diversity_k_max = experiment_metadata["analysis_diversity_k_max"]
+        diversity_source = "experiment_metadata"
+    else:
+        diversity_k_max = None
+        diversity_source = "default"
+    if diversity_k_max is not None and (
+        isinstance(diversity_k_max, bool)
+        or not isinstance(diversity_k_max, int)
+        or diversity_k_max < 1
+    ):
+        raise SystemExit("diversity K must be a positive integer or null")
+
+    return {
+        "architecture_threshold": architecture_threshold,
+        "architecture_threshold_source": architecture_source,
+        "strategy_threshold": strategy_threshold,
+        "strategy_threshold_source": strategy_source,
+        "diversity_k_max": diversity_k_max,
+        "diversity_k_max_source": diversity_source,
+    }
+
+
 def public_validation_succeeded(metadata: Mapping[str, Any]) -> bool:
     explicit = metadata.get("public_validation_success")
     if isinstance(explicit, bool):
@@ -525,29 +591,56 @@ def normalize_repair_metadata(
     )
 
     explicit_infrastructure = normalized.get("infrastructure_failure")
-    explicit_stage = normalized.get("infrastructure_failure_stage")
-    if isinstance(explicit_infrastructure, bool):
-        infrastructure_failure = explicit_infrastructure
-        infrastructure_stage = (
-            str(explicit_stage)
-            if infrastructure_failure and explicit_stage is not None
-            else None
+    explicit_infrastructure_stage = normalized.get("infrastructure_failure_stage")
+    explicit_agent_failure = normalized.get("agent_execution_failure")
+    explicit_agent_stage = normalized.get("agent_execution_failure_stage")
+    permission_rejected = bool(normalized.get("opencode_permission_rejected"))
+    opencode_exit = normalized.get("opencode_exit_code")
+
+    # Only a high-confidence failure before invocation is infrastructure.
+    infrastructure_failure = setup_failed_before_invocation or (
+        explicit_infrastructure is True
+        and explicit_infrastructure_stage == "setup"
+        and llm_invocations == 0
+        and opencode_exit is None
+    )
+    infrastructure_stage = "setup" if infrastructure_failure else None
+    agent_execution_failure = (
+        not infrastructure_failure
+        and (
+            permission_rejected
+            or opencode_exit not in (None, 0)
+            or explicit_agent_failure is True
         )
-        infrastructure_inferred = False
-    else:
-        infrastructure_inferred = True
-        if setup_failed_before_invocation:
-            infrastructure_failure = True
-            infrastructure_stage = "setup"
-        elif bool(normalized.get("opencode_permission_rejected")):
-            infrastructure_failure = True
-            infrastructure_stage = "permission"
-        elif normalized.get("opencode_exit_code") not in (None, 0):
-            infrastructure_failure = True
-            infrastructure_stage = "opencode"
+    )
+    if agent_execution_failure:
+        if permission_rejected:
+            agent_execution_stage = "permission"
+        elif opencode_exit == 124:
+            agent_execution_stage = "timeout"
+        elif explicit_agent_stage in {"timeout", "opencode", "permission"}:
+            agent_execution_stage = str(explicit_agent_stage)
         else:
-            infrastructure_failure = False
-            infrastructure_stage = None
+            agent_execution_stage = "opencode"
+    else:
+        agent_execution_stage = None
+
+    infrastructure_inferred = not (
+        isinstance(explicit_infrastructure, bool)
+        and explicit_infrastructure == infrastructure_failure
+        and explicit_infrastructure_stage == infrastructure_stage
+    )
+    agent_execution_inferred = not (
+        isinstance(explicit_agent_failure, bool)
+        and explicit_agent_failure == agent_execution_failure
+        and explicit_agent_stage == agent_execution_stage
+    )
+
+    if infrastructure_failure or agent_execution_failure:
+        initial_success = False
+        public_success = False
+        success_loop = None
+        normalized["overall_success"] = False
 
     normalized.update(
         {
@@ -558,7 +651,9 @@ def normalize_repair_metadata(
             "loop_limit_reached": bool(
                 normalized.get(
                     "loop_limit_reached",
-                    not public_success and not setup_failed_before_invocation,
+                    not public_success
+                    and not setup_failed_before_invocation
+                    and not agent_execution_failure,
                 )
             ),
             "public_validation_success": public_success,
@@ -570,6 +665,11 @@ def normalize_repair_metadata(
             "infrastructure_failure_stage": infrastructure_stage,
             "infrastructure_failure_classification_inferred": (
                 infrastructure_inferred
+            ),
+            "agent_execution_failure": agent_execution_failure,
+            "agent_execution_failure_stage": agent_execution_stage,
+            "agent_execution_failure_classification_inferred": (
+                agent_execution_inferred
             ),
         }
     )
@@ -680,15 +780,31 @@ def build_reliability_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, An
         if bool(row.get("infrastructure_failure"))
         and row.get("infrastructure_failure_stage") is not None
     )
+    agent_execution_failure_stages = Counter(
+        str(row.get("agent_execution_failure_stage"))
+        for row in rows
+        if bool(row.get("agent_execution_failure"))
+        and row.get("agent_execution_failure_stage") is not None
+    )
     return {
         "n_attempts": attempts,
         "n_infrastructure_failures": infrastructure_failures,
         "n_valid_agent_trials": valid_agent_trials,
+        "n_agent_execution_failures": sum(
+            bool(row.get("agent_execution_failure")) for row in rows
+        ),
         "successful_runs": successes,
         "successful_valid_agent_trials": successful_valid_trials,
         "infrastructure_failure_stages": dict(sorted(failure_stages.items())),
         "infrastructure_classifications_inferred": sum(
             bool(row.get("infrastructure_failure_classification_inferred"))
+            for row in rows
+        ),
+        "agent_execution_failure_stages": dict(
+            sorted(agent_execution_failure_stages.items())
+        ),
+        "agent_execution_classifications_inferred": sum(
+            bool(row.get("agent_execution_failure_classification_inferred"))
             for row in rows
         ),
         "infrastructure_attrition_rate": (
@@ -750,6 +866,54 @@ def select_primary_cluster_population(
     )
 
 
+ANALYSIS_SIGNATURE_KEYS = (
+    "architecture_threshold",
+    "strategy_threshold",
+    "diversity_k_max",
+    "strategy_exclude_regex",
+    "strategy_include_functions",
+    "strategy_main_included",
+)
+
+
+def build_analysis_signature(
+    analysis_configuration: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "architecture_threshold": float(
+            analysis_configuration["architecture_threshold"]
+        ),
+        "strategy_threshold": float(
+            analysis_configuration["strategy_threshold"]
+        ),
+        "diversity_k_max": analysis_configuration.get("diversity_k_max"),
+        "strategy_exclude_regex": str(
+            analysis_configuration["strategy_exclude_regex"]
+        ),
+        "strategy_include_functions": sorted(
+            str(name)
+            for name in analysis_configuration.get(
+                "strategy_include_functions", []
+            )
+        ),
+        "strategy_main_included": bool(
+            analysis_configuration["strategy_main_included"]
+        ),
+    }
+
+
+def paper_row_analysis_signature(row: Mapping[str, Any]) -> dict[str, Any] | None:
+    signature = row.get("_analysis_signature")
+    if not isinstance(signature, Mapping) or not all(
+        key in signature for key in ANALYSIS_SIGNATURE_KEYS
+    ):
+        return None
+    try:
+        return build_analysis_signature(signature)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def build_paper_metrics_row(
     experiment_metadata: Mapping[str, Any],
     summary: Mapping[str, Any],
@@ -769,6 +933,9 @@ def build_paper_metrics_row(
     return {
         "_schema_version": PAPER_SCHEMA_VERSION,
         "_analyzer_version": ANALYZER_VERSION,
+        "_analysis_signature": build_analysis_signature(
+            summary["analysis_configuration"]
+        ),
         "Issue": infer_paper_issue(experiment_metadata, issue_label),
         "Checkpoint": infer_paper_checkpoint(experiment_metadata, checkpoint_label),
         "Model": experiment_metadata.get("model", summary.get("model")),
@@ -863,7 +1030,7 @@ def paper_metrics_schema() -> dict[str, Any]:
         "notes": {
             "primary_population": "successful final candidates with complete measurement for that representation; no fallback",
             "effective_families": "exp(Shannon entropy) of empirical family shares",
-            "fixed_budget_family_discovery_auc": "null unless --diversity-k-max is supplied and supported by the population",
+            "fixed_budget_family_discovery_auc": "null unless a resolved fixed K is configured and supported by the population",
             "excluded_from_clustering": "lexical, APTED, API-call, security, complexity, runtime, and patch-size information",
             "missing_values": "Unavailable measurements are null in JSON and blank in CSV.",
         },
@@ -906,10 +1073,12 @@ def paper_metrics_sort_key(row: Mapping[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def rebuild_paper_metrics_aggregate(repository_root: Path) -> int:
+def rebuild_paper_metrics_aggregate(repository_root: Path) -> dict[str, Any]:
     experiments_root = repository_root / "runs" / "experiments"
     rows_by_experiment: dict[Path, dict[str, Any]] = {}
     skipped_older_rows = 0
+    skipped_configuration_rows = 0
+    aggregate_signature: dict[str, Any] | None = None
     if experiments_root.is_dir():
         for row_path in sorted(
             experiments_root.rglob("analysis/paper_metrics_row.json")
@@ -917,11 +1086,13 @@ def rebuild_paper_metrics_aggregate(repository_root: Path) -> int:
             try:
                 row = read_json(row_path)
             except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+                skipped_older_rows += 1
                 continue
             if not isinstance(row, dict) or not all(
                 column in row
                 for column in ("Issue", "Checkpoint", "Model", "Temp")
             ):
+                skipped_older_rows += 1
                 continue
             if (
                 row.get("_schema_version") != PAPER_SCHEMA_VERSION
@@ -929,6 +1100,15 @@ def rebuild_paper_metrics_aggregate(repository_root: Path) -> int:
                 or not all(column in row for column in PAPER_METRICS_COLUMNS)
             ):
                 skipped_older_rows += 1
+                continue
+            signature = paper_row_analysis_signature(row)
+            if signature is None:
+                skipped_older_rows += 1
+                continue
+            if aggregate_signature is None:
+                aggregate_signature = signature
+            elif signature != aggregate_signature:
+                skipped_configuration_rows += 1
                 continue
             canonical_experiment = row_path.parent.parent.resolve()
             rows_by_experiment.setdefault(canonical_experiment, row)
@@ -943,12 +1123,26 @@ def rebuild_paper_metrics_aggregate(repository_root: Path) -> int:
         PAPER_METRICS_COLUMNS,
     )
     write_json(experiments_root / "paper_metrics.json", aggregate_rows)
-    print(
-        "Repository paper aggregate: "
-        f"included {len(aggregate_rows)} schema-v{PAPER_SCHEMA_VERSION} rows; "
-        f"skipped {skipped_older_rows} older/incompatible rows"
+    aggregate_metadata = {
+        "schema_version": PAPER_SCHEMA_VERSION,
+        "analyzer_version": ANALYZER_VERSION,
+        "analysis_signature": aggregate_signature,
+        "included_rows": len(aggregate_rows),
+        "skipped_old_rows": skipped_older_rows,
+        "skipped_configuration_mismatch_rows": skipped_configuration_rows,
+    }
+    write_json(
+        experiments_root / "paper_metrics_metadata.json",
+        aggregate_metadata,
     )
-    return skipped_older_rows
+    print(
+        "Repository paper aggregate:\n"
+        f"  included {len(aggregate_rows)} schema-v{PAPER_SCHEMA_VERSION} rows\n"
+        f"  skipped {skipped_older_rows} older/incompatible rows\n"
+        "  skipped "
+        f"{skipped_configuration_rows} rows with incompatible analysis configuration"
+    )
+    return aggregate_metadata
 
 
 # ---------------------------------------------------------------------------
@@ -1284,7 +1478,7 @@ def opencode_permission_rejected(path: Path) -> bool:
     return bool(
         re.search(
             r"(?:permission requested:\s*external_directory|auto-rejecting|"
-            r"user rejected permission|permission denied)",
+            r"user rejected permission)",
             text,
             flags=re.I,
         )
@@ -1825,6 +2019,10 @@ def created_function_mapping(
     behavior_index = 0
 
     for name in created_names:
+        if name == "main":
+            architecture_mapping[name] = "main"
+            strategy_mapping[name] = "main"
+            continue
         parser_like = bool(parser_regex.search(name)) and (
             name not in forced_strategy_functions
         )
@@ -1890,9 +2088,9 @@ def filter_strategy_delta(
     created_mapping: Mapping[str, str],
 ) -> dict[str, float]:
     result: dict[str, float] = {}
-    allowed_canonical = set(allowed_function_names) | set(
-        created_mapping.values()
-    )
+    allowed_canonical = {
+        created_mapping.get(name, name) for name in allowed_function_names
+    }
 
     for key, value in values.items():
         match = FUNCTION_FEATURE_RE.match(key)
@@ -2298,18 +2496,10 @@ def representation_ablation_rows(
 
 def main() -> int:
     args = parse_args()
-    if not math.isfinite(args.cluster_threshold) or args.cluster_threshold <= 0:
-        raise SystemExit("--cluster-threshold must be a positive finite number")
-    if args.strategy_threshold is not None and (
-        not math.isfinite(args.strategy_threshold) or args.strategy_threshold <= 0
-    ):
-        raise SystemExit("--strategy-threshold must be a positive finite number")
-    if args.diversity_k_max is not None and args.diversity_k_max < 1:
-        raise SystemExit("--diversity-k-max must be positive")
     if args.bootstrap_repetitions < 0:
         raise SystemExit("--bootstrap-repetitions must be non-negative")
-    global np, AgglomerativeClustering, silhouette_score
-    np, AgglomerativeClustering, silhouette_score = require_python_packages()
+    global np
+    np = require_python_packages()
     experiment = args.experiment.resolve()
     if not experiment.exists():
         raise SystemExit(f"Experiment directory not found: {experiment}")
@@ -2328,6 +2518,16 @@ def main() -> int:
         raise SystemExit(
             f"Missing experiment.json and no enclosing sandbox run.json: {experiment}"
         )
+    analysis_configuration = resolve_analysis_configuration(
+        cli_architecture_threshold=args.cluster_threshold,
+        cli_strategy_threshold=args.strategy_threshold,
+        cli_diversity_k_max=args.diversity_k_max,
+        experiment_metadata=experiment_metadata,
+        inherit_experiment_metadata=experiment_format == "git_experiment",
+    )
+    architecture_threshold = analysis_configuration["architecture_threshold"]
+    strategy_threshold = analysis_configuration["strategy_threshold"]
+    diversity_k_max = analysis_configuration["diversity_k_max"]
     output_dir = (
         args.output_dir.resolve()
         if args.output_dir
@@ -2405,10 +2605,15 @@ def main() -> int:
 
     parser_regex = re.compile(args.strategy_exclude_regex, re.I)
     forced_strategy_functions = set(args.strategy_include_function)
-    strategy_threshold = (
-        args.strategy_threshold
-        if args.strategy_threshold is not None
-        else args.cluster_threshold
+    strategy_main_included = (
+        "main" in forced_strategy_functions or parser_regex.search("main") is None
+    )
+    analysis_configuration.update(
+        {
+            "strategy_exclude_regex": args.strategy_exclude_regex,
+            "strategy_include_functions": sorted(forced_strategy_functions),
+            "strategy_main_included": strategy_main_included,
+        }
     )
 
     tool_paths = {
@@ -2423,7 +2628,7 @@ def main() -> int:
     print(f"Experiment: {experiment}")
     print(f"Output:     {output_dir}")
     print(f"Runs:       {len(attempts)}")
-    print(f"Architecture threshold: {args.cluster_threshold}")
+    print(f"Architecture threshold: {architecture_threshold}")
     print(f"Strategy threshold:     {strategy_threshold}")
     for name, path in tool_paths.items():
         print(f"{name:11s} {path}")
@@ -2569,12 +2774,12 @@ def main() -> int:
         )
         strategy_clang_delta = filter_strategy_delta(
             raw_clang_delta,
-            baseline_behavior,
+            baseline_behavior | created_behavior,
             strategy_created_mapping,
         )
         strategy_tree_delta = filter_strategy_delta(
             raw_tree_delta,
-            baseline_behavior,
+            baseline_behavior | created_behavior,
             strategy_created_mapping,
         )
         strategy_without_main_mapping = {
@@ -2584,12 +2789,12 @@ def main() -> int:
         }
         strategy_without_main_clang_delta = filter_strategy_delta(
             raw_clang_delta,
-            baseline_behavior - {"main"},
+            (baseline_behavior | created_behavior) - {"main"},
             strategy_without_main_mapping,
         )
         strategy_without_main_tree_delta = filter_strategy_delta(
             raw_tree_delta,
-            baseline_behavior - {"main"},
+            (baseline_behavior | created_behavior) - {"main"},
             strategy_without_main_mapping,
         )
 
@@ -2840,12 +3045,12 @@ def main() -> int:
             all_run_ids=run_ids,
             full_distance=architecture_distance,
             full_feature_matrix=architecture_matrix,
-            threshold=args.cluster_threshold,
+            threshold=architecture_threshold,
             supplied_thresholds=args.thresholds,
             diagnostic_data_dir=diagnostic_clustering_dir,
             diagnostic_plot_dir=diagnostic_plot_dir,
             plotting_helpers=plotting_helpers,
-            diversity_k_max=args.diversity_k_max,
+            diversity_k_max=diversity_k_max,
             bootstrap_repetitions=args.bootstrap_repetitions,
             bootstrap_seed=args.bootstrap_seed,
         )
@@ -2867,7 +3072,7 @@ def main() -> int:
             diagnostic_data_dir=diagnostic_clustering_dir,
             diagnostic_plot_dir=diagnostic_plot_dir,
             plotting_helpers=plotting_helpers,
-            diversity_k_max=args.diversity_k_max,
+            diversity_k_max=diversity_k_max,
             bootstrap_repetitions=args.bootstrap_repetitions,
             bootstrap_seed=args.bootstrap_seed + 1,
         )
@@ -3006,7 +3211,7 @@ def main() -> int:
     )
     diagnostics_dir = output_dir / "diagnostics"
     for space_name, population_ids_for_space, distance, threshold in (
-        ("architecture", passing_architecture_ids, architecture_distance, args.cluster_threshold),
+        ("architecture", passing_architecture_ids, architecture_distance, architecture_threshold),
         ("strategy", passing_strategy_ids, strategy_distance, strategy_threshold),
     ):
         indices = [run_ids.index(run_id) for run_id in population_ids_for_space]
@@ -3061,7 +3266,7 @@ def main() -> int:
                 ),
             ),
             primary_representation="clang_plus_tree_sitter_plus_gumtree",
-            threshold=args.cluster_threshold,
+            threshold=architecture_threshold,
         )
         ablation_rows.extend(
             representation_ablation_rows(
@@ -3264,9 +3469,10 @@ def main() -> int:
                     "separate added/removed non-negative features."
                 ),
                 "created_function_canonicalization": (
-                    "New function names are replaced by ordered parser-helper "
-                    "or behavior-helper placeholders so arbitrary names do "
-                    "not create artificial distance."
+                    "The C entry point main retains its identity. Other new "
+                    "function names are replaced by ordered parser-helper or "
+                    "behavior-helper placeholders so arbitrary names do not "
+                    "create artificial distance."
                 ),
                 "excluded_from_clustering": [
                     "lines and files edited",
@@ -3403,14 +3609,8 @@ def main() -> int:
             len(passing_strategy_ids) / successful if successful else None
         ),
         "success_ratio": successful / n if n else None,
-        "diversity_k_max": args.diversity_k_max,
-        "analysis_configuration": {
-            "architecture_threshold": args.cluster_threshold,
-            "strategy_threshold": strategy_threshold,
-            "diversity_k_max": args.diversity_k_max,
-            "strategy_exclude_regex": args.strategy_exclude_regex,
-            "strategy_include_functions": sorted(forced_strategy_functions),
-        },
+        "diversity_k_max": diversity_k_max,
+        "analysis_configuration": analysis_configuration,
         "exact_generation_convergence": exact_repetition,
         "stage_success_ratios": stage_success_ratios,
         "repair": repair_summary,
@@ -3472,7 +3672,7 @@ def main() -> int:
                 "strategy": "passing_complete_runs",
             },
             "architecture": {
-                "threshold_used": args.cluster_threshold,
+                "threshold_used": architecture_threshold,
                 "populations": architecture_summaries,
             },
             "strategy": {
@@ -3566,6 +3766,11 @@ def main() -> int:
         "Infrastructure attrition: "
         f"{reliability_summary['n_infrastructure_failures']}/{n} "
         f"({percentage(reliability_summary['infrastructure_attrition_rate'])})"
+    )
+    print(
+        "Agent execution failures: "
+        f"{reliability_summary['n_agent_execution_failures']}/"
+        f"{valid_agent_trials}"
     )
     print(
         "Conditional agent success: "

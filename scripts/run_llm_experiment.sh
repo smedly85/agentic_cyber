@@ -262,7 +262,7 @@ run_opencode() {
 
     permission_rejected=false
     if grep -Eiq \
-            'permission requested:[[:space:]]*external_directory|auto-rejecting|user rejected permission|permission denied' \
+            'permission requested:[[:space:]]*external_directory|auto-rejecting|user rejected permission' \
             "$current_log"; then
         permission_rejected=true
     fi
@@ -707,6 +707,9 @@ for attempt_number in $(seq 1 "$RUNS"); do
             infrastructure_failure true \
             infrastructure_failure_stage setup \
             infrastructure_failure_classification_inferred false \
+            agent_execution_failure false \
+            agent_execution_failure_stage "__JSON__:null" \
+            agent_execution_failure_classification_inferred false \
             opencode_permission_rejected false \
             max_loops "$MAX_LOOPS" \
             initial_success false \
@@ -782,6 +785,8 @@ PY
     success_loop_json=null
     infrastructure_failed=false
     infrastructure_failure_stage_json=null
+    agent_execution_failed=false
+    agent_execution_failure_stage_json=null
     loop_records=()
 
     while true; do
@@ -810,6 +815,20 @@ PY
         fi
         if [[ "$invocation_permission_rejected" == true ]]; then
             opencode_permission_rejected=true
+        fi
+        invocation_agent_execution_failed=false
+        if [[ "$invocation_permission_rejected" == true ]]; then
+            invocation_agent_execution_failed=true
+            agent_execution_failed=true
+            agent_execution_failure_stage_json='"permission"'
+        elif [[ "$opencode_exit" -ne 0 ]]; then
+            invocation_agent_execution_failed=true
+            agent_execution_failed=true
+            if [[ "$opencode_exit" -eq 124 ]]; then
+                agent_execution_failure_stage_json='"timeout"'
+            else
+                agent_execution_failure_stage_json='"opencode"'
+            fi
         fi
 
         # Snapshot after each invocation. The last snapshot is the final model
@@ -845,6 +864,9 @@ PY
               "$feature_test_exit" -eq 0 ]]; then
             validation_success=true
         fi
+        if [[ "$invocation_agent_execution_failed" == true ]]; then
+            validation_success=false
+        fi
         if [[ "$validation_loop" -eq 0 ]]; then
             initial_success="$validation_success"
         fi
@@ -856,15 +878,9 @@ PY
             "$opencode_ms" "$build_ms" "$base_test_ms" \
             "$feature_test_ms" "$validation_success")")
 
-        # Infrastructure failures end the attempt and never trigger repair.
-        if [[ "$opencode_exit" -ne 0 ||
-              "$invocation_permission_rejected" == true ]]; then
-            infrastructure_failed=true
-            if [[ "$invocation_permission_rejected" == true ]]; then
-                infrastructure_failure_stage_json='"permission"'
-            else
-                infrastructure_failure_stage_json='"opencode"'
-            fi
+        # A failed attempted invocation is a valid agent trial, but repair does
+        # not continue after that invocation fails to complete.
+        if [[ "$invocation_agent_execution_failed" == true ]]; then
             break
         fi
         if [[ "$validation_success" == true ]]; then
@@ -893,6 +909,7 @@ PY
     loop_limit_reached=false
     if [[ "$public_validation_success" == false &&
           "$infrastructure_failed" == false &&
+          "$agent_execution_failed" == false &&
           "$repair_loops" -eq "$MAX_LOOPS" ]]; then
         loop_limit_reached=true
     fi
@@ -905,8 +922,7 @@ PY
     total_ms=$((total_opencode_ms + total_build_ms + total_base_test_ms + total_feature_test_ms + extra_test_ms))
 
     overall_success=true
-    if [[ "$opencode_permission_rejected" == true ||
-          "$opencode_exit" -ne 0 ||
+    if [[ "$agent_execution_failed" == true ||
           "$public_validation_success" == false ||
           "$extra_test_exit" -ne 0 ]]; then
         overall_success=false
@@ -947,6 +963,9 @@ PY
         infrastructure_failure "$infrastructure_failed" \
         infrastructure_failure_stage "__JSON__:$infrastructure_failure_stage_json" \
         infrastructure_failure_classification_inferred false \
+        agent_execution_failure "$agent_execution_failed" \
+        agent_execution_failure_stage "__JSON__:$agent_execution_failure_stage_json" \
+        agent_execution_failure_classification_inferred false \
         loops "__JSON__:$loops_json" \
         overall_success "$overall_success" \
         completed_at "$(date --iso-8601=seconds)"

@@ -50,6 +50,9 @@ records an empty `baseline/<source_path>` snapshot but does not create the file
 in the agent worktree; the model must create it. Existing-source sort and
 new-source mkdir tasks can therefore use the same Git controller, bounded
 repair loop, one-time hidden/extra evaluation, and canonical analyzer.
+For new-source analysis, the known C entry point remains literally `main` in
+both structural representations while arbitrary created helper names are
+canonicalized.
 
 For example, the reverse-sort checkpoint is:
 
@@ -89,8 +92,11 @@ prompt, model, temperature, validation commands, and repair budget. It also
 stores the baseline at `baseline/<source_path>` and each final candidate at
 `attempt-*/candidate/<source_path>`. These metadata and source paths make the
 same analysis invocation applicable to sort, mkdir, and future utilities.
-Each attempt also records setup, OpenCode, or permission infrastructure failure
-separately from generated-code build and evaluator outcomes.
+Each attempt distinguishes setup infrastructure attrition from agent-execution
+failure and candidate failure. Worktree/setup failure before invocation is
+infrastructure attrition. Timeout, permission rejection, and a nonzero attempted
+OpenCode invocation are failed valid agent trials. Build, public-test, and
+hidden/extra-evaluator failures are candidate/workflow failures after generation.
 
 Automatic analysis accepts `--analysis-architecture-threshold`,
 `--analysis-strategy-threshold`, and optional `--analysis-diversity-k-max`.
@@ -105,18 +111,21 @@ values are recorded in `experiment.json` and `analysis/summary.json`.
 `scripts/analyze_experiment.py` is the sole analysis entry point. The Git
 experiment runner invokes it automatically after all attempts. To reproduce or
 extend an analysis manually, pass only the experiment directory; the analyzer
-reads the target source and baseline locations from `experiment.json`:
+reads the target source, baseline, thresholds, and fixed K from
+`experiment.json`:
 
 ```bash
 EXPERIMENT=runs/experiments/<model>/<checkpoint>/temp-<temperature>
 
 python3 scripts/analyze_experiment.py \
     --experiment "$EXPERIMENT" \
-    --cluster-threshold 0.30 \
-    --strategy-threshold 0.30 \
-    --diversity-k-max 25 \
     --clean-output
 ```
+
+Analysis-setting precedence is explicit CLI value, then recorded experiment
+metadata, then analyzer default. Supplying threshold or K options manually
+overrides the recorded value; omitting them reproduces the experiment's stored
+analysis configuration.
 
 Use a common `--diversity-k-max` supported by every compared population for
 cross-condition normalized family-discovery AUC@K. Omit it when only complete
@@ -138,15 +147,19 @@ The analyzer writes schema-v5 results under `<experiment>/analysis/`. The main
 files are `summary.json`, `per_run_metrics.csv`, `paper_metrics.csv`,
 `paper_descriptive_metrics.csv`, diversity family assignments and DF@K curves,
 robustness tables, and uncertainty intervals. It rebuilds the repository-level
-`runs/experiments/paper_metrics.csv` and `paper_metrics.json` only from valid
-schema-v5 rows, logging older rows that were skipped. Historical experiments
-must be re-analyzed with analyzer v4.1 before entering the final aggregate.
+`runs/experiments/paper_metrics.csv` and `paper_metrics.json` only from valid,
+mutually compatible schema-v5 rows. A readable analysis signature covers both
+thresholds, K, strategy scope, and `main` inclusion. Mixed signatures are
+skipped and audited in `paper_metrics_metadata.json`. Historical experiments
+must be re-analyzed with analyzer v4.1.1 before entering the final aggregate.
 
 One complete generation/repair trajectory is one independent attempt.
 Infrastructure attrition remains visible in end-to-end reliability but is
 excluded from valid-agent denominators for initial/final public success, repair
-recovery, and Pass@k. Failed generated implementations remain reliability
-failures but do not enter primary diversity. Repeated byte-identical successful
+recovery, and Pass@k. Agent-execution failures remain in those valid-agent
+denominators: in particular, a timeout is a failed generated sample for Pass@k.
+End-to-end success uses every analyzed attempt. Failed generated implementations
+remain reliability failures but do not enter primary diversity. Repeated byte-identical successful
 outputs remain separate diversity observations. Architecture means structural
 organization of the configured primary C source, not repository- or system-wide
 architecture; implementation strategy is separate. Primary strategy includes
@@ -225,7 +238,7 @@ agentic_cyber/
 ├── Makefile
 ├── README.md
 ├── docs/
-│   └── diversity_methodology.md          # Canonical v4.1/schema-v5 methodology
+│   └── diversity_methodology.md          # Canonical v4.1.1/schema-v5 methodology
 ├── prompts/
 │   ├── checkpoint_base_template.md
 │   ├── checkpoint_feature_template.md
