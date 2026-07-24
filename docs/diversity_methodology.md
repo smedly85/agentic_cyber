@@ -1,291 +1,486 @@
-# Measuring implementation diversity across N-version LLM programs
+# Canonical v4 diversity methodology
 
-`scripts/measure_diversity.py` measures how different a set of independently
-generated implementations of the same specification (e.g. several LLM
-samples of `mkdir` at different temperatures) actually are, at several
-levels each grounded in an established code-similarity paradigm. This
-document is the methodology write-up behind the tool: what each level
-measures, why it was chosen, what it does and doesn't tell you, and the
-validity controls used to sanity-check the numbers. It is written to be
-adapted directly into a paper's methodology section.
+This document defines schema-v4 analysis for repeated, baseline-backed software
+generation experiments. `scripts/analyze_experiment.py` is the sole analysis
+entry point. It evaluates functional reliability first, then two deliberately
+separate forms of structural diversity among successful implementations. No
+single composite score combines correctness, diversity, cost, validation, or
+security diagnostics.
 
-## Motivation: diversity as a security property, not just a curiosity
+The methodology addresses a narrower question than semantic equivalence or
+vulnerability independence: given candidates that satisfy the configured
+validation contract, how reliably are they generated, and how varied are their
+configured-source architectures and behavioral implementation strategies? Static
+structure is evidence about implementation variation, not proof that failures
+or exploits will not transfer.
 
-The reason to care about implementation diversity here is **N-version
-programming / automated software diversity for security**: if an attacker
-finds an exploit against one version, a sufficiently *different* version
-should not share it. This is the line of work started by Forrest, Somayaji
-& Ackley (1997), formalized for security by Cox et al. ("N-Variant
-Systems", *USENIX Security* 2006), surveyed by Larsen, Homescu, Brunthaler
-& Franz ("SoK: Automated Software Diversity", *IEEE S&P* 2014), and by
-Baudry & Monperrus ("The Multiple Facets of Software Diversity", *ACM
-Computing Surveys* 2015). All variants here pass the same test suite; the
-question is whether they are diverse *in the ways that matter for exploit
-non-transferability*, which is a narrower and more falsifiable claim than
-generic code similarity.
+## Evidence hierarchy
 
-This is why the tool reports several distinct levels rather than one
-composite "diversity score": a single weighted number invites the
-objection that the weights were chosen to produce a desired result. Each
-level below answers a distinct, individually defensible question.
+The reporting hierarchy prevents exploratory or easy-to-optimize measurements
+from being presented as confirmatory outcomes.
 
-## What each level contributes (read this before interpreting output)
+### PRIMARY
 
-Every metric here is a *static, syntactic proxy* for the real claim
-(exploit non-transferability). None of them establish it directly - only
-differential/behavioral testing against real exploits could do that. Given
-that, here is what each level does and does not license you to say:
+1. **Functional reliability.** Overall, initial-public, and final-public
+   success rates; repair recovery; and the unbiased pass@k estimator quantify
+   whether generation produces valid final candidates. A run is successful
+   only when OpenCode exits normally without a recorded permission rejection,
+   the final public build/base/checkpoint validation succeeds, and the optional
+   final extra test succeeds. Failed runs remain in reliability denominators.
+2. **Architecture diversity.** Effective architecture-family count, dominant
+   architecture-family share, and fixed-budget architecture NAUADC@K describe
+   structural organization of the configured experiment source.
+3. **Implementation-strategy diversity.** Effective strategy-family count,
+   dominant strategy-family share, and fixed-budget strategy NAUADC@K describe
+   changes inside behavioral functions while suppressing parser and usage
+   organization by default.
 
-- **Lexical/token (Level 1)** - a manipulation check: "did sampling
-  actually produce different artifacts, or cosmetically-edited near
-  clones?" It rules out the trivial-diversity objection. It says nothing
-  about exploit transfer - renaming variables preserves every bug.
-- **AST (Level 2)** - control-flow *shape* difference, robust to
-  renaming/formatting. Informative but noisy at the 40-300 LOC scale of
-  these programs; treat as a distribution, not a single number, and see
-  the scalability note below for larger inputs.
-- **API/call-set (Level 3)** - the most interpretable "different
-  algorithm" signal. Two variants with disjoint call sets are following
-  genuinely different strategies (e.g. manual path-parsing plus a
-  `stat()` pre-check vs. delegating straight to `mkdir(2)`) - which means
-  bug classes tied to one strategy (e.g. a TOCTOU race between the
-  `stat()` check and the `mkdir()` call) cannot exist in the other.
-- **Attack-surface (Level 4)** - the level that most directly carries the
-  security claim. It profiles the syntactic constructs an exploit would
-  actually need: unsafe string calls, fixed-size stack buffers, heap
-  calls, indexing. A memory-corruption exploit needs a corresponding
-  construct; if two variants' construct sets are disjoint, that exploit
-  *class* cannot transfer between them. This is falsifiable per
-  vulnerability class and grounded in attack-surface metrics (Manadhata &
-  Wing, *IEEE TSE* 2011) and the diversity-for-security SoK above.
-  Limitation: it matches on identifier text (e.g. the call name
-  `strcpy`), so it is a *syntactic*, not semantic, detector - see
-  Calibration below for a concrete case where this matters.
-- **Complexity metrics (lizard)** - reported as descriptive per-variant
-  statistics only, **not** used as a distance metric: at 40-300 LOC there
-  isn't enough range in NLOC/cyclomatic-complexity for it to discriminate
-  anything.
-- **Neural (Level 5, `--neural`)** - CodeBLEU (Ren et al., 2020) and
-  code-model embedding cosine similarity, included for comparability with
-  the LLM-codegen literature. Treat a *high* neural similarity between
-  syntactically/structurally distant variants as a genuine negative
-  result worth reporting, not noise: it says the embedding space in
-  question does not discriminate the kind of diversity this tool is
-  built to find. Empirically (see Results below) this is exactly what
-  happened on the two real mkdir variants in this repo.
-- **Cross-level correlation is itself a finding.** If lexical similarity
-  does not predict attack-surface similarity, then token-level clone
-  detection is the wrong instrument for a security-diversity claim - a
-  methodological result in its own right, not just a diagnostic.
+Architecture and strategy are separate outcomes. A patch can reorganize option
+parsing without changing core behavior, or change behavior while retaining the
+same surrounding layout. Strategy families may capture control flow, data
+structures, decomposition, call patterns, resource handling, or error handling;
+they are not asserted to be classical algorithms.
 
-## Level definitions
+### SUPPORTING
 
-### Level 1 - Lexical / token similarity
-Clone-detection paradigm: Type-1 (identical), Type-2 (renamed), Type-3
-(near-miss) clones (Roy, Cordy & Koschke, *Science of Computer Programming*
-2009).
-- **Normalized Levenshtein ratio** (RapidFuzz) on comment-stripped,
-  whitespace-collapsed source.
-- **Type-2-normalized token winnowing / Jaccard**: identifiers and
-  literals are rewritten to class placeholders (`ID`, `NUM`, `STR`,
-  `CHAR`) following the CCFinder normalization (Kamiya, Kusumoto & Inoue,
-  *IEEE TSE* 2002), then compared via winnowing k-gram fingerprints
-  (Schleimer, Wilkerson & Aiken, *SIGMOD* 2003 - the MOSS algorithm, the
-  standard plagiarism-detection technique) and Jaccard similarity of the
-  fingerprint sets.
+- Raw architecture- and strategy-family counts.
+- Mean pairwise cosine distance in each structural representation.
+- The complete exact DA@k curve for every available `k`.
+- Exact source convergence: distinct SHA-256 count, exact-unique rate, modal
+  exact-copy share, and membership of each hash group.
+- Patch and cost descriptors: lines and files edited; functions edited,
+  created, and deleted; normalized baseline edit magnitude; repair loops; LLM
+  invocations; runtime; and available token usage.
 
-### Level 2 - AST / structural similarity
-Normalized tree edit distance between tree-sitter C parse trees (named
-nodes only - see Scalability below), computed with APTED (Pawlik &
-Augsten, *TODS* 2015 / *Information Systems* 2016), normalized by the
-larger tree's size: `similarity = 1 - TED / max(size_a, size_b)`.
+These measurements explain the primary outcomes but do not replace them. Raw
+family count is especially sensitive to sample size and small clusters. Patch
+churn is descriptive effort, not structural diversity. The use of churn as a
+software-change measure follows Nagappan and Ball (2005), while no defect claim
+is inferred from churn in this study.
 
-### Level 3 - API / strategy profile
-Jaccard distance over the set of called function names (extracted via a
-tree-sitter `call_expression` walk), plus lizard complexity metrics
-reported descriptively (NLOC, cyclomatic complexity, function count, max
-nesting - not used as a distance).
+### ROBUSTNESS
 
-### Level 4 - Attack-surface / security-construct profile
-A five-category count vector per variant, extracted via tree-sitter:
-`unsafe_calls` (`strcpy`, `strcat`, `sprintf`, `gets`, `vsprintf`),
-`bounded_risky_calls` (`strncpy`, `strncat`, `snprintf`, `memcpy`,
-`memmove`, `stpcpy`), `heap_calls` (`malloc`/`calloc`/`realloc`/`free`/...),
-`fixed_stack_buffers` (local array declarations with a literal/macro
-size), and `indexing_ops` (`subscript_expression` count). Similarity is
-the average of cosine similarity over the raw count vector (scale-
-sensitive) and Jaccard similarity over which categories are present at
-all (scale-insensitive) - both are also reported per-variant in
-`summary.json["per_variant"][label]["attack_surface_vector"]` for direct
-inspection.
+- Vendi score on each structural feature matrix.
+- Silhouette values where the number of families makes the statistic defined.
+- Family statistics over a deterministic threshold-sensitivity grid.
+- Adjusted Rand index (ARI) between every sensitivity partition and the fixed
+  primary-threshold partition.
 
-### Level 5 - Neural / learned similarity (`--neural`, optional)
-- **CodeBLEU** (Ren et al., 2020): weighted n-gram + syntax (AST subtree
-  match) + dataflow match. CodeBLEU is asymmetric (reference-based); the
-  tool reports the mean of both directions.
-- **Embedding cosine distance**: mean-pooled last-hidden-state embedding
-  from a pretrained code model (default `microsoft/unixcoder-base`) via
-  HuggingFace `transformers`, cosine similarity between pairs.
+These assess whether the primary family result depends on one cut or one
+summary. They are not used to select the primary threshold.
 
-Tool selection across all levels follows the empirical comparison of 30
-code-similarity detectors in Ragkhitwetsagul, Krinke & Clark (*EMSE*
-2018), which is a reasonable starting citation for justifying this
-particular toolset choice in a paper.
+### CONSTRUCT VALIDATION
 
-## Aggregation
+- Lexical normalized Levenshtein distance.
+- Type-2-normalized token winnowing/Jaccard distance.
+- Normalized APTED tree-edit distance.
+- API-call-set Jaccard distance.
+- Pairwise-complete Spearman correlations among those four distances and the
+  architecture and strategy distances.
+- Future blinded human validation of architecture and strategy judgments.
 
-For a set of N variants, each level produces an N x N similarity matrix
-(`<level>.csv`) and a heatmap (`figures/<level>_heatmap.png`). Set-level
-summaries report mean pairwise distance (overall diversity), min pairwise
-distance (the closest, most redundant pair - the one most likely to share
-an exploit), and the full distribution (`figures/distance_distribution.png`).
-For N >= 3, the tool also runs agglomerative clustering (average linkage,
-precomputed 1-similarity distance, `--cluster-threshold` controls the cut)
-with silhouette scoring where well-defined, to detect *pseudo-diversity* -
-variants that read as textually different but collapse into one strategy
-cluster - and computes Spearman correlation between every pair of levels'
-pairwise-distance vectors (`figures/cross_level_correlation.png`).
+These independent representations test convergent and discriminant behavior.
+They never determine family assignments.
 
-## Validity controls
+### SECURITY/FUTURE RQ
 
-- **Size normalization**: every similarity is normalized by program/tree/
-  token size so that a large-vs-small-file pair doesn't trivially dominate
-  the score.
-- **Calibration controls** (`--calibrate`): (a) an identical copy of a
-  fixture program must score 1.0 at every classical level; (b) a copy with
-  every identifier systematically renamed (a synthetic Type-2 clone) must
-  score ~1.0 on `ast_ted` and `lexical_winnowing` (both are structural/
-  normalized and therefore rename-invariant) while `lexical_levenshtein`
-  drops (raw text differs). Run `python3 scripts/measure_diversity.py
-  --calibrate` to reproduce; both controls pass in this repo's current
-  implementation. One informative *failure mode* the renamed-copy control
-  surfaces: because the renaming fixture renames every identifier
-  including library-call names (an artificial worst case - real programs
-  can't rename `strncpy` itself without breaking compilation), the
-  `attack_surface` and `api_callset` levels drop for that synthetic
-  control even though nothing "real" changed. This is a genuine and
-  disclosed limitation of syntactic (non-semantic) call-name matching: a
-  program that aliased a dangerous call behind a wrapper function would
-  evade Level 3/4 detection. Worth stating explicitly as a threat to
-  validity rather than glossing over.
-- **Real-world diversity anchor**: the tool was run against five
-  independently developed, real-world `mkdir` implementations vendored
-  under `tests/diversity-anchors/mkdir/` (GNU coreutils, BusyBox, toybox,
-  FreeBSD, NetBSD - provenance and pinned versions in that directory's
-  `SOURCES.md`). Independent human development is the closest available
-  approximation to a diversity gold standard (Avizienis, "The N-Version
-  Approach to Fault-Tolerant Software", *IEEE TSE* 1985). This anchor run
-  is also a strong sanity check on the tool itself, not just a scale
-  reference: **FreeBSD and NetBSD's implementations, which share a common
-  1983 BSD ancestor (both files carry the identical "Regents of the
-  University of California" copyright header), scored as by far the
-  closest pair at every level** - AST similarity 0.33 vs. 0.07-0.17 for
-  every other pair, API-callset Jaccard 0.48 vs. <=0.13 elsewhere,
-  attack-surface similarity 0.92-1.0 vs. <=0.74 elsewhere. The tool
-  recovered a known genealogical relationship it was never told about,
-  which is meaningful construct validity evidence beyond the synthetic
-  calibration controls. Report LLM-variant diversity relative to this
-  anchor set's distribution, not in isolation.
+Optional static profiles count unsafe calls, bounded-risk calls, heap
+allocation/deallocation calls, fixed-size stack buffers, and indexing
+operations. An optional Flawfinder cross-check reports tool availability and
+hit counts. These profiles support future security research questions and
+hypothesis formation only; they are neither a primary diversity representation
+nor evidence of vulnerability or exploit non-transferability. Future work
+should add dynamic testing, vulnerability-class labeling, and exploit-transfer
+experiments before making security-effect claims.
 
-## Scalability note (Level 2, AST tree edit distance)
+## Experimental unit and populations
 
-APTED's cost grows much faster than linearly with tree size for large or
-structurally dissimilar trees. Using tree-sitter's *named* nodes only
-(excluding punctuation/keyword leaves - which is also the methodologically
-correct notion of "AST" as opposed to a full concrete syntax tree) was
-necessary in practice: on this repo's ~300-line GNU coreutils `mkdir.c`
-against the ~50-line toybox implementation, using all (including
-anonymous/punctuation) parse-tree nodes did not finish in several minutes;
-restricting to named nodes reduced the tree from ~1800 to ~1024 nodes and
-the same pair completed in ~1.3s. `measure_diversity.py` additionally caps
-tree size at `MAX_AST_NODES = 20000` (named nodes) as a safety valve -
-pairs that exceed it report `NaN` for `ast_ted` with a printed warning
-rather than hanging, and downstream clustering/correlation for that level
-degrade gracefully. This ceiling was never approached by any file in this
-repo's actual corpus (largest observed: ~1024 named nodes); it exists for
-robustness against much larger inputs, not because it was needed here.
+The implementation is the sampling and inference unit. One run contributes its
+final candidate after the configured generation/repair process. Repeated source
+or feature-identical candidates are retained as separate observations because
+their frequency is part of the model's output distribution. Deduplicating first
+would inflate effective diversity and erase convergence. Exact duplicates are
+also reported separately by source-byte SHA-256.
 
-## Results on this repo's current corpus (for context)
+Primary diversity uses **successful complete populations with no fallback**:
 
-As of this writing, `runs/` contains exactly two generated `mkdir`
-variants (see repo root `runs/runs_vessel/sandboxed/mkdir/...`, 125 and 38
-lines). Running the classical levels on them:
+- The architecture population contains successful final candidates with a
+  present source and complete baseline/candidate Clang, Tree-sitter C, and
+  GumTree measurements.
+- The strategy population contains successful final candidates with a present
+  source and complete baseline/candidate Clang and Tree-sitter C measurements.
 
-| Level | Similarity |
-|---|---|
-| lexical_levenshtein | 0.47 |
-| lexical_winnowing | 0.16 |
-| ast_ted | 0.25 |
-| api_callset | 0.33 |
-| attack_surface | 0.55 |
+The populations can therefore differ. `architecture_population_n` and
+`architecture_measurement_coverage` are reported separately from
+`strategy_population_n` and `strategy_measurement_coverage`, where coverage is
+the corresponding complete population divided by all successful runs. If a
+representation is unavailable, its primary population shrinks, possibly to
+zero; the analyzer does not substitute passing-but-incomplete, complete-but-
+failed, or all-run results. Failed candidates are excluded from primary
+diversity and exact convergence, but remain visible in reliability and per-run
+records. All-run, complete-run, and passing-run partitions are diagnostic only.
 
-The attack-surface divergence is concrete and interpretable: the 125-line
-variant parses paths manually into fixed `PATH_MAX` stack buffers using
-`strcpy`/`strncpy`/`snprintf` (`unsafe_calls: 7, bounded_risky_calls: 2,
-fixed_stack_buffers: 4`), while the 38-line variant passes `argv` pointers
-directly to `mkdir(2)` with no local buffers at all (`unsafe_calls: 0,
-fixed_stack_buffers: 0`). A stack-buffer-overflow exploit against the
-first variant's path-parsing logic has no construct to attach to in the
-second - a concrete instance of the exploit-non-transferability argument
-this whole methodology is built to support.
+## Functional reliability
 
-Under `--neural`, the same pair scores CodeBLEU similarity 0.35 (broadly
-consistent with the classical levels) but embedding cosine similarity
-**0.85** - substantially higher than every classical/attack-surface
-signal. Read at face value this is a negative result about the embedding
-metric: `microsoft/unixcoder-base`'s general-purpose embedding space
-clusters both programs as "similar C code that implements mkdir" and does
-not resolve the security-relevant difference in how they do it. This is
-worth reporting as-is (a real finding about which metrics discriminate
-security-relevant diversity and which don't) rather than discarding the
-neural level; it's exactly the kind of cross-level divergence the
-methodology is designed to surface.
+Let `n` be all analyzed attempts and `c` the successful attempts. The reported
+success proportion is `c/n`. Initial-public success is success after generation
+before repair. Final-public success is success of the build/base/checkpoint
+contract after the last generation or repair invocation. Repair recovery is the
+number of initially failing runs that later reach public success divided by the
+number initially failing. Overall success additionally requires the optional
+extra test, when configured.
 
-With only two generated variants, clustering and cross-level correlation
-are skipped (both require >= 3 variants) - this is itself worth noting:
-the pipeline currently produces far fewer usable variants than intended
-(see `runs/sandboxed/mkdir/` for the newer run, which produced zero code
-due to `opencode_permission_rejected`), so a stronger empirical diversity
-claim needs more successful generation runs, not just a better metric.
+Following Chen et al. (2021), the unbiased pass@k estimator is
 
-## Deferred: behavioral / differential-testing ground truth
-
-The strongest possible evidence for the exploit-non-transferability
-hypothesis - and the natural next step - is differential/behavioral
-testing: run every variant against a shared input corpus and measure
-divergence in observable behavior (exit code, stdout/stderr, resulting
-filesystem state), following the failure-independence line of work
-(Knight & Leveson, "An Experimental Evaluation of the Assumption of
-Independence in Multiversion Programming", *IEEE TSE* 1986; Littlewood &
-Miller, "Conceptual Modeling of Coincident Failures in Multiversion
-Software", *IEEE TSE* 1989). This was deliberately deferred rather than
-built now, since `tests/mkdir-test-suite/` already provides an exhaustive
-golden/fuzz suite whose existing per-run `test.log`s constitute a coarse
-behavioral observation vector - worth mining first to see how much
-divergence it already exposes before investing in a dedicated harness.
-Fuzzing-based crash-overlap (does an input that crashes variant A also
-crash variant B?) is the natural extension once a harness exists, and
-would be the most direct possible test of the paper's central hypothesis.
-
-## Usage
-
-```bash
-# Classical levels (1-4) only, no heavyweight deps:
-python3 -m pip install -r scripts/diversity-requirements.txt
-python3 scripts/measure_diversity.py "runs/**/new_mkdir.c" --out-dir runs/diversity
-
-# Include the real-world anchor set:
-python3 scripts/measure_diversity.py "runs/**/new_mkdir.c" \
-  --reference "tests/diversity-anchors/mkdir/*.c" --out-dir runs/diversity
-
-# Add neural metrics (downloads a ~500MB model on first use):
-python3 -m pip install codebleu torch transformers
-python3 scripts/measure_diversity.py "runs/**/new_mkdir.c" --neural
-
-# Sanity-check the tool itself before trusting its output on real data:
-python3 scripts/measure_diversity.py --calibrate
+```text
+pass@k = 1 - C(n - c, k) / C(n, k),    1 <= k <= n,
 ```
 
-Output: `<level>.csv` pairwise matrices, `figures/*.png` heatmaps and
-distributions, and `summary.json` (set-level statistics, per-variant
-diagnostics, clustering, cross-level correlation) under `--out-dir`.
+with value `1` when `n - c < k`. It estimates the probability that at least one
+of `k` samples drawn without replacement is successful. Values are emitted only
+for supported `k` among 1, 5, 10, 20, 50, and 100.
+
+Reliability proportions receive 95% Wilson score intervals. This avoids the
+poor boundary behavior of a symmetric normal interval and leaves an interval
+undefined when its denominator is zero.
+
+## Architecture representation
+
+Architecture is a baseline-relative structural representation of the complete
+configured primary source file. Other changed files remain visible through
+descriptive patch metrics but do not enter the structural vector.
+For each candidate, v4 constructs three non-duplicated feature blocks:
+
+1. Clang AST count deltas for source-file and function contexts.
+2. Tree-sitter C node-kind and call-count deltas for source-file and function
+   contexts.
+3. GumTree edit-action counts (`insert`, `delete`, `update`, and `move`
+   variants), following Falleri et al. (2014).
+
+Positive and negative baseline deltas are split into distinct non-negative
+added and removed features. Newly created function names are canonicalized to
+ordered parser-helper or behavior-helper placeholders, preventing arbitrary
+names from creating distance. Each tool block is L2-normalized per candidate;
+the blocks are concatenated and L2-normalized again. This gives each available
+tool block controlled scale without counting the same syntax extractor twice.
+
+Cosine distance is computed on the final vectors. Average-linkage
+agglomerative clustering with a precomputed distance matrix and a fixed cut
+defines architecture families. Patch size, test outcome, runtime, lexical
+distance, validation distances, security profiles, and token use cannot affect
+the assignment. GumTree's action profile is part of architecture, but its
+single normalized edit-magnitude value is only a supporting patch descriptor.
+
+## Implementation-strategy representation
+
+Strategy uses baseline-relative Clang and Tree-sitter C deltas only from
+behavioral functions. By default, `main` and function names matching parser,
+argument, option, usage, help, flag, error-reporting, or diagnostic terms are
+excluded. `--strategy-include-function` can force a known behavioral function
+back into scope, and `--strategy-exclude-regex` records a different
+pre-specified exclusion policy.
+
+Created behavioral helper names are canonicalized, signed deltas are split,
+tool blocks are normalized, and cosine distance plus average linkage are used
+as for architecture. GumTree actions are omitted because they are whole-patch
+rather than reliably function-scoped. This representation operationalizes
+implementation decisions without claiming that every discovered family is a
+named or classical algorithm. Lee et al. (2025) motivates measuring diversity
+beyond correctness; v4 uses a broader, explicitly structural strategy
+construct suitable for maintenance patches.
+
+## Fixed clustering thresholds
+
+The confirmatory architecture and strategy thresholds must be fixed before
+condition labels are examined and reused across checkpoints, models, and
+temperatures being compared. The CLI defaults architecture to `0.30` and
+strategy to the architecture threshold; they can be pre-specified separately
+with `--cluster-threshold` and `--strategy-threshold`. There is no
+condition-specific optimization, silhouette maximization, or post-hoc choice of
+the cut.
+
+Threshold sensitivity is robustness analysis only. Unless `--thresholds`
+provides an exact comma-separated positive grid, v4 evaluates positive members
+of `t + {-0.10, -0.05, -0.025, 0, 0.025, 0.05, 0.10}` around each primary cut.
+For every cut it reports raw and effective family counts, dominant share,
+singleton rate, silhouette when `2 <= families < N`, and ARI against the
+primary partition. Silhouette follows Rousseeuw (1987); chance-adjusted
+partition comparison follows Hubert and Arabie (1985).
+
+## Family summaries and exact discovery
+
+For family sizes `n_1, ..., n_F` in a complete population of size `N`, define
+`p_j = n_j/N`. Duplicates contribute individually to these shares.
+
+- Raw family count: `F`.
+- Effective family count: `exp(-sum_j p_j ln p_j)`, the Hill number of order 1.
+- Dominant family share: `max_j p_j`.
+- Mean pairwise distance: the arithmetic mean of the upper-triangle cosine
+  distances between implementations.
+
+For a size-`k` sample drawn uniformly without replacement, exact Diversity
+Awareness is the expected number of represented families:
+
+```text
+DA@k = sum(j=1..F) [1 - C(N - n_j, k) / C(N, k)],    1 <= k <= N,
+```
+
+where `C(a, k)` is treated as zero when `a < k`. This is an exact combinatorial
+expectation, not a Monte Carlo estimate. The full curve `DA@1, ..., DA@N` is
+always written.
+
+NAUADC is the width-normalized trapezoidal area over that discrete curve:
+
+```text
+NAUADC@K = trapezoid(DA@1, ..., DA@K) / (K - 1),    K > 1,
+NAUADC@1 = DA@1.
+```
+
+Width normalization removes the mechanical area increase caused by a wider
+horizontal range; it does not normalize the number of families. The full-curve
+value with `K=N` is useful within a population, but cross-condition comparison
+requires the same population definition and a common fixed `K`. Supply that
+budget with `--diversity-k-max K`. If a population has `N < K`, fixed-budget
+NAUADC@K is null rather than extrapolated; therefore choose a pre-specified `K`
+supported by every compared architecture and strategy population.
+
+## Exact convergence and supporting change measures
+
+Exact convergence is calculated over successful candidates. Complete SHA-256
+coverage is required; otherwise the rates are null and hash coverage plus the
+reason are reported rather than silently shrinking the population. For
+population size `N_s`, v4 reports:
+
+```text
+exact unique rate = distinct SHA-256 hashes / N_s
+exact modal share = largest hash-group size / N_s
+```
+
+Hash groups retain all run identifiers. Exact equality is not a family
+definition: non-identical implementations may share a structural family, while
+the exact metrics reveal literal model repetition.
+
+Lines added and deleted come from Git numstat plus textual untracked files;
+lines edited are their sum. Files changed, function edits/creations/deletions,
+repair counts, invocations, runtime, and token extraction remain descriptive.
+The normalized edit magnitude is parsed GumTree action count divided by the
+larger baseline/candidate Tree-sitter node count. These variables may explain
+cost or patch scope, but they are excluded from strategy assignments and are
+not alternative correctness measures.
+
+## Robustness and uncertainty
+
+### Vendi score
+
+For normalized structural feature matrix `X`, v4 forms the Gram matrix
+`G = X X^T`, symmetrizes it numerically, normalizes its non-negative
+eigenvalues to sum to one, and returns the exponential Shannon entropy of that
+spectrum. This is the Vendi score of Friedman and Dieng (2023). Because `G` is a
+Gram matrix it is positive semidefinite by construction. Tiny negative
+eigenvalues within numerical tolerance are clipped to zero; a materially
+negative eigenvalue makes the diagnostic unavailable rather than silently
+repairing the matrix. Vendi is clustering-free robustness evidence, not a
+primary family result.
+
+### Intervals
+
+Primary architecture and strategy populations receive deterministic,
+implementation-level percentile bootstrap intervals. Each replicate samples
+`N` implementation rows with replacement, then reconstructs the feature
+matrix subset, cosine distances, clustering, family statistics, mean pairwise
+distance, supported fixed-budget NAUADC, and Vendi score. This preserves the
+implementation as the inference unit rather than incorrectly resampling
+dependent pairs. Defaults are 1,000 repetitions and seed `20260723`; strategy
+uses the next seed so its stream is distinct. Configure these with
+`--bootstrap-repetitions` and `--bootstrap-seed`. Reported bounds are the 2.5th
+and 97.5th percentiles. Functional proportions use the deterministic 95%
+Wilson intervals described above.
+
+## Construct validation
+
+Construct-validation distances are computed only as optional pairwise
+diagnostics among successful candidates with source files:
+
+- **Lexical normalized Levenshtein distance:** comments are removed through the
+  C parse tree, whitespace is collapsed, and edit distance is normalized.
+- **Type-2 token winnowing/Jaccard distance:** leaf identifiers and number,
+  string, and character literals become class placeholders; deterministic
+  token k-grams (`k <= 5`) are winnowed with window size 4; distance is one
+  minus fingerprint-set Jaccard similarity. This controls common Type-2 clone
+  transformations in the taxonomy reviewed by Roy, Cordy, and Koschke (2009).
+- **APTED distance:** ordered tree-edit distance over named, non-comment
+  Tree-sitter C nodes, normalized by the larger tree size, following Pawlik and
+  Augsten (2016). Pairs above 20,000 named nodes return missing rather than
+  risking unbounded computation.
+- **API-call-set Jaccard distance:** one minus Jaccard similarity over directly
+  named called functions. This is interpretable but syntactic: wrappers,
+  aliases, indirect calls, and equivalent APIs can obscure semantic agreement.
+
+For every pair of representations, Spearman correlation uses pairwise-complete
+rows: a pair contributes only when both distances are finite. The output records
+`supporting_pairs`, and a correlation is null when support or variation is
+insufficient. Pairwise completion avoids discarding valid measurements from
+other representations, but different cells can have different support and must
+not be compared as though based on one common sample.
+
+Future human validation should sample implementation pairs and family medoids,
+blind reviewers to model, temperature, checkpoint condition, and machine family
+labels, and use separate codebooks for whole-patch architecture and behavioral
+strategy. At least two reviewers should label independently; report raw
+agreement and Cohen's kappa (Cohen, 1960), adjudicate only after independent
+coding, and compare the adjudicated partition with machine families using ARI.
+This is required before treating machine families as human-validated semantic
+categories.
+
+## Output layout (schema v4)
+
+The default output is `<experiment>/analysis/`:
+
+```text
+analysis/
+├── summary.json
+├── per_run_metrics.csv
+├── runs.csv                              # Compatibility alias of per-run data
+├── paper_metrics.csv
+├── paper_descriptive_metrics.csv
+├── paper_metrics_row.json
+├── paper_metrics_schema.json
+├── diversity/
+│   ├── architecture_clusters.csv
+│   ├── strategy_clusters.csv
+│   ├── architecture_da_curve.csv
+│   ├── strategy_da_curve.csv
+│   └── exact_repetition.csv
+└── diagnostics/
+    ├── architecture_threshold_sensitivity.csv
+    ├── strategy_threshold_sensitivity.csv
+    └── uncertainty.csv
+```
+
+`--diagnostic-output` additionally writes baseline and per-run parser/tool
+artifacts, normalized feature matrices and schemas, assignments for diagnostic
+populations, medoid tables, dendrograms, `pairwise_validation.csv`, and
+`cross_representation_correlation.csv` beneath `diagnostics/`.
+`--security-diagnostics` writes `security/security_profiles.csv` and
+`security/flawfinder.csv`; absence of the optional executable is recorded, not
+treated as a candidate failure. Missing JSON values are `null` and missing CSV
+values are blank.
+
+The standardized **primary CSV schema** is:
+
+```text
+Issue, Checkpoint, Model, Temp, N Runs, Successful Runs,
+Overall Success Rate, Initial Public Success Rate, Final Public Success Rate,
+Repair Recovery Rate, Pass@1, Pass@5, Pass@10,
+Architecture Population N, Effective Architecture Families,
+Dominant Architecture Family Share, Architecture NAUADC@K,
+Strategy Population N, Effective Strategy Families,
+Dominant Strategy Family Share, Strategy NAUADC@K,
+Exact Unique Rate, Exact Modal Share, Diversity K Max
+```
+
+The file is the compact publication-facing schema; the evidence hierarchy above
+still classifies its exact-convergence columns as supporting rather than primary
+outcomes.
+
+The standardized **descriptive CSV schema** is:
+
+```text
+Issue, Checkpoint, Model, Temp,
+Raw Architecture Families, Mean Pairwise Architecture Distance,
+Architecture Vendi Score, Raw Strategy Families,
+Mean Pairwise Strategy Distance, Strategy Vendi Score,
+Mean Repair Loops, Median Repair Loops, Max Repair Loops,
+Mean LLM Invocations, Mean Repair LLM Runtime (s),
+Mean Total Runtime (s), Median Total Runtime (s),
+Mean Lines Edited, Mean Files Edited, Mean Functions Edited,
+Mean Functions Created, Mean Functions Deleted,
+Mean GumTree/AST Edit Magnitude
+```
+
+## Reproducible usage and optional flags
+
+For Git experiments, the analyzer discovers the target from
+`experiment.json["source_path"]`, reads `baseline/<source_path>`, and matches
+`attempt-*/candidate/<source_path>`. Do not construct utility-specific source
+globs:
+
+```bash
+python3 scripts/analyze_experiment.py \
+    --experiment runs/experiments/<model>/<checkpoint>/temp-<temperature> \
+    --cluster-threshold 0.30 \
+    --strategy-threshold 0.30 \
+    --diversity-k-max <common-K> \
+    --bootstrap-repetitions 1000 \
+    --bootstrap-seed 20260723 \
+    --clean-output
+```
+
+Optional diagnostics and controlled overrides are:
+
+- `--diagnostic-output`: detailed feature, clustering, plot, and construct-
+  validation artifacts.
+- `--security-diagnostics`: exploratory security profiles and the optional
+  static-tool cross-check.
+- `--thresholds`: exact sensitivity cuts; never changes the primary cut.
+- `--strategy-exclude-regex` and repeatable `--strategy-include-function`:
+  pre-specified strategy scope adjustments.
+- Repeatable `--clang-extra-arg`: compilation-context arguments for parsing.
+- `--paper-issue-label` and `--paper-checkpoint-label`: reporting labels only.
+- `--output-dir`: alternate output location; default is
+  `<experiment>/analysis`.
+- `--clean-output`: removes only the selected analysis output before rewriting
+  it.
+
+For a no-Git `run.json` experiment, select one `temp-*` condition and pass the
+workspace-relative source path when legacy metadata does not contain it:
+
+```bash
+python3 scripts/analyze_experiment.py \
+    --experiment runs/sandboxed/<utility>/<milestone>/temp-<temperature> \
+    --source-path src/<utility>/<source>.c \
+    --clean-output
+```
+
+The adapter maps each final sandbox workspace and pass/fail record into the
+same attempt, population, feature, clustering, and output code used for Git
+experiments. A matching recorded seed is the baseline for seeded checkpoints;
+an unseeded from-scratch condition has an empty C translation-unit baseline.
+`--baseline-source` can override this explicitly. A mixed-temperature sandbox
+root is rejected rather than pooled into one reported condition.
+
+## References
+
+- Chen, M., et al. (2021). “Evaluating Large Language Models Trained on Code.”
+  arXiv:2107.03374. [https://doi.org/10.48550/arXiv.2107.03374](https://doi.org/10.48550/arXiv.2107.03374).
+- Cohen, J. (1960). “A Coefficient of Agreement for Nominal Scales.”
+  *Educational and Psychological Measurement*, 20(1), 37-46.
+  [https://doi.org/10.1177/001316446002000104](https://doi.org/10.1177/001316446002000104).
+- Falleri, J.-R., Morandat, F., Blanc, X., Martinez, M., and Monperrus, M.
+  (2014). “Fine-grained and Accurate Source Code Differencing.” *Proceedings of
+  ASE 2014*, 313-324.
+  [https://doi.org/10.1145/2642937.2642982](https://doi.org/10.1145/2642937.2642982).
+- Friedman, D., and Dieng, A. B. (2023). “The Vendi Score: A Diversity
+  Evaluation Metric for Machine Learning.” *Transactions on Machine Learning
+  Research*. [https://openreview.net/forum?id=g97OHbQyk1](https://openreview.net/forum?id=g97OHbQyk1).
+- Hubert, L., and Arabie, P. (1985). “Comparing Partitions.” *Journal of
+  Classification*, 2, 193-218.
+  [https://doi.org/10.1007/BF01908075](https://doi.org/10.1007/BF01908075).
+- Lee, S., Chon, H., Jang, J., Lee, D., and Yu, H. (2025). “How Diversely Can
+  Language Models Solve Problems? Exploring the Algorithmic Diversity of
+  Model-Generated Code.” *Findings of EMNLP 2025*, 152-167.
+  [https://doi.org/10.18653/v1/2025.findings-emnlp.10](https://doi.org/10.18653/v1/2025.findings-emnlp.10).
+- Nagappan, N., and Ball, T. (2005). “Use of Relative Code Churn Measures to
+  Predict System Defect Density.” *Proceedings of ICSE 2005*, 284-292.
+  [https://doi.org/10.1145/1062455.1062514](https://doi.org/10.1145/1062455.1062514).
+- Pawlik, M., and Augsten, N. (2016). “Tree Edit Distance: Robust and
+  Memory-efficient.” *Information Systems*, 56, 157-173.
+  [https://doi.org/10.1016/j.is.2015.08.004](https://doi.org/10.1016/j.is.2015.08.004).
+- Rousseeuw, P. J. (1987). “Silhouettes: A Graphical Aid to the Interpretation
+  and Validation of Cluster Analysis.” *Journal of Computational and Applied
+  Mathematics*, 20, 53-65.
+  [https://doi.org/10.1016/0377-0427(87)90125-7](https://doi.org/10.1016/0377-0427(87)90125-7).
+- Roy, C. K., Cordy, J. R., and Koschke, R. (2009). “Comparison and Evaluation
+  of Code Clone Detection Techniques and Tools: A Qualitative Approach.”
+  *Science of Computer Programming*, 74(7), 470-495.
+  [https://doi.org/10.1016/j.scico.2009.02.007](https://doi.org/10.1016/j.scico.2009.02.007).

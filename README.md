@@ -1,24 +1,49 @@
 # Agentic Cyber
 
 An experimental repository for studying how LLM-generated software evolves
-across a sequence of maintenance checkpoints.
+across maintenance checkpoints. Each checkpoint preserves the prompt, baseline
+repository state, generated candidates, validation results, and metadata needed
+to reproduce and compare independent repository histories.
 
-Each checkpoint introduces a new feature while preserving the prompts,
-repository state, generated implementations, and evaluation results needed to
-regenerate and compare alternative repository histories.
-
-## Running an Experiment
+## Requirements
 
 Run experiments from the repository root. OpenCode must be installed and
-configured for the requested model, and the analyzer dependencies must be
-available:
+configured for the requested model. Install the canonical analyzer's Python
+dependencies with:
 
 ```bash
 python3 -m pip install -r scripts/analysis-requirements.txt
 ```
 
-For example, the following command runs 25 isolated attempts for the reverse
-sorting checkpoint at temperature 0.7:
+The analyzer also expects `clang` and `gumtree` on `PATH` for complete
+architecture measurement. The static security cross-check is optional.
+
+## Running an Experiment
+
+`scripts/run_llm_experiment.sh` runs repeated patch-generation attempts from a
+common Git baseline in detached worktrees. The required arguments are
+`--model`, `--temperature`, and `--prompt`. Select any sort, mkdir, or future
+utility by supplying its checkpoint prompt, repository-relative primary source
+path, and validation commands rather than by changing the analysis command:
+
+```bash
+PROMPT=<repository-relative checkpoint prompt path>
+SOURCE=<repository-relative primary source path>
+
+bash scripts/run_llm_experiment.sh \
+    --model school-ollama/qwen3-coder-next:latest \
+    --temperature 0.7 \
+    --runs 25 \
+    --max-loops 3 \
+    --prompt "$PROMPT" \
+    --source "$SOURCE" \
+    --build-cmd "<build command>" \
+    --base-test-cmd "<baseline test command>" \
+    --feature-test-cmd "<checkpoint test command>" \
+    --extra-test-cmd "<optional independent test command>"
+```
+
+For example, the reverse-sort checkpoint is:
 
 ```bash
 bash scripts/run_llm_experiment.sh \
@@ -31,20 +56,19 @@ bash scripts/run_llm_experiment.sh \
         "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/new_sort/test_001_reverse.py -v"
 ```
 
-The required arguments are `--model`, `--temperature`, and `--prompt`. Use
-`--source` and the test-command options to run other utilities or checkpoints.
-See all available options with:
+Each attempt starts at the same `--base-ref`. After the initial generation, a
+failed public build/base/checkpoint validation may trigger at most `--max-loops`
+repair invocations. Repair prompts contain only failing validation output,
+deterministically limited to its final 16,000 characters. The optional extra
+test runs once after the generation/repair loop and is not fed back to the
+model. Generated changes are never committed.
+
+Completed attempts are skipped when a command is resumed; pass `--force` to
+regenerate them. See all runner options with:
 
 ```bash
 bash scripts/run_llm_experiment.sh --help
 ```
-
-Each attempt runs in a detached Git worktree. Completed attempts are skipped
-when the same command is resumed; pass `--force` to regenerate them. After all
-attempts, the analyzer runs automatically and writes per-experiment results to
-`<experiment>/analysis/` and aggregate paper metrics to
-`runs/experiments/paper_metrics.csv` and
-`runs/experiments/paper_metrics.json`.
 
 Unless `--output-dir` is supplied, experiments are stored under:
 
@@ -52,24 +76,68 @@ Unless `--output-dir` is supplied, experiments are stored under:
 runs/experiments/<model>/<checkpoint>/temp-<temperature>/
 ```
 
-### Running the mkdir checkpoints (no Git)
+The runner writes `experiment.json`, including `source_path`, baseline commit,
+prompt, model, temperature, validation commands, and repair budget. It also
+stores the baseline at `baseline/<source_path>` and each final candidate at
+`attempt-*/candidate/<source_path>`. These metadata and source paths make the
+same analysis invocation applicable to sort, mkdir, and future utilities.
 
-`mkdir` is validated by a standalone, exhaustive golden/fuzz suite
-(`tests/mkdir-test-suite/`) instead of hand-authored per-checkpoint unittest
-files, via `tests/mkdir-test-suite/judge_candidate.sh CANDIDATE_BIN [FLAG...]`
-(see that suite's own README). Its prompts (`prompts/mkdir/000_base_new_mkdir.md`,
-`001_parents.md`, `002_mode.md`) have the agent compile directly with `cc` (no
-Makefile) and run that command itself, iterating until every test passes — so
-there is no baseline to git-diff against and no build/test step the harness
-needs to drive. `scripts/run_sandboxed_pipeline.sh` runs this style of prompt
-in a plain temporary directory instead of a Git worktree: for each of `--runs`
-equally-spaced temperature points, it copies the prompt and any `--test-dir`
-paths into a fresh working directory, runs OpenCode with `--dir` pointed at it
-(and a permission config that denies every other path), and leaves whatever
-OpenCode generated sitting in that same directory:
+## Canonical Analysis
+
+`scripts/analyze_experiment.py` is the sole analysis entry point. The Git
+experiment runner invokes it automatically after all attempts. To reproduce or
+extend an analysis manually, pass only the experiment directory; the analyzer
+reads the target source and baseline locations from `experiment.json`:
 
 ```bash
-# Milestone 1 -- base (from-scratch; no --seed-file)
+EXPERIMENT=runs/experiments/<model>/<checkpoint>/temp-<temperature>
+
+python3 scripts/analyze_experiment.py \
+    --experiment "$EXPERIMENT" \
+    --cluster-threshold 0.30 \
+    --strategy-threshold 0.30 \
+    --diversity-k-max 25 \
+    --clean-output
+```
+
+Use a common `--diversity-k-max` supported by every compared population for
+cross-condition NAUADC@K. Omit it when only complete within-population curves
+are needed. Detailed construct-validation artifacts and plots are opt-in:
+
+```bash
+python3 scripts/analyze_experiment.py \
+    --experiment "$EXPERIMENT" \
+    --cluster-threshold 0.30 \
+    --strategy-threshold 0.30 \
+    --diversity-k-max 25 \
+    --diagnostic-output \
+    --security-diagnostics \
+    --clean-output
+```
+
+The analyzer writes schema-v4 results under `<experiment>/analysis/`. The main
+files are `summary.json`, `per_run_metrics.csv`, `paper_metrics.csv`,
+`paper_descriptive_metrics.csv`, diversity family assignments and DA curves,
+robustness tables, and uncertainty intervals. It rebuilds the repository-level
+`runs/experiments/paper_metrics.csv` and `paper_metrics.json` from valid
+per-experiment v4 rows. See `docs/diversity_methodology.md` for metric roles,
+population rules, formulas, output layout, and interpretation.
+
+## No-Git Sandbox Runner
+
+`scripts/run_sandboxed_pipeline.sh` is a separate runner for from-scratch or
+seeded prompts that do not need a Git baseline. It creates a fresh plain
+directory for each equally spaced temperature point, copies the prompt and any
+`--test-dir` paths, applies any `--seed-file SRC[:DEST]` inputs, runs OpenCode,
+and executes `--test-cmd` once afterward as an independent confirmation. It
+does not create worktrees, commits, diffs, repair loops, or canonical analysis
+artifacts.
+
+For example, the mkdir checkpoints can be generated sequentially with the
+standalone golden/fuzz judge:
+
+```bash
+# Base implementation, generated from scratch.
 bash scripts/run_sandboxed_pipeline.sh \
     --model school-ollama/qwen3-coder-next:latest \
     --runs 10 --temp-min 0 --temp-max 2 \
@@ -77,158 +145,70 @@ bash scripts/run_sandboxed_pipeline.sh \
     --test-dir tests/mkdir-test-suite \
     --test-cmd "tests/mkdir-test-suite/judge_candidate.sh build/new_mkdir" \
     --output-dir runs/sandboxed/mkdir/milestone-1
-# -> inspect runs/sandboxed/mkdir/milestone-1/temp-*/{opencode.log,test.log,metadata.json},
-#    pick a winning temp-*/workdir/src/new_mkdir/new_mkdir.c.
 
-# Milestone 2 -- parents, seeded from the milestone-1 winner
+# Later checkpoint, seeded from a promoted prior candidate.
 bash scripts/run_sandboxed_pipeline.sh \
     --model school-ollama/qwen3-coder-next:latest \
     --runs 10 --temp-min 0 --temp-max 2 \
     --prompt prompts/mkdir/001_parents.md \
     --test-dir tests/mkdir-test-suite \
-    --seed-file "runs/sandboxed/mkdir/milestone-1/temp-0p0/workdir/src/new_mkdir/new_mkdir.c:src/new_mkdir/new_mkdir.c" \
+    --seed-file "<prior-workdir>/src/new_mkdir/new_mkdir.c:src/new_mkdir/new_mkdir.c" \
     --test-cmd "tests/mkdir-test-suite/judge_candidate.sh build/new_mkdir -p" \
     --output-dir runs/sandboxed/mkdir/milestone-2
-
-# Milestone 3 -- mode, seeded from the milestone-2 winner
-bash scripts/run_sandboxed_pipeline.sh \
-    --model school-ollama/qwen3-coder-next:latest \
-    --runs 10 --temp-min 0 --temp-max 2 \
-    --prompt prompts/mkdir/002_mode.md \
-    --test-dir tests/mkdir-test-suite \
-    --seed-file "runs/sandboxed/mkdir/milestone-2/temp-0p0/workdir/src/new_mkdir/new_mkdir.c:src/new_mkdir/new_mkdir.c" \
-    --test-cmd "tests/mkdir-test-suite/judge_candidate.sh build/new_mkdir -p -m" \
-    --output-dir runs/sandboxed/mkdir/milestone-3
 ```
 
-`--seed-file SRC[:DEST]` copies an existing file into the working directory at
-`DEST` (default: `SRC`'s own path) before OpenCode runs, so incremental
-checkpoints can read/modify "the current program" without any commit step —
-point it either at a promoted winner in the real tree or directly at a
-previous run's own `workdir/` output under `runs/`. `--test-cmd` is the
-harness's own independent confirmation, run once after OpenCode exits; the
-agent is already instructed by the prompt to self-test and iterate, so this
-just records a final pass/fail in `metadata.json`. See
-`scripts/run_sandboxed_pipeline.sh --help` for all options, including
-`--temp-min`/`--temp-max` (default `0`/`2`) and `--remote-base-url`/
-`--remote-api-key-env` for a self-hosted OpenAI-compatible endpoint.
+`--seed-file` defaults its destination to the source path when `:DEST` is
+omitted. The prompt instructs the agent to compile, self-test, and iterate;
+`--test-cmd` only records the runner's final pass/fail in `metadata.json`. See
+`scripts/run_sandboxed_pipeline.sh --help` for endpoint and temperature options.
 
-Unlike `run_llm_experiment.sh`, this script uses no Git at all: no worktrees,
-no commits, no diffing, no `analyze_experiment.py` call. It's a separate,
-simpler alternative for prompts that don't need git-diff-based baseline
-comparison, not a replacement for the `new_sort` workflow above.
-
-## Measuring implementation diversity
-
-`scripts/measure_diversity.py` compares a set of independently generated
-implementations of the same utility (e.g. multiple `new_mkdir.c` samples
-under `runs/`) and reports how different they actually are, at several
-levels each grounded in an established code-similarity/clone-detection
-paradigm (lexical, AST, API/strategy, security-construct "attack surface",
-and optionally neural). See `docs/diversity_methodology.md` for the full
-methodology, citations, and interpretation guidance.
+The same analyzer accepts one sandbox temperature condition. Legacy `run.json`
+does not record the generated source path, so provide it explicitly. Seeded
+runs derive the baseline from the matching recorded `--seed-file`; unseeded
+from-scratch runs use an empty C translation unit as their recorded analysis
+baseline:
 
 ```bash
-python3 -m pip install -r scripts/diversity-requirements.txt
-python3 scripts/measure_diversity.py "runs/**/new_mkdir.c" --out-dir runs/diversity
-python3 scripts/measure_diversity.py --calibrate   # sanity-check the tool itself
+python3 scripts/analyze_experiment.py \
+    --experiment runs/sandboxed/mkdir/milestone-1/temp-0p0 \
+    --source-path src/new_mkdir/new_mkdir.c \
+    --cluster-threshold 0.30 \
+    --strategy-threshold 0.30 \
+    --clean-output
 ```
 
-`tests/diversity-anchors/` vendors independently developed real-world
-implementations (GNU coreutils, BusyBox, toybox, FreeBSD, NetBSD `mkdir`)
-to use as a diversity reference point via `--reference`.
+Analyze each `temp-*` condition separately. The analyzer rejects a sandbox root
+containing multiple temperatures rather than pooling different experimental
+conditions. `--baseline-source` can explicitly override baseline discovery.
 
 ## Repository Structure
 
 ```text
 agentic_cyber/
-├── .gitignore
 ├── Makefile
 ├── README.md
-│
-├── build/                                  # Generated locally; ignored by Git
-│   └── new_sort                            # Compiled executable created by make
-│
-├── prompts/
-│   ├── checkpoint_feature_template.md      # Generic feature-prompt template
-│   ├── checkpoint_base_template.md         # Generic from-scratch build template
-│   │
-│   ├── new_sort/
-│   │   ├── 000_base_new_sort.md            # Base implementation prompt
-│   │   ├── 001_reverse.md                  # Add -r / --reverse
-│   │   ├── 002_ignore_case.md              # Add -f / --ignore-case
-│   │   ├── 003_unique.md                   # Add -u / --unique
-│   │   ├── 004_random_sort.md              # Add -R / --random-sort
-│   │   │
-│   │   └── tests/
-│   │       ├── 001_reverse_tests.md
-│   │       ├── 002_ignore_case_tests.md
-│   │       ├── 003_unique_tests.md
-│   │       └── 004_random_sort_tests.md
-│   │
-│   └── mkdir/
-│       ├── 000_base_new_mkdir.md           # Base implementation prompt (no flags)
-│       ├── 001_parents.md                  # Add -p / --parents
-│       └── 002_mode.md                     # Add -m / --mode
-│
-├── scripts/
-│   ├── analysis-requirements.txt           # Python analysis dependencies (analyze_experiment.py)
-│   ├── analyze_experiment.py               # Metrics and clustering analyzer
-│   ├── diversity-requirements.txt          # Python dependencies (measure_diversity.py)
-│   ├── measure_diversity.py                # N-version implementation-diversity metrics
-│   ├── run_llm_experiment.sh               # Isolated multi-run experiment runner (Git worktrees)
-│   └── run_sandboxed_pipeline.sh           # No-Git temp-directory pipeline (mkdir checkpoints)
-│
 ├── docs/
-│   └── diversity_methodology.md            # Methodology behind measure_diversity.py
-│
+│   └── diversity_methodology.md          # Canonical v4 methodology
+├── prompts/
+│   ├── checkpoint_base_template.md
+│   ├── checkpoint_feature_template.md
+│   ├── mkdir/                             # mkdir checkpoints
+│   └── new_sort/                          # sort checkpoints and prompt tests
+├── scripts/
+│   ├── analysis/                          # v4 metric and validation modules
+│   ├── analysis-requirements.txt
+│   ├── analyze_experiment.py              # Sole analysis entry point
+│   ├── run_llm_experiment.sh              # Git-worktree experiment runner
+│   └── run_sandboxed_pipeline.sh           # Separate no-Git generator
 ├── src/
 │   └── new_sort/
-│       ├── README.md                       # new_sort usage documentation
-│       └── new_sort.c                      # new_sort C implementation
-│
+│       ├── README.md
+│       └── new_sort.c
 └── tests/
-    ├── new_sort/
-    │   ├── test_new_sort.py                # Baseline new_sort tests
-    │   ├── test_001_reverse.py             # Reverse-sort checkpoint tests
-    │   ├── test_002_ignore_case.py         # Ignore-case checkpoint tests
-    │   ├── test_003_unique.py              # Unique-output checkpoint tests
-    │   └── test_004_random_sort.py         # Random-sort checkpoint tests
-    │
-    ├── mkdir-test-suite/                   # Standalone exhaustive golden/fuzz suite
-    │   ├── judge_candidate.sh              # Per-checkpoint harness entry point
-    │   └── ...                            # config.json, runner.py, suites/, etc.
-    │
-    ├── diversity-anchors/mkdir/            # Vendored real-world mkdir implementations
-    │   ├── SOURCES.md                      # Provenance/license for each vendored file
-    │   └── *.c                             # GNU coreutils, BusyBox, toybox, FreeBSD, NetBSD
-    │
-    └── test_measure_diversity.py           # Unit tests for measure_diversity.py
+    ├── mkdir-test-suite/
+    └── new_sort/
 ```
 
-The `build/` and `runs/` directories are generated locally and are not stored
-in GitHub. The build directory is created when running:
-
-```bash
-make
-```
-
-The command compiles:
-
-```text
-src/new_sort/new_sort.c
-```
-
-and creates:
-
-```text
-build/new_sort
-```
-
-Running:
-
-```bash
-make clean
-```
-
-removes the generated `build/` directory.
+The ignored `build/` and `runs/` directories are generated locally. Build the
+checked-in sort implementation with `make`, producing `build/new_sort`, and
+remove generated build files with `make clean`.

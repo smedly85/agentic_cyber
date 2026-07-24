@@ -5,18 +5,18 @@ This is the unified analyzer used by ``run_llm_experiment.sh``.  It keeps the
 original command-line contract (especially ``--cluster-threshold``), while
 providing two distinct structural analyses:
 
-1. Whole-patch architecture clustering
-   Uses non-duplicated Clang AST deltas, Tree-sitter C deltas, and GumTree edit
+1. Configured-source architecture clustering
+    Uses non-duplicated Clang AST deltas, Tree-sitter C deltas, and GumTree edit
    actions.  Parser organization, helper creation, comparator changes, and
    other patch-wide structural decisions may all affect these clusters.
 
-2. Algorithmic-strategy clustering
+2. Implementation-strategy clustering
    Uses only baseline-relative Clang and Tree-sitter features from behavioral
    functions.  ``main`` and parser/usage helpers are excluded by default so
    argument-parsing structure does not dominate the strategy result.
 
-Traditional patch size, Lizard metrics, tests, runtime, and Levenshtein scores
-are reported separately and do not determine either structural clustering.
+Patch size, tests, runtime, construct-validation distances, and security
+diagnostics are reported separately and cannot determine either clustering.
 
 Default output directory: ``<experiment>/analysis``.
 """
@@ -25,12 +25,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import difflib
 import hashlib
 import itertools
 import json
 import math
 import os
-import random
 import re
 import shutil
 import statistics
@@ -40,6 +40,23 @@ from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
+
+from analysis.diversity_metrics import (
+    bootstrap_diversity_ci,
+    cluster_statistics as family_statistics,
+    compute_vendi_score,
+    da_curve,
+    deterministic_threshold_grid,
+    exact_repetition_summary,
+    nauadc_summary,
+    threshold_sensitivity as family_threshold_sensitivity,
+    wilson_interval,
+)
+from analysis.diversity_validation import (
+    pairwise_spearman_correlations,
+    validation_distances,
+)
+from analysis.security_diagnostics import flawfinder_crosscheck, security_profile
 
 
 # ---------------------------------------------------------------------------
@@ -109,7 +126,7 @@ def require_diagnostic_packages() -> tuple[Any, Any, Any, Any, Any]:
     return plt, levenshtein_ratio, linkage, dendrogram, squareform
 
 
-ANALYZER_VERSION = "3.1.0"
+ANALYZER_VERSION = "4.0.0"
 
 PAPER_METRICS_COLUMNS = [
     "Issue",
@@ -118,49 +135,50 @@ PAPER_METRICS_COLUMNS = [
     "Temp",
     "N Runs",
     "Successful Runs",
-    "Success Rate",
-    "Initial Success Rate",
-    "Repair-Assisted Public Success Rate",
+    "Overall Success Rate",
+    "Initial Public Success Rate",
+    "Final Public Success Rate",
+    "Repair Recovery Rate",
+    "Pass@1",
+    "Pass@5",
+    "Pass@10",
+    "Architecture Population N",
+    "Effective Architecture Families",
+    "Dominant Architecture Family Share",
+    "Architecture NAUADC@K",
+    "Strategy Population N",
+    "Effective Strategy Families",
+    "Dominant Strategy Family Share",
+    "Strategy NAUADC@K",
+    "Exact Unique Rate",
+    "Exact Modal Share",
+    "Diversity K Max",
+]
+
+PAPER_DESCRIPTIVE_COLUMNS = [
+    "Issue",
+    "Checkpoint",
+    "Model",
+    "Temp",
+    "Raw Architecture Families",
+    "Mean Pairwise Architecture Distance",
+    "Architecture Vendi Score",
+    "Raw Strategy Families",
+    "Mean Pairwise Strategy Distance",
+    "Strategy Vendi Score",
     "Mean Repair Loops",
     "Median Repair Loops",
     "Max Repair Loops",
     "Mean LLM Invocations",
-    "Mean Repair Loops - Successful Runs",
-    "Mean Repair Loops - Failed Runs",
     "Mean Repair LLM Runtime (s)",
-    "Pass@1",
-    "Pass@5",
-    "Pass@10",
-    "Pass@20",
-    "Mean Runtime (s)",
-    "Median Runtime (s)",
-    "Mean LLM Total Tokens",
+    "Mean Total Runtime (s)",
+    "Median Total Runtime (s)",
     "Mean Lines Edited",
     "Mean Files Edited",
-    "Mean Source Tokens",
     "Mean Functions Edited",
     "Mean Functions Created",
     "Mean Functions Deleted",
-    "Mean AST Edit Distance",
-    "Raw Arch. Clusters",
-    "Effective Arch. Clusters",
-    "Dominant Arch. Cluster Share",
-    "Arch. Singleton Rate",
-    "Raw Strategy Clusters",
-    "Effective Strategy Clusters",
-    "Dominant Strategy Cluster Share",
-    "Strategy Singleton Rate",
-    "Dominant Cluster Share",
-]
-
-PAPER_ALL_RUN_COLUMNS = [
-    "All-Run Mean Lines Edited",
-    "All-Run Mean Files Edited",
-    "All-Run Mean Source Tokens",
-    "All-Run Mean Functions Edited",
-    "All-Run Mean Functions Created",
-    "All-Run Mean Functions Deleted",
-    "All-Run Mean AST Edit Distance",
+    "Mean GumTree/AST Edit Magnitude",
 ]
 
 
@@ -190,8 +208,6 @@ class ParsedSource:
     tree_sitter_node_count: int | None
     tree_sitter_functions: dict[str, FunctionInfo] | None
     tree_sitter_error: str | None
-    lizard_metrics: dict[str, float] | None
-    lizard_error: str | None
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +227,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--experiment", required=True, type=Path)
     parser.add_argument(
+        "--source-path",
+        type=Path,
+        default=None,
+        help=(
+            "Configured source path override. Required for legacy sandbox run.json "
+            "metadata that does not record source_path."
+        ),
+    )
+    parser.add_argument(
+        "--baseline-source",
+        type=Path,
+        default=None,
+        help=(
+            "Baseline source override for sandbox analysis. Seeded sandbox runs "
+            "otherwise derive it from run.json; unseeded runs use an empty source."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         help="Default: <experiment>/analysis",
@@ -220,7 +254,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.30,
         help=(
-            "Whole-patch architecture cosine-distance cut. This preserves the "
+            "Architecture cosine-distance cut. This preserves the "
             "argument used by run_llm_experiment.sh. Default: 0.30"
         ),
     )
@@ -229,7 +263,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help=(
-            "Algorithmic-strategy cosine-distance cut. Defaults to the value "
+            "Implementation-strategy cosine-distance cut. Defaults to the value "
             "of --cluster-threshold."
         ),
     )
@@ -237,19 +271,31 @@ def parse_args() -> argparse.Namespace:
         "--thresholds",
         default=None,
         help=(
-            "Optional comma-separated thresholds for sensitivity tables in "
-            "--diagnostic-output mode. When omitted, each population "
-            "receives a data-derived grid."
+            "Optional comma-separated thresholds for sensitivity tables. "
+            "Values are used exactly as supplied; "
+            "otherwise a deterministic local grid surrounds each primary cut."
         ),
     )
     parser.add_argument(
-        "--discovery-repetitions",
+        "--diversity-k-max",
         type=int,
-        default=2000,
+        default=None,
         help=(
-            "Random permutations used for discovery curves in "
-            "--diagnostic-output mode. Default: 2000"
+            "Optional common fixed sampling budget K for comparable NAUADC@K. "
+            "The complete DA curve is always calculated."
         ),
+    )
+    parser.add_argument(
+        "--bootstrap-repetitions",
+        type=int,
+        default=1000,
+        help="Implementation-level bootstrap repetitions. Default: 1000",
+    )
+    parser.add_argument(
+        "--bootstrap-seed",
+        type=int,
+        default=20260723,
+        help="Deterministic bootstrap seed. Default: 20260723",
     )
     parser.add_argument(
         "--strategy-exclude-regex",
@@ -286,6 +332,11 @@ def parse_args() -> argparse.Namespace:
             "Write detailed clustering tables, plots, and per-run tool "
             "artifacts beneath analysis/diagnostics/."
         ),
+    )
+    parser.add_argument(
+        "--security-diagnostics",
+        action="store_true",
+        help="Write optional static security profiles and Flawfinder cross-checks.",
     )
     parser.add_argument(
         "--paper-issue-label",
@@ -533,16 +584,13 @@ def build_repair_summary(
 
     initially_failed = n - initial_successes
     return {
-        "initial_successes": initial_successes,
-        "initial_success_rate": initial_successes / n if n else None,
-        "public_validation_successes": len(public_success_rows),
-        "public_validation_success_rate": (
+        "initial_public_successes": initial_successes,
+        "initial_public_success_rate": initial_successes / n if n else None,
+        "final_public_successes": len(public_success_rows),
+        "final_public_success_rate": (
             len(public_success_rows) / n if n else None
         ),
-        "repair_assisted_public_successes": repair_assisted_successes,
-        "repair_assisted_public_success_rate": (
-            repair_assisted_successes / n if n else None
-        ),
+        "recovered_initially_failed_runs": repair_assisted_successes,
         "repair_recovery_rate": (
             repair_assisted_successes / initially_failed
             if initially_failed
@@ -616,19 +664,11 @@ def infer_paper_checkpoint(
 def select_primary_cluster_population(
     populations: Mapping[str, Any],
 ) -> tuple[str, Mapping[str, Any]]:
-    for name in ("passing_complete_runs", "passing_runs"):
-        population = populations.get(name)
-        if not isinstance(population, Mapping):
-            continue
-        run_count = population.get("run_count")
-        if (
-            isinstance(run_count, (int, float))
-            and not isinstance(run_count, bool)
-            and run_count > 0
-        ):
-            return name, population
-
-    return "passing_runs", {}
+    population = populations.get("passing_complete_runs")
+    return (
+        "passing_complete_runs",
+        population if isinstance(population, Mapping) else {},
+    )
 
 
 def build_paper_metrics_row(
@@ -639,360 +679,98 @@ def build_paper_metrics_row(
     issue_label: str | None = None,
     checkpoint_label: str | None = None,
 ) -> dict[str, Any]:
-    passing_rows = [row for row in rows if bool(row.get("overall_success"))]
-    passing_complete_rows = [
-        row
-        for row in passing_rows
-        if bool(row.get("complete_architecture_measurement"))
-    ]
-    patch_rows = passing_complete_rows or passing_rows
-
-    clustering = summary.get("clustering")
-    if not isinstance(clustering, Mapping):
-        clustering = {}
-    architecture = clustering.get("architecture")
-    strategy = clustering.get("strategy")
-    architecture_populations = (
-        architecture.get("populations", {})
-        if isinstance(architecture, Mapping)
-        else {}
-    )
-    strategy_populations = (
-        strategy.get("populations", {})
-        if isinstance(strategy, Mapping)
-        else {}
-    )
-    _, architecture_primary = select_primary_cluster_population(
-        architecture_populations
-        if isinstance(architecture_populations, Mapping)
-        else {}
-    )
-    _, strategy_primary = select_primary_cluster_population(
-        strategy_populations
-        if isinstance(strategy_populations, Mapping)
-        else {}
-    )
-
-    pass_at_k_values = summary.get("pass_at_k")
-    if not isinstance(pass_at_k_values, Mapping):
-        pass_at_k_values = {}
-    runtime = summary.get("runtime_seconds")
-    if not isinstance(runtime, Mapping):
-        runtime = {}
-    llm_usage = summary.get("llm_token_usage")
-    if not isinstance(llm_usage, Mapping):
-        llm_usage = {}
-    repair = summary.get("repair")
-    if not isinstance(repair, Mapping):
-        repair = {}
-
-    patch_fields = {
-        "Mean Lines Edited": "lines_edited",
-        "Mean Files Edited": "files_edited",
-        "Mean Source Tokens": "source_tree_sitter_leaf_tokens",
-        "Mean Functions Edited": "functions_edited_count",
-        "Mean Functions Created": "functions_created_count",
-        "Mean Functions Deleted": "functions_deleted_count",
-        "Mean AST Edit Distance": "gumtree_normalized_edit_distance",
-    }
-    all_run_names = {
-        paper_name: f"All-Run {paper_name}"
-        for paper_name in patch_fields
-    }
-
-    paper_row: dict[str, Any] = {
+    clustering = summary.get("clustering", {})
+    architecture = clustering.get("architecture", {}) if isinstance(clustering, Mapping) else {}
+    strategy = clustering.get("strategy", {}) if isinstance(clustering, Mapping) else {}
+    _, architecture_primary = select_primary_cluster_population(architecture.get("populations", {}))
+    _, strategy_primary = select_primary_cluster_population(strategy.get("populations", {}))
+    pass_values = summary.get("pass_at_k", {})
+    repair = summary.get("repair", {})
+    exact = summary.get("exact_generation_convergence", {})
+    return {
         "Issue": infer_paper_issue(experiment_metadata, issue_label),
-        "Checkpoint": infer_paper_checkpoint(
-            experiment_metadata,
-            checkpoint_label,
-        ),
+        "Checkpoint": infer_paper_checkpoint(experiment_metadata, checkpoint_label),
         "Model": experiment_metadata.get("model", summary.get("model")),
-        "Temp": experiment_metadata.get(
-            "temperature",
-            summary.get("temperature"),
-        ),
+        "Temp": experiment_metadata.get("temperature", summary.get("temperature")),
         "N Runs": summary.get("runs_analyzed", len(rows)),
-        "Successful Runs": summary.get(
-            "successful_runs",
-            len(passing_rows),
-        ),
-        "Success Rate": summary.get("success_ratio"),
-        "Initial Success Rate": repair.get("initial_success_rate"),
-        "Repair-Assisted Public Success Rate": repair.get(
-            "public_validation_success_rate"
-        ),
+        "Successful Runs": summary.get("successful_runs"),
+        "Overall Success Rate": summary.get("success_ratio"),
+        "Initial Public Success Rate": repair.get("initial_public_success_rate"),
+        "Final Public Success Rate": repair.get("final_public_success_rate"),
+        "Repair Recovery Rate": repair.get("repair_recovery_rate"),
+        "Pass@1": pass_values.get("pass@1"),
+        "Pass@5": pass_values.get("pass@5"),
+        "Pass@10": pass_values.get("pass@10"),
+        "Architecture Population N": architecture_primary.get("run_count"),
+        "Effective Architecture Families": architecture_primary.get("effective_family_count"),
+        "Dominant Architecture Family Share": architecture_primary.get("dominant_family_share"),
+        "Architecture NAUADC@K": architecture_primary.get("nauadc_at_kmax"),
+        "Strategy Population N": strategy_primary.get("run_count"),
+        "Effective Strategy Families": strategy_primary.get("effective_family_count"),
+        "Dominant Strategy Family Share": strategy_primary.get("dominant_family_share"),
+        "Strategy NAUADC@K": strategy_primary.get("nauadc_at_kmax"),
+        "Exact Unique Rate": exact.get("exact_unique_rate"),
+        "Exact Modal Share": exact.get("exact_modal_share"),
+        "Diversity K Max": summary.get("diversity_k_max"),
+    }
+
+
+def build_paper_descriptive_row(
+    experiment_metadata: Mapping[str, Any],
+    summary: Mapping[str, Any],
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    issue_label: str | None = None,
+    checkpoint_label: str | None = None,
+) -> dict[str, Any]:
+    clustering = summary.get("clustering", {})
+    architecture = clustering.get("architecture", {}) if isinstance(clustering, Mapping) else {}
+    strategy = clustering.get("strategy", {}) if isinstance(clustering, Mapping) else {}
+    _, architecture_primary = select_primary_cluster_population(architecture.get("populations", {}))
+    _, strategy_primary = select_primary_cluster_population(strategy.get("populations", {}))
+    repair = summary.get("repair", {})
+    runtime = summary.get("runtime_seconds", {})
+    successful_rows = [row for row in rows if bool(row.get("overall_success"))]
+    return {
+        "Issue": infer_paper_issue(experiment_metadata, issue_label),
+        "Checkpoint": infer_paper_checkpoint(experiment_metadata, checkpoint_label),
+        "Model": experiment_metadata.get("model", summary.get("model")),
+        "Temp": experiment_metadata.get("temperature", summary.get("temperature")),
+        "Raw Architecture Families": architecture_primary.get("raw_family_count"),
+        "Mean Pairwise Architecture Distance": architecture_primary.get("mean_pairwise_distance"),
+        "Architecture Vendi Score": architecture_primary.get("vendi_score"),
+        "Raw Strategy Families": strategy_primary.get("raw_family_count"),
+        "Mean Pairwise Strategy Distance": strategy_primary.get("mean_pairwise_distance"),
+        "Strategy Vendi Score": strategy_primary.get("vendi_score"),
         "Mean Repair Loops": repair.get("mean_repair_loops"),
         "Median Repair Loops": repair.get("median_repair_loops"),
         "Max Repair Loops": repair.get("max_repair_loops"),
         "Mean LLM Invocations": repair.get("mean_llm_invocations"),
-        "Mean Repair Loops - Successful Runs": repair.get(
-            "mean_repair_loops_successful_runs"
+        "Mean Repair LLM Runtime (s)": repair.get("mean_repair_llm_runtime_seconds"),
+        "Mean Total Runtime (s)": runtime.get("mean"),
+        "Median Total Runtime (s)": runtime.get("median"),
+        "Mean Lines Edited": safe_numeric_mean(row.get("lines_edited") for row in successful_rows),
+        "Mean Files Edited": safe_numeric_mean(row.get("files_edited") for row in successful_rows),
+        "Mean Functions Edited": safe_numeric_mean(row.get("functions_edited_count") for row in successful_rows),
+        "Mean Functions Created": safe_numeric_mean(row.get("functions_created_count") for row in successful_rows),
+        "Mean Functions Deleted": safe_numeric_mean(row.get("functions_deleted_count") for row in successful_rows),
+        "Mean GumTree/AST Edit Magnitude": safe_numeric_mean(
+            row.get("gumtree_normalized_edit_distance") for row in successful_rows
         ),
-        "Mean Repair Loops - Failed Runs": repair.get(
-            "mean_repair_loops_failed_runs"
-        ),
-        "Mean Repair LLM Runtime (s)": repair.get(
-            "mean_repair_llm_runtime_seconds"
-        ),
-        "Pass@1": pass_at_k_values.get("pass@1"),
-        "Pass@5": pass_at_k_values.get("pass@5"),
-        "Pass@10": pass_at_k_values.get("pass@10"),
-        "Pass@20": pass_at_k_values.get("pass@20"),
-        "Mean Runtime (s)": runtime.get("mean"),
-        "Median Runtime (s)": runtime.get("median"),
-        "Mean LLM Total Tokens": llm_usage.get("mean_total_tokens"),
     }
-    for paper_name, row_name in patch_fields.items():
-        paper_row[paper_name] = safe_numeric_mean(
-            row.get(row_name) for row in patch_rows
-        )
-        paper_row[all_run_names[paper_name]] = safe_numeric_mean(
-            row.get(row_name) for row in rows
-        )
-
-    architecture_fields = {
-        "Raw Arch. Clusters": "raw_cluster_count",
-        "Effective Arch. Clusters": "effective_cluster_count",
-        "Dominant Arch. Cluster Share": "dominant_cluster_share",
-        "Arch. Singleton Rate": "singleton_rate",
-    }
-    strategy_fields = {
-        "Raw Strategy Clusters": "raw_cluster_count",
-        "Effective Strategy Clusters": "effective_cluster_count",
-        "Dominant Strategy Cluster Share": "dominant_cluster_share",
-        "Strategy Singleton Rate": "singleton_rate",
-    }
-    for paper_name, summary_name in architecture_fields.items():
-        paper_row[paper_name] = architecture_primary.get(summary_name)
-    for paper_name, summary_name in strategy_fields.items():
-        paper_row[paper_name] = strategy_primary.get(summary_name)
-    paper_row["Dominant Cluster Share"] = paper_row[
-        "Dominant Arch. Cluster Share"
-    ]
-    return paper_row
 
 
 def paper_metrics_schema() -> dict[str, Any]:
-    all_attempted = "all attempted runs, including failed runs"
-    successful_complete = (
-        "passing_complete_runs when nonempty; otherwise passing_runs"
-    )
-    parsed_token_runs = (
-        "all attempted runs with parsed LLM total-token measurements"
-    )
-    columns = {
-        "Issue": {
-            "description": "Utility, function, or algorithm under study.",
-            "direction": "not applicable (identity)",
-            "population": "experiment metadata or generic source-path inference",
-        },
-        "Checkpoint": {
-            "description": "Prompt checkpoint or issue identifier.",
-            "direction": "not applicable (identity)",
-            "population": "experiment metadata or prompt filename inference",
-        },
-        "Model": {
-            "description": "Model identifier recorded for the experiment.",
-            "direction": "not applicable (identity)",
-            "population": "experiment metadata",
-        },
-        "Temp": {
-            "description": "Sampling temperature recorded for the experiment.",
-            "direction": "higher means higher configured sampling temperature",
-            "population": "experiment metadata",
-        },
-        "N Runs": {
-            "description": "Number of attempted runs analyzed.",
-            "direction": "higher means more attempted runs",
-            "population": all_attempted,
-        },
-        "Successful Runs": {
-            "description": "Number of attempted runs that passed all stages.",
-            "direction": "higher means more successful runs",
-            "population": all_attempted,
-        },
-        "Success Rate": {
-            "description": "Fraction of attempted runs that passed all stages.",
-            "direction": "higher means greater correctness success",
-            "population": all_attempted,
-        },
-        "Initial Success Rate": {
-            "description": "Fraction passing public validation on initial generation.",
-            "direction": "higher means greater one-shot correctness",
-            "population": all_attempted,
-        },
-        "Repair-Assisted Public Success Rate": {
-            "description": "Fraction passing public validation after the repair trajectory.",
-            "direction": "higher means greater final public correctness",
-            "population": all_attempted,
-        },
-        "Mean Repair Loops": {
-            "description": "Mean repair invocations per independent attempt.",
-            "direction": "higher means more repair invocations",
-            "population": all_attempted,
-        },
-        "Median Repair Loops": {
-            "description": "Median repair invocations per independent attempt.",
-            "direction": "higher means more repair invocations",
-            "population": all_attempted,
-        },
-        "Max Repair Loops": {
-            "description": "Maximum repair invocations in an independent attempt.",
-            "direction": "higher means more repair invocations",
-            "population": all_attempted,
-        },
-        "Mean LLM Invocations": {
-            "description": "Mean initial plus repair LLM invocations per attempt.",
-            "direction": "higher means more model invocations",
-            "population": all_attempted,
-        },
-        "Mean Repair Loops - Successful Runs": {
-            "description": "Mean repair invocations among public-validation successes.",
-            "direction": "higher means more repair invocations",
-            "population": "public-validation successful runs",
-        },
-        "Mean Repair Loops - Failed Runs": {
-            "description": "Mean repair invocations among public-validation failures.",
-            "direction": "higher means more repair invocations",
-            "population": "public-validation failed runs",
-        },
-        "Mean Repair LLM Runtime (s)": {
-            "description": "Mean summed repair-invocation OpenCode runtime.",
-            "direction": "higher means more repair runtime cost",
-            "population": all_attempted,
-        },
-        "Pass@1": {
-            "description": "Unbiased probability of at least one success in 1 sample.",
-            "direction": "higher means greater probability of success",
-            "population": all_attempted,
-        },
-        "Pass@5": {
-            "description": "Unbiased probability of at least one success in 5 samples.",
-            "direction": "higher means greater probability of success",
-            "population": all_attempted,
-        },
-        "Pass@10": {
-            "description": "Unbiased probability of at least one success in 10 samples.",
-            "direction": "higher means greater probability of success",
-            "population": all_attempted,
-        },
-        "Pass@20": {
-            "description": "Unbiased probability of at least one success in 20 samples.",
-            "direction": "higher means greater probability of success",
-            "population": all_attempted,
-        },
-        "Mean Runtime (s)": {
-            "description": "Arithmetic mean total attempt runtime in seconds.",
-            "direction": "higher means more runtime cost",
-            "population": all_attempted,
-        },
-        "Median Runtime (s)": {
-            "description": "Median total attempt runtime in seconds.",
-            "direction": "higher means more runtime cost",
-            "population": all_attempted,
-        },
-        "Mean LLM Total Tokens": {
-            "description": "Mean parsed model total-token usage; not source tokens.",
-            "direction": "higher means more model-token cost",
-            "population": parsed_token_runs,
-        },
-    }
-
-    patch_descriptions = {
-        "Mean Lines Edited": "Mean added plus deleted lines.",
-        "Mean Files Edited": "Mean number of changed tracked or untracked files.",
-        "Mean Source Tokens": "Mean Tree-sitter source-code leaf-token count.",
-        "Mean Functions Edited": "Mean number of existing functions edited.",
-        "Mean Functions Created": "Mean number of functions created.",
-        "Mean Functions Deleted": "Mean number of functions deleted.",
-        "Mean AST Edit Distance": (
-            "Mean normalized GumTree baseline-to-candidate edit distance over "
-            "runs with a valid measurement."
-        ),
-    }
-    for name, description in patch_descriptions.items():
-        columns[name] = {
-            "description": description,
-            "direction": "higher means greater patch magnitude",
-            "population": successful_complete,
-        }
-        columns[f"All-Run {name}"] = {
-            "description": f"All-run version of {name}.",
-            "direction": "higher means greater patch magnitude",
-            "population": all_attempted,
-        }
-
-    columns.update(
-        {
-            "Raw Arch. Clusters": {
-                "description": "Number of observed architecture clusters.",
-                "direction": "higher means more observed architecture diversity",
-                "population": successful_complete,
-            },
-            "Effective Arch. Clusters": {
-                "description": "Exponentiated Shannon entropy of architecture cluster sizes.",
-                "direction": "higher means more size-adjusted architecture diversity",
-                "population": successful_complete,
-            },
-            "Dominant Arch. Cluster Share": {
-                "description": "Fraction of successful patches in the largest architecture cluster.",
-                "direction": "higher means more architecture concentration",
-                "population": successful_complete,
-            },
-            "Arch. Singleton Rate": {
-                "description": "Fraction of successful patches in singleton architecture clusters.",
-                "direction": "higher means more one-off architecture patches",
-                "population": successful_complete,
-            },
-            "Raw Strategy Clusters": {
-                "description": "Number of observed strategy clusters.",
-                "direction": "higher means more observed strategy diversity",
-                "population": successful_complete,
-            },
-            "Effective Strategy Clusters": {
-                "description": "Exponentiated Shannon entropy of strategy cluster sizes.",
-                "direction": "higher means more size-adjusted strategy diversity",
-                "population": successful_complete,
-            },
-            "Dominant Strategy Cluster Share": {
-                "description": "Fraction of successful patches in the largest strategy cluster.",
-                "direction": "higher means more strategy concentration",
-                "population": successful_complete,
-            },
-            "Strategy Singleton Rate": {
-                "description": "Fraction of successful patches in singleton strategy clusters.",
-                "direction": "higher means more one-off strategy patches",
-                "population": successful_complete,
-            },
-            "Dominant Cluster Share": {
-                "description": "Compatibility alias of Dominant Arch. Cluster Share.",
-                "direction": "higher means more architecture concentration",
-                "population": successful_complete,
-            },
-        }
-    )
     return {
-        "schema_version": 2,
-        "compact_csv_columns": PAPER_METRICS_COLUMNS,
-        "json_only_columns": PAPER_ALL_RUN_COLUMNS,
-        "columns": columns,
+        "schema_version": 4,
+        "primary_csv_columns": PAPER_METRICS_COLUMNS,
+        "descriptive_csv_columns": PAPER_DESCRIPTIVE_COLUMNS,
         "notes": {
-            "effective_clusters": (
-                "Effective cluster counts account for unequal cluster sizes "
-                "using exp(Shannon entropy)."
-            ),
-            "dominant_share": (
-                "Dominant share is the fraction of successful patches in the "
-                "largest cluster."
-            ),
-            "structural_clustering_inputs": (
-                "Structural clustering does not use runtime, tests, patch "
-                "size, or Levenshtein ratio as clustering inputs."
-            ),
-            "missing_values": (
-                "Unavailable measurements are null in JSON and blank in CSV; "
-                "observed zero values remain zero."
-            ),
+            "primary_population": "successful final candidates with complete measurement for that representation; no fallback",
+            "effective_families": "exp(Shannon entropy) of empirical family shares",
+            "fixed_budget_nauadc": "null unless --diversity-k-max is supplied and supported by the population",
+            "excluded_from_clustering": "lexical, APTED, API-call, security, complexity, runtime, and patch-size information",
+            "missing_values": "Unavailable measurements are null in JSON and blank in CSV.",
         },
     }
 
@@ -1124,6 +902,82 @@ def parse_change_metrics(attempt: Path) -> dict[str, Any]:
         "untracked_files_created": len(untracked_paths),
         "changed_paths": sorted(all_paths),
     }
+
+
+def source_change_metrics(baseline: Path, candidate: Path) -> dict[str, Any]:
+    """Source-only churn for sandbox runs that have no Git artifacts."""
+    baseline_lines = baseline.read_text(encoding="utf-8", errors="replace").splitlines()
+    candidate_lines = candidate.read_text(encoding="utf-8", errors="replace").splitlines()
+    added = 0
+    deleted = 0
+    for line in difflib.ndiff(baseline_lines, candidate_lines):
+        if line.startswith("+ "):
+            added += 1
+        elif line.startswith("- "):
+            deleted += 1
+    changed = added > 0 or deleted > 0
+    return {
+        "lines_added": added,
+        "lines_deleted": deleted,
+        "lines_edited": added + deleted,
+        "files_edited": int(changed),
+        "tracked_files_edited": None,
+        "untracked_files_created": int(not baseline_lines and bool(candidate_lines)),
+        "changed_paths": [str(candidate)] if changed else [],
+    }
+
+
+def sandbox_run_metadata(experiment: Path) -> tuple[Path, dict[str, Any]] | None:
+    """Find run.json for a sandbox root or one selected temp-* condition."""
+    candidates = [experiment / "run.json", experiment.parent / "run.json", experiment.parent.parent / "run.json"]
+    for path in candidates:
+        if path.is_file():
+            return path, read_json(path)
+    return None
+
+
+def sandbox_attempts(experiment: Path, run_root: Path) -> list[Path]:
+    if (experiment / "metadata.json").is_file():
+        return [experiment]
+    direct_repeats = sorted(
+        path for path in experiment.glob("rep-*") if (path / "metadata.json").is_file()
+    )
+    if direct_repeats:
+        return direct_repeats
+    attempts = sorted(run_root.glob("temp-*/metadata.json"))
+    attempts.extend(sorted(run_root.glob("temp-*/rep-*/metadata.json")))
+    return [path.parent for path in attempts]
+
+
+def resolve_sandbox_baseline(
+    metadata: Mapping[str, Any],
+    source_path: Path,
+    override: Path | None,
+    output_dir: Path,
+) -> tuple[Path, str]:
+    if override is not None:
+        baseline = override.expanduser().resolve()
+        if not baseline.is_file():
+            raise SystemExit(f"Baseline source not found: {baseline}")
+        return baseline, "cli_override"
+
+    repository = Path(str(metadata.get("repository", "."))).expanduser()
+    seed_specs = [item for item in str(metadata.get("seed_files", "")).split(",") if item]
+    for spec in seed_specs:
+        source_text, separator, destination_text = spec.partition(":")
+        destination = Path(destination_text if separator else source_text)
+        if destination != source_path:
+            continue
+        seed = Path(source_text).expanduser()
+        if not seed.is_absolute():
+            seed = repository / seed
+        if seed.is_file():
+            return seed.resolve(), "recorded_seed"
+
+    baseline = output_dir / "diagnostics" / "reference" / "empty_baseline.c"
+    baseline.parent.mkdir(parents=True, exist_ok=True)
+    baseline.write_text("", encoding="utf-8")
+    return baseline, "empty_from_scratch"
 
 
 def parse_test_log(path: Path) -> dict[str, int | None]:
@@ -1682,56 +1536,8 @@ def parse_tree_sitter(
 
 
 # ---------------------------------------------------------------------------
-# Lizard, GumTree, and Difftastic
+# GumTree
 # ---------------------------------------------------------------------------
-
-
-def lizard_metrics(
-    source: Path,
-    output_path: Path | None,
-) -> tuple[dict[str, float] | None, str | None]:
-    executable = shutil.which("lizard")
-    if executable is None:
-        return None, "lizard not found"
-
-    result = run_command([executable, "--csv", str(source)], timeout=180)
-    if output_path is not None:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(result.stdout, encoding="utf-8")
-    if result.returncode != 0:
-        return None, result.stderr.strip() or "Lizard failed"
-
-    metrics = {
-        "function_count": 0.0,
-        "total_nloc": 0.0,
-        "total_cyclomatic_complexity": 0.0,
-        "total_token_count": 0.0,
-        "max_cyclomatic_complexity": 0.0,
-        "max_function_length": 0.0,
-    }
-    for row in csv.reader(result.stdout.splitlines()):
-        if len(row) < 8:
-            continue
-        try:
-            nloc = float(row[0])
-            complexity = float(row[1])
-            token_count = float(row[2])
-            function_length = float(row[4])
-        except ValueError:
-            continue
-
-        metrics["function_count"] += 1
-        metrics["total_nloc"] += nloc
-        metrics["total_cyclomatic_complexity"] += complexity
-        metrics["total_token_count"] += token_count
-        metrics["max_cyclomatic_complexity"] = max(
-            metrics["max_cyclomatic_complexity"], complexity
-        )
-        metrics["max_function_length"] = max(
-            metrics["max_function_length"], function_length
-        )
-    return metrics, None
-
 
 GUMTREE_ACTION_RE = re.compile(
     r"\b(insert-node|insert-tree|delete-node|delete-tree|"
@@ -1800,34 +1606,6 @@ def run_gumtree(
     return actions, normalized_distance, None
 
 
-def run_difftastic(
-    baseline: Path,
-    candidate: Path,
-    output_path: Path | None,
-) -> str | None:
-    executable = shutil.which("difft") or shutil.which("difftastic")
-    if executable is None:
-        return "difftastic not found"
-
-    result = run_command(
-        [executable, str(baseline), str(candidate)],
-        timeout=180,
-    )
-    combined = result.stdout
-    if result.stderr:
-        combined += "\n--- STDERR ---\n" + result.stderr
-    if output_path is not None:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(combined, encoding="utf-8")
-
-    if result.returncode not in {0, 1}:
-        return (
-            result.stderr.strip()
-            or f"Difftastic exited with status {result.returncode}"
-        )
-    return None
-
-
 # ---------------------------------------------------------------------------
 # Source-level metric helpers
 # ---------------------------------------------------------------------------
@@ -1850,10 +1628,6 @@ def analyze_source(
         tree_sitter_functions,
         tree_sitter_error,
     ) = parse_tree_sitter(source)
-    candidate_lizard, lizard_error = lizard_metrics(
-        source,
-        output_dir / "lizard.csv" if output_dir is not None else None,
-    )
     return ParsedSource(
         clang_counts=clang_counts,
         clang_node_count=clang_nodes,
@@ -1863,8 +1637,6 @@ def analyze_source(
         tree_sitter_node_count=tree_sitter_nodes,
         tree_sitter_functions=tree_sitter_functions,
         tree_sitter_error=tree_sitter_error,
-        lizard_metrics=candidate_lizard,
-        lizard_error=lizard_error,
     )
 
 
@@ -1896,27 +1668,6 @@ def function_change_metrics(
         "functions_edited": edited,
         "functions_created": created,
         "functions_deleted": deleted,
-    }
-
-
-def lizard_delta(
-    candidate: dict[str, float] | None,
-    baseline: dict[str, float] | None,
-) -> dict[str, float | None]:
-    keys = {
-        "function_count",
-        "total_nloc",
-        "total_cyclomatic_complexity",
-        "total_token_count",
-        "max_cyclomatic_complexity",
-        "max_function_length",
-    }
-    if candidate is None or baseline is None:
-        return {f"{key}_delta": None for key in sorted(keys)}
-    return {
-        f"{key}_delta": candidate.get(key, 0.0)
-        - baseline.get(key, 0.0)
-        for key in sorted(keys)
     }
 
 
@@ -2047,86 +1798,6 @@ def filter_strategy_delta(
     return result
 
 
-def strategy_motifs(
-    *,
-    function_metrics: Mapping[str, Any],
-    baseline_functions: Mapping[str, FunctionInfo],
-    candidate_functions: Mapping[str, FunctionInfo],
-    created_behavior: set[str],
-    edited_behavior: set[str],
-    strategy_tree_delta: Mapping[str, float],
-    file_tree_delta: Mapping[str, float],
-) -> dict[str, int | float]:
-    edited_names = set(function_metrics.get("functions_edited") or [])
-    created_names = set(function_metrics.get("functions_created") or [])
-
-    def name_matches(names: Iterable[str], expression: str) -> int:
-        pattern = re.compile(expression, re.I)
-        return int(any(pattern.search(name) for name in names))
-
-    def added_suffix(*suffixes: str) -> float:
-        total = 0.0
-        for key, value in strategy_tree_delta.items():
-            if value > 0 and any(key.endswith(suffix) for suffix in suffixes):
-                total += float(value)
-        return total
-
-    call_names: set[str] = set()
-    for name in set(edited_behavior) | set(created_behavior):
-        info = candidate_functions.get(name)
-        if info:
-            call_names.update(info.calls)
-
-    global_declaration_delta = sum(
-        value
-        for key, value in file_tree_delta.items()
-        if value > 0 and key.endswith(".kind.declaration")
-    )
-
-    return {
-        "created_behavior_helpers": len(created_behavior),
-        "edited_behavior_functions": len(edited_behavior),
-        "edited_comparator_named_function": name_matches(
-            edited_names, r"(?:compare|comparator|cmp)"
-        ),
-        "created_comparator_named_helper": name_matches(
-            created_names, r"(?:compare|comparator|cmp)"
-        ),
-        "edited_sort_named_function": name_matches(edited_names, r"sort"),
-        "created_sort_named_helper": name_matches(created_names, r"sort"),
-        "edited_output_named_function": name_matches(
-            edited_names, r"(?:write|output|print|emit)"
-        ),
-        "created_output_named_helper": name_matches(
-            created_names, r"(?:write|output|print|emit)"
-        ),
-        "added_conditional_expressions": added_suffix(
-            ".kind.conditional_expression"
-        ),
-        "added_if_statements": added_suffix(".kind.if_statement"),
-        "added_loops": added_suffix(
-            ".kind.for_statement",
-            ".kind.while_statement",
-            ".kind.do_statement",
-        ),
-        "added_unary_expressions": added_suffix(
-            ".kind.unary_expression"
-        ),
-        "added_return_statements": added_suffix(
-            ".kind.return_statement"
-        ),
-        "added_assignments": added_suffix(
-            ".kind.assignment_expression"
-        ),
-        "added_global_declarations": global_declaration_delta,
-        "calls_qsort": int("qsort" in call_names),
-        "calls_memcmp": int("memcmp" in call_names),
-        "calls_strcmp": int("strcmp" in call_names),
-        "calls_rand": int("rand" in call_names),
-        "calls_srand": int("srand" in call_names),
-    }
-
-
 # ---------------------------------------------------------------------------
 # Feature matrices and distances
 # ---------------------------------------------------------------------------
@@ -2255,152 +1926,22 @@ def stabilize_labels(labels: Sequence[int], run_ids: Sequence[str]) -> Any:
 
 
 def cluster_statistics(labels: Sequence[int]) -> dict[str, Any]:
-    if not labels:
-        return {
-            "raw_cluster_count": 0,
-            "cluster_sizes": {},
-            "entropy_nats": None,
-            "entropy_bits": None,
-            "effective_cluster_count": None,
-            "dominant_cluster_share": None,
-            "singleton_rate": None,
-        }
-
-    sizes = Counter(int(label) for label in labels)
-    total = len(labels)
-    proportions = [size / total for size in sizes.values()]
-    entropy_nats = -sum(p * math.log(p) for p in proportions)
-    entropy_bits = -sum(p * math.log2(p) for p in proportions)
-    return {
-        "raw_cluster_count": len(sizes),
-        "cluster_sizes": dict(sorted(sizes.items())),
-        "entropy_nats": entropy_nats,
-        "entropy_bits": entropy_bits,
-        "effective_cluster_count": math.exp(entropy_nats),
-        "dominant_cluster_share": max(proportions),
-        "singleton_rate": sum(size == 1 for size in sizes.values()) / total,
-    }
+    return family_statistics(labels)
 
 
 def parse_threshold_grid(
     supplied: str | None,
-    distance: Any,
+    primary_threshold: float,
 ) -> list[float]:
-    if supplied:
-        values = sorted(
-            {
-                float(item.strip())
-                for item in supplied.split(",")
-                if item.strip()
-            }
-        )
-        if any(value <= 0 for value in values):
-            raise ValueError("Thresholds must be positive.")
-        return values
-
-    if len(distance) < 2:
-        return [0.30]
-
-    condensed = distance[np.triu_indices(len(distance), k=1)]
-    positive = condensed[condensed > 1e-12]
-    if len(positive) == 0:
-        return [0.001]
-
-    quantiles = np.quantile(
-        positive,
-        [
-            0.01,
-            0.025,
-            0.05,
-            0.075,
-            0.10,
-            0.15,
-            0.20,
-            0.25,
-            0.35,
-            0.50,
-            0.65,
-            0.75,
-            0.85,
-            0.90,
-            0.95,
-        ],
-    )
-    regular = np.linspace(
-        max(float(positive.min()), 1e-6),
-        float(positive.max()),
-        20,
-    )
-    return sorted(
-        {
-            round(float(value), 8)
-            for value in np.concatenate([quantiles, regular])
-            if value > 0
-        }
-    )
+    return deterministic_threshold_grid(primary_threshold, supplied)
 
 
 def threshold_sensitivity(
     distance: Any,
     thresholds: Sequence[float],
-) -> tuple[list[dict[str, Any]], float | None]:
-    rows: list[dict[str, Any]] = []
-    n = len(distance)
-
-    for threshold in thresholds:
-        labels = stabilize_labels(
-            agglomerative_labels(distance, threshold),
-            [str(index) for index in range(n)],
-        )
-        stats = cluster_statistics([int(value) for value in labels])
-        cluster_count = stats["raw_cluster_count"]
-
-        silhouette: float | None = None
-        if 2 <= cluster_count < n:
-            try:
-                silhouette = float(
-                    silhouette_score(
-                        distance,
-                        labels,
-                        metric="precomputed",
-                    )
-                )
-            except ValueError:
-                silhouette = None
-
-        rows.append(
-            {
-                "threshold": float(threshold),
-                "cluster_count": cluster_count,
-                "effective_cluster_count": stats[
-                    "effective_cluster_count"
-                ],
-                "dominant_cluster_share": stats[
-                    "dominant_cluster_share"
-                ],
-                "singleton_rate": stats["singleton_rate"],
-                "silhouette": silhouette,
-            }
-        )
-
-    eligible = [
-        row
-        for row in rows
-        if row["silhouette"] is not None
-        and 2 <= int(row["cluster_count"]) <= max(2, min(20, n - 1))
-    ]
-    if not eligible:
-        return rows, None
-
-    selected = max(
-        eligible,
-        key=lambda row: (
-            float(row["silhouette"]),
-            -float(row["singleton_rate"]),
-            -float(row["threshold"]),
-        ),
-    )
-    return rows, float(selected["threshold"])
+    primary_threshold: float = 0.30,
+) -> list[dict[str, Any]]:
+    return family_threshold_sensitivity(distance, primary_threshold, thresholds)
 
 
 def mean_pairwise_distance(distance: Any) -> float:
@@ -2462,87 +2003,6 @@ def cluster_representatives(
     return rows
 
 
-def discovery_curve(
-    labels: Sequence[int],
-    repetitions: int,
-    seed: int = 20260717,
-) -> list[dict[str, Any]]:
-    if not labels:
-        return []
-
-    observed: list[int] = []
-    seen: set[int] = set()
-    for label in labels:
-        seen.add(int(label))
-        observed.append(len(seen))
-
-    rng = random.Random(seed)
-    original = [int(label) for label in labels]
-    curves: list[list[int]] = []
-    for _ in range(repetitions):
-        shuffled = original[:]
-        rng.shuffle(shuffled)
-        current_seen: set[int] = set()
-        curve: list[int] = []
-        for label in shuffled:
-            current_seen.add(label)
-            curve.append(len(current_seen))
-        curves.append(curve)
-
-    rows: list[dict[str, Any]] = []
-    for index in range(len(original)):
-        values = [curve[index] for curve in curves]
-        rows.append(
-            {
-                "runs_sampled": index + 1,
-                "observed_clusters": observed[index],
-                "randomized_mean_clusters": statistics.fmean(values),
-                "randomized_2_5_percentile": float(
-                    np.percentile(values, 2.5)
-                ),
-                "randomized_97_5_percentile": float(
-                    np.percentile(values, 97.5)
-                ),
-            }
-        )
-    return rows
-
-
-def plot_discovery_curve(
-    rows: Sequence[Mapping[str, Any]],
-    output_path: Path,
-    title: str,
-    plt: Any,
-) -> None:
-    if not rows:
-        return
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    x = [int(row["runs_sampled"]) for row in rows]
-    observed = [float(row["observed_clusters"]) for row in rows]
-    randomized_mean = [
-        float(row["randomized_mean_clusters"]) for row in rows
-    ]
-    lower = [
-        float(row["randomized_2_5_percentile"]) for row in rows
-    ]
-    upper = [
-        float(row["randomized_97_5_percentile"]) for row in rows
-    ]
-
-    plt.figure(figsize=(8, 5))
-    plt.plot(x, observed, label="Observed run order")
-    plt.plot(x, randomized_mean, linestyle="--", label="Randomized mean")
-    plt.fill_between(x, lower, upper, alpha=0.2, label="95% interval")
-    plt.xlabel("Runs sampled")
-    plt.ylabel("Clusters discovered")
-    plt.title(title)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=180)
-    plt.close()
-
-
 def plot_dendrogram(
     distance: Any,
     run_ids: Sequence[str],
@@ -2583,21 +2043,28 @@ def analyze_population(
     run_ids: Sequence[str],
     all_run_ids: Sequence[str],
     full_distance: Any,
+    full_feature_matrix: Any,
     threshold: float,
     supplied_thresholds: str | None,
     diagnostic_data_dir: Path | None,
     diagnostic_plot_dir: Path | None,
     plotting_helpers: tuple[Any, Any, Any, Any] | None,
-    discovery_repetitions: int,
+    diversity_k_max: int | None,
+    bootstrap_repetitions: int,
+    bootstrap_seed: int,
 ) -> tuple[dict[str, Any], Any]:
     indices = [all_run_ids.index(run_id) for run_id in run_ids]
     distance = full_distance[np.ix_(indices, indices)]
+    feature_matrix = full_feature_matrix[indices]
 
     labels = stabilize_labels(
         agglomerative_labels(distance, threshold),
         run_ids,
     )
     stats = cluster_statistics([int(value) for value in labels])
+    if not run_ids:
+        for key in ("raw_family_count", "raw_cluster_count"):
+            stats[key] = None
 
     prefix = f"{space_name}_{population_name}"
     representative_rows = cluster_representatives(
@@ -2605,23 +2072,34 @@ def analyze_population(
         distance,
         run_ids,
     )
-    diagnostic_recommendation = None
+    curve = da_curve([int(value) for value in labels])
+    area = nauadc_summary(curve, diversity_k_max)
+    vendi = compute_vendi_score(feature_matrix)
+    bootstrap = bootstrap_diversity_ci(
+        feature_matrix,
+        threshold,
+        bootstrap_repetitions if population_name == "passing_complete_runs" else 0,
+        bootstrap_seed,
+        diversity_k_max,
+    )
     if diagnostic_data_dir is not None:
-        threshold_grid = parse_threshold_grid(supplied_thresholds, distance)
-        sensitivity_rows, diagnostic_recommendation = threshold_sensitivity(
+        threshold_grid = parse_threshold_grid(supplied_thresholds, threshold)
+        sensitivity_rows = threshold_sensitivity(
             distance,
             threshold_grid,
+            threshold,
         )
         write_csv(
             diagnostic_data_dir / f"threshold_sensitivity_{prefix}.csv",
             sensitivity_rows,
             [
                 "threshold",
-                "cluster_count",
-                "effective_cluster_count",
-                "dominant_cluster_share",
+                "raw_family_count",
+                "effective_family_count",
+                "dominant_family_share",
                 "singleton_rate",
                 "silhouette",
+                "adjusted_rand_vs_primary",
             ],
         )
         write_csv(
@@ -2649,31 +2127,9 @@ def analyze_population(
                 "members",
             ],
         )
-        discovery_rows = discovery_curve(
-            [int(value) for value in labels],
-            repetitions=discovery_repetitions,
-        )
-        write_csv(
-            diagnostic_data_dir / f"cluster_discovery_{prefix}.csv",
-            discovery_rows,
-            [
-                "runs_sampled",
-                "observed_clusters",
-                "randomized_mean_clusters",
-                "randomized_2_5_percentile",
-                "randomized_97_5_percentile",
-            ],
-        )
         if diagnostic_plot_dir is None or plotting_helpers is None:
             raise RuntimeError("Diagnostic plotting was not initialized.")
         plt, scipy_linkage, scipy_dendrogram, squareform = plotting_helpers
-        plot_discovery_curve(
-            discovery_rows,
-            diagnostic_plot_dir / f"cluster_discovery_{prefix}.png",
-            f"{space_name.title()} cluster discovery - "
-            f"{population_name.replace('_', ' ')}",
-            plt,
-        )
         plot_dendrogram(
             distance,
             run_ids,
@@ -2694,11 +2150,15 @@ def analyze_population(
             "distance": "cosine",
             "linkage": "average",
             "threshold_used": threshold,
-            "diagnostic_silhouette_recommendation": (
-                diagnostic_recommendation
-            ),
-            "mean_pairwise_distance": mean_pairwise_distance(distance),
+            "measurement_available": bool(run_ids),
+            "unavailable_reason": None if run_ids else "no successful candidates with complete measurement",
+            "mean_pairwise_distance": mean_pairwise_distance(distance) if run_ids else None,
             "representatives": representative_rows,
+            "da_curve": curve,
+            **area,
+            "vendi_score": vendi["score"],
+            "vendi_diagnostic": vendi,
+            "bootstrap_95_percent_ci": bootstrap,
         },
         labels,
     )
@@ -2711,6 +2171,10 @@ def analyze_population(
 
 def main() -> int:
     args = parse_args()
+    if args.diversity_k_max is not None and args.diversity_k_max < 1:
+        raise SystemExit("--diversity-k-max must be positive")
+    if args.bootstrap_repetitions < 0:
+        raise SystemExit("--bootstrap-repetitions must be non-negative")
     global np, AgglomerativeClustering, silhouette_score
     np, AgglomerativeClustering, silhouette_score = require_python_packages()
     experiment = args.experiment.resolve()
@@ -2718,10 +2182,19 @@ def main() -> int:
         raise SystemExit(f"Experiment directory not found: {experiment}")
 
     experiment_metadata_path = experiment / "experiment.json"
-    if not experiment_metadata_path.exists():
-        raise SystemExit(f"Missing experiment.json: {experiment_metadata_path}")
-
-    experiment_metadata = read_json(experiment_metadata_path)
+    sandbox_metadata = None if experiment_metadata_path.exists() else sandbox_run_metadata(experiment)
+    if experiment_metadata_path.exists():
+        experiment_format = "git_experiment"
+        experiment_metadata = read_json(experiment_metadata_path)
+        run_root = experiment
+    elif sandbox_metadata is not None:
+        experiment_format = "sandbox_run"
+        run_metadata_path, experiment_metadata = sandbox_metadata
+        run_root = run_metadata_path.parent
+    else:
+        raise SystemExit(
+            f"Missing experiment.json and no enclosing sandbox run.json: {experiment}"
+        )
     output_dir = (
         args.output_dir.resolve()
         if args.output_dir
@@ -2751,18 +2224,47 @@ def main() -> int:
         else None
     )
 
-    source_path = Path(experiment_metadata["source_path"])
-    baseline_source = experiment / "baseline" / source_path
+    configured_source = args.source_path or experiment_metadata.get("source_path")
+    if configured_source is None:
+        raise SystemExit(
+            "Sandbox metadata does not record source_path; pass --source-path PATH"
+        )
+    source_path = Path(str(configured_source))
+    if source_path.is_absolute():
+        raise SystemExit("source_path must be relative to the candidate workspace")
+    if experiment_format == "git_experiment":
+        baseline_source = (
+            args.baseline_source.resolve()
+            if args.baseline_source is not None
+            else experiment / "baseline" / source_path
+        )
+        baseline_kind = "experiment_snapshot"
+        attempts = sorted(
+            path
+            for path in experiment.glob("attempt-*")
+            if path.is_dir() and (path / "metadata.json").exists()
+        )
+    else:
+        baseline_source, baseline_kind = resolve_sandbox_baseline(
+            experiment_metadata, source_path, args.baseline_source, output_dir
+        )
+        attempts = sandbox_attempts(experiment, run_root)
     if not baseline_source.exists():
         raise SystemExit(f"Baseline source not found: {baseline_source}")
-
-    attempts = sorted(
-        path
-        for path in experiment.glob("attempt-*")
-        if path.is_dir() and (path / "metadata.json").exists()
-    )
     if not attempts:
-        raise SystemExit("No attempt-* directories with metadata.json found.")
+        raise SystemExit("No candidate directories with metadata.json found.")
+
+    attempt_temperatures = {
+        read_json(attempt / "metadata.json").get("temperature") for attempt in attempts
+    }
+    attempt_temperatures.discard(None)
+    if experiment_format == "sandbox_run" and len(attempt_temperatures) > 1:
+        raise SystemExit(
+            "Sandbox analysis must select one temperature condition; pass a temp-* directory, not the mixed run root"
+        )
+    if experiment_metadata.get("temperature") is None and len(attempt_temperatures) == 1:
+        experiment_metadata["temperature"] = next(iter(attempt_temperatures))
+    experiment_metadata["source_path"] = str(source_path)
 
     parser_regex = re.compile(args.strategy_exclude_regex, re.I)
     forced_strategy_functions = set(args.strategy_include_function)
@@ -2775,9 +2277,7 @@ def main() -> int:
     tool_paths = {
         "clang": shutil.which("clang"),
         "gumtree": shutil.which("gumtree"),
-        "difftastic": shutil.which("difft")
-        or shutil.which("difftastic"),
-        "lizard": shutil.which("lizard"),
+        "flawfinder": shutil.which("flawfinder"),
         "python": sys.executable,
     }
     if diagnostic_root is not None:
@@ -2815,22 +2315,38 @@ def main() -> int:
                     for name, info in baseline_functions.items()
                 },
                 "tree_sitter_error": baseline.tree_sitter_error,
-                "lizard_metrics": baseline.lizard_metrics,
-                "lizard_error": baseline.lizard_error,
             },
         )
 
     rows: list[dict[str, Any]] = []
     architecture_blocks: dict[str, dict[str, dict[str, float]]] = {}
     strategy_blocks: dict[str, dict[str, dict[str, float]]] = {}
-    source_texts: dict[str, str] = {}
-    strategy_motif_rows: list[dict[str, Any]] = []
+    candidate_sources: dict[str, Path] = {}
 
     print("\nAnalyzing candidates...")
     for index, attempt in enumerate(attempts, start=1):
-        metadata = normalize_repair_metadata(
-            read_json(attempt / "metadata.json")
-        )
+        raw_metadata = read_json(attempt / "metadata.json")
+        if experiment_format == "sandbox_run":
+            test_exit = raw_metadata.get("test_exit_code")
+            public_success = test_exit == 0 and raw_metadata.get("opencode_exit_code") == 0
+            raw_metadata.update(
+                {
+                    "run_id": str(attempt.relative_to(run_root)),
+                    "build_exit_code": 0,
+                    "base_test_exit_code": 0,
+                    "feature_test_exit_code": test_exit,
+                    "extra_test_exit_code": 0,
+                    "initial_success": public_success,
+                    "public_validation_success": public_success,
+                    "repair_loops": 0,
+                    "llm_invocations": 1,
+                    "success_loop": 0 if public_success else None,
+                    "initial_opencode_runtime_ms": raw_metadata.get("opencode_runtime_ms", 0),
+                    "repair_opencode_runtime_ms": 0,
+                    "total_opencode_runtime_ms": raw_metadata.get("opencode_runtime_ms", 0),
+                }
+            )
+        metadata = normalize_repair_metadata(raw_metadata)
         run_id = str(metadata.get("run_id", attempt.name))
         run_output = (
             diagnostic_root / "runs" / attempt.name
@@ -2838,13 +2354,12 @@ def main() -> int:
             else None
         )
 
-        candidate_source = attempt / "candidate" / source_path
+        candidate_source = attempt / ("candidate" if experiment_format == "git_experiment" else "workdir") / source_path
         candidate_missing = not candidate_source.exists()
-        if candidate_missing:
-            candidate_source = baseline_source
+        measured_source = candidate_source if not candidate_missing else baseline_source
 
         candidate = analyze_source(
-            candidate_source,
+            measured_source,
             run_output,
             args.clang_extra_arg,
         )
@@ -2852,32 +2367,20 @@ def main() -> int:
 
         gumtree_actions, gumtree_distance, gumtree_error = run_gumtree(
             baseline_source,
-            candidate_source,
+            measured_source,
             run_output / "gumtree.txt" if run_output is not None else None,
             baseline.tree_sitter_node_count,
             candidate.tree_sitter_node_count,
         )
-        # Difftastic is diagnostic-only; GumTree supplies structural metrics.
-        if args.diagnostic_output:
-            difftastic_error = run_difftastic(
-                baseline_source,
-                candidate_source,
-                (
-                    run_output / "difftastic.txt"
-                    if run_output is not None
-                    else None
-                ),
-            )
-            difftastic_available: bool | None = difftastic_error is None
-        else:
-            difftastic_error = None
-            difftastic_available = None
-
         function_metrics = function_change_metrics(
             baseline.tree_sitter_functions,
             candidate.tree_sitter_functions,
         )
-        patch_metrics = parse_change_metrics(attempt)
+        patch_metrics = (
+            parse_change_metrics(attempt)
+            if experiment_format == "git_experiment"
+            else source_change_metrics(baseline_source, measured_source)
+        )
 
         architecture_mapping, strategy_created_mapping = (
             created_function_mapping(
@@ -2935,21 +2438,6 @@ def main() -> int:
             strategy_created_mapping,
         )
 
-        file_tree_delta = {
-            key: value
-            for key, value in architecture_tree_delta.items()
-            if key.startswith("file.")
-        }
-        motifs = strategy_motifs(
-            function_metrics=function_metrics,
-            baseline_functions=baseline_functions,
-            candidate_functions=candidate_functions,
-            created_behavior=created_behavior,
-            edited_behavior=edited_behavior,
-            strategy_tree_delta=strategy_tree_delta,
-            file_tree_delta=file_tree_delta,
-        )
-
         architecture_blocks[run_id] = {
             "clang": split_signed_delta(
                 architecture_clang_delta,
@@ -2989,29 +2477,21 @@ def main() -> int:
             else {},
         }
 
-        base_test = parse_test_log(attempt / "base-tests.log")
-        feature_test = parse_test_log(attempt / "feature-tests.log")
-        extra_test = parse_test_log(attempt / "extra-tests.log")
+        if experiment_format == "git_experiment":
+            base_test = parse_test_log(attempt / "base-tests.log")
+            feature_test = parse_test_log(attempt / "feature-tests.log")
+            extra_test = parse_test_log(attempt / "extra-tests.log")
+        else:
+            base_test = parse_test_log(Path("/nonexistent"))
+            feature_test = parse_test_log(attempt / "test.log")
+            extra_test = parse_test_log(Path("/nonexistent"))
         llm_tokens = parse_llm_tokens(attempt / "opencode.log")
-
-        candidate_lizard = candidate.lizard_metrics
-        candidate_lizard_fields = {
-            f"lizard_{key}": value
-            for key, value in (candidate_lizard or {}).items()
-        }
-        if candidate_lizard is None:
-            for key in (
-                "function_count",
-                "total_nloc",
-                "total_cyclomatic_complexity",
-                "total_token_count",
-                "max_cyclomatic_complexity",
-                "max_function_length",
-            ):
-                candidate_lizard_fields[f"lizard_{key}"] = None
 
         complete_architecture_measurement = all(
             [
+                not candidate_missing,
+                baseline.clang_error is None,
+                baseline.tree_sitter_error is None,
                 candidate.clang_error is None,
                 candidate.tree_sitter_error is None,
                 gumtree_error is None,
@@ -3019,6 +2499,9 @@ def main() -> int:
         )
         complete_strategy_measurement = all(
             [
+                not candidate_missing,
+                baseline.clang_error is None,
+                baseline.tree_sitter_error is None,
                 candidate.clang_error is None,
                 candidate.tree_sitter_error is None,
             ]
@@ -3029,8 +2512,8 @@ def main() -> int:
             **patch_metrics,
             **function_metrics,
             "candidate_missing": candidate_missing,
-            "candidate_sha256": file_sha256(candidate_source),
-            "source_bytes": candidate_source.stat().st_size,
+            "candidate_sha256": file_sha256(measured_source) if not candidate_missing else None,
+            "source_bytes": measured_source.stat().st_size if not candidate_missing else None,
             "source_tree_sitter_leaf_tokens": (
                 candidate.tree_sitter_leaf_tokens
             ),
@@ -3067,9 +2550,6 @@ def main() -> int:
             "clang_available": candidate.clang_error is None,
             "tree_sitter_available": candidate.tree_sitter_error is None,
             "gumtree_available": gumtree_error is None,
-            "difftastic_requested": args.diagnostic_output,
-            "difftastic_available": difftastic_available,
-            "lizard_available": candidate.lizard_error is None,
             "complete_architecture_measurement": (
                 complete_architecture_measurement
             ),
@@ -3077,21 +2557,10 @@ def main() -> int:
             "clang_error": candidate.clang_error,
             "tree_sitter_error": candidate.tree_sitter_error,
             "gumtree_error": gumtree_error,
-            "difftastic_error": difftastic_error,
-            "lizard_error": candidate.lizard_error,
-            **candidate_lizard_fields,
-            **lizard_delta(
-                candidate.lizard_metrics,
-                baseline.lizard_metrics,
-            ),
-            **motifs,
         }
         rows.append(row)
-        if args.diagnostic_output:
-            source_texts[run_id] = candidate_source.read_text(
-                encoding="utf-8", errors="replace"
-            )
-        strategy_motif_rows.append({"run_id": run_id, **motifs})
+        if not candidate_missing:
+            candidate_sources[run_id] = measured_source
 
         if run_output is not None:
             write_json(
@@ -3116,7 +2585,6 @@ def main() -> int:
                     "gumtree_normalized_edit_distance": gumtree_distance,
                     "architecture_blocks": architecture_blocks[run_id],
                     "strategy_blocks": strategy_blocks[run_id],
-                    "strategy_motifs": motifs,
                     "candidate_functions": {
                         name: asdict(info)
                         for name, info in candidate_functions.items()
@@ -3125,8 +2593,6 @@ def main() -> int:
                         "clang": candidate.clang_error,
                         "tree_sitter": candidate.tree_sitter_error,
                         "gumtree": gumtree_error,
-                        "difftastic": difftastic_error,
-                        "lizard": candidate.lizard_error,
                     },
                 },
             )
@@ -3194,12 +2660,15 @@ def main() -> int:
             run_ids=ids,
             all_run_ids=run_ids,
             full_distance=architecture_distance,
+            full_feature_matrix=architecture_matrix,
             threshold=args.cluster_threshold,
             supplied_thresholds=args.thresholds,
             diagnostic_data_dir=diagnostic_clustering_dir,
             diagnostic_plot_dir=diagnostic_plot_dir,
             plotting_helpers=plotting_helpers,
-            discovery_repetitions=args.discovery_repetitions,
+            diversity_k_max=args.diversity_k_max,
+            bootstrap_repetitions=args.bootstrap_repetitions,
+            bootstrap_seed=args.bootstrap_seed,
         )
         architecture_summaries[population_name] = summary
         architecture_labels[population_name] = labels
@@ -3213,58 +2682,18 @@ def main() -> int:
             run_ids=ids,
             all_run_ids=run_ids,
             full_distance=strategy_distance,
+            full_feature_matrix=strategy_matrix,
             threshold=strategy_threshold,
             supplied_thresholds=args.thresholds,
             diagnostic_data_dir=diagnostic_clustering_dir,
             diagnostic_plot_dir=diagnostic_plot_dir,
             plotting_helpers=plotting_helpers,
-            discovery_repetitions=args.discovery_repetitions,
+            diversity_k_max=args.diversity_k_max,
+            bootstrap_repetitions=args.bootstrap_repetitions,
+            bootstrap_seed=args.bootstrap_seed + 1,
         )
         strategy_summaries[population_name] = summary
         strategy_labels[population_name] = labels
-
-    if diagnostic_clustering_dir is not None and diagnostic_plot_dir is not None:
-        compatibility_files = [
-            (
-                diagnostic_clustering_dir,
-                "threshold_sensitivity_architecture_all_runs.csv",
-                "threshold_sensitivity_all_runs.csv",
-            ),
-            (
-                diagnostic_clustering_dir,
-                "threshold_sensitivity_architecture_passing_runs.csv",
-                "threshold_sensitivity_passing_runs.csv",
-            ),
-            (
-                diagnostic_clustering_dir,
-                "cluster_assignments_architecture_all_runs.csv",
-                "cluster_assignments_all_runs.csv",
-            ),
-            (
-                diagnostic_clustering_dir,
-                "cluster_assignments_architecture_passing_runs.csv",
-                "cluster_assignments_passing_runs.csv",
-            ),
-            (
-                diagnostic_clustering_dir,
-                "cluster_discovery_architecture_all_runs.csv",
-                "cluster_discovery_curve.csv",
-            ),
-            (
-                diagnostic_plot_dir,
-                "cluster_discovery_architecture_all_runs.png",
-                "cluster_discovery_curve.png",
-            ),
-            (
-                diagnostic_plot_dir,
-                "cluster_dendrogram_architecture_all_runs.png",
-                "cluster_dendrogram.png",
-            ),
-        ]
-        for directory, source_name, destination_name in compatibility_files:
-            source_file = directory / source_name
-            if source_file.exists():
-                shutil.copyfile(source_file, directory / destination_name)
 
     def label_map(ids: Sequence[str], labels: Sequence[int]) -> dict[str, int]:
         return {
@@ -3305,14 +2734,8 @@ def main() -> int:
         strategy_labels["passing_complete_runs"],
     )
 
-    architecture_primary_name = (
-        "passing_complete_runs"
-        if passing_architecture_ids
-        else "passing_runs"
-    )
-    strategy_primary_name = (
-        "passing_complete_runs" if passing_strategy_ids else "passing_runs"
-    )
+    architecture_primary_name = "passing_complete_runs"
+    strategy_primary_name = "passing_complete_runs"
     architecture_primary_map = label_map(
         population_ids[architecture_primary_name],
         architecture_labels[architecture_primary_name],
@@ -3341,6 +2764,139 @@ def main() -> int:
     strategy_sizes, strategy_medoids = primary_cluster_details(
         strategy_summaries[strategy_primary_name]
     )
+
+    diversity_dir = output_dir / "diversity"
+    write_csv(
+        diversity_dir / "architecture_clusters.csv",
+        [
+            {"run_id": run_id, "family_id": architecture_primary_map[run_id]}
+            for run_id in passing_architecture_ids
+        ],
+        ["run_id", "family_id"],
+    )
+    write_csv(
+        diversity_dir / "strategy_clusters.csv",
+        [
+            {"run_id": run_id, "family_id": strategy_primary_map[run_id]}
+            for run_id in passing_strategy_ids
+        ],
+        ["run_id", "family_id"],
+    )
+    write_csv(
+        diversity_dir / "architecture_da_curve.csv",
+        architecture_summaries[architecture_primary_name]["da_curve"],
+        ["k", "da_at_k"],
+    )
+    write_csv(
+        diversity_dir / "strategy_da_curve.csv",
+        strategy_summaries[strategy_primary_name]["da_curve"],
+        ["k", "da_at_k"],
+    )
+
+    successful_candidate_rows = [row for row in rows if bool(row.get("overall_success"))]
+    successful_hash_rows = [
+        row
+        for row in successful_candidate_rows
+        if isinstance(row.get("candidate_sha256"), str)
+    ]
+    exact_repetition = exact_repetition_summary(
+        [str(row["candidate_sha256"]) for row in successful_hash_rows],
+        [str(row["run_id"]) for row in successful_hash_rows],
+    )
+    exact_repetition["successful_candidates"] = len(successful_candidate_rows)
+    exact_repetition["hash_measurement_coverage"] = (
+        len(successful_hash_rows) / len(successful_candidate_rows)
+        if successful_candidate_rows
+        else None
+    )
+    if len(successful_hash_rows) != len(successful_candidate_rows):
+        exact_repetition["exact_unique_rate"] = None
+        exact_repetition["exact_modal_share"] = None
+        exact_repetition["unavailable_reason"] = "one or more successful candidates lacks a source hash"
+    else:
+        exact_repetition["unavailable_reason"] = None
+    write_csv(
+        diversity_dir / "exact_repetition.csv",
+        [
+            {**group, "members": ";".join(group["members"])}
+            for group in exact_repetition["hash_groups"]
+        ],
+        ["sha256", "count", "members"],
+    )
+    diagnostics_dir = output_dir / "diagnostics"
+    for space_name, population_ids_for_space, distance, threshold in (
+        ("architecture", passing_architecture_ids, architecture_distance, args.cluster_threshold),
+        ("strategy", passing_strategy_ids, strategy_distance, strategy_threshold),
+    ):
+        indices = [run_ids.index(run_id) for run_id in population_ids_for_space]
+        primary_distance = distance[np.ix_(indices, indices)]
+        sensitivity = family_threshold_sensitivity(
+            primary_distance,
+            threshold,
+            deterministic_threshold_grid(threshold, args.thresholds),
+        )
+        write_csv(
+            diagnostics_dir / f"{space_name}_threshold_sensitivity.csv",
+            sensitivity,
+            [
+                "threshold", "raw_family_count", "effective_family_count",
+                "dominant_family_share", "singleton_rate", "silhouette",
+                "adjusted_rand_vs_primary",
+            ],
+        )
+
+    uncertainty_rows = []
+    for space_name, population in (
+        ("architecture", architecture_summaries[architecture_primary_name]),
+        ("strategy", strategy_summaries[strategy_primary_name]),
+    ):
+        for metric, interval in population["bootstrap_95_percent_ci"].items():
+            if not isinstance(interval, Mapping):
+                continue
+            uncertainty_rows.append({"space": space_name, "metric": metric, **interval})
+    write_csv(
+        diagnostics_dir / "uncertainty.csv",
+        uncertainty_rows,
+        ["space", "metric", "lower", "upper", "replicates"],
+    )
+    security_summary: dict[str, Any] = {"status": "not_requested"}
+    if args.security_diagnostics:
+        security_rows = []
+        flawfinder_rows = []
+        for run_id in passing_ids:
+            source = candidate_sources.get(run_id)
+            if source is None:
+                continue
+            security_rows.append({"run_id": run_id, **security_profile(source.read_bytes())})
+            flawfinder = flawfinder_crosscheck(source)
+            flawfinder_rows.append(
+                {
+                    "run_id": run_id,
+                    "status": flawfinder["status"],
+                    "reason": flawfinder["reason"],
+                    "hit_count": len(flawfinder["hits"]),
+                }
+            )
+        write_csv(
+            output_dir / "security" / "security_profiles.csv",
+            security_rows,
+            [
+                "run_id", "unsafe_call_count", "bounded_risky_call_count",
+                "heap_allocation_deallocation_call_count",
+                "fixed_size_stack_buffer_count", "indexing_operation_count",
+            ],
+        )
+        write_csv(
+            output_dir / "security" / "flawfinder.csv",
+            flawfinder_rows,
+            ["run_id", "status", "reason", "hit_count"],
+        )
+        security_summary = {
+            "status": "completed",
+            "profiles": len(security_rows),
+            "flawfinder_available_runs": sum(row["status"] == "available" for row in flawfinder_rows),
+            "flawfinder_unavailable_runs": sum(row["status"] != "available" for row in flawfinder_rows),
+        }
 
     for row in rows:
         run_id = str(row["run_id"])
@@ -3391,6 +2947,7 @@ def main() -> int:
     flattened_rows = [flatten_dict(row) for row in rows]
     fields = sorted({key for row in flattened_rows for key in row})
     write_csv(output_dir / "per_run_metrics.csv", flattened_rows, fields)
+    write_csv(output_dir / "runs.csv", flattened_rows, fields)
 
     if diagnostic_clustering_dir is not None:
         architecture_feature_rows = [
@@ -3436,29 +2993,20 @@ def main() -> int:
             ["run_id", *architecture_features],
         )
 
-        motif_fields = sorted(
-            {key for row in strategy_motif_rows for key in row}
-        )
-        write_csv(
-            diagnostic_clustering_dir / "strategy_motifs.csv",
-            strategy_motif_rows,
-            motif_fields,
-        )
-
         write_json(
             diagnostic_clustering_dir / "feature_schema.json",
             {
                 "architecture": {
                     "blocks": architecture_schema,
                     "description": (
-                        "Whole-patch architecture: non-duplicated Clang AST "
+                        "Configured-source architecture: non-duplicated Clang AST "
                         "deltas, Tree-sitter C deltas, and GumTree actions."
                     ),
                 },
                 "strategy": {
                     "blocks": strategy_schema,
                     "description": (
-                        "Algorithmic strategy: Clang and Tree-sitter deltas "
+                        "Implementation strategy: Clang and Tree-sitter deltas "
                         "from behavioral functions only; main and parser/usage "
                         "helpers are excluded by the configured regex."
                     ),
@@ -3481,96 +3029,69 @@ def main() -> int:
                 "excluded_from_clustering": [
                     "lines and files edited",
                     "source token count",
-                    "Lizard metrics",
                     "runtime",
                     "test outcomes",
-                    "Levenshtein ratio",
+                    "lexical, token-winnowing, APTED, and API-call distances",
+                    "security profiles",
                     "LLM token usage",
                 ],
             },
         )
 
-        if diagnostic_packages is None:
-            raise RuntimeError("Diagnostic packages were not initialized.")
-        levenshtein_ratio = diagnostic_packages[1]
         pairwise_rows: list[dict[str, Any]] = []
-        for left_index, right_index in itertools.combinations(
-            range(len(run_ids)), 2
-        ):
-            left = run_ids[left_index]
-            right = run_ids[right_index]
-            pairwise_rows.append(
-                {
-                    "run_a": left,
-                    "run_b": right,
-                    "architecture_cosine_similarity": (
-                        1.0
-                        - float(
-                            architecture_distance[left_index, right_index]
-                        )
-                    ),
-                    "architecture_cosine_distance": float(
-                        architecture_distance[left_index, right_index]
-                    ),
-                    "strategy_cosine_similarity": (
-                        1.0 - float(strategy_distance[left_index, right_index])
-                    ),
-                    "strategy_cosine_distance": float(
-                        strategy_distance[left_index, right_index]
-                    ),
-                    "levenshtein_ratio": (
-                        levenshtein_ratio(
-                            source_texts[left], source_texts[right]
-                        )
-                        / 100.0
-                    ),
-                    "same_architecture_all_cluster": int(
-                        architecture_all_map[left]
-                        == architecture_all_map[right]
-                    ),
-                    "same_strategy_all_cluster": int(
-                        strategy_all_map[left] == strategy_all_map[right]
-                    ),
-                    "both_successful": int(
-                        left in passing_ids and right in passing_ids
-                    ),
-                    "same_architecture_passing_cluster": (
-                        int(
-                            architecture_passing_map[left]
-                            == architecture_passing_map[right]
-                        )
-                        if left in architecture_passing_map
-                        and right in architecture_passing_map
-                        else None
-                    ),
-                    "same_strategy_passing_cluster": (
-                        int(
-                            strategy_passing_map[left]
-                            == strategy_passing_map[right]
-                        )
-                        if left in strategy_passing_map
-                        and right in strategy_passing_map
-                        else None
-                    ),
-                }
+        successful_source_ids = [run_id for run_id in passing_ids if run_id in candidate_sources]
+        run_index = {run_id: index for index, run_id in enumerate(run_ids)}
+        for left, right in itertools.combinations(successful_source_ids, 2):
+            left_index = run_index[left]
+            right_index = run_index[right]
+            validation = validation_distances(
+                candidate_sources[left].read_bytes(),
+                candidate_sources[right].read_bytes(),
             )
+            pairwise_rows.append({
+                "left_run_id": left,
+                "right_run_id": right,
+                **validation,
+                "architecture_distance": (
+                    float(architecture_distance[left_index, right_index])
+                    if left in architecture_primary_map and right in architecture_primary_map
+                    else None
+                ),
+                "strategy_distance": (
+                    float(strategy_distance[left_index, right_index])
+                    if left in strategy_primary_map and right in strategy_primary_map
+                    else None
+                ),
+                "same_architecture_family": (
+                    int(architecture_primary_map[left] == architecture_primary_map[right])
+                    if left in architecture_primary_map and right in architecture_primary_map
+                    else None
+                ),
+                "same_strategy_family": (
+                    int(strategy_primary_map[left] == strategy_primary_map[right])
+                    if left in strategy_primary_map and right in strategy_primary_map
+                    else None
+                ),
+            })
         write_csv(
-            diagnostic_clustering_dir / "pairwise_similarity.csv",
+            diagnostic_root / "pairwise_validation.csv",
             pairwise_rows,
             [
-                "run_a",
-                "run_b",
-                "architecture_cosine_similarity",
-                "architecture_cosine_distance",
-                "strategy_cosine_similarity",
-                "strategy_cosine_distance",
-                "levenshtein_ratio",
-                "same_architecture_all_cluster",
-                "same_strategy_all_cluster",
-                "both_successful",
-                "same_architecture_passing_cluster",
-                "same_strategy_passing_cluster",
+                "left_run_id", "right_run_id", "lexical_distance",
+                "token_winnowing_distance", "apted_distance",
+                "api_callset_distance", "architecture_distance",
+                "strategy_distance", "same_architecture_family",
+                "same_strategy_family",
             ],
+        )
+        correlation_metrics = [
+            "lexical_distance", "token_winnowing_distance", "apted_distance",
+            "api_callset_distance", "architecture_distance", "strategy_distance",
+        ]
+        write_csv(
+            diagnostic_root / "cross_representation_correlation.csv",
+            pairwise_spearman_correlations(pairwise_rows, correlation_metrics),
+            ["left_metric", "right_metric", "spearman_correlation", "supporting_pairs"],
         )
 
     n = len(rows)
@@ -3594,12 +3115,6 @@ def main() -> int:
             (int, float),
         )
     ]
-    llm_total_tokens = [
-        int(row["llm_total_tokens"])
-        for row in rows
-        if isinstance(row.get("llm_total_tokens"), int)
-    ]
-
     stage_success_ratios: dict[str, float | None] = {}
     for key in (
         "opencode_exit_code",
@@ -3622,15 +3137,47 @@ def main() -> int:
     summary = {
         "schema_version": 4,
         "analyzer_version": ANALYZER_VERSION,
+        "experiment_format": experiment_format,
+        "baseline_kind": baseline_kind,
+        "source_path": str(source_path),
         "experiment": str(experiment),
         "output_directory": str(output_dir),
         "model": experiment_metadata.get("model"),
         "temperature": experiment_metadata.get("temperature"),
         "runs_analyzed": n,
         "successful_runs": successful,
+        "architecture_population_n": len(passing_architecture_ids),
+        "architecture_measurement_coverage": (
+            len(passing_architecture_ids) / successful if successful else None
+        ),
+        "strategy_population_n": len(passing_strategy_ids),
+        "strategy_measurement_coverage": (
+            len(passing_strategy_ids) / successful if successful else None
+        ),
         "success_ratio": successful / n if n else None,
+        "diversity_k_max": args.diversity_k_max,
+        "exact_generation_convergence": exact_repetition,
         "stage_success_ratios": stage_success_ratios,
         "repair": repair_summary,
+        "uncertainty": {
+            "wilson_95_percent": {
+                "overall_success_rate": wilson_interval(successful, n),
+                "initial_public_success_rate": wilson_interval(
+                    repair_summary["initial_public_successes"], n
+                ),
+                "final_public_success_rate": wilson_interval(
+                    repair_summary["final_public_successes"], n
+                ),
+                "repair_recovery_rate": wilson_interval(
+                    repair_summary["recovered_initially_failed_runs"],
+                    n - repair_summary["initial_public_successes"],
+                ),
+            },
+            "diversity_bootstrap": {
+                "architecture": architecture_summaries[architecture_primary_name]["bootstrap_95_percent_ci"],
+                "strategy": strategy_summaries[strategy_primary_name]["bootstrap_95_percent_ci"],
+            },
+        },
         "pass_at_k": {
             f"pass@{k}": pass_at_k(n, successful, k)
             for k in (1, 5, 10, 20, 50, 100)
@@ -3647,18 +3194,6 @@ def main() -> int:
             "maximum": max(runtime_seconds) if runtime_seconds else None,
             "total": sum(runtime_seconds) if runtime_seconds else None,
         },
-        "llm_token_usage": {
-            "runs_with_measurement": len(llm_total_tokens),
-            "mean_total_tokens": (
-                statistics.fmean(llm_total_tokens)
-                if llm_total_tokens
-                else None
-            ),
-            "note": (
-                "Best-effort extraction from OpenCode logs. Source-code "
-                "tokens are reported separately."
-            ),
-        },
         "gumtree": {
             "runs_with_measurement": len(gumtree_distances),
             "mean_normalized_baseline_edit_distance": (
@@ -3669,16 +3204,8 @@ def main() -> int:
         },
         "clustering": {
             "primary_population": {
-                "architecture": (
-                    "passing_complete_runs"
-                    if passing_architecture_ids
-                    else "passing_runs"
-                ),
-                "strategy": (
-                    "passing_complete_runs"
-                    if passing_strategy_ids
-                    else "passing_runs"
-                ),
+                "architecture": "passing_complete_runs",
+                "strategy": "passing_complete_runs",
             },
             "architecture": {
                 "threshold_used": args.cluster_threshold,
@@ -3690,9 +3217,9 @@ def main() -> int:
                 "populations": strategy_summaries,
             },
             "note": (
-                "Threshold-sensitivity tables are diagnostic. Freeze both "
-                "thresholds on a calibration set before final cross-model or "
-                "cross-temperature comparisons."
+                "Threshold sensitivity is a robustness analysis only. The "
+                "configured primary thresholds are never optimized on the "
+                "reported population."
             ),
         },
         "measurement_counts": {
@@ -3701,21 +3228,31 @@ def main() -> int:
                 bool(row["tree_sitter_available"]) for row in rows
             ),
             "gumtree": sum(bool(row["gumtree_available"]) for row in rows),
-            "difftastic": sum(
-                bool(row["difftastic_available"]) for row in rows
-            ),
-            "lizard": sum(bool(row["lizard_available"]) for row in rows),
             "complete_architecture": len(complete_architecture_ids),
             "complete_strategy": len(complete_strategy_ids),
-            "llm_token_usage": len(llm_total_tokens),
         },
         "baseline_errors": {
             "clang": baseline.clang_error,
             "tree_sitter": baseline.tree_sitter_error,
-            "lizard": baseline.lizard_error,
         },
+        "security_diagnostics": security_summary,
         "tool_paths": tool_paths,
     }
+    for metric, interval in summary["uncertainty"]["wilson_95_percent"].items():
+        uncertainty_rows.append(
+            {
+                "space": "reliability",
+                "metric": metric,
+                "lower": interval["lower"],
+                "upper": interval["upper"],
+                "replicates": interval["n"],
+            }
+        )
+    write_csv(
+        diagnostics_dir / "uncertainty.csv",
+        uncertainty_rows,
+        ["space", "metric", "lower", "upper", "replicates"],
+    )
     write_json(output_dir / "summary.json", summary)
 
     paper_row = build_paper_metrics_row(
@@ -3725,61 +3262,66 @@ def main() -> int:
         issue_label=args.paper_issue_label,
         checkpoint_label=args.paper_checkpoint_label,
     )
-    paper_output_dir = experiment / "analysis"
+    paper_descriptive_row = build_paper_descriptive_row(
+        experiment_metadata,
+        summary,
+        rows,
+        issue_label=args.paper_issue_label,
+        checkpoint_label=args.paper_checkpoint_label,
+    )
+    paper_output_dir = output_dir
     write_json(paper_output_dir / "paper_metrics_row.json", paper_row)
     write_csv(
-        paper_output_dir / "paper_metrics_row.csv",
+        paper_output_dir / "paper_metrics.csv",
         [paper_row],
         PAPER_METRICS_COLUMNS,
+    )
+    write_csv(
+        paper_output_dir / "paper_descriptive_metrics.csv",
+        [paper_descriptive_row],
+        PAPER_DESCRIPTIVE_COLUMNS,
     )
     write_json(
         paper_output_dir / "paper_metrics_schema.json",
         paper_metrics_schema(),
     )
-    rebuild_paper_metrics_aggregate(
-        infer_repository_root(experiment, experiment_metadata)
-    )
+    if experiment_format == "git_experiment":
+        rebuild_paper_metrics_aggregate(
+            infer_repository_root(experiment, experiment_metadata)
+        )
 
     print("\nAnalysis complete")
     print(f"Success: {successful}/{n} ({successful / n:.1%})")
     print(
         "Initial public success: "
-        f"{repair_summary['initial_successes']}/{n} "
-        f"({repair_summary['initial_success_rate']:.1%})"
+        f"{repair_summary['initial_public_successes']}/{n} "
+        f"({repair_summary['initial_public_success_rate']:.1%})"
     )
     print(
         "Final public success:   "
-        f"{repair_summary['public_validation_successes']}/{n} "
-        f"({repair_summary['public_validation_success_rate']:.1%})"
+        f"{repair_summary['final_public_successes']}/{n} "
+        f"({repair_summary['final_public_success_rate']:.1%})"
     )
     for curve_point in repair_summary["success_curve"]:
         print(
             f"Success by loop {curve_point['loop']}: "
             f"{curve_point['success_rate']:.1%}"
         )
-    architecture_primary_name = (
-        "passing_complete_runs"
-        if passing_architecture_ids
-        else "passing_runs"
-    )
-    strategy_primary_name = (
-        "passing_complete_runs"
-        if passing_strategy_ids
-        else "passing_runs"
-    )
+    architecture_primary_name = "passing_complete_runs"
+    strategy_primary_name = "passing_complete_runs"
     architecture_primary = architecture_summaries[architecture_primary_name]
     strategy_primary = strategy_summaries[strategy_primary_name]
     print(
         "Passing architecture: "
-        f"{architecture_primary['raw_cluster_count']} raw, "
-        f"{architecture_primary['effective_cluster_count']} effective, "
-        f"dominant {architecture_primary['dominant_cluster_share']}"
+        f"{architecture_primary['raw_family_count']} raw, "
+        f"{architecture_primary['effective_family_count']} effective, "
+        f"dominant {architecture_primary['dominant_family_share']}"
     )
     print(
         "Passing strategy:     "
-        f"{strategy_primary['raw_cluster_count']} raw, "
-        f"{strategy_primary['effective_cluster_count']} effective, "
-        f"dominant {strategy_primary['dominant_cluster_share']}"
+        f"{strategy_primary['raw_family_count']} raw, "
+        f"{strategy_primary['effective_family_count']} effective, "
+        f"dominant {strategy_primary['dominant_family_share']}"
     )
     print(f"Results: {output_dir}")
     return 0

@@ -1,12 +1,4 @@
-"""Unit tests for scripts/measure_diversity.py.
-
-Focus: metric *properties* rather than exact values - symmetry,
-self-similarity, and (for the levels that claim it) invariance to
-identifier renaming - on small fixture programs, per the plan's
-validity-controls section (docs/diversity_methodology.md).
-
-Run with: python3 -m pytest tests/test_measure_diversity.py -v
-"""
+"""Tests for the canonical experiment analysis and affected controllers."""
 
 from __future__ import annotations
 
@@ -16,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+import unittest
 from pathlib import Path
 
 import pytest
@@ -35,13 +28,9 @@ SORT_SANITIZER_CC_FLAGS = [
     "-D_POSIX_C_SOURCE=200809L",
 ]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
-
-import measure_diversity as md  # noqa: E402
-
-pytest.importorskip("tree_sitter")
-pytest.importorskip("tree_sitter_c")
-pytest.importorskip("rapidfuzz")
-pytest.importorskip("apted")
+from analysis import diversity_metrics as dm  # noqa: E402
+from analysis import diversity_validation as dv  # noqa: E402
+from analysis import security_diagnostics as sd  # noqa: E402
 
 
 FIXTURE_A = b"""\
@@ -86,125 +75,138 @@ int main(void) {
 """
 
 
-def _variant(label: str, source: bytes) -> md.Variant:
-    return md.Variant(label=label, path=Path(f"<fixture:{label}>"), source=source)
+class CanonicalAnalysisUnitTests(unittest.TestCase):
+    def test_cluster_statistics_and_duplicates(self):
+        stats = dm.cluster_statistics([0, 0, 1, 1])
+        self.assertEqual(stats["raw_family_count"], 2)
+        self.assertAlmostEqual(stats["effective_family_count"], 2.0)
+        self.assertEqual(stats["dominant_family_share"], 0.5)
+        self.assertEqual(stats["singleton_rate"], 0.0)
+        skewed = dm.cluster_statistics([0, 0, 0, 1, 2])
+        self.assertLess(skewed["effective_family_count"], skewed["raw_family_count"])
+        repeated = dm.cluster_statistics([0, 0, 0, 1])
+        self.assertEqual(sum(repeated["family_sizes"].values()), 4)
+        np = pytest.importorskip("numpy")
+        features = np.array([[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+        labels = dm.agglomerative_labels(dm.cosine_distance_matrix(features), 0.3)
+        clustered = dm.cluster_statistics(labels.tolist())
+        self.assertEqual(sum(clustered["family_sizes"].values()), 3)
+        self.assertIn(2, clustered["family_sizes"].values())
 
+    def test_exact_da_at_k(self):
+        labels = [0, 0, 1, 1]
+        self.assertEqual(dm.da_at_k(labels, 1), 1.0)
+        self.assertAlmostEqual(dm.da_at_k(labels, 2), 5 / 3)
+        self.assertEqual(dm.da_at_k(labels, 4), 2.0)
+        self.assertTrue(all(dm.da_at_k([0, 0, 0], k) == 1 for k in range(1, 4)))
+        self.assertEqual([dm.da_at_k(range(4), k) for k in range(1, 5)], [1, 2, 3, 4])
+        with self.assertRaises(ValueError):
+            dm.da_at_k(labels, 0)
+        with self.assertRaises(ValueError):
+            dm.da_at_k(labels, 5)
 
-@pytest.fixture(autouse=True)
-def _clear_parse_cache():
-    md._PARSE_CACHE.clear()
-    yield
-    md._PARSE_CACHE.clear()
+    def test_nauadc_fixed_budget(self):
+        self.assertEqual(dm.nauadc([1, 1, 1, 1]), 1.0)
+        self.assertEqual(dm.nauadc([1, 2, 3, 4]), 2.5)
+        curve = dm.da_curve([0, 1, 2, 3])
+        self.assertEqual(dm.nauadc_summary(curve, 3)["nauadc_at_kmax"], 2.0)
+        insufficient = dm.nauadc_summary(curve[:2], 3)
+        self.assertIsNone(insufficient["nauadc_at_kmax"])
+        self.assertIn("smaller", insufficient["nauadc_at_kmax_reason"])
 
+    def test_exact_repetition(self):
+        result = dm.exact_repetition_summary(["A", "A", "B", "C"])
+        self.assertEqual(result["exact_unique_rate"], 0.75)
+        self.assertEqual(result["exact_modal_share"], 0.5)
 
-CLASSICAL_METRIC_FACTORIES = {
-    "lexical_levenshtein": md._metric_lexical_levenshtein,
-    "lexical_winnowing": md._metric_lexical_winnowing,
-    "ast_ted": md._metric_ast_ted,
-    "api_callset": md._metric_api_callset,
-    "attack_surface": md._metric_attack_surface,
-}
+    def test_vendi(self):
+        np = pytest.importorskip("numpy")
+        self.assertEqual(dm.vendi_score(np.array([[1.0, 0.0]])), 1.0)
+        self.assertAlmostEqual(dm.vendi_score(np.array([[1.0, 0.0], [1.0, 0.0]])), 1.0)
+        self.assertAlmostEqual(dm.vendi_score(np.eye(4)), 4.0)
+        self.assertIsNone(dm.vendi_score(np.empty((0, 0))))
 
-
-@pytest.mark.parametrize("name,fn", CLASSICAL_METRIC_FACTORIES.items())
-def test_self_similarity_is_one(name, fn):
-    a = _variant("a", FIXTURE_A)
-    a_copy = _variant("a_copy", FIXTURE_A)
-    sim = fn(a, a_copy)
-    assert sim == pytest.approx(1.0, abs=1e-9), f"{name} self-similarity != 1.0"
-
-
-@pytest.mark.parametrize("name,fn", CLASSICAL_METRIC_FACTORIES.items())
-def test_symmetry(name, fn):
-    a = _variant("a", FIXTURE_A)
-    c = _variant("c", FIXTURE_C)
-    assert fn(a, c) == pytest.approx(fn(c, a), abs=1e-9), f"{name} is not symmetric"
-
-
-@pytest.mark.parametrize("name,fn", CLASSICAL_METRIC_FACTORIES.items())
-def test_similarity_bounded_in_unit_interval(name, fn):
-    a = _variant("a", FIXTURE_A)
-    c = _variant("c", FIXTURE_C)
-    sim = fn(a, c)
-    assert -1e-9 <= sim <= 1.0 + 1e-9, f"{name} out of [0,1]: {sim}"
-
-
-def test_renamed_clone_is_ast_and_winnowing_invariant():
-    """FIXTURE_B is FIXTURE_A with every identifier renamed (Type-2 clone).
-    The AST-shape and Type-2-token-normalized metrics must not notice;
-    the raw-text metric must."""
-    a = _variant("a", FIXTURE_A)
-    b = _variant("b", FIXTURE_B)
-
-    assert md._metric_ast_ted(a, b) == pytest.approx(1.0, abs=1e-9)
-    assert md._metric_lexical_winnowing(a, b) == pytest.approx(1.0, abs=1e-9)
-    assert md._metric_lexical_levenshtein(a, b) < 0.999
-
-
-def test_different_implementation_is_less_similar_than_renamed_clone():
-    """A genuinely different implementation (FIXTURE_C) should score lower
-    on every structural metric than a mere renamed clone (FIXTURE_B) of
-    the same program - the core sanity property the whole tool rests on."""
-    a = _variant("a", FIXTURE_A)
-    b = _variant("b", FIXTURE_B)
-    c = _variant("c", FIXTURE_C)
-
-    for name, fn in CLASSICAL_METRIC_FACTORIES.items():
-        renamed_sim = fn(a, b)
-        different_sim = fn(a, c)
-        assert different_sim <= renamed_sim + 1e-9, (
-            f"{name}: differently-implemented pair scored more similar "
-            f"({different_sim}) than a renamed clone ({renamed_sim})"
+    def test_ari_and_threshold_grid(self):
+        from sklearn.metrics import adjusted_rand_score
+        np = pytest.importorskip("numpy")
+        self.assertEqual(adjusted_rand_score([0, 0, 1, 1], [7, 7, 4, 4]), 1.0)
+        self.assertEqual(
+            dm.deterministic_threshold_grid(0.30),
+            [0.2, 0.25, 0.275, 0.3, 0.325, 0.35, 0.4],
         )
+        self.assertEqual(dm.deterministic_threshold_grid(0.3, "0.1,0.4"), [0.1, 0.4])
+        distance = np.array([[0, .1, .9], [.1, 0, .8], [.9, .8, 0]])
+        rows = dm.threshold_sensitivity(distance, 0.3, [0.2, 0.3, 0.4])
+        self.assertIn("adjusted_rand_vs_primary", rows[0])
+        self.assertEqual(rows[1]["adjusted_rand_vs_primary"], 1.0)
 
+    def test_population_has_no_fallback(self):
+        rows = [
+            {"run_id": "ok-complete", "overall_success": True, "arch": True, "strategy": False},
+            {"run_id": "ok-incomplete", "overall_success": True, "arch": False, "strategy": True},
+            {"run_id": "failed", "overall_success": False, "arch": True, "strategy": True},
+        ]
+        architecture = dm.primary_population(rows, "arch")
+        strategy = dm.primary_population(rows, "strategy")
+        self.assertEqual(architecture["run_ids"], ["ok-complete"])
+        self.assertEqual(strategy["run_ids"], ["ok-incomplete"])
+        self.assertEqual(architecture["measurement_coverage"], 0.5)
 
-def test_attack_surface_detects_unsafe_construct_divergence():
-    """FIXTURE_C uses strcpy into a fixed-size stack buffer; FIXTURE_A/B
-    use neither. The attack-surface vector must reflect that difference -
-    this is the property the security-diversity claim depends on."""
-    a_parsed = md.parse_source(FIXTURE_A)
-    c_parsed = md.parse_source(FIXTURE_C)
-    va = md.attack_surface_vector(a_parsed)
-    vc = md.attack_surface_vector(c_parsed)
-    assert va["unsafe_calls"] == 0
-    assert vc["unsafe_calls"] >= 1
-    assert va["fixed_stack_buffers"] == 0
-    assert vc["fixed_stack_buffers"] >= 1
+    def test_wilson_and_bootstrap_determinism(self):
+        np = pytest.importorskip("numpy")
+        self.assertIsNone(dm.wilson_interval(0, 0)["estimate"])
+        self.assertGreater(dm.wilson_interval(0, 10)["upper"], 0)
+        self.assertLess(dm.wilson_interval(10, 10)["lower"], 1)
+        matrix = np.eye(3)
+        first = dm.bootstrap_diversity_ci(matrix, 0.3, 20, 17, 2)
+        second = dm.bootstrap_diversity_ci(matrix, 0.3, 20, 17, 2)
+        self.assertEqual(first, second)
+        self.assertEqual(first["sampling_unit"], "implementation")
 
+    def test_validation_distances(self):
+        for dependency in ("tree_sitter", "tree_sitter_c", "rapidfuzz", "apted"):
+            pytest.importorskip(dependency)
+        dv._PARSE_CACHE.clear()
+        a = dv.parse_source(FIXTURE_A + b"// comment\n")
+        plain = dv.parse_source(FIXTURE_A)
+        renamed = dv.parse_source(FIXTURE_B)
+        different = dv.parse_source(FIXTURE_C)
+        self.assertEqual(dv.lexical_distance(a, plain), 0.0)
+        self.assertEqual(dv.token_winnowing_distance(plain, renamed), 0.0)
+        self.assertEqual(dv.apted_distance(plain, plain), 0.0)
+        self.assertEqual(dv.api_callset_distance(plain, plain), 0.0)
+        self.assertGreater(dv.api_callset_distance(plain, different), 0.0)
 
-def test_call_set_extraction():
-    parsed = md.parse_source(FIXTURE_C)
-    calls = md.call_set(parsed)
-    assert "strcpy" in calls
-    assert "printf" in calls
+    def test_security_profile_is_separate_diagnostic(self):
+        for dependency in ("tree_sitter", "tree_sitter_c"):
+            pytest.importorskip(dependency)
+        source = FIXTURE_C.replace(b"return 0;", b"buf[0] = '5'; return 0;")
+        profile = sd.security_profile(source)
+        self.assertGreaterEqual(profile["unsafe_call_count"], 1)
+        self.assertGreaterEqual(profile["fixed_size_stack_buffer_count"], 1)
+        self.assertGreaterEqual(profile["indexing_operation_count"], 1)
 
+    def test_correlations_use_pairwise_complete_distances(self):
+        pytest.importorskip("scipy")
+        rows = [{"a_distance": 0.1, "b_distance": 0.2}, {"a_distance": 0.8, "b_distance": 0.9}, {"a_distance": None, "b_distance": 0.4}]
+        result = dv.pairwise_spearman_correlations(rows, ["a_distance", "b_distance"])
+        cross = next(row for row in result if row["left_metric"] == "a_distance" and row["right_metric"] == "b_distance")
+        self.assertEqual(cross["supporting_pairs"], 2)
+        self.assertAlmostEqual(cross["spearman_correlation"], 1.0)
 
-def test_winnowing_fingerprints_nonempty_for_nontrivial_input():
-    parsed = md.parse_source(FIXTURE_A)
-    tokens = md.type2_token_stream(parsed)
-    assert len(tokens) > 10
-    fps = md.winnowing_fingerprints(tokens)
-    assert len(fps) > 0
-
-
-def test_jaccard_edge_cases():
-    assert md.jaccard(set(), set()) == 1.0
-    assert md.jaccard({1, 2}, {1, 2}) == 1.0
-    assert md.jaccard({1}, {2}) == 0.0
-
-
-def test_load_variants_derives_temp_dir_label(tmp_path):
-    run_dir = tmp_path / "runs" / "mkdir" / "temp-0p2" / "workdir" / "src"
-    run_dir.mkdir(parents=True)
-    f = run_dir / "new_mkdir.c"
-    f.write_bytes(FIXTURE_A)
-    variants = md.load_variants([str(f)])
-    assert len(variants) == 1
-    assert variants[0].label == "temp-0p2"
-
-
-def test_calibration_passes():
-    assert md.run_calibration() is True
+    def test_canonical_removals(self):
+        analyzer_text = ANALYZER.read_text(encoding="utf-8").lower()
+        for forbidden in ("import torch", "import transformers", "codebleu", "jplag", "lizard", "difftastic"):
+            self.assertNotIn(forbidden, analyzer_text)
+        self.assertFalse((REPO_ROOT / "scripts" / "measure_diversity.py").exists())
+        self.assertFalse((REPO_ROOT / "scripts" / "diversity_pipeline.py").exists())
+        module = load_analyzer()
+        forbidden_columns = {
+            "Mean LLM Total Tokens", "Mean Source Tokens", "entropy_nats",
+            "entropy_bits", "singleton rate", "CodeBLEU", "JPlag",
+        }
+        self.assertTrue(forbidden_columns.isdisjoint(module.PAPER_METRICS_COLUMNS))
+        self.assertTrue(forbidden_columns.isdisjoint(module.PAPER_DESCRIPTIVE_COLUMNS))
 
 
 # ---------------------------------------------------------------------------
@@ -977,8 +979,9 @@ def test_repair_summary_and_pass_at_k_use_attempts(analyzer):
     ]
     summary = analyzer.build_repair_summary(rows, configured_max_loops=3)
 
-    assert summary["initial_success_rate"] == pytest.approx(1 / 3)
-    assert summary["public_validation_success_rate"] == pytest.approx(2 / 3)
+    assert summary["initial_public_success_rate"] == pytest.approx(1 / 3)
+    assert summary["final_public_success_rate"] == pytest.approx(2 / 3)
+    assert summary["repair_recovery_rate"] == pytest.approx(1 / 2)
     assert summary["mean_repair_loops"] == pytest.approx(5 / 3)
     assert summary["median_repair_loops"] == 2
     assert summary["max_repair_loops"] == 3
@@ -1124,6 +1127,99 @@ def test_full_analyzer_accepts_mixed_old_and_repair_metadata(tmp_path: Path):
     )
     assert summary["runs_analyzed"] == 2
     assert summary["pass_at_k"]["pass@1"] == pytest.approx(0.5)
-    assert summary["repair"]["initial_success_rate"] == pytest.approx(0.5)
-    assert summary["repair"]["public_validation_success_rate"] == 1.0
+    assert summary["repair"]["initial_public_success_rate"] == pytest.approx(0.5)
+    assert summary["repair"]["final_public_success_rate"] == 1.0
     assert summary["repair"]["mean_llm_invocations"] == 2.0
+    assert summary["successful_runs"] == 1
+    assert summary["exact_generation_convergence"]["exact_unique_rate"] == 1.0
+    assert summary["clustering"]["primary_population"] == {
+        "architecture": "passing_complete_runs",
+        "strategy": "passing_complete_runs",
+    }
+    for relative in (
+        "runs.csv",
+        "paper_metrics.csv",
+        "paper_descriptive_metrics.csv",
+        "diversity/architecture_da_curve.csv",
+        "diversity/strategy_da_curve.csv",
+        "diversity/exact_repetition.csv",
+        "diagnostics/uncertainty.csv",
+    ):
+        assert (experiment / "analysis" / relative).exists()
+    primary_header = (experiment / "analysis" / "paper_metrics.csv").read_text().splitlines()[0]
+    assert "Mean LLM Total Tokens" not in primary_header
+    assert "entropy" not in primary_header.lower()
+    assert "singleton" not in primary_header.lower()
+
+
+def test_full_analyzer_accepts_sandbox_run_metadata(tmp_path: Path):
+    pytest.importorskip("numpy")
+    pytest.importorskip("sklearn")
+    run_root = tmp_path / "sandbox"
+    condition = run_root / "temp-0p5"
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    run_root.mkdir()
+    (run_root / "run.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "repository": str(repository),
+                "model": "fake/model",
+                "prompt": "prompts/mkdir/checkpoint.md",
+                "seed_files": "",
+            }
+        ),
+        encoding="utf-8",
+    )
+    for repeat, success in ((1, True), (2, False)):
+        attempt = condition / f"rep-{repeat}"
+        source = attempt / "workdir" / "src" / "tool.c"
+        source.parent.mkdir(parents=True)
+        source.write_text(f"int helper_{repeat}(void) {{ return {repeat}; }}\n", encoding="utf-8")
+        (attempt / "metadata.json").write_text(
+            json.dumps(
+                {
+                    "model": "fake/model",
+                    "temperature": 0.5,
+                    "repeat": repeat,
+                    "opencode_exit_code": 0,
+                    "opencode_permission_rejected": False,
+                    "test_exit_code": 0 if success else 1,
+                    "opencode_runtime_ms": 10,
+                    "test_runtime_ms": 5,
+                    "total_runtime_ms": 15,
+                    "overall_success": success,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (attempt / "opencode.log").write_text("", encoding="utf-8")
+        (attempt / "test.log").write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ANALYZER),
+            "--experiment",
+            str(condition),
+            "--source-path",
+            "src/tool.c",
+            "--bootstrap-repetitions",
+            "5",
+            "--clean-output",
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    summary = json.loads((condition / "analysis" / "summary.json").read_text())
+    assert summary["experiment_format"] == "sandbox_run"
+    assert summary["baseline_kind"] == "empty_from_scratch"
+    assert summary["source_path"] == "src/tool.c"
+    assert summary["runs_analyzed"] == 2
+    assert summary["successful_runs"] == 1
+    assert summary["temperature"] == 0.5
