@@ -177,6 +177,14 @@ for i in range(0, len(pairs), 2):
     if value.startswith("__JSON__:"):
         data[key] = json.loads(value.removeprefix("__JSON__:"))
         continue
+    if value.startswith("__STR__:"):
+        # Free text that must never be type-guessed. A shell command is the
+        # motivating case: `--base-test-cmd true` would otherwise be stored as
+        # the boolean true, and the resume guard -- which compares against the
+        # string it was given -- would report a configuration mismatch on every
+        # re-run of an unchanged command line.
+        data[key] = value.removeprefix("__STR__:")
+        continue
     if value in {"true", "false"}:
         data[key] = value == "true"
         continue
@@ -791,10 +799,10 @@ write_metadata "$OUTPUT_DIR/sweep.json" \
     max_loops "$MAX_LOOPS" \
     test_dirs "$TEST_DIRS_JOINED" \
     seed_files "$SEED_FILES_JOINED" \
-    build_command "$BUILD_CMD" \
-    base_test_command "$BASE_TEST_CMD" \
-    feature_test_command "$FEATURE_TEST_CMD" \
-    extra_test_command "$EXTRA_TEST_CMD" \
+    build_command "__STR__:$BUILD_CMD" \
+    base_test_command "__STR__:$BASE_TEST_CMD" \
+    feature_test_command "__STR__:$FEATURE_TEST_CMD" \
+    extra_test_command "__STR__:$EXTRA_TEST_CMD" \
     timeout_seconds "$TIMEOUT_SECONDS" \
     timeout_enforced "$TIMEOUT_ENFORCED" \
     created_at "$(timestamp)"
@@ -914,10 +922,10 @@ PY
         max_loops "$MAX_LOOPS" \
         test_dirs "$TEST_DIRS_JOINED" \
         seed_files "$SEED_FILES_JOINED" \
-        build_command "$BUILD_CMD" \
-        base_test_command "$BASE_TEST_CMD" \
-        feature_test_command "$FEATURE_TEST_CMD" \
-        extra_test_command "$EXTRA_TEST_CMD" \
+        build_command "__STR__:$BUILD_CMD" \
+        base_test_command "__STR__:$BASE_TEST_CMD" \
+        feature_test_command "__STR__:$FEATURE_TEST_CMD" \
+        extra_test_command "__STR__:$EXTRA_TEST_CMD" \
         timeout_seconds "$TIMEOUT_SECONDS" \
         timeout_enforced "$TIMEOUT_ENFORCED" \
         analysis_architecture_threshold "$RESOLVED_ARCHITECTURE_THRESHOLD" \

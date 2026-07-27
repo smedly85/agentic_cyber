@@ -17,6 +17,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 
 
 def die(message: str, code: int = 125) -> "None":
@@ -96,16 +97,44 @@ def main(argv: list[str]) -> int:
     except OSError as exc:
         die(f"failed to run command {args[0]!r}: {exc.strerror}", 126)
 
+    # Captured now, while the child is certainly alive: once it is reaped
+    # os.getpgid() fails, and the group still needs signalling because members
+    # can outlive the leader.
+    try:
+        child_pgid = os.getpgid(child.pid)
+    except ProcessLookupError:
+        child_pgid = None
+
     def signal_group(sig: int) -> None:
-        try:
-            os.killpg(os.getpgid(child.pid), sig)
-        except (ProcessLookupError, PermissionError):
-            # Already reaped, or the child changed credentials; fall back to
-            # the direct child so a timeout still terminates something.
+        if child_pgid is not None:
             try:
-                child.send_signal(sig)
-            except ProcessLookupError:
+                os.killpg(child_pgid, sig)
+                return
+            except (ProcessLookupError, PermissionError):
                 pass
+        # No group left, or the child changed credentials; fall back to the
+        # direct child so a timeout still terminates something.
+        try:
+            child.send_signal(sig)
+        except ProcessLookupError:
+            pass
+
+    def sweep_group() -> None:
+        """Clear anything still in the group after the direct child is gone.
+
+        The child is not always the last process standing. `sh -c 'cmd &'`
+        leaves the background job in the same group, and a non-interactive
+        shell sets SIGINT to ignore for exactly those jobs -- so the leader can
+        exit on the first signal while a sibling keeps running.
+        """
+        if child_pgid is None:
+            return
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(child_pgid, sig)
+            except (ProcessLookupError, PermissionError):
+                return
+            time.sleep(0.2)
 
     timed_out = False
     try:
@@ -121,11 +150,18 @@ def main(argv: list[str]) -> int:
                     except subprocess.TimeoutExpired:
                         signal_group(signal.SIGKILL)
                 child.wait()
+                sweep_group()
         else:
             child.wait()
     except KeyboardInterrupt:
+        # Ctrl-C during a sweep has to clear the whole tree, so the next run
+        # does not compete with a stray agent helper still holding the model.
         signal_group(signal.SIGINT)
-        child.wait()
+        try:
+            child.wait(timeout=kill_after if kill_after is not None else 10)
+        except subprocess.TimeoutExpired:
+            pass
+        sweep_group()
         return 128 + signal.SIGINT
 
     if timed_out:
