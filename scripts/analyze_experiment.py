@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Analyze repeated OpenCode maintenance runs.
 
-This is the unified analyzer used by ``run_llm_experiment.sh``.  It keeps the
+This is the unified analyzer used by ``run_experiment.sh``.  It keeps the
 original command-line contract (especially ``--cluster-threshold``), while
 providing two distinct structural analyses:
 
@@ -220,7 +220,7 @@ DEFAULT_STRATEGY_EXCLUDE_REGEX = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Analyze an experiment produced by run_llm_experiment.sh."
+        description="Analyze an experiment produced by run_experiment.sh."
     )
     parser.add_argument("--experiment", required=True, type=Path)
     parser.add_argument(

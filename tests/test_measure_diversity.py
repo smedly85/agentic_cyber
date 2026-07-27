@@ -17,8 +17,16 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-RUNNER = REPO_ROOT / "scripts" / "run_llm_experiment.sh"
+RUNNER = REPO_ROOT / "scripts" / "run_experiment.sh"
+RUNNER_HELPERS = (
+    REPO_ROOT / "scripts" / "capture_candidate.py",
+    REPO_ROOT / "scripts" / "repair_prompt.py",
+)
+REPAIR_TEMPLATE = REPO_ROOT / "prompts" / "repair_continuation_template.md"
 ANALYZER = REPO_ROOT / "scripts" / "analyze_experiment.py"
+# `true` lives in /bin on Linux but /usr/bin on macOS; resolve it instead of
+# hardcoding either, so suite fixtures that need a stub binary work on both.
+TRUE_BIN = shutil.which("true") or "/usr/bin/true"
 SORT_SUITE = REPO_ROOT / "tests" / "sort-test-suite"
 SORT_SANITIZER_CC_FLAGS = [
     "-std=c11",
@@ -561,7 +569,7 @@ def initialize_sort_suite_harness(tmp_path: Path) -> tuple[Path, Path, Path, Pat
     runtime_config = json.loads((SORT_SUITE / "config.json").read_text())
     runtime_config["paths"].update(
         {
-            "oracle_bin": "/bin/true",
+            "oracle_bin": TRUE_BIN,
             "candidate_bin": "/tracked/example/candidate",
             "candidate_asan_bin": str(tmp_path / "unused-asan"),
             "candidate_src": "",
@@ -617,11 +625,11 @@ raise SystemExit(0 if float(budget) == 0 else 1)
     )
     (suite / "report_summary.py").write_text("pass\n", encoding="utf-8")
     (suite / "build_asan.sh").write_text(
-        """\
+        f"""\
 #!/usr/bin/env bash
 set -eu
 out=$(python3 config.py "$1" paths.candidate_asan_bin)
-cp /bin/true "$out"
+cp {TRUE_BIN} "$out"
 """,
         encoding="utf-8",
     )
@@ -904,8 +912,12 @@ def analyzer():
 def initialize_experiment_repo(tmp_path: Path) -> tuple[Path, Path]:
     repository = tmp_path / "repository"
     (repository / "scripts").mkdir(parents=True)
+    (repository / "prompts").mkdir(parents=True)
     (repository / "src").mkdir()
     shutil.copy2(RUNNER, repository / "scripts" / RUNNER.name)
+    for helper in RUNNER_HELPERS:
+        shutil.copy2(helper, repository / "scripts" / helper.name)
+    shutil.copy2(REPAIR_TEMPLATE, repository / "prompts" / REPAIR_TEMPLATE.name)
     (repository / "scripts" / "analyze_experiment.py").write_text(
         """\
 import argparse
@@ -996,15 +1008,16 @@ def run_experiment(
     source_path: str = "src/tool.c",
     base_test_cmd: str = "true",
     analysis_args: list[str] | None = None,
+    extra_args: list[str] | None = None,
 ) -> tuple[Path, subprocess.CompletedProcess[str], int, str]:
     repository, fake_opencode = initialize_experiment_repo(tmp_path)
     counter = tmp_path / "counter.txt"
     prompts = tmp_path / "prompts.txt"
     extra_count = tmp_path / "extra-count.txt"
-    output = repository / "runs" / "experiment"
+    sweep = repository / "runs" / "experiment"
     command = [
         "bash",
-        str(repository / "scripts" / "run_llm_experiment.sh"),
+        str(repository / "scripts" / RUNNER.name),
         "--model",
         "fake/model",
         "--temperature",
@@ -1018,7 +1031,7 @@ def run_experiment(
         "--source-mode",
         source_mode,
         "--output-dir",
-        str(output),
+        str(sweep),
         "--build-cmd",
         f"if test \"$(tr -d '\\n' < {source_path})\" = repaired; then exit 0; else echo broken-build; exit 1; fi",
         "--base-test-cmd",
@@ -1030,10 +1043,16 @@ def run_experiment(
         "--timeout",
         "0",
     ]
+    # `existing` mode now seeds the workspace from a file rather than from a
+    # baseline commit; the seed matching --source is also the analysis baseline.
+    if source_mode == "existing":
+        command.extend(["--seed-file", source_path])
     if max_loops is not None:
         command.extend(["--max-loops", str(max_loops)])
     if analysis_args:
         command.extend(analysis_args)
+    if extra_args:
+        command.extend(extra_args)
 
     environment = os.environ.copy()
     environment.update(
@@ -1058,11 +1077,14 @@ def run_experiment(
         timeout=30,
         check=False,
     )
-    invocations = int(counter.read_text())
+    invocations = int(counter.read_text()) if counter.exists() else 0
+    # --output-dir is the sweep root; each temperature is its own experiment.
+    output = sweep / "temp-0p0"
     return output, result, invocations, prompts.read_text(encoding="utf-8")
 
 
-def test_default_max_loops_is_one_shot(tmp_path: Path):
+def test_default_max_loops_allows_repair(tmp_path: Path):
+    """The controller repairs by default; --max-loops 0 opts out."""
     output, result, invocations, _ = run_experiment(
         tmp_path,
         scenario="always-fail",
@@ -1073,10 +1095,32 @@ def test_default_max_loops_is_one_shot(tmp_path: Path):
     metadata = json.loads(
         (output / "attempt-001" / "metadata.json").read_text(encoding="utf-8")
     )
+    assert json.loads((output / "experiment.json").read_text())["max_loops"] == 3
+    # The fake agent rewrites the same failing source every time, so the
+    # controller stops early rather than spending the whole budget.
+    assert metadata["stop_reason"] == "no_progress"
+    assert invocations == 2
+    assert metadata["repair_loops"] == 1
+    assert metadata["llm_invocations"] == 2
+    assert metadata["loop_limit_reached"] is False
+
+
+def test_max_loops_zero_is_one_shot(tmp_path: Path):
+    output, result, invocations, _ = run_experiment(
+        tmp_path,
+        scenario="always-fail",
+        max_loops=0,
+    )
+
+    assert result.returncode == 0, result.stderr
+    metadata = json.loads(
+        (output / "attempt-001" / "metadata.json").read_text(encoding="utf-8")
+    )
     assert json.loads((output / "experiment.json").read_text())["max_loops"] == 0
     assert invocations == 1
     assert metadata["repair_loops"] == 0
     assert metadata["llm_invocations"] == 1
+    assert metadata["stop_reason"] == "loop_limit"
     assert metadata["loop_limit_reached"] is True
     assert len(metadata["loops"]) == 1
 
@@ -1103,17 +1147,24 @@ def test_successful_repair_stops_and_captures_final_candidate(tmp_path: Path):
         False,
         True,
     ]
-    assert (attempt / "candidate" / "src" / "tool.c").read_text() == "repaired\n"
-    assert "+repaired" in (attempt / "patch.diff").read_text()
+    # Sources are captured flattened to their basename.
+    assert (attempt / "candidate" / "tool.c").read_text() == "repaired\n"
+    assert "tool.c" in (attempt / "changed-files.txt").read_text()
     assert "LLM INVOCATION 0: INITIAL" in (attempt / "opencode.log").read_text()
     assert "LLM INVOCATION 1: REPAIR LOOP 1" in (attempt / "opencode.log").read_text()
     assert "VALIDATION LOOP 0" in (attempt / "build.log").read_text()
     assert "VALIDATION LOOP 1" in (attempt / "build.log").read_text()
-    assert "Continue working on the CURRENT implementation" in prompts
+    assert "Continue the current implementation" in prompts
     assert "broken-build" in prompts
+    # The rendered continuation prompt is kept for reproducibility.
+    assert (attempt / "repair-prompt-1.md").exists()
+    assert "broken-build" in (attempt / "repair-prompt-1.md").read_text()
     assert (tmp_path / "extra-count.txt").read_text() == "x"
     assert (output / "analysis" / "AUTOMATIC").exists()
-    forbidden = {"loop-001", "repair", "initial", "final"}
+    # The working directory is reclaimed once the attempt finishes.
+    assert not (attempt / "workdir").exists()
+    assert metadata["workdir_pruned"] is True
+    forbidden = {"loop-001", "repair", "initial", "final", "workdir"}
     assert forbidden.isdisjoint(path.name for path in attempt.iterdir() if path.is_dir())
 
 
@@ -1143,10 +1194,13 @@ def test_hidden_evaluator_failure_is_final_and_never_repairs(tmp_path: Path):
 
 
 def test_repair_budget_exhaustion_is_recorded(tmp_path: Path):
+    # The fake agent rewrites identical failing source, which would normally
+    # trip the no-progress stop; opt out so the budget itself is exercised.
     output, result, invocations, _ = run_experiment(
         tmp_path,
         scenario="always-fail",
         max_loops=2,
+        extra_args=["--allow-no-progress"],
     )
 
     assert result.returncode == 0, result.stderr
@@ -1157,6 +1211,7 @@ def test_repair_budget_exhaustion_is_recorded(tmp_path: Path):
     assert metadata["repair_loops"] == 2
     assert metadata["llm_invocations"] == 3
     assert metadata["success_loop"] is None
+    assert metadata["stop_reason"] == "loop_limit"
     assert metadata["loop_limit_reached"] is True
     assert metadata["public_validation_success"] is False
     assert len(metadata["loops"]) == 3
@@ -1269,6 +1324,89 @@ def test_candidate_validation_failures_are_not_infrastructure(tmp_path: Path):
     assert hidden_metadata["agent_execution_failure"] is False
 
 
+def test_visible_test_tampering_is_recorded_and_preserved(tmp_path: Path):
+    """Every prompt forbids editing the visible tests.
+
+    The per-attempt copies are deleted to reclaim space, so the integrity
+    record and the preserved files are the only remaining evidence that the
+    instruction was violated.
+    """
+    repository, fake_opencode = initialize_experiment_repo(tmp_path)
+    suite = repository / "tests" / "suite"
+    suite.mkdir(parents=True)
+    (suite / "check.py").write_text("assert True\n", encoding="utf-8")
+    (suite / "helper.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    tampering_agent = tmp_path / "tampering-opencode"
+    tampering_agent.write_text(
+        """\
+#!/usr/bin/env python3
+import os
+import sys
+from pathlib import Path
+
+workdir = Path(sys.argv[sys.argv.index("--dir") + 1])
+source = workdir / os.environ["FAKE_SOURCE"]
+source.parent.mkdir(parents=True, exist_ok=True)
+source.write_text("repaired\\n")
+# Weaken one visible test and smuggle in another file.
+(workdir / "tests" / "suite" / "check.py").write_text("pass\\n")
+(workdir / "tests" / "suite" / "EXTRA.txt").write_text("bypass\\n")
+""",
+        encoding="utf-8",
+    )
+    tampering_agent.chmod(0o755)
+
+    sweep = repository / "runs" / "tamper"
+    result = subprocess.run(
+        [
+            "bash",
+            str(repository / "scripts" / RUNNER.name),
+            "--model", "fake/model",
+            "--temperature", "0",
+            "--runs", "1",
+            "--max-loops", "0",
+            "--timeout", "0",
+            "--prompt", "prompt.md",
+            "--source", "src/tool.c",
+            "--source-mode", "new",
+            "--test-dir", "tests/suite",
+            "--output-dir", str(sweep),
+            "--feature-test-cmd", "true",
+        ],
+        cwd=repository,
+        env={
+            **os.environ,
+            "OPENCODE_BIN": str(tampering_agent),
+            "PYTHON_BIN": sys.executable,
+            "FAKE_SOURCE": "src/tool.c",
+        },
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+    attempt = sweep / "temp-0p0" / "attempt-001"
+    metadata = json.loads((attempt / "metadata.json").read_text(encoding="utf-8"))
+    integrity = metadata["test_dir_integrity"]
+    assert integrity["clean"] is False
+    assert integrity["tampered_file_count"] == 2
+    directory = integrity["directories"]["tests/suite"]
+    assert directory["modified"] == ["check.py"]
+    assert directory["added"] == ["EXTRA.txt"]
+    assert directory["deleted"] == []
+
+    # The touched files survive; the untouched bulk of the suite does not.
+    preserved = attempt / "tampered-tests" / "tests" / "suite"
+    assert (preserved / "check.py").read_text() == "pass\n"
+    assert (preserved / "EXTRA.txt").read_text() == "bypass\n"
+    assert not (preserved / "helper.py").exists()
+    assert not (attempt / "workdir").exists()
+
+
 def test_runner_existing_and_new_source_modes(tmp_path: Path):
     existing_output, result, _, _ = run_experiment(
         tmp_path / "existing",
@@ -1279,7 +1417,10 @@ def test_runner_existing_and_new_source_modes(tmp_path: Path):
     existing = json.loads((existing_output / "experiment.json").read_text())
     assert existing["source_mode"] == "existing"
     assert existing["baseline_source_kind"] == "existing_source_snapshot"
-    assert (existing_output / "baseline" / "src" / "tool.c").read_text() == "baseline\n"
+    # Baseline and candidates share the flattened source name.
+    assert existing["source_path"] == "tool.c"
+    assert existing["source_workdir_path"] == "src/tool.c"
+    assert (existing_output / "baseline" / "tool.c").read_text() == "baseline\n"
 
     new_output, result, _, _ = run_experiment(
         tmp_path / "new",
@@ -1293,27 +1434,44 @@ def test_runner_existing_and_new_source_modes(tmp_path: Path):
     attempt = new_output / "attempt-001"
     assert experiment["source_mode"] == "new"
     assert experiment["baseline_source_kind"] == "empty_new_source"
-    assert (new_output / "baseline" / "src" / "new_tool.c").read_bytes() == b""
+    assert (new_output / "baseline" / "new_tool.c").read_bytes() == b""
     assert (tmp_path / "new" / "source-preexisted.txt").read_text() == "false"
-    assert (attempt / "candidate" / "src" / "new_tool.c").read_text() == "repaired\n"
-    assert "src/new_tool.c" in (attempt / "untracked-files.txt").read_text()
+    assert (attempt / "candidate" / "new_tool.c").read_text() == "repaired\n"
+    # An empty baseline exists for new-source mode, so churn is a tracked edit.
+    assert "new_tool.c" in (attempt / "diff-numstat.txt").read_text()
 
 
 @pytest.mark.parametrize(
-    "source_mode,source_path,expected",
+    "source_mode,source_path,seed_files,expected",
     [
-        ("new", "src/tool.c", "already exists in baseline commit"),
-        ("existing", "src/missing.c", "not found in baseline commit"),
+        # `existing` needs a seed for the source; without one there would be no
+        # analysis baseline to measure churn against.
+        ("existing", "src/tool.c", [], "requires a --seed-file whose destination is"),
+        # `new` means from scratch, so seeding the source contradicts it.
+        (
+            "new",
+            "src/tool.c",
+            ["src/tool.c"],
+            "conflicts with a --seed-file targeting",
+        ),
+        ("existing", "src/missing.c", ["src/missing.c"], "--seed-file source not found"),
     ],
 )
-def test_runner_source_mode_rejects_baseline_mismatch(
-    tmp_path: Path, source_mode: str, source_path: str, expected: str
+def test_runner_source_mode_rejects_seed_mismatch(
+    tmp_path: Path,
+    source_mode: str,
+    source_path: str,
+    seed_files: list[str],
+    expected: str,
 ):
     repository, fake_opencode = initialize_experiment_repo(tmp_path)
+    seed_arguments: list[str] = []
+    for seed in seed_files:
+        seed_arguments.extend(["--seed-file", seed])
     result = subprocess.run(
         [
             "bash",
-            str(repository / "scripts" / "run_llm_experiment.sh"),
+            str(repository / "scripts" / RUNNER.name),
             "--model",
             "fake/model",
             "--temperature",
@@ -1326,6 +1484,7 @@ def test_runner_source_mode_rejects_baseline_mismatch(
             source_mode,
             "--runs",
             "1",
+            *seed_arguments,
         ],
         cwd=repository,
         env={
@@ -1467,7 +1626,7 @@ def test_runner_rejects_unsafe_source_paths(source: str):
         check=False,
     )
     assert result.returncode == 2
-    assert "normalized repository-relative path" in result.stderr
+    assert "normalized relative path" in result.stderr
 
 
 def test_max_loops_rejects_arithmetic_overflow():
@@ -1481,6 +1640,10 @@ def test_max_loops_rejects_arithmetic_overflow():
             "0",
             "--prompt",
             "prompts/new_sort/001_reverse.md",
+            "--source",
+            "src/new_sort/new_sort.c",
+            "--source-mode",
+            "new",
             "--max-loops",
             "999999999999999999999999999999999999999",
         ],

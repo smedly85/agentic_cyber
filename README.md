@@ -7,96 +7,230 @@ to reproduce and compare independent repository histories.
 
 ## Requirements
 
-Run experiments from the repository root. OpenCode must be installed and
-configured for the requested model. Install the canonical analyzer's Python
-dependencies with:
+Run experiments from the repository root.
+
+### Python
+
+The pinned analyzer dependencies need Python 3.11 or newer; `tree-sitter`
+0.26 has no wheels for older interpreters, and on 3.9 it fails at import with
+`Incompatible Language version`. Create the virtual environment with an
+explicit interpreter rather than a bare `python3`, which on macOS is still the
+system 3.9:
 
 ```bash
-python3 -m pip install -r scripts/analysis-requirements.txt
+python3.14 -m venv ac_venv
+ac_venv/bin/python -m pip install --upgrade pip
+ac_venv/bin/python -m pip install -r scripts/analysis-requirements.txt
 ```
 
-The analyzer also expects `clang` and `gumtree` on `PATH` for complete
-architecture measurement. The static security cross-check is optional.
+Use `ac_venv/bin/python` for the analyzer, and export `PYTHON_BIN` so the
+runner uses it too:
+
+```bash
+export PYTHON_BIN="$PWD/ac_venv/bin/python"
+```
+
+### External tools
+
+| Tool | Required for | Notes |
+|---|---|---|
+| `opencode` | generation | Must resolve by **name** on `PATH`; the runner checks `command -v` |
+| `clang` | architecture measurement | Ships with the Xcode command line tools |
+| `gumtree` | architecture measurement | Java program; without it `gumtree_available` is false and clustering is incomplete |
+| `flawfinder` | `--security-diagnostics` only | Optional |
+
+GumTree needs a real JDK. On macOS `/usr/bin/java` is a stub that shadows
+anything later on `PATH`, so pin `JAVA_HOME` in a launcher instead of relying
+on `PATH` order:
+
+```bash
+# JDK, user-local
+mkdir -p ~/.local/opt/jdk-21
+curl -sL "https://api.adoptium.net/v3/binary/latest/21/ga/mac/aarch64/jdk/hotspot/normal/eclipse" \
+  | tar -xz -C ~/.local/opt/jdk-21 --strip-components=1
+
+# GumTree (newest release carrying a distribution zip)
+curl -sLo /tmp/gumtree.zip \
+  https://github.com/GumTreeDiff/gumtree/releases/download/v4.0.0-beta4/gumtree-4.0.0-beta4.zip
+mkdir -p ~/.local/opt/gumtree && unzip -q /tmp/gumtree.zip -d ~/.local/opt/gumtree
+
+cat > ~/.local/bin/gumtree <<'SH'
+#!/usr/bin/env bash
+export JAVA_HOME="$HOME/.local/opt/jdk-21/Contents/Home"
+exec "$HOME/.local/opt/gumtree/gumtree-4.0.0-beta4/bin/gumtree" "$@"
+SH
+chmod +x ~/.local/bin/gumtree
+```
+
+Confirm everything resolves before a run:
+
+```bash
+for t in opencode clang gumtree flawfinder; do printf '%-12s %s\n' "$t" "$(command -v $t || echo MISSING)"; done
+```
+
+### Model backend
+
+Point the runner at any OpenAI-compatible endpoint with `--remote-base-url`;
+the provider is injected for that run only, leaving `~/.config/opencode` alone.
+For a local Ollama server:
+
+```bash
+export OPENCODE_REMOTE_API_KEY=ollama   # required to be non-empty; Ollama ignores it
+
+bash scripts/run_experiment.sh \
+    --model ollama/qwen3-coder-next:latest \
+    --remote-base-url http://localhost:11434/v1 \
+    ...
+```
+
+A per-session timeout additionally needs `timeout` or `gtimeout`; without
+either the runner warns, runs unwrapped, and records `timeout_enforced: false`.
 
 ## Running an Experiment
 
-`scripts/run_llm_experiment.sh` runs repeated patch-generation attempts from a
-common Git baseline in detached worktrees. The required arguments are
-`--model`, `--temperature`, and `--prompt`. Select any sort, mkdir, or future
-utility by supplying its checkpoint prompt, repository-relative primary source
-path, and validation commands rather than by changing the analysis command:
+`scripts/run_experiment.sh` is the single experiment runner. Each attempt gets a
+fresh plain working directory containing only the prompt, any `--test-dir`
+directories, and any `--seed-file` inputs. OpenCode runs with `--dir` pointed at
+it and a configuration denying every other path, so nothing else in the
+repository is ever visible. No Git worktrees are involved.
+
+The required arguments are `--model`, `--prompt`, and `--source`. Select any
+sort, mkdir, or future utility by supplying its checkpoint prompt, source path,
+and validation commands rather than by changing the analysis command:
 
 ```bash
 PROMPT=<repository-relative checkpoint prompt path>
-SOURCE=<repository-relative primary source path>
+SOURCE=<working-directory-relative primary source path>
 
-bash scripts/run_llm_experiment.sh \
+bash scripts/run_experiment.sh \
     --model school-ollama/qwen3-coder-next:latest \
     --temperature 0.7 \
     --runs 25 \
     --max-loops 3 \
     --prompt "$PROMPT" \
     --source "$SOURCE" \
-    --source-mode existing \
+    --source-mode new \
+    --test-dir tests/mkdir-test-suite \
     --build-cmd "<build command>" \
     --base-test-cmd "<baseline test command>" \
     --feature-test-cmd "<checkpoint test command>" \
     --extra-test-cmd "<optional independent test command>"
 ```
 
-Use `--source-mode existing` when the source is present in the selected baseline
-commit. Use `--source-mode new` when the source must be absent. New-source mode
-records an empty `baseline/<source_path>` snapshot but does not create the file
-in the agent worktree; the model must create it. Existing-source sort and
-new-source mkdir tasks can therefore use the same Git controller, bounded
-repair loop, one-time hidden/extra evaluation, and canonical analyzer.
-For new-source analysis, the known C entry point remains literally `main` in
-both structural representations while arbitrary created helper names are
-canonicalized.
+Use `--source-mode new` for from-scratch checkpoints; the model must create the
+file and the analysis baseline is an empty translation unit. Use
+`--source-mode existing` for continuation checkpoints, together with a
+`--seed-file` whose destination is `--source`; that seed is also recorded as the
+analysis baseline. For new-source analysis, the known C entry point remains
+literally `main` in both structural representations while arbitrary created
+helper names are canonicalized.
 
 For example, the reverse-sort checkpoint is:
 
 ```bash
-bash scripts/run_llm_experiment.sh \
+bash scripts/run_experiment.sh \
     --model school-ollama/qwen3-coder-next:latest \
     --temperature 0.7 \
     --runs 25 \
     --prompt prompts/new_sort/001_reverse.md \
     --source src/new_sort/new_sort.c \
+    --source-mode existing \
+    --seed-file "src/new_sort/new_sort.c" \
     --feature-test-cmd \
         "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/new_sort/test_001_reverse.py -v"
 ```
 
-Each attempt starts at the same `--base-ref`. After the initial generation, a
-failed public build/base/checkpoint validation may trigger at most `--max-loops`
-repair invocations. Repair prompts contain only failing validation output,
-deterministically limited to its final 16,000 characters. The optional extra
-test runs once after the generation/repair loop and is not fed back to the
-model. Generated changes are never committed.
+### Generation, validation, and continuation
+
+After each OpenCode session the controller independently runs `--build-cmd`,
+`--base-test-cmd`, and `--feature-test-cmd` inside the working directory. If any
+of them fails, it renders a continuation prompt from
+`prompts/repair_continuation_template.md` and starts a **new** OpenCode session
+against the **same** working directory, so the model picks up where the previous
+session left off. This repeats up to `--max-loops` times (default 3).
+
+The continuation prompt quotes the original task, states where the source and
+the visible tests live, and reports what failed as a compact list of failing
+test names with short details, followed by a bounded raw tail. Failing tests are
+read from a suite `--json-report` when one exists, otherwise parsed from the
+suite runner's output, unittest output, or compiler diagnostics. Every rendered
+prompt is saved as `attempt-*/repair-prompt-<loop>.md`.
+
+The loop also stops early when a session leaves the source byte-identical to the
+previous loop, recorded as `stop_reason: "no_progress"`; pass
+`--allow-no-progress` to spend the full budget regardless. Other stop reasons
+are `success`, `loop_limit`, and `agent_execution_failure`. The optional extra
+test runs once after the loop and is never fed back to the model.
+
+Override the continuation template with `--repair-prompt FILE`.
+
+### Temperature
+
+`--temperature T` runs a single point. For a sweep, give `--temp-min`,
+`--temp-max`, and `--temp-points N`; `--runs` is always the number of attempts
+*per temperature*. `--temp-points` is required whenever the endpoints differ, so
+a sweep can never be confused with an attempt count.
 
 Completed attempts are skipped when a command is resumed; pass `--force` to
-regenerate them. See all runner options with:
+regenerate them. Resuming with a different configuration is rejected rather than
+silently mixing conditions. See all runner options with:
 
 ```bash
-bash scripts/run_llm_experiment.sh --help
+bash scripts/run_experiment.sh --help
 ```
 
 Unless `--output-dir` is supplied, experiments are stored under:
 
 ```text
-runs/experiments/<model>/<checkpoint>/temp-<temperature>/
+runs/experiments/<model>/<checkpoint>/
 ```
 
-The runner writes `experiment.json`, including `source_path`, baseline commit,
-prompt, model, temperature, validation commands, and repair budget. It also
-stores the baseline at `baseline/<source_path>` and each final candidate at
+with one self-contained experiment directory per temperature inside it. The
+runner writes `experiment.json` per temperature, including `source_path`,
+prompt, model, temperature, validation commands, and repair budget. It stores
+the baseline at `baseline/<source_path>` and each final candidate at
 `attempt-*/candidate/<source_path>`. These metadata and source paths make the
 same analysis invocation applicable to sort, mkdir, and future utilities.
-Each attempt distinguishes setup infrastructure attrition from agent-execution
-failure and candidate failure. Worktree/setup failure before invocation is
-infrastructure attrition. Timeout, permission rejection, and a nonzero attempted
+
+### Working directory cleanup
+
+The working directory is a per-attempt copy of the test suite
+(`tests/sort-test-suite` alone is 14M), so it is deleted once the attempt
+finishes. Before deletion the runner:
+
+1. copies every kept source file into `attempt-*/candidate/`, **flattened** to
+   its basename, with `candidate/manifest.json` recording the original layout;
+2. writes the diff artifacts the analyzer reads;
+3. hashes each copied `--test-dir` against the repository original, records
+   `test_dir_integrity` in `metadata.json`, and preserves anything the agent
+   modified or added under `attempt-*/tampered-tests/`.
+
+Every prompt forbids modifying the visible tests, so the integrity record is
+what makes a violation visible after the copies are gone. Use `--keep-glob` to
+preserve additional file patterns (default `*.c` and `*.h`), or `--keep-workdir`
+to retain the working directory.
+
+To reclaim space in runs produced earlier:
+
+```bash
+bash scripts/run_experiment.sh --prune-only runs/
+```
+
+This removes the working directory from completed attempts in the current
+format. Older sandbox-format runs are analyzed straight out of `workdir/`, so
+for those it removes only the copied test suites and build output and leaves the
+generated source in place. Incomplete attempts are never touched.
+
+### Failure classification
+
+Each attempt distinguishes infrastructure attrition from agent-execution failure
+and candidate failure. Timeout, permission rejection, and a nonzero attempted
 OpenCode invocation are failed valid agent trials. Build, public-test, and
 hidden/extra-evaluator failures are candidate/workflow failures after generation.
+
+A per-session timeout needs `timeout` or `gtimeout` on `PATH`. When neither is
+available the runner warns, runs sessions unwrapped, and records
+`timeout_enforced: false` so the distinction stays visible in analysis.
 
 Automatic analysis accepts `--analysis-architecture-threshold`,
 `--analysis-strategy-threshold`, and optional `--analysis-diversity-k-max`.
@@ -108,11 +242,10 @@ values are recorded in `experiment.json` and `analysis/summary.json`.
 
 ## Canonical Analysis
 
-`scripts/analyze_experiment.py` is the sole analysis entry point. The Git
-experiment runner invokes it automatically after all attempts. To reproduce or
-extend an analysis manually, pass only the experiment directory; the analyzer
-reads the target source, baseline, thresholds, and fixed K from
-`experiment.json`:
+`scripts/analyze_experiment.py` is the sole analysis entry point. The experiment
+runner invokes it automatically once per temperature. To reproduce or extend an
+analysis manually, pass only the experiment directory; the analyzer reads the
+target source, baseline, thresholds, and fixed K from `experiment.json`:
 
 ```bash
 EXPERIMENT=runs/experiments/<model>/<checkpoint>/temp-<temperature>
@@ -121,6 +254,10 @@ python3 scripts/analyze_experiment.py \
     --experiment "$EXPERIMENT" \
     --clean-output
 ```
+
+Analyze each `temp-*` condition separately. The analyzer rejects a directory
+containing multiple temperatures rather than pooling different experimental
+conditions.
 
 Analysis-setting precedence is explicit CLI value, then recorded experiment
 metadata, then analyzer default. Supplying threshold or K options manually
@@ -178,51 +315,47 @@ architecture; implementation strategy is separate. Primary strategy includes
 `main`; excluding `main` is a diagnostic robustness ablation only. See
 `docs/diversity_methodology.md` for formulas and interpretation.
 
-## Exploratory No-Git Sandbox Runner
+## Chained Checkpoints
 
-`scripts/run_sandboxed_pipeline.sh` is retained as an exploratory/legacy runner
-for pilot and historical work. It is a separate runner for from-scratch or
-seeded prompts that do not need a Git baseline. It creates a fresh plain
-directory for each equally spaced temperature point, copies the prompt and any
-`--test-dir` paths, applies any `--seed-file SRC[:DEST]` inputs, runs OpenCode,
-and executes `--test-cmd` once afterward as an independent confirmation. It
-does not create worktrees, commits, diffs, repair loops, or canonical analysis
-artifacts.
-
-For example, the mkdir checkpoints can be generated sequentially with the
-standalone golden/fuzz judge:
+Later checkpoints are seeded from a promoted earlier candidate. Because working
+directories are removed after each attempt, the seed comes from the preserved
+flattened candidate:
 
 ```bash
 # Base implementation, generated from scratch.
-bash scripts/run_sandboxed_pipeline.sh \
+bash scripts/run_experiment.sh \
     --model school-ollama/qwen3-coder-next:latest \
-    --runs 10 --temp-min 0 --temp-max 2 \
+    --temp-min 0 --temp-max 2 --temp-points 10 --runs 1 \
     --prompt prompts/mkdir/000_base_new_mkdir.md \
+    --source src/new_mkdir/new_mkdir.c --source-mode new \
     --test-dir tests/mkdir-test-suite \
-    --test-cmd "tests/mkdir-test-suite/judge_candidate.sh build/new_mkdir" \
-    --output-dir runs/sandboxed/mkdir/milestone-1
+    --build-cmd "mkdir -p build && cc -std=c11 -Wall -Wextra -Werror -pedantic -O2 src/new_mkdir/new_mkdir.c -o build/new_mkdir" \
+    --feature-test-cmd "tests/mkdir-test-suite/judge_candidate.sh build/new_mkdir" \
+    --output-dir runs/experiments/mkdir/milestone-1
 
 # Later checkpoint, seeded from a promoted prior candidate.
-bash scripts/run_sandboxed_pipeline.sh \
+bash scripts/run_experiment.sh \
     --model school-ollama/qwen3-coder-next:latest \
-    --runs 10 --temp-min 0 --temp-max 2 \
+    --temp-min 0 --temp-max 2 --temp-points 10 --runs 1 \
     --prompt prompts/mkdir/001_parents.md \
+    --source src/new_mkdir/new_mkdir.c --source-mode existing \
     --test-dir tests/mkdir-test-suite \
-    --seed-file "<prior-workdir>/src/new_mkdir/new_mkdir.c:src/new_mkdir/new_mkdir.c" \
-    --test-cmd "tests/mkdir-test-suite/judge_candidate.sh build/new_mkdir -p" \
-    --output-dir runs/sandboxed/mkdir/milestone-2
+    --seed-file "runs/experiments/mkdir/milestone-1/temp-0p0/attempt-001/candidate/new_mkdir.c:src/new_mkdir/new_mkdir.c" \
+    --build-cmd "mkdir -p build && cc -std=c11 -Wall -Wextra -Werror -pedantic -O2 src/new_mkdir/new_mkdir.c -o build/new_mkdir" \
+    --feature-test-cmd "tests/mkdir-test-suite/judge_candidate.sh build/new_mkdir -p" \
+    --output-dir runs/experiments/mkdir/milestone-2
 ```
 
 `--seed-file` defaults its destination to the source path when `:DEST` is
-omitted. The prompt instructs the agent to compile, self-test, and iterate;
-`--test-cmd` only records the runner's final pass/fail in `metadata.json`. See
-`scripts/run_sandboxed_pipeline.sh --help` for endpoint and temperature options.
+omitted. The seed whose destination matches `--source` also becomes that
+experiment's analysis baseline, so churn is measured against the promoted
+candidate rather than against nothing.
 
-The same analyzer accepts one sandbox temperature condition. Legacy `run.json`
-does not record the generated source path, so provide it explicitly. Seeded
-runs derive the baseline from the matching recorded `--seed-file`; unseeded
-from-scratch runs use an empty C translation unit as their recorded analysis
-baseline:
+### Historical sandbox runs
+
+Runs under `runs/sandboxed/` were produced by the earlier no-Git runner and
+remain analyzable in place. Their `run.json` does not record the generated
+source path, so provide it explicitly, and analyze one temperature at a time:
 
 ```bash
 python3 scripts/analyze_experiment.py \
@@ -233,15 +366,10 @@ python3 scripts/analyze_experiment.py \
     --clean-output
 ```
 
-Analyze each `temp-*` condition separately. The analyzer rejects a sandbox root
-containing multiple temperatures rather than pooling different experimental
-conditions. `--baseline-source` can explicitly override baseline discovery.
-
-The Git-backed `run_llm_experiment.sh` workflow is the intended confirmatory
-workflow for cross-utility conference comparisons. Sandbox results remain
-analyzable, but runs generated under materially different agent-feedback or
-controller protocols must not be pooled as one condition. Sandbox rows are not
-automatically added to the repository-level confirmatory paper aggregate.
+`--baseline-source` can explicitly override baseline discovery. Runs generated
+under materially different agent-feedback or controller protocols must not be
+pooled as one condition; sandbox rows are not added to the repository-level
+confirmatory paper aggregate.
 
 ## Repository Structure
 
@@ -254,14 +382,16 @@ agentic_cyber/
 ├── prompts/
 │   ├── checkpoint_base_template.md
 │   ├── checkpoint_feature_template.md
+│   ├── repair_continuation_template.md    # Continuation prompt for repair loops
 │   ├── mkdir/                             # mkdir checkpoints
 │   └── new_sort/                          # sort checkpoints and prompt tests
 ├── scripts/
 │   ├── analysis/                          # Canonical metric and validation modules
 │   ├── analysis-requirements.txt
 │   ├── analyze_experiment.py              # Sole analysis entry point
-│   ├── run_llm_experiment.sh              # Git-worktree experiment runner
-│   └── run_sandboxed_pipeline.sh           # Separate no-Git generator
+│   ├── capture_candidate.py               # Flat capture, integrity check, cleanup
+│   ├── repair_prompt.py                   # Continuation prompt renderer
+│   └── run_experiment.sh                  # Sole experiment runner
 ├── src/
 │   └── new_sort/
 │       ├── README.md

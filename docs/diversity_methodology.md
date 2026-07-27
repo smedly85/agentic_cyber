@@ -102,7 +102,7 @@ experiments before making security-effect claims.
 
 One complete generation/repair trajectory is one independent attempt and the
 implementation is the sampling and inference unit. Only high-confidence
-pre-invocation worktree/setup failure is infrastructure attrition. Once an
+pre-invocation workspace/setup failure is infrastructure attrition. Once an
 OpenCode invocation is attempted, the attempt is a valid agent trial even if it
 times out, encounters a permission rejection, or exits nonzero. One valid trial
 contributes its final candidate after the configured process. Repeated source
@@ -149,7 +149,7 @@ test, when configured.
 
 The failure taxonomy is deliberately conservative:
 
-- **Infrastructure attrition:** experiment worktree/setup failed before a
+- **Infrastructure attrition:** experiment workspace/setup failed before a
   usable agent invocation was attempted.
 - **Agent-execution failure:** timeout, configured-policy permission rejection,
   or another nonzero attempted OpenCode invocation. These are valid failed
@@ -505,10 +505,17 @@ automatically.
 
 ## Reproducible usage and optional flags
 
-For Git experiments, the analyzer discovers the target from
+The analyzer reports the primary input format as `git_experiment`. That name is
+historical: it identifies the `experiment.json` + `attempt-*/candidate/` layout,
+which `scripts/run_experiment.sh` produces from plain working directories. No
+Git worktree, baseline commit, or diff is involved. `sandbox_run` remains the
+format of historical `run.json` runs under `runs/sandboxed/`.
+
+For `git_experiment` runs, the analyzer discovers the target from
 `experiment.json["source_path"]`, reads `baseline/<source_path>`, and matches
-`attempt-*/candidate/<source_path>`. Do not construct utility-specific source
-globs:
+`attempt-*/candidate/<source_path>`. Sources are captured flattened, so
+`source_path` is a bare filename such as `new_mkdir.c`. Do not construct
+utility-specific source globs:
 
 ```bash
 python3 scripts/analyze_experiment.py \
