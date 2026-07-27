@@ -99,6 +99,11 @@ def capture(
 ) -> dict:
     excluded = [workdir / relative for relative in test_dirs]
     excluded.append(workdir / "build")
+    # The runner runs `git init` in the workdir so OpenCode treats it as the
+    # project root and its external_directory deny rules take effect. Nothing
+    # under .git is agent-authored source, and OpenCode's own snapshots live
+    # there, so it never belongs in candidate/.
+    excluded.append(workdir / ".git")
 
     candidate_dir = attempt_dir / "candidate"
     if candidate_dir.exists():
@@ -308,9 +313,20 @@ def main() -> int:
     )
 
     pruned = False
+    git_marker_removed = False
     if not args.keep_workdir:
         shutil.rmtree(args.workdir)
         pruned = True
+    else:
+        # The runner creates an empty repository in the workdir purely to move
+        # OpenCode's project boundary onto it. Dropping the workdir normally
+        # takes it along; when the workdir is kept for inspection the marker is
+        # still scratch, and leaving it makes the kept tree look like a real
+        # checkout.
+        git_marker = args.workdir / ".git"
+        if git_marker.is_dir():
+            shutil.rmtree(git_marker)
+            git_marker_removed = True
 
     print(
         json.dumps(
@@ -319,6 +335,7 @@ def main() -> int:
                 "collisions_mangled": result["collisions_mangled"],
                 "test_dir_integrity": integrity,
                 "workdir_pruned": pruned,
+                "git_marker_removed": git_marker_removed,
             },
             separators=(",", ":"),
         )

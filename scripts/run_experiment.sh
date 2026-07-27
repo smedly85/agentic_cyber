@@ -58,6 +58,9 @@ Temperature:
   --temp-points N            Number of equally spaced points across
                              [--temp-min, --temp-max] inclusive (default: 1).
                              Required when --temp-min differs from --temp-max.
+  --temp-list T1,T2,...      Explicit temperature points, for grids that are
+                             not equally spaced (e.g. 0,0.125,0.25,0.5,1,2).
+                             Mutually exclusive with the options above.
   --runs N                   Attempts per temperature point (default: 1)
 
 Generation and repair:
@@ -357,6 +360,10 @@ TEMPERATURE=""
 TEMP_MIN="0"
 TEMP_MAX="2"
 TEMP_POINTS=""
+TEMP_LIST=""
+# Tracked separately so `--temp-list ""` is rejected as the mistake it is
+# rather than silently falling through to the --temp-min/--temp-max path.
+TEMP_LIST_SET=0
 RUNS=1
 MAX_LOOPS=3
 REPAIR_TEMPLATE=""
@@ -391,7 +398,8 @@ while [[ $# -gt 0 ]]; do
     # re-reads the same argument forever.
     case "$1" in
         --model|--prompt|--source|--source-mode|--temperature|--temp-min| \
-        --temp-max|--temp-points|--runs|--max-loops|--repair-prompt|--agent| \
+        --temp-max|--temp-points|--temp-list|--runs|--max-loops| \
+        --repair-prompt|--agent| \
         --test-dir|--seed-file|--keep-glob|--build-cmd|--base-test-cmd| \
         --feature-test-cmd|--test-cmd|--extra-test-cmd|--timeout|--output-dir| \
         --prune-only|--remote-base-url|--remote-api-key-env| \
@@ -410,6 +418,7 @@ while [[ $# -gt 0 ]]; do
         --temp-min) TEMP_MIN="${2:-}"; shift 2 ;;
         --temp-max) TEMP_MAX="${2:-}"; shift 2 ;;
         --temp-points) TEMP_POINTS="${2:-}"; shift 2 ;;
+        --temp-list) TEMP_LIST="${2:-}"; TEMP_LIST_SET=1; shift 2 ;;
         --runs) RUNS="${2:-}"; shift 2 ;;
         --max-loops) MAX_LOOPS="${2:-}"; shift 2 ;;
         --repair-prompt) REPAIR_TEMPLATE="${2:-}"; shift 2 ;;
@@ -464,6 +473,9 @@ resolve_repo_path() {
 
 CAPTURE_TOOL="$REPO/scripts/capture_candidate.py"
 [[ -f "$CAPTURE_TOOL" ]] || die "capture helper not found: $CAPTURE_TOOL"
+
+STATS_TOOL="$REPO/scripts/opencode_stats.py"
+[[ -f "$STATS_TOOL" ]] || die "stats helper not found: $STATS_TOOL"
 
 # ---------------------------------------------------------------------------
 # Standalone cleanup of existing runs
@@ -547,6 +559,17 @@ raise SystemExit(0 if valid else 1)
 PY
     die "--source must be a normalized relative path without '..'"
 
+if [[ "$TEMP_LIST_SET" -eq 1 ]]; then
+    [[ -z "$TEMPERATURE" ]] ||
+        die "--temp-list and --temperature are mutually exclusive"
+    [[ -z "$TEMP_POINTS" ]] ||
+        die "--temp-list and --temp-points are mutually exclusive"
+    # Guard the defaults too: a caller who set an explicit range and then a
+    # list has described two different grids.
+    [[ "$TEMP_MIN" == "0" && "$TEMP_MAX" == "2" ]] ||
+        die "--temp-list and --temp-min/--temp-max are mutually exclusive"
+fi
+
 if [[ -n "$TEMPERATURE" ]]; then
     [[ -z "$TEMP_POINTS" || "$TEMP_POINTS" == "1" ]] ||
         die "--temperature and --temp-points are mutually exclusive"
@@ -555,26 +578,55 @@ if [[ -n "$TEMPERATURE" ]]; then
     TEMP_POINTS=1
 fi
 
-"$PYTHON_BIN" -c 'import sys; float(sys.argv[1])' "$TEMP_MIN" ||
-    die "--temp-min must be numeric"
-"$PYTHON_BIN" -c 'import sys; float(sys.argv[1])' "$TEMP_MAX" ||
-    die "--temp-max must be numeric"
-"$PYTHON_BIN" -c 'import sys; sys.exit(0 if float(sys.argv[1]) <= float(sys.argv[2]) else 1)' \
-    "$TEMP_MIN" "$TEMP_MAX" || die "--temp-min must be <= --temp-max"
+if [[ "$TEMP_LIST_SET" -eq 1 ]]; then
+    # Normalized once here so the grid, the slugs and sweep.json all agree, and
+    # so a malformed list fails before any model time is spent. Diagnostics come
+    # back on stdout so the reason survives into the die message.
+    temp_list_parsed="$("$PYTHON_BIN" - "$TEMP_LIST" <<'PY' 2>&1
+import sys
 
-SWEEP_IS_RANGE=0
-"$PYTHON_BIN" -c 'import sys; sys.exit(0 if float(sys.argv[1]) == float(sys.argv[2]) else 1)' \
-    "$TEMP_MIN" "$TEMP_MAX" || SWEEP_IS_RANGE=1
+values = [part.strip() for part in sys.argv[1].split(",") if part.strip()]
+if not values:
+    print("--temp-list must name at least one temperature")
+    raise SystemExit(1)
+seen: list[float] = []
+for value in values:
+    try:
+        number = float(value)
+    except ValueError:
+        print(f"--temp-list entry is not numeric: {value}")
+        raise SystemExit(1)
+    if number in seen:
+        print(f"--temp-list repeats {value}; each point runs once")
+        raise SystemExit(1)
+    seen.append(number)
+print(",".join(repr(number) for number in seen))
+PY
+    )" || die "$temp_list_parsed"
+    TEMP_LIST="$temp_list_parsed"
+    TEMP_POINTS="$(awk -F, '{print NF}' <<<"$TEMP_LIST")"
+else
+    "$PYTHON_BIN" -c 'import sys; float(sys.argv[1])' "$TEMP_MIN" ||
+        die "--temp-min must be numeric"
+    "$PYTHON_BIN" -c 'import sys; float(sys.argv[1])' "$TEMP_MAX" ||
+        die "--temp-max must be numeric"
+    "$PYTHON_BIN" -c 'import sys; sys.exit(0 if float(sys.argv[1]) <= float(sys.argv[2]) else 1)' \
+        "$TEMP_MIN" "$TEMP_MAX" || die "--temp-min must be <= --temp-max"
 
-if [[ -z "$TEMP_POINTS" ]]; then
-    if [[ "$SWEEP_IS_RANGE" -eq 1 ]]; then
-        # --runs used to mean "temperature points" in run_sandboxed_pipeline.sh
-        # and "attempts" in run_llm_experiment.sh. Refuse to guess.
-        die "--temp-points is required when --temp-min differs from --temp-max (--runs is attempts per temperature)"
+    SWEEP_IS_RANGE=0
+    "$PYTHON_BIN" -c 'import sys; sys.exit(0 if float(sys.argv[1]) == float(sys.argv[2]) else 1)' \
+        "$TEMP_MIN" "$TEMP_MAX" || SWEEP_IS_RANGE=1
+
+    if [[ -z "$TEMP_POINTS" ]]; then
+        if [[ "$SWEEP_IS_RANGE" -eq 1 ]]; then
+            # --runs used to mean "temperature points" in run_sandboxed_pipeline.sh
+            # and "attempts" in run_llm_experiment.sh. Refuse to guess.
+            die "--temp-points is required when --temp-min differs from --temp-max (--runs is attempts per temperature)"
+        fi
+        TEMP_POINTS=1
     fi
-    TEMP_POINTS=1
+    [[ "$TEMP_POINTS" =~ ^[1-9][0-9]*$ ]] || die "--temp-points must be a positive integer"
 fi
-[[ "$TEMP_POINTS" =~ ^[1-9][0-9]*$ ]] || die "--temp-points must be a positive integer"
 
 if [[ -n "$REMOTE_BASE_URL" ]]; then
     [[ "$MODEL" == */* ]] ||
@@ -699,8 +751,11 @@ REPO_COMMIT="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || printf 'unknown')"
 TEST_DIRS_JOINED="$(IFS=,; printf '%s' "${TEST_DIRS[*]+"${TEST_DIRS[*]}"}")"
 SEED_FILES_JOINED="$(IFS=,; printf '%s' "${SEED_FILES[*]+"${SEED_FILES[*]}"}")"
 
-TEMPERATURES="$(
-    "$PYTHON_BIN" -c '
+if [[ -n "$TEMP_LIST" ]]; then
+    TEMPERATURES="$(tr ',' '\n' <<<"$TEMP_LIST")"
+else
+    TEMPERATURES="$(
+        "$PYTHON_BIN" -c '
 import sys
 n, lo, hi = int(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3])
 if n == 1:
@@ -710,7 +765,8 @@ else:
     for i in range(n):
         print(lo + step * i)
 ' "$TEMP_POINTS" "$TEMP_MIN" "$TEMP_MAX"
-)"
+    )"
+fi
 
 TEMPERATURES_ARR=()
 while IFS= read -r line; do
@@ -730,6 +786,7 @@ write_metadata "$OUTPUT_DIR/sweep.json" \
     temp_min "$TEMP_MIN" \
     temp_max "$TEMP_MAX" \
     temp_points "$TEMP_POINTS" \
+    temp_list "$TEMP_LIST" \
     runs_per_temperature "$RUNS" \
     max_loops "$MAX_LOOPS" \
     test_dirs "$TEST_DIRS_JOINED" \
@@ -746,7 +803,9 @@ printf 'Repository:  %s\n' "$REPO"
 printf 'Model:       %s\n' "$MODEL"
 printf 'Prompt:      %s\n' "$PROMPT_ABS"
 printf 'Source:      %s (captured as %s)\n' "$SOURCE_PATH" "$SOURCE_FLAT"
-if [[ "$TEMP_POINTS" -gt 1 ]]; then
+if [[ -n "$TEMP_LIST" ]]; then
+    printf 'Temperature: %s explicit points (%s)\n' "$TEMP_POINTS" "$TEMP_LIST"
+elif [[ "$TEMP_POINTS" -gt 1 ]]; then
     printf 'Temperature: %s points across [%s, %s]\n' \
         "$TEMP_POINTS" "$TEMP_MIN" "$TEMP_MAX"
 else
@@ -881,6 +940,12 @@ PY
 
         printf '[%s/%s] starting %s\n' "$attempt_number" "$RUNS" "$attempt_id"
 
+        # OpenCode keys its sessions by working directory, and this path is
+        # reused whenever an attempt is re-run with --force or restarted after
+        # an interruption. Without a floor, the stats for this attempt would
+        # also collect the abandoned run's sessions.
+        attempt_started_ms="$(( $(date +%s) * 1000 ))"
+
         rm -rf "$attempt_dir"
         mkdir -p "$workdir"
 
@@ -900,6 +965,23 @@ PY
             mkdir -p "$(dirname "$workdir/$seed_dest")"
             cp -p "$(resolve_repo_path "$seed_src")" "$workdir/$seed_dest"
         done
+
+        # OpenCode resolves a session's project root by walking up for a .git
+        # directory, and only consults its external_directory rules for paths
+        # outside that root. Without a .git of its own the workdir inherits
+        # this repository as its root, every repository path counts as
+        # internal, and the agent can read and write anywhere in the checkout
+        # -- observed: a session wrote src/new_mkdir/new_mkdir.c into the real
+        # repository. An empty repository here moves the boundary onto the
+        # workdir. It is scratch metadata only, never committed to, and it
+        # goes away with the workdir during the prune.
+        git init -q "$workdir" ||
+            die "failed to initialize sandbox marker repository in $workdir"
+        sandbox_root="$(git -C "$workdir" rev-parse --show-toplevel 2>/dev/null || printf '')"
+        # Fail closed: without this boundary the agent is loose in the repo,
+        # which silently corrupts both the checkout and every later attempt.
+        [[ "$sandbox_root" == "$(cd "$workdir" && pwd -P)" ]] ||
+            die "sandbox boundary not established for $workdir (root=$sandbox_root)"
 
         ATTEMPT_OPENCODE_CONFIG_CONTENT="$(
             "$PYTHON_BIN" - "$AGENT" "$temperature" "$workdir" \
@@ -928,6 +1010,11 @@ if escaped_workdir != workdir:
 
 config = {
     "$schema": "https://opencode.ai/config.json",
+    # Snapshots exist so an interactive user can undo a change. Nothing here
+    # reverts, and with a per-attempt project root OpenCode would otherwise
+    # keep one snapshot repository per attempt under its shared data
+    # directory, copying the whole seeded tree on every step.
+    "snapshot": False,
     "agent": {
         agent: {
             "temperature": temperature,
@@ -1176,6 +1263,19 @@ PY
               "$extra_test_exit" -ne 0 ]]; then
             overall_success=false
         fi
+
+        # Pull token counts, per-step latency, tool usage and reasoning volume
+        # out of OpenCode's own database. `opencode run` prints none of it, and
+        # the sessions are keyed by working directory, so this has to happen
+        # before the prune renames nothing but while the path is still known.
+        "$PYTHON_BIN" "$STATS_TOOL" \
+            --workdir "$workdir" \
+            --output-dir "$attempt_dir" \
+            --model "$MODEL" \
+            --temperature "$temperature" \
+            --attempt "$attempt_id" \
+            --since-ms "$attempt_started_ms" ||
+            warn "opencode stats extraction failed for $attempt_id"
 
         # Flatten the sources, record any test tampering, drop the workdir.
         capture_args=(

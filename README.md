@@ -35,9 +35,21 @@ export PYTHON_BIN="$PWD/ac_venv/bin/python"
 | Tool | Required for | Notes |
 |---|---|---|
 | `opencode` | generation | Must resolve by **name** on `PATH`; the runner checks `command -v` |
+| `git` | generation | Also used per attempt to fence the agent into its working directory |
+| `timeout` | generation | Bounds each agent session. macOS ships none; without it the runner warns, runs unbounded, and records `timeout_enforced: false` |
 | `clang` | architecture measurement | Ships with the Xcode command line tools |
 | `gumtree` | architecture measurement | Java program; without it `gumtree_available` is false and clustering is incomplete |
 | `flawfinder` | `--security-diagnostics` only | Optional |
+
+`timeout` matters for any unattended sweep: a stalled session otherwise blocks
+every attempt behind it. It comes from GNU coreutils (`brew install coreutils`
+provides it as `gtimeout`, which the runner also accepts). Where Homebrew is
+unavailable, `scripts/timeout.py` implements the subset the runner uses and can
+be linked onto `PATH`:
+
+```bash
+ln -sf "$PWD/scripts/timeout.py" ~/.local/bin/timeout
+```
 
 GumTree needs a real JDK. On macOS `/usr/bin/java` is a stub that shadows
 anything later on `PATH`, so pin `JAVA_HOME` in a launcher instead of relying
@@ -65,7 +77,7 @@ chmod +x ~/.local/bin/gumtree
 Confirm everything resolves before a run:
 
 ```bash
-for t in opencode clang gumtree flawfinder; do printf '%-12s %s\n' "$t" "$(command -v $t || echo MISSING)"; done
+for t in opencode git timeout clang gumtree flawfinder; do printf '%-12s %s\n' "$t" "$(command -v $t || echo MISSING)"; done
 ```
 
 ### Model backend
@@ -166,10 +178,21 @@ Override the continuation template with `--repair-prompt FILE`.
 
 ### Temperature
 
-`--temperature T` runs a single point. For a sweep, give `--temp-min`,
-`--temp-max`, and `--temp-points N`; `--runs` is always the number of attempts
-*per temperature*. `--temp-points` is required whenever the endpoints differ, so
-a sweep can never be confused with an attempt count.
+`--temperature T` runs a single point. For an evenly spaced sweep, give
+`--temp-min`, `--temp-max`, and `--temp-points N`. `--temp-points` is required
+whenever the endpoints differ, so a sweep can never be confused with an attempt
+count. `--runs` is always the number of attempts *per temperature*.
+
+Grids that are not evenly spaced — a doubling ladder, for example — are given
+directly with `--temp-list`, which is mutually exclusive with the three options
+above:
+
+```bash
+--temp-list 0.0,0.125,0.25,0.5,1.0,2.0 --runs 10
+```
+
+That is one sweep of six temperatures with ten attempts each, sharing a single
+`sweep.json`.
 
 Completed attempts are skipped when a command is resumed; pass `--force` to
 regenerate them. Resuming with a different configuration is rejected rather than
@@ -191,6 +214,54 @@ prompt, model, temperature, validation commands, and repair budget. It stores
 the baseline at `baseline/<source_path>` and each final candidate at
 `attempt-*/candidate/<source_path>`. These metadata and source paths make the
 same analysis invocation applicable to sort, mkdir, and future utilities.
+
+### Agent sandboxing
+
+Each attempt runs in its own working directory, and the agent must not be able
+to reach anything else — not the repository it is nested inside, and not another
+attempt.
+
+OpenCode enforces this through its `external_directory` permission, which the
+runner sets to deny everything except the working directory. That rule alone is
+not enough: OpenCode decides whether a path *is* external by comparing it
+against the session's project root, which it finds by walking up from `--dir`
+looking for a `.git` directory. A working directory nested inside this
+repository therefore inherits the repository as its root, every repository path
+counts as internal, and the deny rule is never consulted. Observed directly: a
+session asked to create `src/new_mkdir/new_mkdir.c` wrote it into the real
+checkout.
+
+The runner closes this by running `git init` in each working directory before
+the first invocation, which moves the project root onto the working directory
+itself, and then verifying the boundary took effect before spending any model
+time. The repository is a marker only — nothing is ever committed to it, and it
+is removed during cleanup along with the rest of the working directory (or on
+its own when `--keep-workdir` is used).
+
+### Session statistics
+
+`opencode run` reports no usage figures, so after each attempt the runner reads
+them out of OpenCode's own database
+(`~/.local/share/opencode/opencode.db`) and writes them into the attempt
+directory before the working directory is pruned:
+
+```text
+attempt-001/opencode-stats.json   one record per session
+attempt-001/opencode-stats.txt    the same, formatted for reading
+```
+
+Sessions are matched by working directory and floored at the attempt's start
+time, so a re-run under `--force` does not inherit the abandoned run's numbers.
+Each validation loop is a separate session, reported in order as loop 0 (the
+initial generation) onward, with input/output/reasoning/cache token counts, cost,
+wall and model time, per-step latency, finish reasons, tool-call and tool-error
+counts by tool, and reasoning-block volume. `scripts/opencode_stats.py` can also
+be run by hand against any working directory that still has sessions on record.
+
+Note that token *counts* depend on the backend: Ollama's OpenAI-compatible
+endpoint does not report reasoning tokens separately, so `reasoning tokens`
+reads 0 there even for a reasoning model. Reasoning blocks and characters are
+counted from the transcript and remain accurate.
 
 ### Working directory cleanup
 
@@ -390,8 +461,10 @@ agentic_cyber/
 │   ├── analysis-requirements.txt
 │   ├── analyze_experiment.py              # Sole analysis entry point
 │   ├── capture_candidate.py               # Flat capture, integrity check, cleanup
+│   ├── opencode_stats.py                  # Per-session token, timing and tool stats
 │   ├── repair_prompt.py                   # Continuation prompt renderer
-│   └── run_experiment.sh                  # Sole experiment runner
+│   ├── run_experiment.sh                  # Sole experiment runner
+│   └── timeout.py                         # `timeout` subset for hosts without coreutils
 ├── src/
 │   └── new_sort/
 │       ├── README.md

@@ -21,6 +21,7 @@ RUNNER = REPO_ROOT / "scripts" / "run_experiment.sh"
 RUNNER_HELPERS = (
     REPO_ROOT / "scripts" / "capture_candidate.py",
     REPO_ROOT / "scripts" / "repair_prompt.py",
+    REPO_ROOT / "scripts" / "opencode_stats.py",
 )
 REPAIR_TEMPLATE = REPO_ROOT / "prompts" / "repair_continuation_template.md"
 ANALYZER = REPO_ROOT / "scripts" / "analyze_experiment.py"
@@ -965,6 +966,7 @@ args, _ = parser.parse_known_args()
 #!/usr/bin/env python3
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -975,6 +977,17 @@ prompt = sys.argv[-1]
 with Path(os.environ["FAKE_PROMPTS"]).open("a", encoding="utf-8") as handle:
     handle.write(f"\\n===== PROMPT {invocation} =====\\n{prompt}\\n")
 worktree = Path(sys.argv[sys.argv.index("--dir") + 1])
+# OpenCode only applies its external_directory rules outside the session's
+# project root, which it finds by walking up for .git. Record what that walk
+# would land on so a test can prove the boundary is the workdir itself and
+# not the surrounding repository.
+Path(os.environ["FAKE_GIT_ROOT"]).write_text(
+    subprocess.run(
+        ["git", "-C", str(worktree), "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+)
 scenario = os.environ["FAKE_SCENARIO"]
 source = worktree / os.environ.get("FAKE_SOURCE", "src/tool.c")
 Path(os.environ["FAKE_PREEXISTED"]).write_text(str(source.exists()).lower())
@@ -1009,6 +1022,8 @@ def run_experiment(
     base_test_cmd: str = "true",
     analysis_args: list[str] | None = None,
     extra_args: list[str] | None = None,
+    temperature: str | None = "0",
+    runs: int = 1,
 ) -> tuple[Path, subprocess.CompletedProcess[str], int, str]:
     repository, fake_opencode = initialize_experiment_repo(tmp_path)
     counter = tmp_path / "counter.txt"
@@ -1020,10 +1035,9 @@ def run_experiment(
         str(repository / "scripts" / RUNNER.name),
         "--model",
         "fake/model",
-        "--temperature",
-        "0",
+        *(["--temperature", temperature] if temperature is not None else []),
         "--runs",
-        "1",
+        str(runs),
         "--prompt",
         "prompt.md",
         "--source",
@@ -1064,6 +1078,7 @@ def run_experiment(
             "FAKE_SCENARIO": scenario,
             "FAKE_SOURCE": source_path,
             "FAKE_PREEXISTED": str(tmp_path / "source-preexisted.txt"),
+            "FAKE_GIT_ROOT": str(tmp_path / "sandbox-root.txt"),
             "EXTRA_COUNT": str(extra_count),
         }
     )
@@ -1081,6 +1096,110 @@ def run_experiment(
     # --output-dir is the sweep root; each temperature is its own experiment.
     output = sweep / "temp-0p0"
     return output, result, invocations, prompts.read_text(encoding="utf-8")
+
+
+def test_temp_list_runs_an_unequally_spaced_grid(tmp_path: Path):
+    """--temp-list covers grids --temp-points cannot express.
+
+    A doubling grid like 0, 0.125, 0.25, 0.5, 1, 2 is not equally spaced, so
+    without this it takes one runner invocation per point and each one
+    overwrites the previous sweep.json.
+    """
+    _, result, invocations, _ = run_experiment(
+        tmp_path,
+        scenario="valid",
+        max_loops=0,
+        temperature=None,
+        extra_args=["--temp-list", "0.0,0.125,0.25,0.5,1.0,2.0", "--no-analysis"],
+    )
+
+    assert result.returncode == 0, result.stderr
+    sweep = tmp_path / "repository" / "runs" / "experiment"
+    produced = sorted(path.name for path in sweep.glob("temp-*"))
+    assert produced == [
+        "temp-0p0",
+        "temp-0p125",
+        "temp-0p25",
+        "temp-0p5",
+        "temp-1p0",
+        "temp-2p0",
+    ]
+    # One attempt per point, and a single sweep manifest describing all of them.
+    assert invocations == 6
+    manifest = json.loads((sweep / "sweep.json").read_text())
+    assert manifest["temp_list"] == "0.0,0.125,0.25,0.5,1.0,2.0"
+    assert manifest["temp_points"] == 6
+    for point, directory in zip(
+        [0.0, 0.125, 0.25, 0.5, 1.0, 2.0], produced, strict=True
+    ):
+        experiment = json.loads((sweep / directory / "experiment.json").read_text())
+        assert experiment["temperature"] == point
+
+
+def test_workdir_is_its_own_project_root(tmp_path: Path):
+    """The agent's project boundary is the workdir, not the repository.
+
+    OpenCode resolves a session's project root by walking up for a .git
+    directory and only consults its external_directory deny rules for paths
+    outside that root. A workdir nested in the repository without one inherits
+    the repository as its root, so every repository path counts as internal and
+    the agent can write anywhere in the checkout -- which is exactly what
+    happened before the runner started seeding a marker repository.
+    """
+    output, result, _, _ = run_experiment(
+        tmp_path,
+        scenario="valid",
+        max_loops=0,
+    )
+
+    assert result.returncode == 0, result.stderr
+    observed = (tmp_path / "sandbox-root.txt").read_text().strip()
+    workdir = output / "attempt-001" / "workdir"
+    assert observed, "the agent saw no project root at all"
+    assert Path(observed).resolve() == workdir.resolve(), (
+        f"agent's project root was {observed}, not its own workdir"
+    )
+    # The marker is scratch: it must not survive into the stored artifacts.
+    assert not workdir.exists()
+    assert not (output / "attempt-001" / "candidate" / ".git").exists()
+
+
+def test_kept_workdir_drops_the_sandbox_marker(tmp_path: Path):
+    """--keep-workdir keeps the tree for inspection but not the marker repo."""
+    output, result, _, _ = run_experiment(
+        tmp_path,
+        scenario="valid",
+        max_loops=0,
+        extra_args=["--keep-workdir"],
+    )
+
+    assert result.returncode == 0, result.stderr
+    workdir = output / "attempt-001" / "workdir"
+    assert workdir.is_dir()
+    assert not (workdir / ".git").exists()
+
+
+def test_attempt_records_opencode_session_statistics(tmp_path: Path):
+    """Token and timing stats land in the attempt directory before the prune."""
+    output, result, _, _ = run_experiment(
+        tmp_path,
+        scenario="valid",
+        max_loops=0,
+    )
+
+    assert result.returncode == 0, result.stderr
+    attempt = output / "attempt-001"
+    stats = json.loads((attempt / "opencode-stats.json").read_text())
+    # The fake agent never talks to OpenCode, so there are no sessions to find;
+    # what matters here is that the runner always emits the files and records
+    # which workdir it looked for, rather than failing the attempt.
+    assert stats["context"]["attempt"] == "attempt-001"
+    assert stats["context"]["model"] == "fake/model"
+    assert stats["context"]["workdir"].endswith("attempt-001/workdir")
+    assert stats["totals"]["sessions"] == 0
+    assert (attempt / "opencode-stats.txt").read_text().startswith(
+        "OpenCode session statistics"
+    )
 
 
 def test_default_max_loops_allows_repair(tmp_path: Path):
