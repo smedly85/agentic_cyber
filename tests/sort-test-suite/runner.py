@@ -12,14 +12,19 @@ Key differences from a naive text-mode runner:
     (see config.json / config.py -- no path or flag list is hardcoded here)
   - crash/sanitizer/timeout classified distinctly from wrong-output
   - stderr matched by exact | regex | class(empty/nonempty)
-  - -o output-file assertion; -R property checks
+  - output-file assertion; property checks for cases with no valid golden
   - parallel across cases
   - suite files may be plain .json or gzipped .json.gz, transparently
+
+This module is copied into the agent-visible stage bundle, so it names no
+specific flag and no oracle binary: which flags exist at a checkpoint comes
+from config.json, and the oracle is an offline concern. See README.md, which
+stays outside every bundle.
 
 Usage:
   runner.py suites/*.json.gz --config config.json -- ./my-sort
   runner.py suites/singles.json.gz --config config.json --sanitizer -- ./my-sort-asan
-  runner.py suites/*.json.gz --all-flags -- /usr/bin/sort     # oracle self-check
+  runner.py suites/*.json.gz --all-flags -- ORACLE_BIN         # oracle self-check
 """
 from __future__ import annotations
 
@@ -78,7 +83,15 @@ def _open_suite(path: str):
 
 
 def case_selected(case: dict, manifest: dict) -> tuple[bool, str]:
-    """(runnable, reason). implemented=None means run everything."""
+    """(runnable, reason). implemented=None means run everything.
+
+    A case may also require a flag to be ABSENT (`absent_flags`): that is how a
+    checkpoint asserts a later feature has not been built yet, by requiring the
+    option to still be rejected as unknown. Such a case stops being selected as
+    soon as that flag is introduced, and is skipped entirely when every flag is
+    declared implemented, because there is then no checkpoint for it to
+    describe.
+    """
     tags = set(case.get("tags", []))
     # Older frozen corpora predate the obsolete tag on GNU's ignored
     # -y[SIZE] compatibility option. Keep them on the existing tag-based
@@ -92,12 +105,19 @@ def case_selected(case: dict, manifest: dict) -> tuple[bool, str]:
         return False, "outside stdin-only scope"
     impl = manifest.get("implemented")
     if impl is None:
+        # Every flag counts as implemented, so a case that requires one to
+        # be absent has no checkpoint left to describe.
+        if case.get("absent_flags"):
+            return False, "requires flags to be unimplemented"
         return True, ""
     impl = set(impl)
     needed = set(case.get("flags", []))
     missing = needed - impl
     if missing:
         return False, f"unimplemented {sorted(missing)}"
+    present = set(case.get("absent_flags", [])) & set(impl)
+    if present:
+        return False, f"requires {sorted(present)} to be unimplemented"
     return True, ""
 
 

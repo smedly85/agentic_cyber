@@ -79,19 +79,34 @@ def _open_suite(path: str):
 
 
 def case_selected(case: dict, manifest: dict) -> tuple[bool, str]:
-    """(runnable, reason). implemented=None means run everything."""
+    """(runnable, reason). implemented=None means run everything.
+
+    A case may also require a flag to be ABSENT (`absent_flags`): that is how a
+    checkpoint asserts a later feature has not been built yet, by requiring the
+    option to still be rejected as unknown. Such a case stops being selected as
+    soon as that flag is introduced, and is skipped entirely when every flag is
+    declared implemented, because there is then no checkpoint for it to
+    describe.
+    """
     tags = set(case.get("tags", []))
     excl = set(manifest.get("excluded_tags", []))
     if tags & excl:
         return False, f"excluded tag {sorted(tags & excl)}"
     impl = manifest.get("implemented")
     if impl is None:
+        # Every flag counts as implemented, so a case that requires one to
+        # be absent has no checkpoint left to describe.
+        if case.get("absent_flags"):
+            return False, "requires flags to be unimplemented"
         return True, ""
     impl = set(impl)
     needed = set(case.get("flags", []))
     missing = needed - impl
     if missing:
         return False, f"unimplemented {sorted(missing)}"
+    present = set(case.get("absent_flags", [])) & set(impl)
+    if present:
+        return False, f"requires {sorted(present)} to be unimplemented"
     return True, ""
 
 

@@ -131,96 +131,53 @@ Do not replace byte-oriented input with text-only or UTF-8-specific logic.
 
 ## Files
 
-Create:
+Create only:
 
-    Makefile
-    README.md
-    src/new_sort.c
+    src/new_sort/new_sort.c
 
-Create or update:
-
-    .gitignore
-
-The .gitignore file must include:
-
-    build/
-    __pycache__/
-    *.pyc
-    .pytest_cache/
+Do not create or modify any other file (no Makefile, no README, no
+.gitignore, nothing else).
 
 ## Build
 
-The Makefile must support:
+Compile directly, without a Makefile:
 
-    make
-    make test
-    make clean
+    mkdir -p build
+    cc -std=c11 -Wall -Wextra -Werror -pedantic -O2 src/new_sort/new_sort.c -o build/new_sort
 
-The normal build must produce:
-
-    build/new_sort
-
-Compile with strict settings equivalent to:
-
-    -std=c11 -Wall -Wextra -Werror -pedantic -O2
-
-The build must create the build directory when needed.
-
-The clean target must remove generated build files and test caches.
-
-The controller will build with:
-
-    make clean
-    make
-
-## Documentation
-
-Document:
-
-- what new_sort does
-- that it reads from standard input
-- that it writes to standard output
-- that it accepts no arguments
-- the bytewise sorting behavior
-- how to build it
-- how to run it
-- how to run the tests
-- how to clean generated files
-
-Do not describe unsupported features.
+Fix all compiler errors and warnings.
 
 ## Visible tests
 
-The controller will evaluate this checkpoint using the following visible base
-test:
+The command-specific test suite is copied into your working directory at:
 
-    tests/new_sort/test_new_sort.py
+    tests/sort-test-suite/
 
-This test covers the checkpoint 000 base behavior and becomes regression
-coverage for every later checkpoint.
+You may read anything in it while implementing the task.
 
-You may inspect this visible test while implementing the task.
+The controller will judge this checkpoint by running exactly:
 
-Do not modify, replace, weaken, disable, bypass, or delete this visible test.
+    tests/sort-test-suite/judge_candidate.sh build/new_sort
 
-The controller will run exactly:
+That command runs every frozen case whose required flags are all named on the
+command line. With no flags named, it runs the base-behavior cases this
+checkpoint is responsible for; later checkpoints re-run them as regression
+coverage.
 
-    PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/new_sort/test_new_sort.py -v
+Do not modify, replace, weaken, disable, bypass, or delete any file under
+`tests/sort-test-suite/`. Test tampering is detected and recorded.
 
-after your implementation is returned.
-
-Do not perform an autonomous repair loop. If validation fails, the experiment
-controller will provide the failure output in a subsequent repair invocation.
-
-Only the test listed above is visible. Any hidden, comprehensive, or external
-evaluation is controller-only, is not exposed here, and is not used as repair
-feedback.
+The experiment controller owns validation and any repair iterations. Do not
+perform an autonomous repair loop. If validation fails, the controller will
+provide the failure output in a subsequent repair invocation. Any hidden,
+comprehensive, or sanitizer evaluation is controller-only, is not exposed here,
+and is never used as repair feedback.
 
 ## Final response
 
 Report:
 
-1. Files created or changed.
+1. File created.
 2. Program behavior implemented.
-3. Build commands run.
-4. Test results.
+3. Build command run.
+4. Commands run.

@@ -5,6 +5,56 @@ across maintenance checkpoints. Each checkpoint preserves the prompt, baseline
 repository state, generated candidates, validation results, and metadata needed
 to reproduce and compare independent repository histories.
 
+## The experimental unit is a lineage
+
+A **lineage** is one complete sequential walk through every checkpoint of a
+single utility:
+
+```text
+000_base -> 001 -> 002 -> ... -> final candidate
+```
+
+* checkpoint 000 is generated **from scratch**, independently, per lineage
+* every later checkpoint inherits **only the source produced by the previous
+  checkpoint of that same lineage** — never a candidate from another lineage
+* every stage starts a **fresh LLM session**; the seed file is the only
+  implementation state that crosses a stage boundary
+* controller-driven **repair sessions may occur within a stage**, bounded by
+  `--max-loops`
+* a stage that still fails after its allowed repairs **stops that lineage**; a
+  broken implementation is never fed into the next feature. The lineage is
+  retained with its stopping point and reason recorded
+
+The experiment then repeats that whole lineage `N` times independently. `N` is a
+command-line value (`--lineages`), not a constant in the code.
+
+Two denominators are reported and never conflated:
+
+* **reliability** is measured over every lineage **started**
+* **final diversity** compares only the lineages that **completed every
+  checkpoint**, and its report states both numbers
+
+A stopped lineage is never replaced with another attempt to round out the number
+of finished implementations.
+
+### Selected feature surfaces
+
+**BusyBox determines which flags are in scope.** These sequences are the
+selected experimental feature surface; the experiments do **not** reproduce the
+BusyBox implementations, and checkpoints are not added merely because GNU
+Coreutils or another implementation supports a flag.
+
+| Utility | Checkpoint sequence |
+|---|---|
+| `mkdir` | `000` → `-p` → `-m` |
+| `sort`  | `000` → `-r` → `-f` → `-u` → `-c` |
+| `grep`  | `000` → `-H` → `-h` → `-r` → `-i` |
+| `chmod` | `000` → `-R` → `-c` → `-v` → `-f` |
+
+`grep` and `chmod` have **no committed baseline source**: checkpoint 000 must
+make the agent create `src/new_grep/new_grep.c` and `src/new_chmod/new_chmod.c`
+from scratch.
+
 ## Requirements
 
 Run experiments from the repository root.
@@ -100,6 +150,19 @@ either the runner warns, runs unwrapped, and records `timeout_enforced: false`.
 
 ## Running an Experiment
 
+There are two entry points, and they sit on top of each other:
+
+* `scripts/run_lineage_experiment.sh` runs whole **lineages**. This is the
+  experiment described above and the one to use for new work.
+* `scripts/run_experiment.sh` runs a **single stage** — one prompt, one source
+  mode, one validation command, with the generate/validate/repair loop. The
+  lineage controller calls it once per checkpoint and adds nothing to it.
+
+Everything in the rest of this section describes the single-stage runner,
+because that is where the sandbox, the repair loop, the validation and the
+metadata live. See [Lineage experiments](#lineage-experiments) for the layer
+above it.
+
 `scripts/run_experiment.sh` is the single experiment runner. Each attempt gets a
 fresh plain working directory containing only the prompt, any `--test-dir`
 directories, and any `--seed-file` inputs. OpenCode runs with `--dir` pointed at
@@ -148,9 +211,18 @@ bash scripts/run_experiment.sh \
     --source src/new_sort/new_sort.c \
     --source-mode existing \
     --seed-file "src/new_sort/new_sort.c" \
-    --feature-test-cmd \
-        "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/new_sort/test_001_reverse.py -v"
+    --test-dir tests/sort-test-suite \
+    --build-cmd "mkdir -p build && cc -std=c11 -Wall -Wextra -Werror -pedantic -O2 src/new_sort/new_sort.c -o build/new_sort" \
+    --feature-test-cmd "tests/sort-test-suite/judge_candidate.sh build/new_sort -r"
 ```
+
+Every utility is judged the same way: `tests/<command>-test-suite/` is copied
+into the sandbox, and `judge_candidate.sh CANDIDATE [FLAG...]` runs the frozen
+cases whose required flags are all named on the command line. Passing a
+checkpoint's **cumulative** flag list therefore re-runs every earlier
+checkpoint's applicable cases as regression coverage. The agent may read the
+copied suite; it may not modify, weaken, or delete any part of it, and tampering
+is detected and recorded in `metadata.json`.
 
 ### Generation, validation, and continuation
 
@@ -313,10 +385,13 @@ values are recorded in `experiment.json` and `analysis/summary.json`.
 
 ## Canonical Analysis
 
-`scripts/analyze_experiment.py` is the sole analysis entry point. The experiment
-runner invokes it automatically once per temperature. To reproduce or extend an
-analysis manually, pass only the experiment directory; the analyzer reads the
-target source, baseline, thresholds, and fixed K from `experiment.json`:
+`scripts/analyze_experiment.py` is the sole analysis entry point for a
+**population** of implementations. The single-stage runner invokes it
+automatically once per temperature, and `scripts/analyze_lineages.py` invokes it
+once per lineage population; neither adds or redefines a metric. To reproduce or
+extend an analysis manually, pass only the experiment directory; the analyzer
+reads the target source, baseline, thresholds, and fixed K from
+`experiment.json`:
 
 ```bash
 EXPERIMENT=runs/experiments/<model>/<checkpoint>/temp-<temperature>
@@ -386,25 +461,205 @@ architecture; implementation strategy is separate. Primary strategy includes
 `main`; excluding `main` is a diagnostic robustness ablation only. See
 `docs/diversity_methodology.md` for formulas and interpretation.
 
-## Chained Checkpoints
+## Lineage Experiments
 
-Later checkpoints are seeded from a promoted earlier candidate. Because working
-directories are removed after each attempt, the seed comes from the preserved
-flattened candidate:
+`scripts/run_lineage_experiment.sh` runs complete lineages. It owns lineage
+bookkeeping only: every stage is one call to `scripts/run_experiment.sh`, so the
+isolated working directory, the OpenCode permissions, the source modes, the seed
+files, the repair loop, the build and test validation, the candidate capture and
+the infrastructure-failure metadata are all the mechanisms documented above,
+unchanged and not duplicated.
 
 ```bash
-# Base implementation, generated from scratch.
-bash scripts/run_experiment.sh \
+bash scripts/run_lineage_experiment.sh \
+    --utility sort \
     --model school-ollama/qwen3-coder-next:latest \
-    --temp-min 0 --temp-max 2 --temp-points 10 --runs 1 \
-    --prompt prompts/mkdir/000_base_new_mkdir.md \
-    --source src/new_mkdir/new_mkdir.c --source-mode new \
-    --test-dir tests/mkdir-test-suite \
-    --build-cmd "mkdir -p build && cc -std=c11 -Wall -Wextra -Werror -pedantic -O2 src/new_mkdir/new_mkdir.c -o build/new_mkdir" \
-    --feature-test-cmd "tests/mkdir-test-suite/judge_candidate.sh build/new_mkdir" \
-    --output-dir runs/experiments/mkdir/milestone-1
+    --temperature 0.2 \
+    --lineages 10 \
+    --max-loops 3
+```
 
-# Later checkpoint, seeded from a promoted prior candidate.
+Useful flags: `--lineage-start N` extends an existing run without touching
+lineages already on disk, `--output-dir DIR` relocates the results, `--force`
+reruns stages that are already complete, `--print-plan` shows the resolved stage
+plan, `--dry-run` prints every `run_experiment.sh` command without running one,
+and `--list-utilities` lists the manifests. Sandbox and backend options
+(`--agent`, `--timeout`, `--keep-workdir`, `--allow-no-progress`,
+`--repair-prompt`, `--remote-base-url`, `--remote-api-key-env`) pass straight
+through.
+
+### Utility manifests
+
+No utility detail lives in the controller. `experiments/utilities/<name>.json`
+describes the source path, executable path, build command, visible test
+directory, ordered checkpoints, per-checkpoint prompt, and the **cumulative**
+implemented-flag list that becomes the judge command. See
+[`experiments/utilities/README.md`](experiments/utilities/README.md) for the
+schema. `scripts/lineage_plan.py` resolves a manifest into the stage plan and is
+where the manifest's invariants are enforced: checkpoint 000 must be
+`source_mode: new`, every later checkpoint must be `existing`, and
+`implemented_flags` must never drop a flag an earlier checkpoint declared.
+
+### Source inheritance
+
+Stage 000 runs `--source-mode new`. Every later stage runs
+`--source-mode existing` with a `--seed-file` pointing at the immediately
+preceding **successful candidate of the same lineage**:
+
+```text
+lineage-003 / 000 candidate  ->  lineage-003 / 001 seed
+lineage-003 / 001 candidate  ->  lineage-003 / 002 seed
+```
+
+There is no cross-lineage path. A stage whose seed is missing is a hard error
+rather than a silent substitution, and `lineage.json` records the SHA-256 of
+both the seed consumed and the candidate produced, so the chain can be proved
+after the fact — `scripts/analyze_lineages.py` re-checks it.
+
+### Visible tests are built per checkpoint, not copied
+
+The agent at checkpoint N may read the current prompt, the inherited source, the
+shared runtime judging files, the cases for checkpoint N, and the cases for
+checkpoints before N. It must not be able to read anything describing a
+checkpoint it has not reached. Copying `tests/<utility>-test-suite/` wholesale
+fails that: the frozen corpora carry every later checkpoint's cases *with their
+expected outputs*, `gen/` names and groups them, `model/` holds the flag and
+specification models, and the READMEs tabulate the whole ladder. Filtering which
+cases the judge *runs* does not help, because the files are still readable.
+
+`scripts/stage_test_bundle.py` therefore **builds** each stage's visible tests:
+
+* an explicit allowlist ships the runtime judging path only — `judge_candidate.sh`,
+  `runner.py`, `engine.py`, `props.py`, `config.py`. Nothing under `gen/`,
+  `model/` or `corpus/`, no generator, no fuzzer, no README, no self-check, no
+  prior run logs;
+* `suites/` is re-frozen to the cases whose required flags are all implemented at
+  that checkpoint, so a later checkpoint's case is **absent**, not skipped;
+* `config.json` is reduced to the minimal judging configuration, dropping
+  `paths.oracle_bin` — an oracle path is a hint;
+* `props.py` is pruned to the property checks the retained cases actually
+  dispatch to, plus their transitive dependencies, and regenerated from its AST
+  so comments and the module docstring go too. Both were leaking: mkdir's
+  `check_idempotent_p` spells out the `-p`/`-m` contract, and chmod's report-line
+  regexes spell out the exact `-c`/`-v` output format.
+
+The bundle is mounted at the suite's own path (`run_experiment.sh --test-dir
+SRC:DEST`), so the prompt and the judge command stay literally correct, and it is
+kept next to the stage results as the record of what was visible. Its fingerprint
+is folded into the run's configuration fingerprint, so regenerated goldens or an
+edited allowlist invalidate a resume instead of silently mixing bundles.
+
+No reference implementation reaches a bundle. `new_grep` and `new_chmod` have no
+valid external oracle, so their specification models were written for this
+project and live in `tests/reference_generators/`, outside every suite; only
+offline generation and auditing import them, and the runtime judge works from
+frozen expected results alone.
+
+### Detecting premature implementation
+
+The checkpoint contract is incremental: 000 implements base behavior only, 001
+adds exactly one feature, and so on. Cumulative flag filtering tests the ladder
+from *below* — it never reaches a feature that does not exist yet — but on its
+own it cannot notice a candidate that implemented the whole option set at 000.
+
+A case may therefore declare `absent_flags`. It is selected only while none of
+those flags is implemented, which is how a checkpoint asserts a later feature is
+still missing:
+
+```text
+grep  base-rejects-i-before-its-checkpoint   -i must exit 2 at 000..003
+chmod base-rejects-v-before-its-checkpoint   -v must exit 2 at 000..002
+```
+
+Every prompt makes an option it has not introduced an unknown option, so these
+are contract-consistent rather than extra requirements. Each case disappears at
+the checkpoint that introduces its flag, where the same invocation must now
+succeed; `gen/verify.py` asserts exactly that, and the suites' monotone-coverage
+invariant excludes them so their intended disappearance does not read as lost
+coverage.
+
+**Coverage and its limits.** `new_grep` and `new_chmod` carry rejection cases for
+every flag in their ladders, because their goldens come from specification models
+that `parse_args` can restrict to one checkpoint's option set. `new_sort` and
+`new_mkdir` **do not**, and cannot without a different mechanism: their goldens
+are frozen by running a real GNU binary, and GNU `sort` supports `-r` and GNU
+`mkdir` supports `-p`, so the oracle cannot produce a "this must be rejected"
+golden for a flag it implements. Adding them there means authoring those
+expectations by hand instead of deriving them from the oracle. Until then,
+premature implementation is detected for grep and chmod only; for sort and mkdir
+the ladder is still tested from below, and the unknown-option rejection cases
+that do exist (`-Z`, `--no-such-flag`) cover options outside the experiment.
+
+### Output layout
+
+```text
+runs/lineages/<utility>/<model-slug>/temp-<slug>/
+├── lineages.json                 run configuration + fingerprint
+├── lineage-001/
+│   ├── lineage.json              per-stage outcome, seed provenance, stop point
+│   ├── 000/                      a complete single-stage run_experiment.sh tree
+│   │   ├── sweep.json
+│   │   └── temp-<slug>/
+│   │       ├── experiment.json
+│   │       ├── baseline/
+│   │       └── attempt-001/{metadata.json,candidate/,*.log,repair-prompt-*.md}
+│   ├── 001/  002/  ...
+│   └── final/<source>.c          only when every checkpoint succeeded
+└── lineage-002/ ...
+```
+
+Every stage stays inspectable, including the repair prompts and logs. Failed
+lineages are retained; `final/` exists **only** for a lineage that completed the
+whole sequence, so its presence is never ambiguous.
+
+### Resume safety
+
+`lineage_plan.py` computes a configuration fingerprint over the resolved
+manifest, the *contents* of every checkpoint prompt, the contents of the judge
+script, and the model, agent, temperature and repair budget. The controller
+refuses to write into an existing lineage root whose `lineages.json` records a
+different fingerprint, so a run cannot silently mix stage configurations. When a
+completed stage is reused, its recorded seed snapshot is compared against the
+seed the current walk holds, which catches the one remaining way a resume could
+mix generations: an earlier stage regenerated while a later one was left alone.
+
+The number of lineages and the output directory are deliberately excluded from
+the fingerprint — extending a run from 10 lineages to 15 is a valid resume,
+while editing a prompt is not.
+
+### Analyzing a lineage run
+
+```bash
+python3 scripts/analyze_lineages.py \
+    --lineage-root runs/lineages/sort/<model-slug>/temp-0p2
+```
+
+This writes `analysis/lineage_report.json`, `analysis/lineage_stages.csv` and
+`analysis/summary.md`, covering the end-to-end completion rate over all lineages
+started, the count of lineages stopped at each checkpoint and why, and repair
+behavior per checkpoint. Infrastructure failures and agent-execution failures
+stay distinguishable from implementation and test failures, using the
+single-stage runner's own metadata vocabulary rather than a second
+classification.
+
+Diversity is not reimplemented. For each population the script materializes a
+*view* — a directory in exactly the layout `scripts/analyze_experiment.py`
+already consumes — and runs that analyzer on it, so the metric definitions and
+the architecture/strategy thresholds are unchanged. The **final** population is
+the last stage of every lineage that completed every checkpoint;
+`--checkpoint-diversity` additionally analyzes the successful implementations at
+each intermediate checkpoint. `--skip-diversity` aggregates outcomes only.
+
+`summary.md` always states both `lineages started = N` and
+`successful final implementations = n`; the completion rate is never computed
+over the survivors.
+
+### Running a single stage by hand
+
+The single-stage runner remains usable directly, which is how the older
+non-lineage results in `runs/experiments/` were produced:
+
+```bash
 bash scripts/run_experiment.sh \
     --model school-ollama/qwen3-coder-next:latest \
     --temp-min 0 --temp-max 2 --temp-points 10 --runs 1 \
@@ -421,6 +676,11 @@ bash scripts/run_experiment.sh \
 omitted. The seed whose destination matches `--source` also becomes that
 experiment's analysis baseline, so churn is measured against the promoted
 candidate rather than against nothing.
+
+Results produced this way are **not** lineage results: each temperature point
+there is an independent single-checkpoint population, not a sequential walk, and
+the existing output under `runs/` and `review-bundle/` should not be
+reinterpreted as lineages.
 
 ### Historical sandbox runs
 
@@ -450,29 +710,46 @@ agentic_cyber/
 ├── README.md
 ├── docs/
 │   └── diversity_methodology.md          # Canonical v4.1.2/schema-v5 methodology
+├── experiments/
+│   └── utilities/                        # One manifest per experimental utility
+│       ├── README.md                     # Manifest schema and feature surfaces
+│       ├── chmod.json  grep.json  mkdir.json  sort.json
 ├── prompts/
 │   ├── checkpoint_base_template.md
 │   ├── checkpoint_feature_template.md
 │   ├── repair_continuation_template.md    # Continuation prompt for repair loops
-│   ├── mkdir/                             # mkdir checkpoints
-│   └── new_sort/                          # sort checkpoints and prompt tests
+│   ├── chmod/                             # chmod checkpoints (000 -> -R -> -c -> -v -> -f)
+│   ├── grep/                              # grep checkpoints  (000 -> -H -> -h -> -r -> -i)
+│   ├── mkdir/                             # mkdir checkpoints (000 -> -p -> -m)
+│   └── new_sort/                          # sort checkpoints  (000 -> -r -> -f -> -u -> -c)
 ├── scripts/
 │   ├── analysis/                          # Canonical metric and validation modules
 │   ├── analysis-requirements.txt
-│   ├── analyze_experiment.py              # Sole analysis entry point
+│   ├── analyze_experiment.py              # Sole per-population analysis entry point
+│   ├── analyze_lineages.py                # Lineage aggregation; delegates diversity
 │   ├── capture_candidate.py               # Flat capture, integrity check, cleanup
+│   ├── lineage_plan.py                    # Manifest -> stage plan + config fingerprint
 │   ├── opencode_stats.py                  # Per-session token, timing and tool stats
 │   ├── repair_prompt.py                   # Continuation prompt renderer
-│   ├── run_experiment.sh                  # Sole experiment runner
+│   ├── run_experiment.sh                  # Single-stage experiment runner
+│   ├── run_lineage_experiment.sh          # Lineage controller over the stage runner
 │   └── timeout.py                         # `timeout` subset for hosts without coreutils
 ├── src/
-│   └── new_sort/
+│   └── new_sort/                          # Historical checked-in sort implementation
 │       ├── README.md
 │       └── new_sort.c
 └── tests/
-    ├── mkdir-test-suite/
-    └── new_sort/
+    ├── chmod-test-suite/                  # Model-derived goldens, isolated fixtures
+    ├── grep-test-suite/                   # Model-derived goldens
+    ├── mkdir-test-suite/                  # GNU-oracle goldens
+    ├── sort-test-suite/                   # GNU-oracle goldens
+    ├── new_sort/                          # Historical per-checkpoint unittest files
+    ├── test_lineage_tools.py              # Manifests, stage plan, lineage aggregation
+    └── test_measure_diversity.py          # Analysis and controller tests
 ```
+
+There is deliberately no `src/new_grep/` or `src/new_chmod/`: checkpoint 000 of
+those lineages must make the agent create the source.
 
 The ignored `build/` and `runs/` directories are generated locally. Build the
 checked-in sort implementation with `make`, producing `build/new_sort`, and

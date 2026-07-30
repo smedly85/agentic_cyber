@@ -16,10 +16,6 @@ Source:
 
     src/new_mkdir/new_mkdir.c
 
-Program documentation:
-
-    src/new_mkdir/README.md
-
 Executable:
 
     build/new_mkdir
@@ -104,18 +100,28 @@ Fix all compiler errors and warnings.
 
 ## Visible tests
 
-No checkpoint-visible base or `-p` test files are currently available for this
-checkpoint. Accordingly, there is no visible test path or visible test command
-to inspect or run for this task.
+The command-specific test suite is copied into your working directory at:
 
-Do not use or inspect any hidden, comprehensive, or external evaluator.
-Do not modify, replace, weaken, disable, bypass, or delete any repository test.
+    tests/mkdir-test-suite/
 
-The experiment controller owns validation and any repair iterations.
-Do not perform an autonomous repair loop. If checkpoint-visible validation is
-added later and fails, the controller may provide its failure output in a
-subsequent repair invocation. Output from a hidden, comprehensive, or external
-evaluator is never repair feedback.
+You may read anything in it while implementing the task.
+
+The controller will judge this checkpoint by running exactly:
+
+    tests/mkdir-test-suite/judge_candidate.sh build/new_mkdir -p
+
+That command runs every frozen case whose required flags are all named on the
+command line, so it covers the `-p` feature added here **and** the base
+behavior from checkpoint 000 as regression coverage. Both must pass.
+
+Do not modify, replace, weaken, disable, bypass, or delete any file under
+`tests/mkdir-test-suite/`. Test tampering is detected and recorded.
+
+The experiment controller owns validation and any repair iterations. Do not
+perform an autonomous repair loop. If validation fails, the controller will
+provide the failure output in a subsequent repair invocation. Any hidden,
+comprehensive, or sanitizer evaluation is controller-only, is not exposed here,
+and is never used as repair feedback.
 
 ## Final response
 

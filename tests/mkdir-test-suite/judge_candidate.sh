@@ -3,13 +3,18 @@
 # with `implemented` set to exactly the flags given on the command line.
 #
 # Usage: judge_candidate.sh CANDIDATE_BIN [FLAG...]
-#   judge_candidate.sh build/new_mkdir              # base checkpoint (no flags)
-#   judge_candidate.sh build/new_mkdir -p           # base + -p checkpoint
-#   judge_candidate.sh build/new_mkdir -p -m        # base + -p + -m checkpoint
+#   judge_candidate.sh build/new_mkdir           # no flags declared implemented
+#   judge_candidate.sh build/new_mkdir FLAG...   # those flags declared implemented
 #
+# FLAG... is the cumulative list of flags the candidate is expected to support.
 # Base-tier cases (needing zero flags) always run regardless of the FLAG
 # list, so passing the cumulative flag list for a checkpoint automatically
 # re-checks every earlier checkpoint's cases too.
+#
+# The checkpoint sequence itself is deliberately NOT written here: this file is
+# copied into the agent-visible stage bundle, and naming a later checkpoint's
+# flags would disclose work the agent has not been asked for yet. See
+# README.md, which stays outside every bundle, for the ladder.
 #
 # Unlike run_all.sh, this never touches the committed config.json -- it
 # builds a throwaway copy so it's safe to call repeatedly (e.g. once per

@@ -131,6 +131,46 @@ visible in reliability and per-attempt records. Repeated identical successful
 candidates remain separate observations. All-run, complete-run, and passing-run
 partitions are diagnostic only.
 
+### Lineage experiments
+
+Nothing in this document changes for a lineage experiment. The definitions,
+representations, thresholds and populations above apply unchanged to whatever
+population `scripts/analyze_experiment.py` is pointed at.
+
+What a lineage experiment adds is one level above that. The sampling unit of the
+*experiment* is a lineage — one independent walk through every checkpoint of a
+utility, where each stage inherits only the source produced by the previous
+stage of that same lineage, and where a stage that fails after its allowed
+repairs stops the lineage. `scripts/analyze_lineages.py` aggregates that level
+and then delegates every diversity measurement here by materializing each
+population as an ordinary experiment directory.
+
+Two denominators result, and both are reported rather than reconciled:
+
+- **Lineage reliability** is measured over every lineage **started**. A lineage
+  that stopped is retained, its stopping checkpoint and reason are recorded, and
+  it is never replaced with another attempt. Within a stage, the reliability
+  vocabulary above is unchanged: infrastructure attrition, agent-execution
+  failure and validation failure stay distinguishable.
+- **Final diversity** is measured over the completed lineages only — the final
+  candidate of each lineage that passed every checkpoint. That population is a
+  set of independent implementations and is treated exactly like any other
+  successful complete population. Its report states both the number of lineages
+  started and the number of successful final implementations, so the completion
+  rate is never implied to be one.
+
+Diversity at an intermediate checkpoint, when requested, uses the successful
+implementations at that checkpoint, including those from lineages that stopped
+later. Each such population is analyzed on its own; populations from different
+checkpoints are never pooled.
+
+Because the lineages in a run do not share a seed, a lineage population has no
+single prior source to diff against, and its baseline is the empty translation
+unit — the same situation a `--source-mode new` experiment is already in. Churn
+measures relative to that baseline are therefore whole-program measures for
+these populations, and the structural diversity measures, which are computed
+from the candidate itself, are unaffected.
+
 ## Functional reliability
 
 Let `N_attempts` include every analyzed independent attempt,

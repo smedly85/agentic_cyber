@@ -16,6 +16,22 @@ under a fresh, per-case temp dir, after the run) in addition to exit code,
 stderr, and stdout (for `-v`). The umask is pinned per case (default
 `0022`), exactly as locale/env are pinned, so mode goldens are reproducible.
 
+## Checkpoint interface (bounded new_mkdir experiment)
+
+```bash
+tests/mkdir-test-suite/judge_candidate.sh build/new_mkdir        # 000
+tests/mkdir-test-suite/judge_candidate.sh build/new_mkdir -p     # 001
+tests/mkdir-test-suite/judge_candidate.sh build/new_mkdir -p -m  # 002
+```
+
+The flag list is **cumulative**, so a later checkpoint automatically re-runs
+every earlier checkpoint's applicable cases as regression coverage.
+
+This ladder is documented here rather than inside `judge_candidate.sh` because
+that script is copied into the agent-visible stage bundle, and naming a later
+checkpoint's flags there would disclose work the agent has not yet been asked
+for. `README.md` is never copied into a bundle.
+
 ## 1. One-time setup
 
 Edit **`config.json`** -- it's the only file you should need to touch:

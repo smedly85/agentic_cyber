@@ -1,0 +1,1039 @@
+#!/usr/bin/env python3
+"""Aggregate a lineage run produced by scripts/run_lineage_experiment.sh.
+
+The experimental unit is a LINEAGE: one independent walk through every
+checkpoint of a utility, where each stage inherits only the source the previous
+stage of that same lineage produced.
+
+Four questions are reported separately, because they need different populations
+and different baselines and must not be blended:
+
+  A. END-TO-END RELIABILITY, over every lineage STARTED. Completion rate,
+     stopping checkpoint, infrastructure attrition, repair usage per checkpoint.
+
+  B. FINAL-POPULATION DIVERSITY, over the successful completed finals only.
+     Delegated wholesale to `scripts/analyze_experiment.py` by materializing the
+     population as a view it already knows how to read.
+
+  C. PER-STAGE MAINTENANCE CHANGE, for each successful transition inside a
+     lineage: checkpoint N's candidate against checkpoint N-1's source. This is
+     the only correct baseline for "how much did this maintenance task change",
+     and it is computed here because the pairing is per attempt.
+
+  D. TOTAL LINEAGE CHANGE, the final source against that same lineage's own
+     checkpoint 000 source. Labelled as total change across the trajectory, not
+     as a single maintenance step.
+
+There is no natural shared source baseline for a final population: each lineage
+generated its own checkpoint 000 independently, so no lineage's source is a
+meaningful predecessor of another's final. The view therefore uses the empty
+translation unit -- the same baseline a `--source-mode new` experiment already
+uses -- which is correct for the structural and clustering metrics (every member
+shares one constant baseline, and the comparisons among finals are pairwise) and
+meaningless for the churn metrics (difference from nothing is program size, not
+maintenance effort). Those churn metrics are therefore reported as UNSUPPORTED
+in the final view, by name, and are answered properly by C and D instead. See
+`BASELINE_DEPENDENT_METRICS`.
+
+Reliability and diversity deliberately use different denominators, and both are
+always reported:
+
+    lineages started                 = every lineage the run attempted
+    successful final implementations = those that passed every checkpoint
+
+A lineage that stopped is retained and counted. It is never replaced with
+another attempt to keep the number of finals round, and the completion rate is
+never computed over the survivors.
+
+Usage:
+  python3 scripts/analyze_lineages.py --lineage-root runs/lineages/sort/MODEL/temp-0
+  python3 scripts/analyze_lineages.py --lineage-root DIR --checkpoint-diversity
+  python3 scripts/analyze_lineages.py --lineage-root DIR --skip-diversity
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import shutil
+import statistics
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any, Mapping
+
+SCHEMA_VERSION = 1
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
+
+# Reused, never reimplemented: the interval formula lives with the other
+# diversity statistics. It is imported on first use rather than at module
+# import, because scripts/analysis/diversity_metrics.py pulls in NumPy and
+# scikit-learn -- a machine that can still aggregate lineage outcomes without
+# the clustering stack should get its counts and an explicit note, not an
+# ImportError.
+_WILSON: dict[str, Any] = {"function": None, "unavailable_reason": None}
+
+
+def wilson(successes: int, total: int) -> dict[str, Any] | None:
+    if _WILSON["function"] is None and _WILSON["unavailable_reason"] is None:
+        try:
+            from analysis.diversity_metrics import wilson_interval
+        except ImportError as error:
+            _WILSON["unavailable_reason"] = (
+                f"scripts/analysis/diversity_metrics.py is unimportable "
+                f"({error}); install scripts/analysis-requirements.txt for "
+                "confidence intervals"
+            )
+        else:
+            _WILSON["function"] = wilson_interval
+    function = _WILSON["function"]
+    return function(successes, total) if function else None
+
+
+# Copied into a population view alongside metadata.json and candidate/. These
+# are the small per-attempt artifacts analyze_experiment.py knows how to read;
+# opencode.log is deliberately not copied, because a view exists to compare
+# sources and the session transcript stays with the stage run that produced it.
+#
+# diff-numstat / untracked-files / changed-files are deliberately NOT copied:
+# they record the stage's churn against its own seed, and dropping them into a
+# view whose baseline is the empty translation unit would let a baseline-
+# dependent number look consistent when it is not. Per-stage churn is reported
+# by this script instead, against the right baseline. See
+# BASELINE_DEPENDENT_METRICS.
+VIEW_ATTEMPT_FILES = (
+    "build.log",
+    "base-tests.log",
+    "feature-tests.log",
+    "extra-tests.log",
+)
+
+# Metrics in a population view's report that are computed against the view's
+# baseline. For a final population that baseline is the empty translation unit,
+# so each of these measures the whole program rather than a maintenance step and
+# must not be read as change. They are named here, echoed into the report, and
+# answered properly by the per-stage (C) and total-lineage (D) sections.
+#
+# NOT listed, because they remain valid: the architecture and strategy
+# clustering, the family/Vendi/discovery/repetition summaries, and the pairwise
+# distances. Those compare members with each other; every member shares the one
+# constant baseline, so it cancels.
+BASELINE_DEPENDENT_METRICS = (
+    "lines_added",
+    "lines_deleted",
+    "lines_edited",
+    "files_edited",
+    "tracked_files_edited",
+    "untracked_files_created",
+    "functions_edited_count",
+    "functions_created_count",
+    "functions_deleted_count",
+    "gumtree_edit_actions",
+    "gumtree_normalized_edit_distance",
+)
+
+# Reused, never reimplemented: the churn and function-change formulas live in
+# the canonical analyzer. Imported on first use because that module pulls in
+# NumPy and scikit-learn at import time.
+_ANALYZER: dict[str, Any] = {"module": None, "unavailable_reason": None}
+
+
+def experiment_analyzer():
+    """`scripts.analyze_experiment`, or None with a recorded reason."""
+    if _ANALYZER["module"] is None and _ANALYZER["unavailable_reason"] is None:
+        try:
+            import analyze_experiment
+        except ImportError as error:
+            _ANALYZER["unavailable_reason"] = (
+                f"scripts/analyze_experiment.py is unimportable ({error}); "
+                "install scripts/analysis-requirements.txt for change metrics"
+            )
+        else:
+            _ANALYZER["module"] = analyze_experiment
+    return _ANALYZER["module"]
+
+
+class LineageError(SystemExit):
+    def __init__(self, message: str) -> None:
+        super().__init__(f"analyze_lineages: {message}")
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise LineageError(f"cannot read {path}: {error}") from error
+
+
+def write_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+
+
+def write_csv(path: Path, rows: list[dict[str, Any]], columns: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({column: row.get(column) for column in columns})
+
+
+# ---------------------------------------------------------------------------
+# Loading
+# ---------------------------------------------------------------------------
+
+
+def load_run(root: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    if not root.is_dir():
+        raise LineageError(f"lineage root not found: {root}")
+
+    run_metadata_path = root / "lineages.json"
+    run_metadata = read_json(run_metadata_path) if run_metadata_path.is_file() else {}
+
+    lineages = []
+    for directory in sorted(root.glob("lineage-*")):
+        record_path = directory / "lineage.json"
+        if not record_path.is_file():
+            # A lineage directory without a record is an interrupted run, not a
+            # result. Skipping it silently would quietly shrink the
+            # denominator, so it is reported instead.
+            print(f"warning: {directory.name} has no lineage.json; skipping",
+                  file=sys.stderr)
+            continue
+        record = read_json(record_path)
+        record["_dir"] = directory
+        lineages.append(record)
+
+    if not lineages:
+        raise LineageError(f"no lineage-*/lineage.json under {root}")
+
+    fingerprints = {record.get("config_fingerprint") for record in lineages}
+    if len(fingerprints) > 1:
+        raise LineageError(
+            "lineages under this root were produced under different stage "
+            f"configurations ({sorted(str(f) for f in fingerprints)}); analyze "
+            "them separately rather than pooling them"
+        )
+    if run_metadata and run_metadata.get("config_fingerprint") not in fingerprints:
+        raise LineageError(
+            "lineages.json records a different configuration fingerprint than "
+            "the lineages themselves; the run directory has been mixed"
+        )
+
+    return run_metadata, lineages
+
+
+def checkpoint_order(
+    run_metadata: dict[str, Any], lineages: list[dict[str, Any]]
+) -> list[str]:
+    declared = run_metadata.get("checkpoints")
+    if isinstance(declared, list) and declared:
+        return [str(entry["id"]) for entry in declared]
+    # Fall back to the longest walk observed, which is the full sequence unless
+    # every lineage stopped early.
+    order: list[str] = []
+    for record in lineages:
+        for stage in record.get("stages", []):
+            identifier = str(stage.get("checkpoint_id"))
+            if identifier not in order:
+                order.append(identifier)
+    return order
+
+
+# ---------------------------------------------------------------------------
+# Aggregation
+# ---------------------------------------------------------------------------
+
+
+def numeric(values: list[Any]) -> list[float]:
+    return [float(value) for value in values
+            if isinstance(value, (int, float)) and not isinstance(value, bool)]
+
+
+def summarize(values: list[Any]) -> dict[str, Any]:
+    numbers = numeric(values)
+    if not numbers:
+        return {"n": 0, "total": None, "mean": None, "median": None, "max": None}
+    return {
+        "n": len(numbers),
+        "total": sum(numbers),
+        "mean": statistics.fmean(numbers),
+        "median": statistics.median(numbers),
+        "max": max(numbers),
+    }
+
+
+def build_reliability(
+    lineages: list[dict[str, Any]], order: list[str]
+) -> dict[str, Any]:
+    started = len(lineages)
+    completed = [record for record in lineages if record.get("end_to_end_success")]
+
+    failure_stages: dict[str, int] = {}
+    failure_reasons: dict[str, int] = {}
+    for record in lineages:
+        if record.get("end_to_end_success"):
+            continue
+        stage = str(record.get("failure_stage") or "unknown")
+        reason = str(record.get("failure_reason") or "unknown")
+        failure_stages[stage] = failure_stages.get(stage, 0) + 1
+        failure_reasons[reason] = failure_reasons.get(reason, 0) + 1
+
+    return {
+        "lineages_started": started,
+        "lineages_completed": len(completed),
+        "successful_final_implementations": len(completed),
+        "end_to_end_completion_rate": len(completed) / started if started else None,
+        "end_to_end_completion_interval": wilson(len(completed), started),
+        "completed_lineage_ids": [record["lineage_id"] for record in completed],
+        "stopped_lineage_ids": [
+            record["lineage_id"] for record in lineages
+            if not record.get("end_to_end_success")
+        ],
+        # Keyed by checkpoint so a reader never has to guess whether a missing
+        # entry means "no failures there" or "never reached".
+        "failure_stage_counts": {
+            checkpoint: failure_stages.get(checkpoint, 0) for checkpoint in order
+        },
+        "failure_stage_counts_other": {
+            stage: count for stage, count in sorted(failure_stages.items())
+            if stage not in set(order)
+        },
+        "failure_reason_counts": dict(sorted(failure_reasons.items())),
+    }
+
+
+def build_checkpoint_rows(
+    lineages: list[dict[str, Any]], order: list[str]
+) -> list[dict[str, Any]]:
+    by_checkpoint: dict[str, list[dict[str, Any]]] = {
+        checkpoint: [] for checkpoint in order
+    }
+    for record in lineages:
+        for stage in record.get("stages", []):
+            by_checkpoint.setdefault(str(stage.get("checkpoint_id")), []).append(stage)
+
+    rows = []
+    for checkpoint in order:
+        stages = by_checkpoint.get(checkpoint, [])
+        successes = [stage for stage in stages if stage.get("success")]
+        rows.append(
+            {
+                "checkpoint_id": checkpoint,
+                "checkpoint_name": stages[0].get("checkpoint_name") if stages else None,
+                "source_mode": stages[0].get("source_mode") if stages else None,
+                "implemented_flags": (
+                    " ".join(stages[0].get("implemented_flags", [])) if stages else ""
+                ),
+                # A lineage only reaches a checkpoint if every earlier one
+                # passed, so "reached" shrinks down the ladder by construction.
+                "lineages_reached": len(stages),
+                "lineages_passed": len(successes),
+                "pass_rate_given_reached": (
+                    len(successes) / len(stages) if stages else None
+                ),
+                "pass_interval_given_reached": wilson(len(successes), len(stages)),
+                "initial_success": sum(
+                    1 for stage in stages if stage.get("initial_success")
+                ),
+                "passed_after_repair": sum(
+                    1 for stage in successes if not stage.get("initial_success")
+                ),
+                "repair_loops": summarize(
+                    [stage.get("repair_loops") for stage in stages]
+                ),
+                "llm_invocations": summarize(
+                    [stage.get("llm_invocations") for stage in stages]
+                ),
+                "loop_limit_reached": sum(
+                    1 for stage in stages if stage.get("loop_limit_reached")
+                ),
+                # Kept distinct from implementation failure, using the
+                # single-stage runner's own metadata vocabulary.
+                "infrastructure_failures": sum(
+                    1 for stage in stages if stage.get("infrastructure_failure")
+                ),
+                "agent_execution_failures": sum(
+                    1 for stage in stages if stage.get("agent_execution_failure")
+                ),
+                "stop_reasons": dict(
+                    sorted(
+                        (reason, sum(1 for stage in stages
+                                     if stage.get("stop_reason") == reason))
+                        for reason in {
+                            str(stage.get("stop_reason")) for stage in stages
+                            if stage.get("stop_reason")
+                        }
+                    )
+                ),
+            }
+        )
+    return rows
+
+
+def build_stage_rows(lineages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows = []
+    for record in lineages:
+        for stage in record.get("stages", []):
+            rows.append(
+                {
+                    "lineage_id": record.get("lineage_id"),
+                    "end_to_end_success": record.get("end_to_end_success"),
+                    "checkpoint_id": stage.get("checkpoint_id"),
+                    "checkpoint_name": stage.get("checkpoint_name"),
+                    "source_mode": stage.get("source_mode"),
+                    "implemented_flags": " ".join(stage.get("implemented_flags", [])),
+                    "success": stage.get("success"),
+                    "failure_reason": stage.get("failure_reason"),
+                    "initial_success": stage.get("initial_success"),
+                    "repair_loops": stage.get("repair_loops"),
+                    "llm_invocations": stage.get("llm_invocations"),
+                    "success_loop": stage.get("success_loop"),
+                    "stop_reason": stage.get("stop_reason"),
+                    "loop_limit_reached": stage.get("loop_limit_reached"),
+                    "infrastructure_failure": stage.get("infrastructure_failure"),
+                    "agent_execution_failure": stage.get("agent_execution_failure"),
+                    "build_exit_code": stage.get("build_exit_code"),
+                    "feature_test_exit_code": stage.get("feature_test_exit_code"),
+                    # Provenance: which candidate seeded this stage, and what
+                    # this stage produced for the next one.
+                    "seed": stage.get("seed"),
+                    "seed_sha256": stage.get("seed_sha256"),
+                    "candidate": stage.get("candidate"),
+                    "candidate_sha256": stage.get("candidate_sha256"),
+                    "total_opencode_runtime_ms": stage.get("total_opencode_runtime_ms"),
+                }
+            )
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# C. Per-stage maintenance change, and D. total lineage change
+# ---------------------------------------------------------------------------
+
+
+def change_between(before: Path, after: Path) -> dict[str, Any]:
+    """Reuse the canonical churn and function-change measures for one pair.
+
+    Both are taken verbatim from `scripts/analyze_experiment.py`, so a per-stage
+    number here is defined exactly as the same number is in a single-stage
+    report -- only the baseline differs, and that is the whole point.
+
+    Structural measures degrade rather than fail: when Tree-sitter is not
+    installed the function counts come back None with a recorded reason, which
+    is honest, where substituting zero would not be.
+    """
+    analyzer = experiment_analyzer()
+    if analyzer is None:
+        return {"available": False,
+                "unavailable_reason": _ANALYZER["unavailable_reason"]}
+    if not before.is_file() or not after.is_file():
+        return {"available": False,
+                "unavailable_reason": "a source in this pair is missing"}
+
+    metrics: dict[str, Any] = {"available": True}
+    metrics.update(analyzer.source_change_metrics(before, after))
+    metrics.pop("changed_paths", None)
+
+    before_parsed = analyzer.analyze_source(before, None, [])
+    after_parsed = analyzer.analyze_source(after, None, [])
+    metrics.update(
+        analyzer.function_change_metrics(
+            before_parsed.tree_sitter_functions, after_parsed.tree_sitter_functions
+        )
+    )
+    metrics["tree_sitter_error"] = (
+        before_parsed.tree_sitter_error or after_parsed.tree_sitter_error
+    )
+    # Code scope: the size of the thing being maintained, on both sides.
+    metrics["tree_sitter_nodes_before"] = before_parsed.tree_sitter_node_count
+    metrics["tree_sitter_nodes_after"] = after_parsed.tree_sitter_node_count
+
+    actions, distance, error = analyzer.run_gumtree(
+        before, after, None,
+        before_parsed.tree_sitter_node_count, after_parsed.tree_sitter_node_count,
+    )
+    metrics["gumtree_edit_actions"] = None if error else int(sum(actions.values()))
+    metrics["gumtree_normalized_edit_distance"] = distance
+    metrics["gumtree_error"] = error
+    return metrics
+
+
+def stage_source(stage: Mapping[str, Any]) -> Path | None:
+    candidate = stage.get("candidate")
+    return Path(str(candidate)) if candidate else None
+
+
+def build_transitions(lineages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """C: one row per successful transition, N-1's source vs N's candidate.
+
+    The pairing is what makes this correct and what a population-shaped
+    analyzer cannot express: every row has its own baseline, namely the exact
+    file that stage was seeded with.
+    """
+    rows: list[dict[str, Any]] = []
+    for record in lineages:
+        previous: dict[str, Any] | None = None
+        for stage in record.get("stages", []):
+            if not stage.get("success"):
+                break
+            after = stage_source(stage)
+            if previous is not None and after is not None:
+                before = stage_source(previous)
+                row = {
+                    "lineage_id": record.get("lineage_id"),
+                    "from_checkpoint": previous.get("checkpoint_id"),
+                    "to_checkpoint": stage.get("checkpoint_id"),
+                    "to_checkpoint_name": stage.get("checkpoint_name"),
+                    "added_flags": sorted(
+                        set(stage.get("implemented_flags", []))
+                        - set(previous.get("implemented_flags", []))
+                    ),
+                    "baseline_source": str(before) if before else None,
+                    "candidate_source": str(after),
+                    # Effort, alongside change: both are per stage.
+                    "repair_loops": stage.get("repair_loops"),
+                    "llm_invocations": stage.get("llm_invocations"),
+                    "initial_success": stage.get("initial_success"),
+                    "total_opencode_runtime_ms": stage.get("total_opencode_runtime_ms"),
+                    "total_runtime_ms": stage.get("total_runtime_ms"),
+                }
+                row.update(
+                    {f"change_{k}": v
+                     for k, v in change_between(before, after).items()}
+                    if before else {"change_available": False,
+                                    "change_unavailable_reason": "no seed source"}
+                )
+                rows.append(row)
+            previous = stage
+    return rows
+
+
+def build_total_change(lineages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """D: the final source against that lineage's OWN checkpoint 000 source.
+
+    Same-lineage only. Comparing a final against another lineage's 000 would
+    measure the difference between two independent programs, not a trajectory.
+    """
+    rows: list[dict[str, Any]] = []
+    for record in lineages:
+        if not record.get("end_to_end_success"):
+            continue
+        stages = record.get("stages", [])
+        if len(stages) < 2:
+            continue
+        first, last = stage_source(stages[0]), stage_source(stages[-1])
+        if first is None or last is None:
+            continue
+        row = {
+            "lineage_id": record.get("lineage_id"),
+            "from_checkpoint": stages[0].get("checkpoint_id"),
+            "to_checkpoint": stages[-1].get("checkpoint_id"),
+            "checkpoints_traversed": len(stages),
+            "baseline_source": str(first),
+            "final_source": str(last),
+            "total_repair_loops": sum(
+                stage.get("repair_loops") or 0 for stage in stages
+            ),
+            "total_llm_invocations": sum(
+                stage.get("llm_invocations") or 0 for stage in stages
+            ),
+        }
+        row.update({f"change_{k}": v for k, v in change_between(first, last).items()})
+        rows.append(row)
+    return rows
+
+
+def check_seed_provenance(lineages: list[dict[str, Any]]) -> list[str]:
+    """Every stage after the first must have been seeded by the immediately
+    preceding stage of the SAME lineage. The controller enforces this while
+    running; re-checking it from the recorded hashes means a pooled or hand-
+    edited result set cannot pass silently."""
+    problems = []
+    for record in lineages:
+        previous: dict[str, Any] | None = None
+        for stage in record.get("stages", []):
+            if previous is None:
+                if stage.get("source_mode") != "new":
+                    problems.append(
+                        f"{record.get('lineage_id')}: first stage "
+                        f"{stage.get('checkpoint_id')} is not source-mode new"
+                    )
+            else:
+                if stage.get("seed_sha256") != previous.get("candidate_sha256"):
+                    problems.append(
+                        f"{record.get('lineage_id')}: stage "
+                        f"{stage.get('checkpoint_id')} was not seeded by "
+                        f"{previous.get('checkpoint_id')}'s candidate"
+                    )
+            previous = stage
+    return problems
+
+
+# ---------------------------------------------------------------------------
+# Population views
+# ---------------------------------------------------------------------------
+
+
+def population_members(
+    lineages: list[dict[str, Any]], checkpoint: str | None
+) -> list[tuple[str, dict[str, Any]]]:
+    """(lineage_id, stage) pairs for one population.
+
+    checkpoint=None selects the FINAL population: the last stage of every
+    lineage that completed every checkpoint. Otherwise it selects every lineage
+    that passed that checkpoint, whether or not the lineage later stopped.
+    """
+    members = []
+    for record in lineages:
+        stages = record.get("stages", [])
+        if checkpoint is None:
+            if not record.get("end_to_end_success") or not stages:
+                continue
+            members.append((record["lineage_id"], stages[-1]))
+            continue
+        for stage in stages:
+            if str(stage.get("checkpoint_id")) == checkpoint and stage.get("success"):
+                members.append((record["lineage_id"], stage))
+                break
+    return members
+
+
+def materialize_view(
+    view_dir: Path,
+    members: list[tuple[str, dict[str, Any]]],
+    run_metadata: dict[str, Any],
+    label: str,
+) -> Path:
+    """Write a population as an experiment directory analyze_experiment.py can
+    read: experiment.json, an empty baseline, and one attempt per member.
+
+    The baseline is the empty translation unit, and that is a deliberate,
+    recorded choice rather than a convenience. Each member is a whole program
+    produced by an independent lineage; the lineages share no seed, so no
+    member's source is a meaningful predecessor of another's. Picking one
+    lineage's 000, one lineage's final, or an arbitrary candidate would invent a
+    common ancestor that does not exist.
+
+    The consequence is written into the view's own metadata: every clustering
+    and pairwise metric stays valid, because all members share one constant
+    baseline that cancels out of a member-to-member comparison, while every
+    churn metric measures the program's size rather than a maintenance step.
+    Those are listed by name in `baseline_dependent_metrics_unsupported` so a
+    reader of the view's report cannot mistake them for change.
+    """
+    if view_dir.exists():
+        shutil.rmtree(view_dir)
+    source_basename = run_metadata.get("source_basename") or (
+        members[0][1].get("candidate_source_basename") if members else "source.c"
+    )
+    (view_dir / "baseline").mkdir(parents=True, exist_ok=True)
+    (view_dir / "baseline" / source_basename).write_bytes(b"")
+
+    index = []
+    for number, (lineage_id, stage) in enumerate(members, start=1):
+        attempt_source = Path(str(stage.get("attempt_dir")))
+        attempt_target = view_dir / f"attempt-{number:03d}"
+        (attempt_target / "candidate").mkdir(parents=True, exist_ok=True)
+
+        metadata = read_json(attempt_source / "metadata.json")
+        # Keep the stage's own metadata intact and add the lineage coordinates,
+        # so a row in the view's report can always be traced back.
+        metadata.update(
+            {
+                "run_id": f"attempt-{number:03d}",
+                "attempt_number": number,
+                "lineage_id": lineage_id,
+                "lineage_checkpoint_id": stage.get("checkpoint_id"),
+                "lineage_stage_dir": stage.get("stage_dir"),
+                "source_path": source_basename,
+            }
+        )
+        write_json(attempt_target / "metadata.json", metadata)
+
+        candidate = Path(str(stage.get("candidate")))
+        if not candidate.is_file():
+            raise LineageError(f"recorded candidate is missing: {candidate}")
+        shutil.copy2(candidate, attempt_target / "candidate" / source_basename)
+        for name in VIEW_ATTEMPT_FILES:
+            origin = attempt_source / name
+            if origin.is_file():
+                shutil.copy2(origin, attempt_target / name)
+        (attempt_target / "COMPLETE").write_text("", encoding="utf-8")
+
+        index.append(
+            {
+                "attempt": f"attempt-{number:03d}",
+                "lineage_id": lineage_id,
+                "checkpoint_id": stage.get("checkpoint_id"),
+                "candidate": stage.get("candidate"),
+                "candidate_sha256": stage.get("candidate_sha256"),
+            }
+        )
+
+    write_json(
+        view_dir / "experiment.json",
+        {
+            "schema_version": 2,
+            "experiment_format": "lineage_population_view",
+            "population": label,
+            # Points at the view, not the checkout: analyze_experiment.py
+            # rebuilds a repository-level paper aggregate under
+            # <repository>/runs/experiments, and a lineage analysis must not
+            # rewrite the results of unrelated experiments.
+            "repository": str(view_dir),
+            "repository_commit": run_metadata.get("repository_commit"),
+            "utility": run_metadata.get("utility"),
+            "model": run_metadata.get("model"),
+            "temperature": run_metadata.get("temperature"),
+            "agent": run_metadata.get("agent"),
+            "max_loops": run_metadata.get("max_loops"),
+            "source_path": source_basename,
+            "source_workdir_path": run_metadata.get("source_path"),
+            "source_mode": "new",
+            "baseline_source_kind": "empty_new_source",
+            "requested_runs": len(members),
+            "config_fingerprint": run_metadata.get("config_fingerprint"),
+            "baseline_rationale": (
+                "Lineages share no seed, so this population has no common "
+                "prior source. The empty translation unit is used so that every "
+                "member has the same constant baseline; clustering and pairwise "
+                "metrics are unaffected, churn metrics are not maintenance "
+                "change."
+            ),
+            "baseline_dependent_metrics_unsupported": list(
+                BASELINE_DEPENDENT_METRICS
+            ),
+            "baseline_dependent_metrics_reported_by": (
+                "lineage_transitions.csv (per stage) and "
+                "lineage_total_change.csv (per lineage)"
+            ),
+        },
+    )
+    write_json(view_dir / "members.json", index)
+    return view_dir
+
+
+def run_analyzer(
+    view_dir: Path, args: argparse.Namespace
+) -> dict[str, Any]:
+    command = [
+        args.python,
+        str(args.analyzer),
+        "--experiment", str(view_dir),
+        "--clean-output",
+    ]
+    if args.cluster_threshold is not None:
+        command += ["--cluster-threshold", str(args.cluster_threshold)]
+    if args.strategy_threshold is not None:
+        command += ["--strategy-threshold", str(args.strategy_threshold)]
+    if args.diversity_k_max is not None:
+        command += ["--diversity-k-max", str(args.diversity_k_max)]
+
+    print(f"\n=== diversity: {view_dir.name} ===")
+    completed = subprocess.run(command, check=False)
+    return {
+        "command": command,
+        "returncode": completed.returncode,
+        "analysis_dir": str(view_dir / "analysis"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
+
+
+def render_summary(report: dict[str, Any]) -> str:
+    reliability = report["reliability"]
+    lines = [
+        f"# Lineage analysis: {report['utility']}",
+        "",
+        f"* Root: `{report['lineage_root']}`",
+        f"* Model: `{report['model']}`  Temperature: {report['temperature']}",
+        f"* Checkpoints: {' -> '.join(report['checkpoints'])}",
+        f"* Configuration fingerprint: `{report['config_fingerprint']}`",
+        "",
+        "## Reliability",
+        "",
+        "The denominator is every lineage started. A lineage that stopped is "
+        "retained and counted; it is never replaced to keep the number of "
+        "finals round.",
+        "",
+        f"* **lineages started = {reliability['lineages_started']}**",
+        f"* **successful final implementations = "
+        f"{reliability['successful_final_implementations']}**",
+    ]
+    rate = reliability["end_to_end_completion_rate"]
+    interval = reliability["end_to_end_completion_interval"]
+    if rate is not None and interval:
+        lines.append(
+            f"* end-to-end completion rate = {rate:.3f} "
+            f"(95% Wilson {interval['lower']:.3f}–{interval['upper']:.3f})"
+        )
+    elif rate is not None:
+        lines.append(f"* end-to-end completion rate = {rate:.3f}")
+        lines.append(
+            f"* confidence interval unavailable: "
+            f"{report['confidence_interval_unavailable_reason']}"
+        )
+    lines += ["", "### Where lineages stopped", ""]
+    stopped = sum(reliability["failure_stage_counts"].values()) + sum(
+        reliability["failure_stage_counts_other"].values()
+    )
+    if not stopped:
+        lines.append("Every lineage completed every checkpoint.")
+    else:
+        lines += ["| checkpoint | lineages stopped here |", "|---|---|"]
+        for checkpoint, count in reliability["failure_stage_counts"].items():
+            lines.append(f"| {checkpoint} | {count} |")
+        for checkpoint, count in reliability["failure_stage_counts_other"].items():
+            lines.append(f"| {checkpoint} (unrecognized) | {count} |")
+        lines += ["", "Reasons: " + ", ".join(
+            f"{reason} × {count}"
+            for reason, count in reliability["failure_reason_counts"].items()
+        )]
+
+    lines += [
+        "",
+        "## Per-checkpoint behavior",
+        "",
+        "| checkpoint | flags | reached | passed | first try | after repair | "
+        "mean repair loops | infra fail | agent fail |",
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
+    for row in report["checkpoints_detail"]:
+        mean_loops = row["repair_loops"]["mean"]
+        lines.append(
+            f"| {row['checkpoint_id']} {row['checkpoint_name'] or ''} "
+            f"| `{row['implemented_flags'] or '(none)'}` "
+            f"| {row['lineages_reached']} | {row['lineages_passed']} "
+            f"| {row['initial_success']} | {row['passed_after_repair']} "
+            f"| {'—' if mean_loops is None else f'{mean_loops:.2f}'} "
+            f"| {row['infrastructure_failures']} "
+            f"| {row['agent_execution_failures']} |"
+        )
+
+    lines += ["", "## Diversity (final population)", ""]
+    if not report["populations"]:
+        lines.append("Diversity analysis was not run.")
+    else:
+        for population in report["populations"]:
+            lines.append(
+                f"* **{population['label']}** — {population['members']} "
+                f"implementation(s) from {reliability['lineages_started']} "
+                f"lineages started; report under "
+                f"`{population['analysis_dir']}`"
+                + ("" if population["returncode"] == 0
+                   else f" (analyzer exit {population['returncode']})")
+            )
+        baseline = report["final_population_baseline"]
+        lines += [
+            "",
+            "Final diversity compares only completed lineages. The number of "
+            "lineages started is stated above and is not replaced by the "
+            "number of finals.",
+            "",
+            f"**Baseline.** {baseline['why']}, so the view uses "
+            f"`{baseline['kind']}`. Clustering, family, Vendi, discovery, "
+            "repetition and pairwise-distance metrics are unaffected by that "
+            "choice. These metrics in the view's report are **not** maintenance "
+            "change and must not be read as such:",
+            "",
+        ]
+        lines += [f"* `{name}`" for name in baseline["unsupported_metrics"]]
+        lines.append("")
+        lines.append(baseline["unsupported_reason"].capitalize() + ".")
+
+    lines += ["", "## Change", ""]
+    per_stage = report["per_stage_change"]
+    total = report["total_lineage_change"]
+    if per_stage["unavailable_reason"]:
+        lines.append(f"Change measures unavailable: {per_stage['unavailable_reason']}")
+    else:
+        lines += [
+            f"* **Per stage** ({per_stage['transitions']} successful "
+            f"transitions) — baseline: {per_stage['baseline']}. "
+            f"See `{per_stage['rows']}`.",
+            f"* **Total per lineage** ({total['lineages']} completed) — "
+            f"baseline: {total['baseline']}. {total['label'].capitalize()}. "
+            f"See `{total['rows']}`.",
+        ]
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--lineage-root", required=True, type=Path)
+    parser.add_argument("--output-dir", type=Path,
+                        help="Default: <lineage-root>/analysis")
+    parser.add_argument("--checkpoint-diversity", action="store_true",
+                        help="Also analyze the successful implementations at "
+                             "each intermediate checkpoint")
+    parser.add_argument("--skip-diversity", action="store_true",
+                        help="Aggregate reliability only; build no views and "
+                             "run no clustering")
+    parser.add_argument("--skip-change", action="store_true",
+                        help="Skip the per-stage and total-lineage change "
+                             "measures, which reparse every retained source")
+    parser.add_argument("--cluster-threshold", type=float, default=None)
+    parser.add_argument("--strategy-threshold", type=float, default=None)
+    parser.add_argument("--diversity-k-max", type=int, default=None)
+    parser.add_argument("--analyzer", type=Path,
+                        default=REPO_ROOT / "scripts" / "analyze_experiment.py")
+    parser.add_argument("--python", default=sys.executable)
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    if args.checkpoint_diversity and args.skip_diversity:
+        raise LineageError(
+            "--checkpoint-diversity and --skip-diversity are mutually exclusive"
+        )
+
+    root = args.lineage_root.resolve()
+    output_dir = (args.output_dir or root / "analysis").resolve()
+    run_metadata, lineages = load_run(root)
+    order = checkpoint_order(run_metadata, lineages)
+
+    reliability = build_reliability(lineages, order)
+    checkpoints_detail = build_checkpoint_rows(lineages, order)
+    stage_rows = build_stage_rows(lineages)
+    provenance_problems = check_seed_provenance(lineages)
+    transitions = [] if args.skip_change else build_transitions(lineages)
+    total_change = [] if args.skip_change else build_total_change(lineages)
+
+    populations: list[dict[str, Any]] = []
+    if not args.skip_diversity:
+        wanted: list[tuple[str, str | None]] = [("final", None)]
+        if args.checkpoint_diversity:
+            wanted += [(f"checkpoint-{checkpoint}", checkpoint)
+                       for checkpoint in order]
+        for label, checkpoint in wanted:
+            members = population_members(lineages, checkpoint)
+            entry: dict[str, Any] = {
+                "label": label,
+                "checkpoint_id": checkpoint,
+                "members": len(members),
+                "lineage_ids": [lineage_id for lineage_id, _ in members],
+                "analysis_dir": None,
+                "returncode": None,
+            }
+            if len(members) < 2:
+                entry["skipped"] = (
+                    "fewer than two successful implementations; diversity is "
+                    "undefined for this population"
+                )
+                print(f"skipping {label}: {entry['skipped']}", file=sys.stderr)
+                populations.append(entry)
+                continue
+            view = materialize_view(
+                output_dir / "populations" / label, members, run_metadata, label
+            )
+            entry.update(run_analyzer(view, args))
+            entry["view_dir"] = str(view)
+            populations.append(entry)
+
+    report = {
+        "schema_version": SCHEMA_VERSION,
+        "lineage_root": str(root),
+        "utility": run_metadata.get("utility"),
+        "model": run_metadata.get("model"),
+        "temperature": run_metadata.get("temperature"),
+        "agent": run_metadata.get("agent"),
+        "max_loops": run_metadata.get("max_loops"),
+        "config_fingerprint": (
+            run_metadata.get("config_fingerprint")
+            or lineages[0].get("config_fingerprint")
+        ),
+        "checkpoints": order,
+        "reliability": reliability,
+        "confidence_interval_unavailable_reason": _WILSON["unavailable_reason"],
+        "checkpoints_detail": checkpoints_detail,
+        # Change is reported against the baseline each measurement actually
+        # has, never against the final population's placeholder baseline.
+        "per_stage_change": {
+            "baseline": "the source the stage was seeded with, i.e. checkpoint "
+                        "N-1's candidate in the same lineage",
+            "transitions": len(transitions),
+            "rows": "lineage_transitions.csv",
+            "unavailable_reason": _ANALYZER["unavailable_reason"],
+        },
+        "total_lineage_change": {
+            "baseline": "that same lineage's checkpoint 000 source",
+            "label": "total change across the maintenance trajectory, not a "
+                     "single maintenance step",
+            "lineages": len(total_change),
+            "rows": "lineage_total_change.csv",
+            "unavailable_reason": _ANALYZER["unavailable_reason"],
+        },
+        "final_population_baseline": {
+            "kind": "empty_new_source",
+            "why": "lineages share no seed, so the final population has no "
+                   "common prior source; a shared constant baseline keeps the "
+                   "clustering and pairwise metrics valid",
+            "unsupported_metrics": list(BASELINE_DEPENDENT_METRICS),
+            "unsupported_reason": "measured against an empty baseline these "
+                                  "describe program size, not maintenance "
+                                  "change; use per_stage_change instead",
+        },
+        "seed_provenance_problems": provenance_problems,
+        "populations": populations,
+    }
+
+    write_json(output_dir / "lineage_report.json", report)
+    write_csv(
+        output_dir / "lineage_stages.csv",
+        stage_rows,
+        [
+            "lineage_id", "end_to_end_success", "checkpoint_id", "checkpoint_name",
+            "source_mode", "implemented_flags", "success", "failure_reason",
+            "initial_success", "repair_loops", "llm_invocations", "success_loop",
+            "stop_reason", "loop_limit_reached", "infrastructure_failure",
+            "agent_execution_failure", "build_exit_code", "feature_test_exit_code",
+            "seed", "seed_sha256", "candidate", "candidate_sha256",
+            "total_opencode_runtime_ms",
+        ],
+    )
+    if transitions:
+        write_csv(
+            output_dir / "lineage_transitions.csv",
+            transitions,
+            sorted({key for row in transitions for key in row}),
+        )
+    if total_change:
+        write_csv(
+            output_dir / "lineage_total_change.csv",
+            total_change,
+            sorted({key for row in total_change for key in row}),
+        )
+    summary = render_summary(report)
+    (output_dir / "summary.md").write_text(summary, encoding="utf-8")
+
+    print()
+    print(summary)
+    if provenance_problems:
+        print("seed provenance problems:", file=sys.stderr)
+        for problem in provenance_problems:
+            print(f"  {problem}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except LineageError as error:
+        print(error, file=sys.stderr)
+        raise SystemExit(2) from error

@@ -7,6 +7,27 @@ fuzzing against real GNU `sort`. 751 frozen golden cases + 195 previously
 fuzz-discovered regressions ship in `suites/`, so you can judge a candidate
 without even needing GNU `sort` installed (only fuzzing/regeneration need it).
 
+## Checkpoint interface (bounded new_sort experiment)
+
+```bash
+tests/sort-test-suite/judge_candidate.sh build/new_sort              # 000
+tests/sort-test-suite/judge_candidate.sh build/new_sort -r           # 001
+tests/sort-test-suite/judge_candidate.sh build/new_sort -r -f        # 002
+tests/sort-test-suite/judge_candidate.sh build/new_sort -r -f -u     # 003
+tests/sort-test-suite/judge_candidate.sh build/new_sort -r -f -u -c  # 004
+```
+
+The flag list is **cumulative**, so a later checkpoint automatically re-runs
+every earlier checkpoint's applicable cases as regression coverage.
+
+This ladder is documented here rather than inside `judge_candidate.sh` because
+that script is copied into the agent-visible stage bundle, and naming a later
+checkpoint's flags there would disclose work the agent has not yet been asked
+for. `README.md` is never copied into a bundle. The suite as a whole still
+knows about GNU sort's full flag surface — that generic infrastructure is
+unrelated to the bounded checkpoint sequence above, and
+`scripts/stage_test_bundle.py` keeps it out of every sandbox.
+
 ## 1. One-time setup
 
 Edit **`config.json`** — it's the only file you should need to touch:

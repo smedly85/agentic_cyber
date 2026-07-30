@@ -80,8 +80,13 @@ Workspace:
   --source-mode MODE         existing requires a --seed-file for --source;
                              new starts from an empty baseline
                              (default: existing)
-  --test-dir DIR             Repo-relative directory copied into the working
-                             directory at the same relative path (repeatable)
+  --test-dir SRC[:DEST]      Directory copied into the working directory at
+                             DEST (default DEST = SRC). Repeatable. SRC is
+                             repo-relative or absolute; DEST is always
+                             workdir-relative. A separate DEST lets a caller
+                             supply a generated per-checkpoint test bundle while
+                             the agent still sees it at the path its prompt and
+                             validation command name.
   --seed-file SRC[:DEST]     File copied into the working directory at DEST
                              (default DEST = SRC). Repeatable. The spec whose
                              destination matches --source also becomes the
@@ -660,11 +665,41 @@ if [[ "$MAX_LOOPS" -gt 0 ]]; then
     [[ -f "$REPAIR_TOOL" ]] || die "repair prompt renderer not found: $REPAIR_TOOL"
 fi
 
-for test_dir in "${TEST_DIRS[@]+"${TEST_DIRS[@]}"}"; do
-    [[ -d "$(resolve_repo_path "$test_dir")" ]] ||
-        die "--test-dir not found: $(resolve_repo_path "$test_dir")"
-    [[ "$test_dir" != /* ]] ||
-        die "--test-dir must be repo-relative: $test_dir"
+# --test-dir accepts SRC[:DEST]. DEST is what the agent sees and what the
+# prompt and the validation command name; SRC is where the content comes from,
+# which may be a generated per-checkpoint bundle outside the source tree. With
+# no DEST the two are the same, which is the original behavior.
+TEST_DIR_SOURCES=()
+TEST_DIR_DESTINATIONS=()
+for test_dir_spec in "${TEST_DIRS[@]+"${TEST_DIRS[@]}"}"; do
+    # Split on the LAST colon: DEST is a normalized relative path and so never
+    # contains one, while SRC may be absolute.
+    if [[ "$test_dir_spec" == *:* ]]; then
+        test_dir_src="${test_dir_spec%:*}"
+        test_dir_dest="${test_dir_spec##*:}"
+    else
+        test_dir_src="$test_dir_spec"
+        test_dir_dest="$test_dir_spec"
+    fi
+    [[ -n "$test_dir_src" && -n "$test_dir_dest" ]] ||
+        die "--test-dir needs a non-empty SRC and DEST: $test_dir_spec"
+    [[ -d "$(resolve_repo_path "$test_dir_src")" ]] ||
+        die "--test-dir source not found: $(resolve_repo_path "$test_dir_src")"
+    # The destination is created inside the working directory, so it must not
+    # be absolute and must not climb out of it.
+    "$PYTHON_BIN" - "$test_dir_dest" <<'PY' ||
+import sys
+from pathlib import PurePosixPath
+
+raw = sys.argv[1]
+path = PurePosixPath(raw)
+valid = bool(raw) and not path.is_absolute() and ".." not in path.parts
+valid = valid and str(path) == raw and "\\" not in raw
+raise SystemExit(0 if valid else 1)
+PY
+        die "--test-dir destination must be a normalized relative path without '..': $test_dir_dest"
+    TEST_DIR_SOURCES+=("$test_dir_src")
+    TEST_DIR_DESTINATIONS+=("$test_dir_dest")
 done
 
 SEED_SOURCE=""
@@ -959,9 +994,13 @@ PY
 
         # Seed the working directory. This is everything the agent can see.
         cp "$PROMPT_ABS" "$workdir/$(basename "$PROMPT_ABS")"
-        for test_dir in "${TEST_DIRS[@]+"${TEST_DIRS[@]}"}"; do
-            mkdir -p "$(dirname "$workdir/$test_dir")"
-            cp -R "$(resolve_repo_path "$test_dir")" "$workdir/$test_dir"
+        for (( test_dir_index = 0;
+               test_dir_index < ${#TEST_DIR_SOURCES[@]};
+               test_dir_index++ )); do
+            test_dir_dest="${TEST_DIR_DESTINATIONS[test_dir_index]}"
+            mkdir -p "$(dirname "$workdir/$test_dir_dest")"
+            cp -R "$(resolve_repo_path "${TEST_DIR_SOURCES[test_dir_index]}")" \
+                "$workdir/$test_dir_dest"
         done
         for seed_spec in "${SEED_FILES[@]+"${SEED_FILES[@]}"}"; do
             seed_src="${seed_spec%%:*}"
@@ -1195,9 +1234,9 @@ PY
             next_loop=$((validation_loop + 1))
             repair_prompt_file="$attempt_dir/repair-prompt-$next_loop.md"
             json_report_dir=""
-            for test_dir in "${TEST_DIRS[@]+"${TEST_DIRS[@]}"}"; do
-                if [[ -d "$workdir/$test_dir/run_logs" ]]; then
-                    json_report_dir="$workdir/$test_dir/run_logs"
+            for test_dir_dest in "${TEST_DIR_DESTINATIONS[@]+"${TEST_DIR_DESTINATIONS[@]}"}"; do
+                if [[ -d "$workdir/$test_dir_dest/run_logs" ]]; then
+                    json_report_dir="$workdir/$test_dir_dest/run_logs"
                     break
                 fi
             done
@@ -1217,8 +1256,8 @@ PY
                 --feature-test-log "$attempt_dir/feature-tests.log"
                 --feature-test-exit "$feature_test_exit"
             )
-            for test_dir in "${TEST_DIRS[@]+"${TEST_DIRS[@]}"}"; do
-                repair_args+=(--test-dir "$test_dir")
+            for test_dir_dest in "${TEST_DIR_DESTINATIONS[@]+"${TEST_DIR_DESTINATIONS[@]}"}"; do
+                repair_args+=(--test-dir "$test_dir_dest")
             done
             for command in "$BUILD_CMD" "$BASE_TEST_CMD" "$FEATURE_TEST_CMD"; do
                 [[ -n "$command" ]] && repair_args+=(--validation-command "$command")
@@ -1296,8 +1335,10 @@ PY
         for glob in "${KEEP_GLOBS[@]}"; do
             capture_args+=(--keep-glob "$glob")
         done
-        for test_dir in "${TEST_DIRS[@]+"${TEST_DIRS[@]}"}"; do
-            capture_args+=(--test-dir "$test_dir")
+        for (( test_dir_index = 0;
+               test_dir_index < ${#TEST_DIR_SOURCES[@]};
+               test_dir_index++ )); do
+            capture_args+=(--test-dir                 "${TEST_DIR_SOURCES[test_dir_index]}:${TEST_DIR_DESTINATIONS[test_dir_index]}")
         done
         [[ "$KEEP_WORKDIR" -eq 1 ]] && capture_args+=(--keep-workdir)
 

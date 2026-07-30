@@ -97,7 +97,7 @@ def capture(
     keep_globs: list[str],
     test_dirs: list[str],
 ) -> dict:
-    excluded = [workdir / relative for relative in test_dirs]
+    excluded = [workdir / split_test_dir(spec)[1] for spec in test_dirs]
     excluded.append(workdir / "build")
     # The runner runs `git init` in the workdir so OpenCode treats it as the
     # project root and its external_directory deny rules take effect. Nothing
@@ -170,13 +170,29 @@ def relative_files(root: Path) -> dict[str, Path]:
     }
 
 
+def split_test_dir(spec: str) -> tuple[str, str]:
+    """`SRC[:DEST]` -> (source, destination).
+
+    DEST is where the agent saw the tests inside the working directory; SRC is
+    where that content came from, which for a lineage stage is a generated
+    per-checkpoint bundle rather than the suite itself. With no DEST the two are
+    the same, which is the original behavior.
+
+    Split on the LAST colon, not the first: DEST is a normalized relative path
+    and so never contains one, while SRC may be absolute -- and on Windows an
+    absolute path starts with a drive letter and a colon.
+    """
+    source, separator, destination = spec.rpartition(":")
+    return (source, destination) if separator else (destination, destination)
+
+
 def check_test_dirs(
     workdir: Path,
     attempt_dir: Path,
     repository: Path,
     test_dirs: list[str],
 ) -> dict:
-    """Compare the per-attempt test copies with the repository originals.
+    """Compare the per-attempt test copies with the originals they came from.
 
     Every prompt forbids modifying the visible tests, and the continuation
     prompt repeats that instruction each loop. Deleting the copies without
@@ -186,9 +202,11 @@ def check_test_dirs(
     preserved_root = attempt_dir / "tampered-tests"
     tampered_total = 0
 
-    for relative in test_dirs:
+    for spec in test_dirs:
+        source, relative = split_test_dir(spec)
         copy_root = workdir / relative
-        source_root = repository / relative
+        source_path = Path(source)
+        source_root = source_path if source_path.is_absolute() else repository / source
         if not copy_root.is_dir() or not source_root.is_dir():
             continue
 
@@ -247,15 +265,15 @@ def prune_legacy_sandbox(run_root: Path) -> int:
             continue
         if not (workdir.parent / "COMPLETE").is_file():
             continue
-        targets = [workdir / relative for relative in test_dirs]
+        targets = [workdir / split_test_dir(spec)[1] for spec in test_dirs]
         targets.append(workdir / "build")
         for target in targets:
             if target.is_dir():
                 shutil.rmtree(target)
                 removed += 1
         # Drop now-empty parents of the removed test directories.
-        for relative in test_dirs:
-            parent = (workdir / relative).parent
+        for spec in test_dirs:
+            parent = (workdir / split_test_dir(spec)[1]).parent
             while parent != workdir and parent.is_dir() and not any(parent.iterdir()):
                 parent.rmdir()
                 parent = parent.parent
@@ -275,7 +293,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--baseline-dir", type=Path, default=None)
     parser.add_argument("--repository", type=Path, default=Path("."))
     parser.add_argument("--keep-glob", action="append", default=[])
-    parser.add_argument("--test-dir", action="append", default=[])
+    parser.add_argument(
+        "--test-dir",
+        action="append",
+        default=[],
+        help="SRC[:DEST]; DEST is the workdir-relative path the agent saw.",
+    )
     parser.add_argument("--run-root", type=Path, default=None)
     parser.add_argument(
         "--keep-workdir",
