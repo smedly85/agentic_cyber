@@ -39,6 +39,12 @@ import stage_test_bundle  # noqa: E402
 
 SCHEMA_VERSION = 1
 
+# ASCII unit separator. Chosen for `--emit stages` because it is not IFS
+# whitespace in Bash: adjacent separators therefore delimit an empty field
+# rather than collapsing, and fields are not whitespace-trimmed. See
+# emit_stages for the bug that motivated it.
+RECORD_SEPARATOR = "\x1f"
+
 
 class ManifestError(SystemExit):
     def __init__(self, message: str) -> None:
@@ -175,7 +181,8 @@ def resolve_plan(
                 f"{manifest_path}: checkpoint {checkpoint_id} implemented_flags must "
                 "be a list of strings"
             )
-        if any("\t" in flag or not flag for flag in flags):
+        if any(RECORD_SEPARATOR in flag or "\n" in flag or not flag
+               for flag in flags):
             raise ManifestError(
                 f"{manifest_path}: checkpoint {checkpoint_id} implemented_flags must "
                 "be non-empty and tab-free"
@@ -203,10 +210,12 @@ def resolve_plan(
                 f"{manifest_path}: checkpoint {checkpoint_id} feature_test_command "
                 "must be a non-empty string"
             )
-        if "\t" in feature_test_command:
+        if (RECORD_SEPARATOR in feature_test_command
+                or "\n" in feature_test_command):
             raise ManifestError(
-                f"{manifest_path}: checkpoint {checkpoint_id} feature_test_command "
-                "must not contain a tab"
+                f"{manifest_path}: checkpoint {checkpoint_id} "
+                "feature_test_command must not contain the record separator "
+                "or a newline"
             )
 
         entry = {
@@ -284,8 +293,11 @@ def resolve_plan(
     ):
         if not isinstance(command, str):
             raise ManifestError(f"{manifest_path}: '{label}' must be a string")
-        if "\t" in command:
-            raise ManifestError(f"{manifest_path}: '{label}' must not contain a tab")
+        if RECORD_SEPARATOR in command or "\n" in command:
+            raise ManifestError(
+                f"{manifest_path}: '{label}' must not contain the record "
+                "separator or a newline"
+            )
 
     plan = {
         "schema_version": SCHEMA_VERSION,
@@ -341,21 +353,39 @@ def fingerprint(plan: dict[str, Any]) -> str:
 
 
 def emit_stages(plan: dict[str, Any]) -> str:
+    """One record per checkpoint, fields separated by ASCII US (0x1f).
+
+    NOT tab. Tab is IFS *whitespace* in Bash, so `IFS=$'\\t' read` collapses runs
+    of tabs and drops empty fields entirely. Checkpoint 000 has an empty
+    cumulative flag list, so its record ended `...\\t\\t<fingerprint>`: the two
+    adjacent tabs collapsed into one, the fingerprint slid into `stage_flags`,
+    and `stage_bundle_fingerprint` came back empty. The controller then compared
+    an empty planned fingerprint against the freshly built one and aborted every
+    run at stage 000 with "test bundle ... changed since the run was planned".
+
+    0x1f is not IFS whitespace, so adjacent separators delimit an empty field
+    exactly as they should, and no field is whitespace-trimmed -- which also
+    keeps paths and commands containing spaces intact.
+    """
     lines = []
     for checkpoint in plan["checkpoints"]:
-        lines.append(
-            "\t".join(
-                [
-                    checkpoint["id"],
-                    checkpoint["name"],
-                    checkpoint["prompt"],
-                    checkpoint["source_mode"],
-                    checkpoint["feature_test_command"],
-                    ",".join(checkpoint["implemented_flags"]),
-                    checkpoint["test_bundle_fingerprint"],
-                ]
-            )
-        )
+        fields = [
+            checkpoint["id"],
+            checkpoint["name"],
+            checkpoint["prompt"],
+            checkpoint["source_mode"],
+            checkpoint["feature_test_command"],
+            ",".join(checkpoint["implemented_flags"]),
+            checkpoint["test_bundle_fingerprint"],
+        ]
+        for field in fields:
+            if RECORD_SEPARATOR in field or "\n" in field:
+                raise ManifestError(
+                    f"checkpoint {checkpoint['id']} field {field!r} contains "
+                    "the record separator or a newline; it cannot be passed to "
+                    "the controller unambiguously"
+                )
+        lines.append(RECORD_SEPARATOR.join(fields))
     return "\n".join(lines)
 
 
@@ -398,6 +428,14 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if args.emit == "stages":
+        # LF explicitly. On Windows `print` would translate to CRLF, and the
+        # shell reader would then carry a trailing carriage return into the last
+        # field of every record -- silently corrupting the test-bundle
+        # fingerprint it parses out.
+        try:
+            sys.stdout.reconfigure(newline="\n")
+        except (AttributeError, ValueError):        # pragma: no cover
+            pass
         print(emit_stages(plan))
     elif args.emit == "fingerprint":
         print(plan["config_fingerprint"])

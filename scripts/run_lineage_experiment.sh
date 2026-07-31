@@ -321,7 +321,15 @@ STAGE_MODES=()
 STAGE_FEATURE_CMDS=()
 STAGE_FLAGS=()
 STAGE_BUNDLE_FINGERPRINTS=()
-while IFS=$'\t' read -r stage_id stage_name stage_prompt stage_mode stage_cmd \
+# Fields are separated by ASCII US (0x1f), not tab. Tab is IFS *whitespace*, so
+# `IFS=$'\t' read` collapses runs of tabs and drops empty fields: checkpoint 000
+# has an empty cumulative flag list, so its record ended `...<TAB><TAB><hash>`,
+# the pair collapsed, the fingerprint landed in stage_flags, and
+# stage_bundle_fingerprint came back empty -- which then failed the
+# planned-vs-built comparison on every single run at stage 000. 0x1f is not IFS
+# whitespace, so an empty field survives and nothing is whitespace-trimmed
+# (which also keeps paths and commands containing spaces intact).
+while IFS=$'\x1f' read -r stage_id stage_name stage_prompt stage_mode stage_cmd \
         stage_flags stage_bundle_fingerprint; do
     [[ -n "$stage_id" ]] || continue
     STAGE_IDS+=("$stage_id")
@@ -335,6 +343,27 @@ done <<<"$STAGE_TABLE"
 
 STAGE_COUNT=${#STAGE_IDS[@]}
 [[ "$STAGE_COUNT" -gt 0 ]] || die "manifest for $UTILITY resolved to zero checkpoints"
+
+# A plan-loading defect must be caught HERE -- before any lineage directory or
+# lineage.json exists, so a parsing bug can never make a lineage count as
+# started. The original defect was silent: an empty planned fingerprint simply
+# lost the comparison later, after the run had already begun.
+for array_name in STAGE_NAMES STAGE_PROMPTS STAGE_MODES STAGE_FEATURE_CMDS \
+                  STAGE_FLAGS STAGE_BUNDLE_FINGERPRINTS; do
+    declare -n array_ref="$array_name"
+    [[ "${#array_ref[@]}" -eq "$STAGE_COUNT" ]] || die \
+        "stage plan is malformed: $array_name has ${#array_ref[@]} entries but $STAGE_COUNT checkpoints were declared (the plan record format and this reader disagree)"
+    unset -n array_ref
+done
+
+for (( check_index = 0; check_index < STAGE_COUNT; check_index++ )); do
+    checkpoint="${STAGE_IDS[check_index]}"
+    fingerprint="${STAGE_BUNDLE_FINGERPRINTS[check_index]}"
+    [[ -n "$fingerprint" ]] || die \
+        "stage plan is malformed: checkpoint $checkpoint has an empty test-bundle fingerprint; the plan record was not parsed correctly"
+    [[ "$fingerprint" =~ ^[0-9a-f]{64}$ ]] || die \
+        "stage plan is malformed: checkpoint $checkpoint has a test-bundle fingerprint that is not a SHA-256 hex digest: '$fingerprint'"
+done
 
 MODEL_SLUG="$(slugify "$MODEL")"
 TEMP_SLUG="$(slugify "$TEMPERATURE" | sed 's/\./p/g')"

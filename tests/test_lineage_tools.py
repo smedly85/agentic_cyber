@@ -2884,6 +2884,281 @@ class PlatformPreflightTests(unittest.TestCase):
                 self.assertIsNone(neutral["required_platform"])
 
 
+class StageRecordParsingTests(unittest.TestCase):
+    """The plan -> controller record format must preserve empty fields.
+
+    The original format was tab-separated and read with `IFS=$'\\t' read`. Tab is
+    IFS *whitespace* in Bash, so runs of tabs collapse and empty fields vanish.
+    Checkpoint 000 has an empty cumulative flag list, so its record ended
+    `...<TAB><TAB><hash>`: the pair collapsed, the fingerprint slid into
+    `stage_flags`, and `stage_bundle_fingerprint` came back empty. Every run
+    then aborted at stage 000 comparing an empty planned fingerprint against the
+    freshly built one.
+    """
+
+    FIELDS = 7
+    SEP = "\x1f"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bash = shutil.which("bash")
+        if not cls.bash:
+            raise unittest.SkipTest("bash is required")
+
+    def setUp(self):
+        import tempfile
+
+        self.temp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    def stages_text(self, utility: str) -> str:
+        result = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "lineage_plan.py"),
+             "--repo", str(REPO_ROOT), "--utility", utility, "--emit", "stages"],
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        # Decoded without universal newlines: a stray CR must stay visible.
+        return result.stdout.decode("utf-8")
+
+    def parse_with_bash(self, utility: str) -> list[list[str]]:
+        """Parse using the controller's own reader line, verbatim."""
+        controller = (REPO_ROOT / "scripts"
+                      / "run_lineage_experiment.sh").read_text(encoding="utf-8")
+        self.assertIn("while IFS=$'\\x1f' read -r stage_id", controller,
+                      "the controller must read with the unit separator")
+
+        table = self.temp / f"{utility}.table"
+        table.write_bytes(self.stages_text(utility).encode("utf-8"))
+        script = (
+            'while IFS=$\'\\x1f\' read -r a b c d e f g; do\n'
+            '  [[ -n "$a" ]] || continue\n'
+            '  printf \'%s|%s|%s|%s|%s|%s|%s\\n\' "$a" "$b" "$c" "$d" "$e" "$f" "$g"\n'
+            f'done < "{table.as_posix()}"\n'
+        )
+        result = subprocess.run([self.bash, "-c", script],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return [line.split("|") for line in result.stdout.splitlines() if line]
+
+    def plan_checkpoints(self, utility: str) -> list[dict]:
+        return lineage_plan.resolve_plan(
+            REPO_ROOT, utility, "m", "0", "build", 3, 1800
+        )["checkpoints"]
+
+    # --- serialization -----------------------------------------------------
+
+    def test_records_use_the_unit_separator_not_tab(self):
+        text = self.stages_text("grep")
+        self.assertIn(self.SEP, text)
+        self.assertNotIn("\t", text)
+        self.assertNotIn("\r", text, "a stray CR would corrupt the last field")
+
+    def test_an_empty_intermediate_field_is_preserved(self):
+        first = self.stages_text("grep").splitlines()[0]
+        self.assertEqual(len(first.split(self.SEP)), self.FIELDS)
+        self.assertIn(self.SEP + self.SEP, first,
+                      "checkpoint 000's empty flag field must survive")
+
+    def test_emit_rejects_a_field_containing_the_separator(self):
+        plan = lineage_plan.resolve_plan(
+            REPO_ROOT, "grep", "m", "0", "build", 3, 1800
+        )
+        plan["checkpoints"][0]["name"] = f"ba{self.SEP}d"
+        with self.assertRaises(SystemExit):
+            lineage_plan.emit_stages(plan)
+
+    # --- parsing -----------------------------------------------------------
+
+    def test_checkpoint_000_keeps_empty_cumulative_flags(self):
+        for utility in sorted(EXPECTED_SEQUENCES):
+            with self.subTest(utility=utility):
+                self.assertEqual(self.parse_with_bash(utility)[0][5], "")
+
+    def test_checkpoint_000_fingerprint_reaches_the_fingerprint_field(self):
+        for utility in sorted(EXPECTED_SEQUENCES):
+            row = self.parse_with_bash(utility)[0]
+            expected = self.plan_checkpoints(utility)[0]["test_bundle_fingerprint"]
+            with self.subTest(utility=utility):
+                self.assertEqual(row[6], expected)
+                self.assertRegex(row[6], r"^[0-9a-f]{64}$")
+
+    def test_stage_flags_never_receives_the_fingerprint(self):
+        """The exact symptom of the old bug."""
+        for utility in sorted(EXPECTED_SEQUENCES):
+            for row in self.parse_with_bash(utility):
+                with self.subTest(utility=utility, checkpoint=row[0]):
+                    self.assertNotRegex(row[5], r"^[0-9a-f]{64}$")
+
+    def test_every_checkpoint_of_every_utility_round_trips(self):
+        for utility in sorted(EXPECTED_SEQUENCES):
+            rows = self.parse_with_bash(utility)
+            checkpoints = self.plan_checkpoints(utility)
+            with self.subTest(utility=utility):
+                self.assertEqual(len(rows), len(checkpoints))
+            for row, checkpoint in zip(rows, checkpoints):
+                with self.subTest(utility=utility, checkpoint=checkpoint["id"]):
+                    self.assertEqual(len(row), self.FIELDS)
+                    self.assertEqual(row[0], checkpoint["id"])
+                    self.assertEqual(row[1], checkpoint["name"])
+                    self.assertEqual(row[2], checkpoint["prompt"])
+                    self.assertEqual(row[3], checkpoint["source_mode"])
+                    self.assertEqual(row[4], checkpoint["feature_test_command"])
+                    self.assertEqual(
+                        row[5], ",".join(checkpoint["implemented_flags"]))
+                    self.assertEqual(row[6], checkpoint["test_bundle_fingerprint"])
+
+    def test_grep_loads_exactly_the_expected_fingerprints(self):
+        rows = self.parse_with_bash("grep")
+        expected = [c["test_bundle_fingerprint"]
+                    for c in self.plan_checkpoints("grep")]
+        self.assertEqual([r[6] for r in rows], expected)
+        self.assertEqual(len(set(expected)), len(expected),
+                         "each checkpoint has its own bundle")
+
+    def test_fields_containing_spaces_round_trip(self):
+        """Feature-test commands carry spaces; nothing may be split or trimmed."""
+        for utility in sorted(EXPECTED_SEQUENCES):
+            for row, checkpoint in zip(self.parse_with_bash(utility),
+                                       self.plan_checkpoints(utility)):
+                command = checkpoint["feature_test_command"]
+                if " " not in command:
+                    continue
+                with self.subTest(utility=utility, checkpoint=row[0]):
+                    self.assertEqual(row[4], command)
+                    self.assertIn(" ", row[4])
+
+    # --- the planned-vs-built integrity check ------------------------------
+
+    def test_planned_fingerprint_matches_the_freshly_built_bundle(self):
+        for utility in sorted(EXPECTED_SEQUENCES):
+            for row in self.parse_with_bash(utility):
+                built = build_bundle(
+                    utility, row[0], self.temp / f"{utility}-{row[0]}"
+                )["bundle_fingerprint"]
+                with self.subTest(utility=utility, checkpoint=row[0]):
+                    self.assertEqual(row[6], built,
+                                     "planned and built must agree, which is "
+                                     "what the controller compares")
+
+    def test_an_altered_bundle_still_fails_the_comparison(self):
+        """The integrity check must stay fail-closed."""
+        planned = self.parse_with_bash("grep")[0][6]
+        bundle = self.temp / "tampered"
+        build_bundle("grep", "000", bundle)
+        judge = bundle / "judge_candidate.sh"
+        judge.write_bytes(judge.read_bytes() + b"\n# tampered\n")
+        rebuilt = hashlib.sha256(judge.read_bytes()).hexdigest()
+        self.assertNotEqual(planned, rebuilt)
+
+
+class StagePlanValidationTests(unittest.TestCase):
+    """A plan-loading defect must abort before a lineage counts as started."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bash = shutil.which("bash")
+        if not cls.bash:
+            raise unittest.SkipTest("bash is required")
+
+    def setUp(self):
+        import tempfile
+
+        self.temp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    def posix(self, path: Path) -> str:
+        text = path.as_posix()
+        return "/" + text[0].lower() + text[2:] if text[1:2] == ":" else text
+
+    def run_with_corrupt_stage_table(self, corruption: str) -> tuple:
+        """Run the real controller with a python shim that corrupts only the
+        `--emit stages` output, leaving every other call untouched."""
+        shim_dir = self.temp / f"shim-{abs(hash(corruption))}"
+        shim_dir.mkdir(parents=True, exist_ok=True)
+        shim_py = shim_dir / "shim.py"
+        shim_py.write_text(
+            "import subprocess, sys\n"
+            f"real = {sys.executable!r}\n"
+            "argv = sys.argv[1:]\n"
+            "out = subprocess.run([real, *argv], capture_output=True, text=True)\n"
+            "sys.stderr.write(out.stderr)\n"
+            "text = out.stdout\n"
+            "if '--emit' in argv and 'stages' in argv:\n"
+            f"    text = {corruption!r}\n"
+            "sys.stdout.write(text)\n"
+            "sys.exit(out.returncode)\n",
+            encoding="utf-8",
+        )
+        # A shebang script on both platforms: the controller invokes
+        # "$PYTHON_BIN" from bash, and Git Bash cannot `command -v` a .cmd.
+        launcher = shim_dir / "python3"
+        launcher.write_text(
+            f'#!/bin/sh\nexec "{sys.executable}" "{shim_py}" "$@"\n',
+            encoding="utf-8", newline="\n",
+        )
+        launcher.chmod(0o755)
+
+        output = self.temp / f"out-{abs(hash(corruption))}"
+        result = subprocess.run(
+            [self.bash,
+             str(REPO_ROOT / "scripts" / "run_lineage_experiment.sh"),
+             "--utility", "grep", "--model", "demo/m", "--temperature", "0",
+             "--lineages", "5", "--output-dir", self.posix(output)],
+            cwd=str(REPO_ROOT), capture_output=True, text=True,
+            env={**os.environ, "PYTHON_BIN": self.posix(launcher)},
+        )
+        return result, output
+
+    def test_an_empty_fingerprint_aborts_before_any_lineage_exists(self):
+        """Exactly the state the old tab bug produced."""
+        row = "\x1f".join(["000", "base", "prompts/grep/000_base_new_grep.md",
+                           "new", "cmd", "", ""])
+        result, output = self.run_with_corrupt_stage_table(row + "\n")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("empty test-bundle fingerprint", result.stderr)
+        self.assertEqual(
+            [] if not output.exists() else list(output.glob("lineage-*")), [],
+            "no lineage directory may be created by a plan-loading failure",
+        )
+        self.assertEqual(
+            [] if not output.exists() else list(output.rglob("lineage.json")), [],
+        )
+
+    def test_a_malformed_fingerprint_aborts_before_any_lineage_exists(self):
+        row = "\x1f".join(["000", "base", "prompts/grep/000_base_new_grep.md",
+                           "new", "cmd", "", "not-a-sha256"])
+        result, output = self.run_with_corrupt_stage_table(row + "\n")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not a SHA-256 hex digest", result.stderr)
+        self.assertEqual(
+            [] if not output.exists() else list(output.glob("lineage-*")), [])
+
+    def test_a_short_record_aborts_rather_than_shifting_fields(self):
+        """A record missing its last field must not silently proceed."""
+        row = "\x1f".join(["000", "base", "prompts/grep/000_base_new_grep.md",
+                           "new", "cmd", ""])
+        result, output = self.run_with_corrupt_stage_table(row + "\n")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(
+            [] if not output.exists() else list(output.glob("lineage-*")), [])
+
+    def test_the_validation_precedes_lineage_creation_in_the_source(self):
+        text = (REPO_ROOT / "scripts"
+                / "run_lineage_experiment.sh").read_text(encoding="utf-8")
+        guard = text.index("stage plan is malformed")
+        for side_effect in ("for (( offset = 0", '--path "$lineage_record"',
+                            'bash "$STAGE_RUNNER"'):
+            with self.subTest(side_effect=side_effect):
+                self.assertLess(guard, text.index(side_effect))
+
+    def test_the_planned_versus_built_comparison_is_unchanged(self):
+        """It must stay fail-closed: no fallback to the built value."""
+        text = (REPO_ROOT / "scripts"
+                / "run_lineage_experiment.sh").read_text(encoding="utf-8")
+        self.assertIn(
+            '[[ "$built_fingerprint" == "$stage_bundle_fingerprint" ]] || die',
+            text)
+
+
 class SuiteReproducibilityTests(unittest.TestCase):
     """The self-check must compare the reproducible artifact set, semantically."""
 
