@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import platform
 import sys
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -233,6 +234,18 @@ def resolve_plan(
     # feature in under its long name. Declared here rather than discovered, and
     # validated against the ladder so an alias can never name a flag no
     # checkpoint introduces.
+    # The suite's own config.json owns the platform contract; the manifest
+    # simply inherits it, so there is one place to change it.
+    manifest_platform = None
+    suite_config = repo / test_dir / "config.json"
+    if suite_config.is_file():
+        try:
+            manifest_platform = json.loads(
+                suite_config.read_text(encoding="utf-8")
+            ).get("required_platform")
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            manifest_platform = None
+
     flag_aliases = manifest.get("flag_aliases", {})
     if not isinstance(flag_aliases, dict):
         raise ManifestError(f"{manifest_path}: 'flag_aliases' must be an object")
@@ -287,6 +300,12 @@ def resolve_plan(
         "judge": judge,
         "judge_sha256": sha256_file(judge_file),
         "flag_aliases": {k: list(v) for k, v in sorted(flag_aliases.items())},
+        # Platform contract. Some frozen suites are only valid on one OS, so
+        # the requirement and the host actually running are both part of the
+        # configuration: resuming a run on a different platform must not
+        # silently mix results produced under different expectations.
+        "required_platform": manifest_platform,
+        "host_platform": platform.system(),
         "base_test_command": base_test_command,
         "extra_test_command": extra_test_command,
         "checkpoints": resolved,

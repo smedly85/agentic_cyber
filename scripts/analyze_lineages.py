@@ -286,6 +286,11 @@ def load_run(root: Path) -> tuple[dict[str, Any], list[dict[str, Any]], list[str
     )
 
     if not lineages:
+        # A run the controller refused on environment grounds legitimately has
+        # no lineages: the platform preflight stops before any is initialized.
+        # That is a valid, fully-described outcome, not a broken directory.
+        if run_metadata.get("run_status") == "platform_incompatible":
+            return run_metadata, [], []
         raise LineageError(f"no lineage-* directories under {root}")
 
     fingerprints = {record.get("config_fingerprint") for record in lineages
@@ -1034,6 +1039,47 @@ def main(argv: list[str] | None = None) -> int:
     root = args.lineage_root.resolve()
     output_dir = (args.output_dir or root / "analysis").resolve()
     run_metadata, lineages, never_started = load_run(root)
+
+    # Run-level environment eligibility is answered before anything else, and
+    # answers a different question from reliability. No lineage started, so
+    # there is no denominator: reliability is NOT APPLICABLE, which is not the
+    # same as 0.0 and must never be rendered as one.
+    if run_metadata.get("run_status") == "platform_incompatible":
+        report = {
+            "schema_version": SCHEMA_VERSION,
+            "lineage_root": str(root),
+            "utility": run_metadata.get("utility"),
+            "model": run_metadata.get("model"),
+            "run_status": "platform_incompatible",
+            "required_platform": run_metadata.get("required_platform"),
+            "host_platform": run_metadata.get("host_platform"),
+            "lineages_started": 0,
+            "reliability": None,
+            "reliability_applicable": False,
+            "reliability_unavailable_reason": (
+                "no lineage was started: this host does not satisfy the "
+                "suite's platform contract, so there is no denominator over "
+                "which to estimate reliability"
+            ),
+            "populations": [],
+        }
+        write_json(output_dir / "lineage_report.json", report)
+        summary = (
+            f"# Lineage analysis: {report['utility']}\n\n"
+            f"* Root: `{root}`\n"
+            f"* **Run status: platform_incompatible**\n"
+            f"* Requires `{report['required_platform']}`; "
+            f"this host is `{report['host_platform']}`\n\n"
+            "## Reliability\n\n"
+            "**Not applicable.** No lineage started, so there is no "
+            "denominator. This is a run-level environment incompatibility, not "
+            "a model result: it is not a validation failure, not an "
+            "infrastructure failure inside a lineage, not a controller "
+            "interruption, and not an unsuccessful generated implementation.\n"
+        )
+        (output_dir / "summary.md").write_text(summary, encoding="utf-8")
+        print(summary)
+        return 0
     order = checkpoint_order(run_metadata, lineages)
 
     reliability = build_reliability(lineages, order, never_started)

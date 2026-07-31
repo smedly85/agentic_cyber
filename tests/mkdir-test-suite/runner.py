@@ -217,6 +217,47 @@ def run_one(case: dict, cmd: list[str], sanitizer: bool,
     return PASS, ""
 
 
+PLATFORM_INCOMPATIBLE_EXIT = 3
+"""Exit status meaning: this host cannot run this frozen suite at all.
+
+Distinct from 0 (pass), 1 (a candidate failed a case) and 2 (usage error), so a
+controller can classify it as an infrastructure/platform incompatibility rather
+than counting it against the candidate.
+"""
+
+
+def check_platform(manifest: dict) -> None:
+    """Refuse to judge when the frozen goldens are not valid for this host.
+
+    Some frozen expectations are platform-specific: the same utility version can
+    resolve the same arguments differently on different operating systems, so a
+    corpus produced on one platform does not describe another. Judging a
+    candidate against goldens from a different platform would report defects
+    that are properties of the host, not of the candidate.
+
+    `required_platform` is set by the suite's config.json; when it is absent the
+    suite is platform-neutral and nothing is enforced.
+    """
+    required = manifest.get("required_platform")
+    if not required:
+        return
+    import platform as _platform
+
+    actual = _platform.system()
+    if actual == required:
+        return
+    for line in (
+        f"runner.py: PLATFORM INCOMPATIBLE -- this frozen suite requires "
+        f"{required}, but this host is {actual}.",
+        f"  Its expected results were produced and validated on {required} "
+        f"and do not describe {actual}.",
+        "  This is an infrastructure/platform incompatibility, NOT a "
+        "candidate failure: no verdict is reported.",
+    ):
+        print(line, file=sys.stderr)
+    sys.exit(PLATFORM_INCOMPATIBLE_EXIT)
+
+
 def main():
     # Split the candidate command (after the first "--") off ourselves;
     # argparse REMAINDER mis-handles options that precede positionals.
@@ -249,6 +290,7 @@ def main():
     cmd = [os.path.abspath(t) if os.path.exists(t) else t for t in cmd]
 
     manifest = load_manifest(args.config, args.all_flags)
+    check_platform(manifest)
     xfail = manifest.get("unimplemented_policy") == "xfail"
 
     files = []

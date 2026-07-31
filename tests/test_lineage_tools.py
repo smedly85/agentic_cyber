@@ -2574,6 +2574,316 @@ class UmaskDeterminismTests(unittest.TestCase):
             self.assertIn(umask, text)
 
 
+class PlatformContractTests(unittest.TestCase):
+    """The mkdir frozen suite is only valid on Darwin.
+
+    GNU coreutils 9.11 resolves a symbolic mode argument that does not itself
+    set the rwx bits from a 0777 departure on Darwin and a 0755 departure on
+    Linux, so the identical binary version yields different directory modes.
+    Measured on both: Darwin reproduces the committed corpus exactly and passes
+    every gate; Linux does not. The goldens are correct -- for Darwin.
+    """
+
+    SUITE = REPO_ROOT / "tests" / "mkdir-test-suite"
+
+    def config(self) -> dict:
+        return json.loads((self.SUITE / "config.json").read_text(encoding="utf-8"))
+
+    def test_the_contract_is_declared_in_config(self):
+        config = self.config()
+        self.assertEqual(config["required_platform"], "Darwin")
+        self.assertEqual(config["oracle_version_required"], "9.11")
+        self.assertIn("_platform_contract", config)
+
+    def test_only_the_platform_specific_suite_declares_one(self):
+        for utility in ("sort", "grep", "chmod"):
+            path = REPO_ROOT / "tests" / f"{utility}-test-suite" / "config.json"
+            if not path.is_file():
+                continue
+            with self.subTest(utility=utility):
+                self.assertNotIn(
+                    "required_platform",
+                    json.loads(path.read_text(encoding="utf-8")),
+                    "only mkdir has a measured platform dependence",
+                )
+
+    def test_the_selfcheck_gate_precedes_regeneration_and_the_oracle(self):
+        text = (self.SUITE / "selfcheck.sh").read_text(encoding="utf-8")
+        gate = text.index("REQUIRED_PLATFORM")
+        self.assertLess(gate, text.index("python3 gen/generate.py"))
+        self.assertLess(gate, text.index("gate 0"))
+        self.assertIn('uname -s', text)
+        self.assertIn("refusing to run on", text)
+
+    def test_the_selfcheck_gate_explains_all_three_consequences(self):
+        text = (self.SUITE / "selfcheck.sh").read_text(encoding="utf-8")
+        self.assertIn("produced AND validated on", text)
+        self.assertIn("redefine the benchmark", text)
+        self.assertIn("belongs to the platform, not to the binary", text)
+
+    def test_candidate_evaluation_has_a_distinct_platform_exit(self):
+        source = (self.SUITE / "runner.py").read_text(encoding="utf-8")
+        self.assertIn("PLATFORM_INCOMPATIBLE_EXIT = 3", source)
+        self.assertIn("def check_platform(", source)
+        self.assertIn("check_platform(manifest)", source)
+        self.assertIn("NOT a", source)
+
+    def test_the_platform_gate_runs_before_any_case(self):
+        source = (self.SUITE / "runner.py").read_text(encoding="utf-8")
+        self.assertLess(source.index("check_platform(manifest)"),
+                        source.index("ThreadPoolExecutor("))
+
+    def test_darwin_is_accepted_and_linux_is_rejected(self):
+        """Exercises the real gate, with the platform substituted."""
+        import platform as platform_module
+
+        runner_source = (self.SUITE / "runner.py").read_text(encoding="utf-8")
+        namespace: dict[str, Any] = {"sys": sys, "platform": platform_module}
+        start = runner_source.index("PLATFORM_INCOMPATIBLE_EXIT = 3")
+        end = runner_source.index("def main():")
+        exec(compile(runner_source[start:end], "check_platform", "exec"), namespace)
+        check = namespace["check_platform"]
+
+        original = platform_module.system
+        try:
+            platform_module.system = lambda: "Darwin"
+            check({"required_platform": "Darwin"})          # must not raise
+
+            platform_module.system = lambda: "Linux"
+            with self.assertRaises(SystemExit) as caught:
+                check({"required_platform": "Darwin"})
+            self.assertEqual(caught.exception.code, 3)
+
+            # A suite without a contract is platform-neutral.
+            check({})
+        finally:
+            platform_module.system = original
+
+    def test_a_platform_exit_is_not_counted_as_validation_failed(self):
+        """The controller must classify exit 3 as its own reason."""
+        controller = (REPO_ROOT / "scripts"
+                      / "run_lineage_experiment.sh").read_text(encoding="utf-8")
+        self.assertIn('metadata.get("feature_test_exit_code") == 3', controller)
+        self.assertIn('reason = "platform_incompatible"', controller)
+        # It must be decided BEFORE the validation_failed fallback.
+        self.assertLess(controller.index('reason = "platform_incompatible"'),
+                        controller.index('or "validation_failed"'))
+
+    def test_the_platform_contract_participates_in_the_fingerprint(self):
+        plan = lineage_plan.resolve_plan(
+            REPO_ROOT, "mkdir", "m", "0", "build", 3, 1800
+        )
+        self.assertEqual(plan["required_platform"], "Darwin")
+        self.assertIn("host_platform", plan)
+        # The fingerprint hashes the whole plan, so both fields are covered.
+        material = {k: v for k, v in plan.items() if k != "config_fingerprint"}
+        self.assertIn("required_platform", material)
+        self.assertIn("host_platform", material)
+        changed = dict(plan)
+        changed["required_platform"] = "Linux"
+        self.assertNotEqual(lineage_plan.fingerprint(changed),
+                            plan["config_fingerprint"])
+
+    def test_the_run_record_carries_the_platform_provenance(self):
+        controller = (REPO_ROOT / "scripts"
+                      / "run_lineage_experiment.sh").read_text(encoding="utf-8")
+        self.assertIn('"required_platform": plan.get("required_platform")', controller)
+        self.assertIn('"host_platform": plan.get("host_platform")', controller)
+
+    def test_the_bundle_carries_the_platform_but_no_feature_information(self):
+        """The judge needs the contract inside the sandbox; the agent must not
+        learn anything about future flags from it."""
+        for checkpoint_id in ("000", "001", "002"):
+            bundle = shared_bundle("mkdir", checkpoint_id)
+            config = json.loads(
+                (bundle / "config.json").read_text(encoding="utf-8")
+            )
+            with self.subTest(checkpoint=checkpoint_id):
+                self.assertEqual(config.get("required_platform"), "Darwin")
+                # An OS name only -- no contract prose, no oracle, no flags.
+                self.assertNotIn("_platform_contract", config)
+                self.assertNotIn("oracle_bin", config.get("paths", {}))
+                self.assertNotIn("oracle_version_required", config)
+
+    def test_no_frozen_suite_changed_for_the_platform_contract(self):
+        result = subprocess.run(
+            ["git", "status", "--short", "tests/mkdir-test-suite/suites/"],
+            cwd=str(REPO_ROOT), capture_output=True, text=True,
+        )
+        self.assertEqual(result.stdout.strip(), "",
+                         "the platform contract must not touch frozen goldens")
+
+
+class PlatformPreflightTests(unittest.TestCase):
+    """Environment eligibility is decided before any lineage is initialized.
+
+    Stopping each lineage at checkpoint 000 would have created a start record
+    for every one, so all N would count in `lineages_started` and
+    successful_finals / lineages_started would read 0/N -- a model reliability
+    of zero for an environment mismatch. A distinct stop reason does not fix
+    that; the lineages must never start.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bash = shutil.which("bash")
+        if not cls.bash:
+            raise unittest.SkipTest("bash is required to run the controller")
+        import platform as _platform
+
+        cls.host = _platform.system()
+
+    def setUp(self):
+        import tempfile
+
+        self.temp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    def posix(self, path: Path) -> str:
+        text = path.as_posix()
+        return "/" + text[0].lower() + text[2:] if text[1:2] == ":" else text
+
+    def run_controller(self, utility: str, output: Path,
+                       lineages: int = 10) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [self.bash,
+             str(REPO_ROOT / "scripts" / "run_lineage_experiment.sh"),
+             "--utility", utility, "--model", "demo/m", "--temperature", "0",
+             "--lineages", str(lineages),
+             "--output-dir", self.posix(output)],
+            cwd=str(REPO_ROOT), capture_output=True, text=True,
+            env={**os.environ, "PYTHON_BIN": sys.executable},
+        )
+
+    @unittest.skipIf(__import__("platform").system() == "Darwin",
+                     "this asserts the non-Darwin rejection path")
+    def test_ten_mkdir_lineages_on_a_foreign_host_start_zero(self):
+        output = self.temp / "mk"
+        result = self.run_controller("mkdir", output, lineages=10)
+
+        self.assertEqual(result.returncode, 4,
+                         f"expected the distinct platform exit\n{result.stderr}")
+        self.assertIn("platform_incompatible", result.stderr)
+
+        record = json.loads((output / "lineages.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["run_status"], "platform_incompatible")
+        self.assertEqual(record["lineages_started"], 0)
+        self.assertEqual(record["required_platform"], "Darwin")
+        self.assertEqual(record["host_platform"], self.host)
+
+    @unittest.skipIf(__import__("platform").system() == "Darwin",
+                     "this asserts the non-Darwin rejection path")
+    def test_no_lineage_directory_or_start_record_is_created(self):
+        output = self.temp / "mk-dirs"
+        self.run_controller("mkdir", output, lineages=10)
+        entries = sorted(p.name for p in output.iterdir())
+        self.assertEqual(entries, ["lineages.json"])
+        self.assertEqual([p for p in output.glob("lineage-*")], [])
+        self.assertEqual([p for p in output.rglob("lineage.json")], [])
+
+    @unittest.skipIf(__import__("platform").system() == "Darwin",
+                     "this asserts the non-Darwin rejection path")
+    def test_no_stage_command_or_agent_is_invoked(self):
+        output = self.temp / "mk-noexec"
+        result = self.run_controller("mkdir", output, lineages=10)
+        combined = result.stdout + result.stderr
+        for marker in ("run_experiment.sh", "opencode", "attempt-001",
+                       "test-bundle", "=== lineage-"):
+            with self.subTest(marker=marker):
+                self.assertNotIn(marker, combined)
+
+    @unittest.skipIf(__import__("platform").system() == "Darwin",
+                     "this asserts the non-Darwin rejection path")
+    def test_planned_lineages_never_become_failures(self):
+        """The record must not list planned ids: analysis would otherwise
+        resurrect them as missing_directory / planned_not_started entries."""
+        output = self.temp / "mk-planned"
+        self.run_controller("mkdir", output, lineages=10)
+        record = json.loads((output / "lineages.json").read_text(encoding="utf-8"))
+        self.assertNotIn("planned_lineage_ids", record)
+        self.assertNotIn("lineage_ids", record)
+
+        run_metadata, lineages, never_started = analyze_lineages.load_run(output)
+        self.assertEqual(lineages, [])
+        self.assertEqual(never_started, [])
+
+    @unittest.skipIf(__import__("platform").system() == "Darwin",
+                     "this asserts the non-Darwin rejection path")
+    def test_the_analyzer_reports_reliability_as_not_applicable(self):
+        output = self.temp / "mk-analysis"
+        self.run_controller("mkdir", output, lineages=10)
+        analysis = self.temp / "report"
+        result = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "analyze_lineages.py"),
+             "--lineage-root", str(output), "--output-dir", str(analysis),
+             "--skip-diversity"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        report = json.loads(
+            (analysis / "lineage_report.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(report["run_status"], "platform_incompatible")
+        self.assertFalse(report["reliability_applicable"])
+        self.assertIsNone(report["reliability"])
+        self.assertEqual(report["lineages_started"], 0)
+
+        summary = (analysis / "summary.md").read_text(encoding="utf-8")
+        self.assertIn("Not applicable", summary)
+        # It must not be dressed up as any kind of model outcome.
+        for wrong in ("0.000", "validation_failed", "controller_interrupted"):
+            with self.subTest(wrong=wrong):
+                self.assertNotIn(wrong, summary)
+
+    def test_a_platform_neutral_utility_is_unaffected(self):
+        """sort, grep and chmod declare no contract and must run normally."""
+        for utility in ("sort", "grep", "chmod"):
+            result = subprocess.run(
+                [self.bash,
+                 str(REPO_ROOT / "scripts" / "run_lineage_experiment.sh"),
+                 "--utility", utility, "--model", "demo/m", "--temperature", "0",
+                 "--lineages", "1", "--dry-run"],
+                cwd=str(REPO_ROOT), capture_output=True, text=True,
+                env={**os.environ, "PYTHON_BIN": sys.executable},
+            )
+            with self.subTest(utility=utility):
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("platform_incompatible", result.stderr)
+                self.assertIn("run_experiment.sh", result.stdout)
+
+    def test_the_preflight_precedes_every_lineage_side_effect(self):
+        text = (REPO_ROOT / "scripts"
+                / "run_lineage_experiment.sh").read_text(encoding="utf-8")
+        gate = text.index("Platform preflight")
+        # Anchored on the actual side effects, not on the tool-path
+        # declarations near the top of the script.
+        for side_effect in (
+            "for (( offset = 0",                     # the lineage loop
+            '--path "$lineage_record"',              # the start record
+            'bash "$STAGE_RUNNER"',                  # the stage invocation
+            '"$PYTHON_BIN" "$BUNDLE_TOOL"',           # building a stage bundle
+        ):
+            with self.subTest(side_effect=side_effect):
+                self.assertLess(gate, text.index(side_effect))
+        self.assertIn("exit 4", text)
+
+    def test_darwin_would_be_accepted(self):
+        """The gate compares the plan's two fields; equal means proceed."""
+        plan = lineage_plan.resolve_plan(
+            REPO_ROOT, "mkdir", "m", "0", "build", 3, 1800
+        )
+        self.assertEqual(plan["required_platform"], "Darwin")
+        # The shell condition is: required is non-empty, not "None", and differs
+        # from host. On Darwin the third clause is false, so the run proceeds.
+        self.assertNotEqual(plan["required_platform"], "None")
+        for utility in ("sort", "grep", "chmod"):
+            with self.subTest(utility=utility):
+                neutral = lineage_plan.resolve_plan(
+                    REPO_ROOT, utility, "m", "0", "build", 3, 1800
+                )
+                self.assertIsNone(neutral["required_platform"])
+
+
 class SuiteReproducibilityTests(unittest.TestCase):
     """The self-check must compare the reproducible artifact set, semantically."""
 

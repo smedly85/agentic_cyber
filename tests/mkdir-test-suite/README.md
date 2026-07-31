@@ -32,6 +32,47 @@ that script is copied into the agent-visible stage bundle, and naming a later
 checkpoint's flags there would disclose work the agent has not yet been asked
 for. `README.md` is never copied into a bundle.
 
+## Platform contract
+
+> **This suite's frozen goldens require Darwin (macOS) *and* GNU coreutils 9.11.**
+> Both halves are load-bearing; the version alone is not enough.
+
+GNU coreutils 9.11 resolves a symbolic `-m` argument that does not itself set
+the rwx bits from a **0777 departure on Darwin** and a **0755 departure on
+Linux**. The same binary version therefore produces different directory modes on
+the two platforms. Measured in both environments, with the umask verified in the
+process that execs mkdir:
+
+| invocation | Darwin 9.11 | Linux 9.11 |
+|---|---|---|
+| `mkdir` (no `-m`), umask 0000/0022/0077 | 0777 / 0755 / 0700 | 0777 / 0755 / 0700 |
+| `mkdir -m +t`, any umask | **01777** | **01755** |
+| `mkdir -m a+t`, any umask | 01777 | 01755 |
+| `mkdir -m a=rwx,+t`, any umask | 01777 | 01777 |
+| `mkdir -m 1777`, any umask | 01777 | 01777 |
+
+The umask reaches mkdir correctly on both platforms — the bare-`mkdir` row
+varies exactly as it should, and the declared per-case umask was confirmed at
+the exec'ing process. This is a genuine platform difference, not a suite,
+engine, runner or umask-propagation defect. On Darwin the committed corpus
+reproduces exactly and every self-check gate passes.
+
+| Enforced at | Behavior on a non-Darwin host |
+|---|---|
+| `selfcheck.sh` | stops **before** regeneration and before the oracle self-pass, exit 2 |
+| `runner.py` (candidate evaluation) | `check_platform` exits **3 = PLATFORM INCOMPATIBLE**, distinct from 1 (a case failed) |
+| `scripts/run_lineage_experiment.sh` | records exit 3 as `platform_incompatible`, **not** `validation_failed` |
+| `scripts/lineage_plan.py` | `required_platform` and `host_platform` join the configuration fingerprint |
+
+`required_platform` is declared once, in `config.json`, and inherited
+everywhere else. It is carried into the agent-visible stage bundle so the judge
+can refuse correctly inside a sandbox; that value is an operating-system name —
+part of the generic execution environment — and discloses nothing about flags,
+features or checkpoints.
+
+**No frozen case was changed.** The goldens are correct for the platform they
+were produced on; the contract records which platform that is.
+
 ## Canonical symlink policy
 
 A symlink's permission bits are **host-OS metadata, not mkdir behavior**. Linux

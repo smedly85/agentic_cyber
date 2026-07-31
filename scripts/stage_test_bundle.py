@@ -182,6 +182,13 @@ def bundle_config(source: Path, implemented: list[str]) -> bytes:
     # judge re-applies at run time; carrying it keeps the bundle self-describing.
     if isinstance(original.get("scope"), dict):
         config["scope"] = original["scope"]
+    # Carried so the judge can refuse to run a platform-specific frozen suite on
+    # the wrong host and report it as an infrastructure incompatibility rather
+    # than as a candidate defect. It names an operating system, which is part of
+    # the generic execution environment the agent already runs in -- no flag,
+    # feature or checkpoint information is disclosed.
+    if isinstance(original.get("required_platform"), str):
+        config["required_platform"] = original["required_platform"]
     return (json.dumps(config, indent=1, sort_keys=True) + "\n").encode("utf-8")
 
 

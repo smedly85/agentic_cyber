@@ -299,6 +299,8 @@ TEST_DIR="$(plan_field test_dir)"
 BASE_TEST_CMD="$(plan_field base_test_command)"
 EXTRA_TEST_CMD="$(plan_field extra_test_command)"
 CONFIG_FINGERPRINT="$(plan_field config_fingerprint)"
+REQUIRED_PLATFORM="$(plan_field required_platform)"
+HOST_PLATFORM="$(plan_field host_platform)"
 
 STAGE_TABLE="$(
     "$PYTHON_BIN" "$PLAN_TOOL" \
@@ -358,8 +360,91 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
     mkdir -p "$OUTPUT_DIR"
     OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd -P)"
 fi
+RUN_METADATA_PATH="$OUTPUT_DIR/lineages.json"
 
 REPO_COMMIT="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || printf 'unknown')"
+
+# ---------------------------------------------------------------------------
+# Platform preflight -- run-level environment eligibility
+# ---------------------------------------------------------------------------
+#
+# This runs BEFORE any lineage is initialized, because eligibility to run at all
+# is a property of the RUN, not of any lineage. Letting the walk begin and
+# stopping each lineage at checkpoint 000 would create a lineage directory and a
+# start record for every one of them, so all N would count in lineages_started
+# and successful_finals / lineages_started would read 0/N -- reporting a model
+# reliability of zero for what is purely an environment mismatch. Classifying
+# the stop reason distinctly does not fix that: the lineages must never start.
+#
+# So: no lineage-* directory, no lineage.json, no checkpoint, no agent
+# invocation, and lineages_started stays 0. The outcome is recorded at the top
+# level only, as a run status.
+if [[ -n "$REQUIRED_PLATFORM" && "$REQUIRED_PLATFORM" != "None" &&
+      "$REQUIRED_PLATFORM" != "$HOST_PLATFORM" ]]; then
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        # A dry run starts no lineage, writes nothing and invokes no agent,
+        # so the harm this preflight prevents cannot occur. Resolving the
+        # plan stays useful on any host, so warn loudly and continue rather
+        # than refusing to describe the experiment.
+        warn "platform_incompatible: $UTILITY requires $REQUIRED_PLATFORM but this host is $HOST_PLATFORM; a real run would be refused (exit 4)"
+    else
+        printf 'error: platform_incompatible\n' >&2
+        printf '  %s requires %s; this host is %s.\n' \
+            "$UTILITY" "$REQUIRED_PLATFORM" "$HOST_PLATFORM" >&2
+        printf '  Its frozen expected results were produced and validated on %s and\n' \
+            "$REQUIRED_PLATFORM" >&2
+        printf '  do not describe %s. No lineage is started: this is a run-level\n' \
+            "$HOST_PLATFORM" >&2
+        printf '  environment incompatibility, not a model result.\n' >&2
+
+        if [[ "$DRY_RUN" -eq 0 ]]; then
+            # Top-level metadata only, and deliberately NO planned lineage ids:
+            # recording them would let analysis later resurrect them as
+            # missing_directory or planned_not_started entries, which is exactly the
+            # denominator pollution this preflight exists to prevent.
+            "$PYTHON_BIN" - "$RUN_METADATA_PATH" "$UTILITY" "$MODEL" \
+                "$REQUIRED_PLATFORM" "$HOST_PLATFORM" "$CONFIG_FINGERPRINT" \
+                "$(timestamp)" <<'PYPRE'
+import json
+import sys
+from pathlib import Path
+
+path, utility, model, required, host, fingerprint, created = sys.argv[1:]
+target = Path(path)
+target.parent.mkdir(parents=True, exist_ok=True)
+target.write_text(
+    json.dumps(
+        {
+            "schema_version": 1,
+            "experiment_unit": "lineage",
+            "utility": utility,
+            "model": model,
+            "config_fingerprint": fingerprint,
+            "run_status": "platform_incompatible",
+            "required_platform": required,
+            "host_platform": host,
+            "lineages_started": 0,
+            "lineages_planned": 0,
+            "_comment": (
+                "No lineage was started: this host does not satisfy the "
+                "suite's platform contract. Reliability is not applicable "
+                "rather than zero -- there is no denominator."
+            ),
+            "created_at": created,
+        },
+        indent=2,
+    )
+    + "\n",
+    encoding="utf-8",
+)
+PYPRE
+            printf '  recorded run_status=platform_incompatible in %s\n' \
+                "$RUN_METADATA_PATH" >&2
+        fi
+        # Distinct from 1 (a stage failed) and 2 (usage/configuration error).
+        exit 4
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # Resume guard: an existing lineage root must describe the same experiment
@@ -461,6 +546,8 @@ record.update(
         "executable_path": plan["executable_path"],
         "test_dir": plan["test_dir"],
         "judge": plan["judge"],
+        "required_platform": plan.get("required_platform"),
+        "host_platform": plan.get("host_platform"),
         "config_fingerprint": plan["config_fingerprint"],
         "checkpoints": plan["checkpoints"],
         "planned_lineage_ids": planned_lineage_ids,
@@ -703,6 +790,12 @@ elif metadata.get("infrastructure_failure"):
     reason = "infrastructure_failure"
 elif metadata.get("agent_execution_failure"):
     reason = "agent_execution_failure"
+elif metadata.get("feature_test_exit_code") == 3:
+    # runner.py exits 3 for PLATFORM INCOMPATIBLE: the frozen suite cannot be
+    # judged on this host at all. That is an environment fault, so it is
+    # classified with the infrastructure failures rather than counted against
+    # the candidate as validation_failed.
+    reason = "platform_incompatible"
 elif not public_success:
     reason = str(metadata.get("stop_reason") or "validation_failed")
 elif candidate_sha is None:
@@ -742,6 +835,7 @@ record = {
     "stop_reason": metadata.get("stop_reason"),
     "loop_limit_reached": bool(metadata.get("loop_limit_reached")),
     "infrastructure_failure": bool(metadata.get("infrastructure_failure")),
+    "platform_incompatible": metadata.get("feature_test_exit_code") == 3,
     "infrastructure_failure_stage": metadata.get("infrastructure_failure_stage"),
     "agent_execution_failure": bool(metadata.get("agent_execution_failure")),
     "agent_execution_failure_stage": metadata.get("agent_execution_failure_stage"),
