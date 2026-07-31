@@ -158,10 +158,19 @@ def main() -> int:
 
 
 def generate_check() -> int:
-    """Run generate.py's --check without re-entering its argument parser."""
+    """Run generate.py's --check without re-entering its argument parser.
+
+    Offline by construction: the model-derived derivation is compared against
+    the committed goldens, and the recorded oracle version is read back from the
+    corpus rather than by running a binary. That is what keeps this audit
+    runnable on a host with no GNU grep -- and it is sound because freezing
+    refuses to write unless the model reproduced the oracle byte for byte.
+    """
     suites = generate.build_suites()
     payloads = {name: generate.render(data) for name, data in suites.items()}
-    payloads["MANIFEST.json"] = generate.render(generate.manifest(suites))
+    payloads["MANIFEST.json"] = generate.render(
+        generate.manifest(suites, generate.recorded_version())
+    )
     for name, text in payloads.items():
         path = generate.SUITE_DIR / name
         if not path.is_file() or path.read_text(encoding="utf-8") != text:

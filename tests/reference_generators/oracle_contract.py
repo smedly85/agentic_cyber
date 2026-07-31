@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resolve and verify the GNU oracle binary for the sort and mkdir suites.
+"""Resolve and verify the GNU oracle binary for the sort, mkdir and grep suites.
 
 **Offline only. Never copied into an agent-visible bundle.** It lives here for
 the same reason the specification models do: `scripts/stage_test_bundle.py`
@@ -8,14 +8,23 @@ directory, so an oracle path can never appear in a sandbox.
 
 Why this exists
 ---------------
-`new_sort` and `new_mkdir` freeze their goldens by running a real GNU binary.
-That makes the oracle part of the benchmark definition, not an implementation
-detail: coreutils changes diagnostic wording between releases, so goldens frozen
-against one version are not the goldens another version produces. The suites
-already recorded which version they were frozen from --
+`new_sort`, `new_mkdir` and `new_grep` freeze their goldens by running a real
+GNU binary. That makes the oracle part of the benchmark definition, not an
+implementation detail: these projects change diagnostic wording and some
+behavior between releases, so goldens frozen against one version are not the
+goldens another version produces. The suites already recorded which version they
+were frozen from --
 
     tests/sort-test-suite/suites/MANIFEST.json   "sort (GNU coreutils) 9.4"
     tests/mkdir-test-suite/suites/MANIFEST.json  "mkdir (GNU coreutils) 9.11"
+    tests/grep-test-suite/suites/MANIFEST.json   "grep (GNU grep) 3.12"
+
+Version identity is necessary but not sufficient. `new_grep`'s contract is
+byte-exact, and a build can carry the right version string while still being
+unfit -- the Git-for-Windows grep 3.0 opens files in text mode and drops CR from
+its output, and aborts outright on `LC_ALL=C -i`. Identity and pin are checked
+here; `tests/grep-test-suite/gen/oracle.py:precheck` checks that the binary
+actually behaves the way the contract needs before anything is regenerated.
 
 -- but nothing checked it before regenerating. A self-check run against a
 different coreutils either failed late and cryptically (a MODEL MISMATCH deep
@@ -30,8 +39,8 @@ Resolution order (first hit wins)
 ---------------------------------
 1. an explicit path passed on the command line (`--oracle-bin` / `--sort-bin`
    / `--mkdir-bin`);
-2. the environment variable for that suite -- ``SORT_ORACLE_BIN`` or
-   ``MKDIR_ORACLE_BIN``;
+2. the environment variable for that suite -- ``SORT_ORACLE_BIN``,
+   ``MKDIR_ORACLE_BIN`` or ``GREP_ORACLE_BIN``;
 3. ``paths.oracle_bin`` in the suite's config.json;
 4. the first of a few conventional locations that exists.
 
@@ -67,6 +76,7 @@ SUITES: dict[str, dict[str, Any]] = {
         "env": "SORT_ORACLE_BIN",
         "program": "sort",
         "manifest_key": "sort_version",
+        "toolkit": "GNU coreutils",
         "candidates": (
             "/usr/bin/sort",
             "/bin/sort",
@@ -78,6 +88,7 @@ SUITES: dict[str, dict[str, Any]] = {
         "env": "MKDIR_ORACLE_BIN",
         "program": "mkdir",
         "manifest_key": "mkdir_version",
+        "toolkit": "GNU coreutils",
         "candidates": (
             "/usr/bin/mkdir",
             "/bin/mkdir",
@@ -85,9 +96,35 @@ SUITES: dict[str, dict[str, Any]] = {
             "/usr/local/opt/coreutils/libexec/gnubin/mkdir",
         ),
     },
+    # grep is not coreutils: it is its own GNU package and reports
+    # "grep (GNU grep) 3.12", so it needs its own version line. On macOS
+    # /usr/bin/grep is BSD grep, which is why the Homebrew locations are
+    # searched -- `brew install grep` installs both a gnubin/grep and a ggrep.
+    "grep": {
+        "env": "GREP_ORACLE_BIN",
+        "program": "grep",
+        "manifest_key": "grep_version",
+        "toolkit": "GNU grep",
+        "candidates": (
+            "/usr/bin/grep",
+            "/bin/grep",
+            "/opt/homebrew/opt/grep/libexec/gnubin/grep",
+            "/usr/local/opt/grep/libexec/gnubin/grep",
+            "/opt/homebrew/bin/ggrep",
+            "/usr/local/bin/ggrep",
+        ),
+    },
 }
 
 VERSION_LINE = re.compile(r"\(GNU coreutils\)\s+(?P<version>[0-9][0-9.]*)")
+# One pattern per toolkit. A suite's oracle must come from the toolkit its
+# goldens were frozen from: "GNU grep" and "GNU coreutils" are separate
+# projects on separate release schedules, so one version number says nothing
+# about the other.
+TOOLKIT_VERSION = {
+    "GNU coreutils": VERSION_LINE,
+    "GNU grep": re.compile(r"\(GNU grep\)\s+(?P<version>[0-9][0-9.]*)"),
+}
 
 
 class OracleError(SystemExit):
@@ -142,6 +179,17 @@ def coreutils_version(line: str) -> str | None:
     return match.group("version") if match else None
 
 
+def toolkit(suite: str) -> str:
+    """Which GNU project this suite's oracle must come from."""
+    return SUITES[suite].get("toolkit", "GNU coreutils")
+
+
+def program_version(suite: str, line: str) -> str | None:
+    """The version number in a --version line, per that suite's toolkit."""
+    match = TOOLKIT_VERSION[toolkit(suite)].search(line)
+    return match.group("version") if match else None
+
+
 def required_version(suite: str, suite_root: Path,
                      config_path: Path | None = None) -> str | None:
     """The version this suite's frozen corpus was produced from.
@@ -161,7 +209,7 @@ def required_version(suite: str, suite_root: Path,
     except (OSError, UnicodeError, json.JSONDecodeError):
         return None
     recorded = data.get(SUITES[suite]["manifest_key"])
-    return coreutils_version(str(recorded)) if recorded else None
+    return program_version(suite, str(recorded)) if recorded else None
 
 
 def verify(suite: str, suite_root: Path, binary: str,
@@ -175,29 +223,30 @@ def verify(suite: str, suite_root: Path, binary: str,
     if not (os.path.isfile(binary) and os.access(binary, os.X_OK)):
         env = SUITES[suite]["env"]
         problems.append(
-            f"{binary!r} is not an executable file. Point {env} at a GNU "
-            f"coreutils {SUITES[suite]['program']}, e.g. "
+            f"{binary!r} is not an executable file. Point {env} at a "
+            f"{toolkit(suite)} {SUITES[suite]['program']}, e.g. "
             f"{env}=/usr/bin/{SUITES[suite]['program']}"
         )
         return problems
 
     line = version_line(binary)
-    if "GNU coreutils" not in line:
+    wanted_toolkit = toolkit(suite)
+    if wanted_toolkit not in line:
         problems.append(
-            f"{binary!r} is not GNU coreutils (--version said {line!r}). "
+            f"{binary!r} is not {wanted_toolkit} (--version said {line!r}). "
             "BSD/BusyBox implementations differ in both behavior and "
             "diagnostics, so they cannot produce this suite's goldens."
         )
         return problems
 
-    found = coreutils_version(line)
+    found = program_version(suite, line)
     wanted = required_version(suite, suite_root, config_path)
     if wanted and found and found != wanted:
         problems.append(
             f"oracle version mismatch: this suite's frozen goldens were "
-            f"produced by GNU coreutils {wanted}, but {binary!r} is "
+            f"produced by {wanted_toolkit} {wanted}, but {binary!r} is "
             f"{found}. Diagnostic wording and some behavior differ between "
-            f"coreutils releases, so regenerating against {found} would "
+            f"releases, so regenerating against {found} would "
             f"change the benchmark rather than reproduce it. Either install "
             f"coreutils {wanted} and point {SUITES[suite]['env']} at it, or "
             f"re-pin deliberately (see the suite README)."

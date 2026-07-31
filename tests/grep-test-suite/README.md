@@ -22,8 +22,12 @@ earlier checkpoint's applicable cases as regression coverage, and never reaches
 a feature that does not exist yet. Base-tier cases (`flags: []`) run at every
 checkpoint.
 
-Coverage grows monotonically: 32 cases at 000, 40 at 001, 50 at 002, 65 at 003,
-82 at 004. `gen/verify.py` enforces both the growth and the non-emptiness.
+Coverage grows monotonically: 38 cases at 000, 44 at 001, 53 at 002, 67 at 003,
+82 at 004, out of 88 frozen. `gen/verify.py` enforces both the growth and the
+non-emptiness, and prints these counts. (000 through 003 include the
+`absent_flags` cases that assert a later flag is *not* implemented yet; each
+disappears at the checkpoint that introduces its flag, which is why the total
+selected at 004 is lower than the corpus.)
 
 `judge_candidate.sh` writes its runtime configuration to a throwaway file and
 never modifies the committed `config.json`, so it is safe to call repeatedly
@@ -31,35 +35,108 @@ from an experiment harness with no shared mutable state.
 
 ## Where the goldens come from
 
-The sort and mkdir suites freeze their goldens from a GNU oracle binary.
-`new_grep` has no oracle: it is a deliberately bounded utility whose contract
-comes from the checkpoint prompts, not from any shipping grep. In particular
-**PATTERN is a fixed byte string, not a regular expression**, so GNU grep is not
-a valid oracle for it.
+**78 of the 88 frozen cases are derived from a real GNU grep**, the same way the
+sort and mkdir suites use a real coreutils binary. The remaining 10 cannot come
+from any grep and are listed by name, with a reason each, in
+`suites/MANIFEST.json` under `model_only_cases`.
 
-`tests/reference_generators/grep_reference.py` is therefore the oracle — an executable restatement of the
-prompt contract. `gen/generate.py` derives every case's expected stdout, exit
-status and stderr class from it. Cases themselves are written in
+This suite previously claimed GNU grep could not be an oracle at all, because
+`new_grep`'s PATTERN is a literal byte string rather than a regular expression.
+That was incomplete: `grep -F` (`--fixed-strings`) treats PATTERN as a literal
+substring, which *is* `new_grep`'s matching contract.
+
+### Oracle contract
+
+Pinned to **GNU grep 3.12** (`oracle_version_required` in `config.json`, echoed
+as `grep_version` in `suites/MANIFEST.json`). Resolution order, matching the
+other suites: `--oracle-bin` > `$GREP_ORACLE_BIN` > `config.json`
+`paths.oracle_bin` > a conventional location. On Linux/WSL `/usr/bin/grep` is
+already GNU; on macOS the system grep is BSD, so `brew install grep` and point
+`GREP_ORACLE_BIN` at its `gnubin/grep` (or `ggrep`).
+
+Three invocation-level adjustments make a live grep speak this contract. Each
+was verified against the binary rather than assumed:
+
+| Adjustment | Why | What was observed |
+|---|---|---|
+| `-F` | PATTERN is literal bytes | `-F 'a.c'` selects only `a.c`; without `-F` it also selects `abc` and `aXc`. Same for `*`, `[`, `^`, `$`, `\`. An empty PATTERN selects every line |
+| `-a` | NUL bytes are ordinary data | Plain `-F` suppresses the line and reports "binary file matches" — on **stdout** in grep 3.0, on **stderr** in 3.12. `-a` prints the line with its NUL bytes intact, and is byte-identical to plain `-F` for input that has none |
+| `LC_ALL=C` | `-i` folds `A`–`Z` only | Under `C.UTF-8` a live grep also folds U+00C9/U+00E9 together; under `C` it does not. `LANG`, `LC_CTYPE` and `LC_COLLATE` are pinned too, since `LC_CTYPE` alone re-enables multibyte folding |
+
+Two contract points needed no adjustment and are confirmed rather than assumed:
+a match on a final line with **no trailing newline** is still emitted *with* one,
+and a **directory operand without `-r`** is a diagnosed error with exit 2.
+
+### `-r` order is computed, not taken from `grep -r`
+
+GNU grep's own recursive walk follows raw `readdir` order. The same tree
+produced two different orders on two hosts, and neither matched the contract
+(pre-order, ascending byte order of entry name). Freezing from `grep -r` would
+bake one filesystem's directory order into the benchmark.
+
+So `gen/oracle.py` computes the traversal itself and invokes the oracle **once
+per file, non-recursively**. Every byte of every emitted line still comes from
+the live grep; only the visiting order comes from the contract. Symlink handling
+needed no such treatment — GNU grep `-r` skips symlinks met during traversal,
+which is already what the contract says (verified: a symlink to a file is not
+read, a symlink to a directory is not descended).
+
+### The 10 cases a real grep cannot produce
+
+* **Nine argument-grammar cases.** `new_grep` implements five options and
+  rejects everything else, so a case asserting an option is *rejected* is a
+  statement about the bounded utility, not about fixed-string matching. This
+  covers `-Z`, `--colour` (a real GNU option), the no-arguments case, and the
+  six `absent_flags` cases — at checkpoint 000, `-H` must be an *unknown
+  option*, and no real grep will ever say so.
+* **`base-stdin-dash-is-an-operand-name`.** GNU grep reads standard input for
+  the operand `-`; `new_grep`'s contract makes `-` an ordinary pathname. A
+  genuine, unavoidable disagreement, so it is documented rather than forced —
+  the same way the mkdir suite documents its Darwin/Linux mode quirk.
+
+These keep goldens from `tests/reference_generators/grep_reference.py`, the
+executable restatement of the prompt contract. Cases themselves are written in
 `gen/curated_cases.py` as **inputs only**; no expectation is ever typed by hand.
 
-That makes the model a single point of failure, so it is audited from two
-independent directions:
+### How the two derivations are kept honest
 
-* **Freshness.** `gen/generate.py --check` fails if `suites/` differs by a byte
-  from what the current definitions and model produce.
+Freezing computes *both* the model's answer and the oracle's for every
+non-exempt case and **refuses to write anything if they differ**, naming the
+case and both outputs. Switching this suite to the oracle changed no golden at
+all: all 88 files came out byte-identical, and only `MANIFEST.json` gained the
+provenance fields.
+
+That equality is what lets the offline audit stay offline:
+
+* **Freshness.** `gen/generate.py --check` compares `suites/` against the
+  model-derived derivation. It needs no grep, so it still runs on any host —
+  and it is sound precisely because freezing refuses to write unless the model
+  reproduced the oracle byte for byte.
+* **Fitness.** Regenerating verifies the oracle twice: `oracle_contract.py`
+  checks it *is* GNU grep at the pinned version, and `gen/oracle.py --oracle-bin`
+  checks it *behaves* — a build can report the right version and still be
+  unusable. The Git-for-Windows grep 3.0 is GNU, reports a version, drops CR
+  from its output (text-mode build), and aborts outright under `LC_ALL=C -i`;
+  freezing against it silently produced three wrong goldens before the precheck
+  existed. The precheck also refuses a filesystem that ignores mode 0000 or
+  cannot create symlinks, and refuses to run as root, because each of those
+  turns a fault case into a passing one.
 * **Invariants.** `props.case_invariants()` asserts properties that hold however
   the golden was produced: exit status agrees with stdout (0 selected something,
   1 selected nothing, 2 carries a diagnostic), stdout ends with a newline, every
   emitted line really is a matching line of some input, and each case's declared
   `flags` match the options its argv actually uses.
 
-Run both, plus the config-immutability check, with:
+Run all of it with:
 
 ```bash
-tests/grep-test-suite/selfcheck.sh
+tests/grep-test-suite/selfcheck.sh                          # offline
+GREP_ORACLE_BIN=/usr/bin/grep tests/grep-test-suite/selfcheck.sh
 ```
 
-`selfcheck.sh` executes no candidate, so it runs anywhere.
+`selfcheck.sh` executes no candidate, so it runs anywhere. Its oracle pass
+reports "not verified on this host" where there is no GNU grep, but fails hard
+when `GREP_ORACLE_BIN` is set and unfit.
 
 ## Contract the cases encode
 
@@ -92,10 +169,9 @@ tests/grep-test-suite/
 ├── selfcheck.sh         # offline audit; runs no candidate
 ├── gen/
 │   ├── curated_cases.py # case inputs, grouped by checkpoint
-│   ├── generate.py      # freeze suites/ from the model
+│   ├── oracle.py        # live-grep harness + the fitness precheck
+│   ├── generate.py      # freeze suites/ from the oracle, cross-checked
 │   └── verify.py        # freshness + invariants + checkpoint reachability
-├── model/
-│   └── reference.py     # the specification model (the oracle)
 └── suites/
     ├── MANIFEST.json
     ├── base.json  with_filename.json  no_filename.json
@@ -106,10 +182,15 @@ tests/grep-test-suite/
 
 ```bash
 cd tests/grep-test-suite
-python3 gen/generate.py          # rewrite suites/
-python3 gen/generate.py --check  # fail if suites/ is stale
+GREP_ORACLE_BIN=/usr/bin/grep python3 gen/generate.py   # rewrite suites/
+python3 gen/generate.py --check  # fail if suites/ is stale (offline)
 python3 gen/verify.py            # full offline audit
+python3 gen/oracle.py --oracle-bin /usr/bin/grep   # is this host fit to freeze?
 ```
+
+Only the first of those needs a GNU grep. Regeneration writes the corpus with a
+pinned line terminator, so freezing on a different host cannot change the
+lineage configuration fingerprint without changing a golden.
 
 Editing `tests/reference_generators/grep_reference.py` changes the contract, and therefore the goldens.
 Do that only alongside the corresponding prompt change, and regenerate. Note

@@ -321,6 +321,43 @@ STAGE_MODES=()
 STAGE_FEATURE_CMDS=()
 STAGE_FLAGS=()
 STAGE_BUNDLE_FINGERPRINTS=()
+
+# How many elements a named stage array holds.
+#
+# Bash namerefs (`declare -n` / `local -n`) arrived in Bash 4.3 and do not exist
+# in Bash 3.2.57, which is the newest Bash Apple ships and therefore the shell
+# that runs this controller on Darwin -- a supported and required experiment
+# platform. `declare -n array_ref="$array_name"` there is
+# "declare: -n: invalid option" followed by "array_ref: unbound variable", so
+# the guard below aborted every macOS run at exactly the point it exists to
+# protect. Requiring a Homebrew Bash instead would make the experiment
+# unrunnable on a stock supported host.
+#
+# The lookup is an explicit case over the arrays this script itself declares:
+# only those fixed names resolve, an unrecognized name is an error rather than a
+# lookup, and no value -- least of all one that came out of the plan -- is ever
+# expanded as code. There is no eval here.
+#
+# The body is a subshell so `set +u` cannot leak into the caller: in Bash 3.2,
+# `${#array[@]}` on an EMPTY array is an "unbound variable" error under `set -u`,
+# and a zero count is precisely what this validation has to be able to observe.
+# Being a subshell, `exit` here ends only the lookup and never the controller --
+# it is used in place of `return`, whose behavior inside a subshell function body
+# is not something to rely on across Bash 3.2 and 5.x.
+stage_array_length() (
+    set +u
+    case "$1" in
+        STAGE_IDS)                 printf '%s' "${#STAGE_IDS[@]}" ;;
+        STAGE_NAMES)               printf '%s' "${#STAGE_NAMES[@]}" ;;
+        STAGE_PROMPTS)             printf '%s' "${#STAGE_PROMPTS[@]}" ;;
+        STAGE_MODES)               printf '%s' "${#STAGE_MODES[@]}" ;;
+        STAGE_FEATURE_CMDS)        printf '%s' "${#STAGE_FEATURE_CMDS[@]}" ;;
+        STAGE_FLAGS)               printf '%s' "${#STAGE_FLAGS[@]}" ;;
+        STAGE_BUNDLE_FINGERPRINTS) printf '%s' "${#STAGE_BUNDLE_FINGERPRINTS[@]}" ;;
+        *) exit 1 ;;
+    esac
+)
+
 # Fields are separated by ASCII US (0x1f), not tab. Tab is IFS *whitespace*, so
 # `IFS=$'\t' read` collapses runs of tabs and drops empty fields: checkpoint 000
 # has an empty cumulative flag list, so its record ended `...<TAB><TAB><hash>`,
@@ -341,7 +378,8 @@ while IFS=$'\x1f' read -r stage_id stage_name stage_prompt stage_mode stage_cmd 
     STAGE_BUNDLE_FINGERPRINTS+=("$stage_bundle_fingerprint")
 done <<<"$STAGE_TABLE"
 
-STAGE_COUNT=${#STAGE_IDS[@]}
+STAGE_COUNT="$(stage_array_length STAGE_IDS)" ||
+    die "internal error: STAGE_IDS is not a known stage array"
 [[ "$STAGE_COUNT" -gt 0 ]] || die "manifest for $UTILITY resolved to zero checkpoints"
 
 # A plan-loading defect must be caught HERE -- before any lineage directory or
@@ -350,10 +388,10 @@ STAGE_COUNT=${#STAGE_IDS[@]}
 # lost the comparison later, after the run had already begun.
 for array_name in STAGE_NAMES STAGE_PROMPTS STAGE_MODES STAGE_FEATURE_CMDS \
                   STAGE_FLAGS STAGE_BUNDLE_FINGERPRINTS; do
-    declare -n array_ref="$array_name"
-    [[ "${#array_ref[@]}" -eq "$STAGE_COUNT" ]] || die \
-        "stage plan is malformed: $array_name has ${#array_ref[@]} entries but $STAGE_COUNT checkpoints were declared (the plan record format and this reader disagree)"
-    unset -n array_ref
+    array_length="$(stage_array_length "$array_name")" ||
+        die "internal error: $array_name is not a known stage array"
+    [[ "$array_length" -eq "$STAGE_COUNT" ]] || die \
+        "stage plan is malformed: $array_name has $array_length entries but $STAGE_COUNT checkpoints were declared (the plan record format and this reader disagree)"
 done
 
 for (( check_index = 0; check_index < STAGE_COUNT; check_index++ )); do

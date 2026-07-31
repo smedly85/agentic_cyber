@@ -3108,6 +3108,53 @@ class StagePlanValidationTests(unittest.TestCase):
         )
         return result, output
 
+    def run_controller(self, *arguments: str,
+                       output: Path) -> subprocess.CompletedProcess:
+        """Run the controller against the REAL, uncorrupted stage plan."""
+        return subprocess.run(
+            [self.bash,
+             str(REPO_ROOT / "scripts" / "run_lineage_experiment.sh"),
+             "--utility", "grep", "--model", "demo/m", "--temperature", "0",
+             "--lineages", "3", "--output-dir", self.posix(output), *arguments],
+            cwd=str(REPO_ROOT), capture_output=True, text=True,
+            env={**os.environ, "PYTHON_BIN": sys.executable},
+        )
+
+    def assert_nothing_started(self, output: Path) -> None:
+        """A preflight failure may leave no trace of a started lineage."""
+        for pattern in ("lineage-*", "lineage.json", "lineages.json"):
+            with self.subTest(pattern=pattern):
+                self.assertEqual(
+                    [] if not output.exists() else list(output.rglob(pattern)), [],
+                    f"{pattern} exists after a preflight failure",
+                )
+
+    # --- the valid plan must still pass ------------------------------------
+
+    def test_the_real_stage_arrays_pass_validation(self):
+        """The guard is only useful if a correct plan walks straight through."""
+        output = self.temp / "valid-plan"
+        result = self.run_controller("--print-plan", output=output)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("stage plan is malformed", result.stderr)
+        # --print-plan exits after the guard and before the output directory is
+        # created, so reaching it at all proves the guard passed.
+        self.assertFalse(output.exists())
+
+    def test_a_dry_run_passes_validation_and_indexes_every_checkpoint(self):
+        output = self.temp / "valid-dry"
+        result = self.run_controller("--dry-run", output=output)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("stage plan is malformed", result.stderr)
+        checkpoints = lineage_plan.resolve_plan(
+            REPO_ROOT, "grep", "demo/m", "0", "build", 3, 1800
+        )["checkpoints"]
+        invocations = [line for line in result.stdout.splitlines()
+                       if "run_experiment.sh" in line]
+        self.assertEqual(len(invocations), 3 * len(checkpoints),
+                         "every checkpoint of every lineage must be reached")
+        self.assertFalse(output.exists())
+
     def test_an_empty_fingerprint_aborts_before_any_lineage_exists(self):
         """Exactly the state the old tab bug produced."""
         row = "\x1f".join(["000", "base", "prompts/grep/000_base_new_grep.md",
@@ -3115,13 +3162,7 @@ class StagePlanValidationTests(unittest.TestCase):
         result, output = self.run_with_corrupt_stage_table(row + "\n")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("empty test-bundle fingerprint", result.stderr)
-        self.assertEqual(
-            [] if not output.exists() else list(output.glob("lineage-*")), [],
-            "no lineage directory may be created by a plan-loading failure",
-        )
-        self.assertEqual(
-            [] if not output.exists() else list(output.rglob("lineage.json")), [],
-        )
+        self.assert_nothing_started(output)
 
     def test_a_malformed_fingerprint_aborts_before_any_lineage_exists(self):
         row = "\x1f".join(["000", "base", "prompts/grep/000_base_new_grep.md",
@@ -3129,8 +3170,7 @@ class StagePlanValidationTests(unittest.TestCase):
         result, output = self.run_with_corrupt_stage_table(row + "\n")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("not a SHA-256 hex digest", result.stderr)
-        self.assertEqual(
-            [] if not output.exists() else list(output.glob("lineage-*")), [])
+        self.assert_nothing_started(output)
 
     def test_a_short_record_aborts_rather_than_shifting_fields(self):
         """A record missing its last field must not silently proceed."""
@@ -3138,8 +3178,22 @@ class StagePlanValidationTests(unittest.TestCase):
                            "new", "cmd", ""])
         result, output = self.run_with_corrupt_stage_table(row + "\n")
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(
-            [] if not output.exists() else list(output.glob("lineage-*")), [])
+        self.assert_nothing_started(output)
+
+    def test_the_guard_itself_never_fails_on_the_interpreter(self):
+        """A guard that cannot run is worse than no guard.
+
+        `declare: -n: invalid option` and `array_ref: unbound variable` are how
+        this block failed on Darwin's Bash 3.2, and both went to stderr while
+        the run aborted -- so the absence of those messages is what separates a
+        working guard from one that merely happens to stop the run.
+        """
+        output = self.temp / "interpreter"
+        result = self.run_controller("--print-plan", output=output)
+        for message in ("invalid option", "unbound variable", "array_ref",
+                        "declare:", "not a known stage array"):
+            with self.subTest(message=message):
+                self.assertNotIn(message, result.stderr)
 
     def test_the_validation_precedes_lineage_creation_in_the_source(self):
         text = (REPO_ROOT / "scripts"
@@ -3157,6 +3211,243 @@ class StagePlanValidationTests(unittest.TestCase):
         self.assertIn(
             '[[ "$built_fingerprint" == "$stage_bundle_fingerprint" ]] || die',
             text)
+
+
+def system_bash() -> str | None:
+    """The Bash a stock host runs the controller with, if it has one.
+
+    Deliberately not `shutil.which("bash")`: macOS ships Bash 3.2.57 at
+    /bin/bash and nothing newer, and a Homebrew bash earlier on PATH is exactly
+    what would hide a 4.x-only construct from these tests. Darwin is a supported
+    and required experiment platform, so the OS shell is the one that matters.
+    """
+    path = Path("/bin/bash")
+    return str(path) if path.is_file() else None
+
+
+class StageArrayPreflightTests(unittest.TestCase):
+    """The pre-lineage stage-array guard, lifted from the controller and run.
+
+    Vessel (Darwin, Bash 3.2.57) reported `declare: -n: invalid option` and
+    `array_ref: unbound variable` from this block. Namerefs are Bash 4.3+, so
+    the guard aborted every macOS run at precisely the point it exists to
+    protect -- a validation that cannot execute is not fail-closed, it is
+    unrunnable.
+
+    The guard's source is extracted from the controller rather than
+    reimplemented here, so this cannot drift away from what actually runs, and
+    the arrays are fabricated so the malformed shapes the reader could produce
+    can be exercised directly.
+    """
+
+    MAINTAINED_SCRIPTS = ("run_lineage_experiment.sh", "run_experiment.sh")
+    IDS = ["000", "001", "002"]
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bash = shutil.which("bash")
+        if not cls.bash:
+            raise unittest.SkipTest("bash is required")
+
+    @staticmethod
+    def region(text: str, start: str, end: str) -> str:
+        begin = text.index(start)
+        return text[begin:text.index(end, begin) + len(end)]
+
+    def controller_text(self) -> str:
+        return (REPO_ROOT / "scripts"
+                / "run_lineage_experiment.sh").read_text(encoding="utf-8")
+
+    def preflight_source(self) -> str:
+        """The length lookup plus both validation loops, verbatim."""
+        text = self.controller_text()
+        return "".join((
+            self.region(text, "stage_array_length() (", "\n)\n"),
+            self.region(text, "for array_name in", "\ndone\n"),
+            self.region(text, "for (( check_index", "\ndone\n"),
+        ))
+
+    @staticmethod
+    def bash_array(name: str, values: list[str]) -> str:
+        quoted = " ".join("'" + value.replace("'", "'\\''") + "'"
+                          for value in values)
+        return f"{name}=({quoted})\n"
+
+    def fingerprints(self) -> list[str]:
+        return [sha256_text(f"bundle-{checkpoint}") for checkpoint in self.IDS]
+
+    def run_preflight(self, *, flags: list[str] | None = None,
+                      fingerprints: list[str] | None = None
+                      ) -> subprocess.CompletedProcess:
+        arrays = {
+            "STAGE_IDS": self.IDS,
+            "STAGE_NAMES": ["base", "one", "two"],
+            "STAGE_PROMPTS": [f"prompts/demo/{i}.md" for i in self.IDS],
+            "STAGE_MODES": ["new", "existing", "existing"],
+            "STAGE_FEATURE_CMDS": ["judge x", "judge x -a", "judge x -a -b"],
+            # Checkpoint 000's cumulative flag list is empty -- the field whose
+            # collapse under tab-splitting caused the original defect.
+            "STAGE_FLAGS": ["", "-a", "-a,-b"] if flags is None else flags,
+            "STAGE_BUNDLE_FINGERPRINTS": (
+                self.fingerprints() if fingerprints is None else fingerprints
+            ),
+        }
+        script = (
+            "set -uo pipefail\n"
+            "die() { printf 'error: %s\\n' \"$*\" >&2; exit 2; }\n"
+            + "".join(self.bash_array(name, values)
+                      for name, values in arrays.items())
+            + f"STAGE_COUNT={len(self.IDS)}\n"
+            + self.preflight_source()
+            + "printf 'preflight-passed\\n'\n"
+        )
+        return subprocess.run([self.bash, "-c", script],
+                             capture_output=True, text=True)
+
+    # --- the four shapes the guard must decide -----------------------------
+
+    def test_valid_stage_arrays_pass(self):
+        result = self.run_preflight()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("preflight-passed", result.stdout)
+        self.assertEqual(result.stderr, "")
+
+    def test_a_short_stage_array_fails(self):
+        result = self.run_preflight(flags=["", "-a"])
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("stage plan is malformed", result.stderr)
+        self.assertIn("STAGE_FLAGS has 2 entries but 3 checkpoints",
+                      result.stderr)
+        self.assertNotIn("preflight-passed", result.stdout)
+
+    def test_an_empty_fingerprint_fails(self):
+        fingerprints = self.fingerprints()
+        fingerprints[1] = ""
+        result = self.run_preflight(fingerprints=fingerprints)
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("checkpoint 001 has an empty test-bundle fingerprint",
+                      result.stderr)
+        self.assertNotIn("preflight-passed", result.stdout)
+
+    def test_a_malformed_fingerprint_fails(self):
+        for bad in ("not-a-sha256", "ABCDEF" + "0" * 58, "0" * 63, "0" * 65):
+            fingerprints = self.fingerprints()
+            fingerprints[2] = bad
+            with self.subTest(fingerprint=bad):
+                result = self.run_preflight(fingerprints=fingerprints)
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn("not a SHA-256 hex digest", result.stderr)
+                self.assertNotIn("preflight-passed", result.stdout)
+
+    # --- how the guard is implemented --------------------------------------
+
+    def test_no_maintained_script_depends_on_a_bash_nameref(self):
+        # Comment lines are excluded: the controller explains at length the
+        # nameref it no longer uses, and an explanation is not a dependency.
+        constructs = ("declare -n", "local -n", "typeset -n", "unset -n")
+        for name in self.MAINTAINED_SCRIPTS:
+            text = (REPO_ROOT / "scripts" / name).read_text(encoding="utf-8")
+            offenders = [
+                line.strip()
+                for line in text.splitlines()
+                if not line.lstrip().startswith("#")
+                and any(construct in line for construct in constructs)
+            ]
+            with self.subTest(script=name):
+                self.assertEqual(
+                    offenders, [],
+                    "namerefs are Bash 4.3+; Darwin's /bin/bash is 3.2.57",
+                )
+
+    def test_the_lookup_is_an_explicit_case_over_the_known_arrays(self):
+        source = self.region(self.controller_text(),
+                             "stage_array_length() (", "\n)\n")
+        self.assertIn("case ", source)
+        for name in ("STAGE_IDS", "STAGE_NAMES", "STAGE_PROMPTS", "STAGE_MODES",
+                     "STAGE_FEATURE_CMDS", "STAGE_FLAGS",
+                     "STAGE_BUNDLE_FINGERPRINTS"):
+            with self.subTest(array=name):
+                self.assertIn(f"{name})", source)
+
+    def test_the_lookup_evaluates_nothing(self):
+        """A name-to-value lookup must not become arbitrary execution."""
+        self.assertNotIn("eval", self.preflight_source())
+
+    def test_an_unknown_array_name_is_an_error_rather_than_a_lookup(self):
+        script = (
+            "set -uo pipefail\n"
+            + self.region(self.controller_text(),
+                          "stage_array_length() (", "\n)\n")
+            + "STAGE_IDS=(a b)\n"
+            "stage_array_length NOT_A_STAGE_ARRAY && printf 'resolved\\n'\n"
+            "printf 'status=%s\\n' \"$?\"\n"
+        )
+        result = subprocess.run([self.bash, "-c", script],
+                                capture_output=True, text=True)
+        self.assertIn("status=1", result.stdout)
+        self.assertNotIn("resolved", result.stdout)
+
+    def test_counting_an_empty_array_does_not_trip_set_u(self):
+        """Bash 3.2 raises "unbound variable" for `${#a[@]}` on an empty array
+        under `set -u`, and zero is the count this guard must be able to see."""
+        script = (
+            "set -uo pipefail\n"
+            + self.region(self.controller_text(),
+                          "stage_array_length() (", "\n)\n")
+            + "STAGE_FLAGS=()\n"
+            "printf 'count=%s\\n' \"$(stage_array_length STAGE_FLAGS)\"\n"
+            # The subshell body must not leak `set +u` back to the caller.
+            "printf 'nounset=%s\\n' \"$(set -o | grep nounset)\"\n"
+        )
+        result = subprocess.run([self.bash, "-c", script],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("count=0", result.stdout)
+        self.assertIn("on", result.stdout.split("nounset=")[1])
+
+
+class SystemBashStageArrayPreflightTests(StageArrayPreflightTests):
+    """The same guard under /bin/bash -- on Darwin, Bash 3.2.57 itself.
+
+    Skipped where the OS has no /bin/bash; on macOS it is the one interpreter
+    the controller is actually required to work with.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bash = system_bash()
+        if not cls.bash:
+            raise unittest.SkipTest("/bin/bash is not present on this host")
+
+    def test_the_interpreter_is_the_operating_system_bash(self):
+        self.assertEqual(self.bash, "/bin/bash")
+
+    def test_it_runs_whatever_bash_version_the_operating_system_ships(self):
+        """No minimum version, and no Homebrew Bash, may be required."""
+        result = subprocess.run(
+            [self.bash, "-c",
+             'printf "%s.%s" "${BASH_VERSINFO[0]}" "${BASH_VERSINFO[1]}"'],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stdout, r"^\d+\.\d+$")
+        self.assertEqual(self.run_preflight().returncode, 0,
+                         f"the guard must run under Bash {result.stdout}")
+
+
+class SystemBashStagePlanValidationTests(StagePlanValidationTests):
+    """The whole controller preflight under /bin/bash rather than PATH's bash.
+
+    Everything inherited runs again against the OS shell: the valid plan passes,
+    a short record, an empty fingerprint and a malformed fingerprint each abort,
+    and none of them leaves a lineage directory or a lineage.json behind.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bash = system_bash()
+        if not cls.bash:
+            raise unittest.SkipTest("/bin/bash is not present on this host")
 
 
 class SuiteReproducibilityTests(unittest.TestCase):
