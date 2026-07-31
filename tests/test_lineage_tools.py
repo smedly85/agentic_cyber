@@ -1747,6 +1747,140 @@ def maintained_shell_scripts() -> list[Path]:
     ]
 
 
+class SamplingParameterSurfaceTests(unittest.TestCase):
+    """The sampling knobs must be real, recorded, and refused when they are not.
+
+    Measured against OpenCode 1.18.9 by pointing its provider at a recording
+    HTTP endpoint: temperature, top_p, seed and max_tokens all reach the
+    request body from the agent block, and temperature reaches it ONLY when the
+    model declares the capability -- which a config-defined model does not do by
+    default. These assertions pin the wiring that measurement justified.
+    """
+
+    RUNNER = REPO_ROOT / "scripts" / "run_experiment.sh"
+
+    def setUp(self):
+        self.text = self.RUNNER.read_text(encoding="utf-8")
+
+    def test_each_confirmed_knob_has_a_flag(self):
+        for flag in ("--top-p", "--sampling-seed", "--max-tokens"):
+            with self.subTest(flag=flag):
+                self.assertIn(f"{flag})", self.text)
+
+    def test_the_sampling_seed_flag_is_not_called_seed(self):
+        """--seed-file is the source-inheritance file; the senses must not mix."""
+        self.assertIn('--sampling-seed) SAMPLING_SEED=', self.text)
+        # `--seed` exists only to refuse the ambiguous spelling: it must never
+        # assign anything.
+        self.assertIn("--seed is ambiguous here", self.text)
+        seed_arm = self.text.split("--seed)", 1)[1].split(";;", 1)[0]
+        self.assertNotIn("=", seed_arm.replace("--seed-file", ""))
+
+    def test_top_k_is_refused_rather_than_silently_recorded(self):
+        """It reaches the body but the OpenAI-compatible API has no top_k, so
+        the server drops it. A recorded condition the server ignored would be
+        worse than no flag."""
+        self.assertIn("--top-k is not supported", self.text)
+        self.assertNotIn('"top_k"', self.text)
+
+    def test_the_temperature_capability_is_declared(self):
+        """Without this, OpenCode discards the agent's temperature for any
+        config-defined model -- which is every model this harness uses."""
+        self.assertIn('model_entry = {"temperature": True}', self.text)
+        self.assertIn('config["provider"] = {provider_id: {"models"', self.text)
+
+    def test_every_knob_is_recorded_where_temperature_is(self):
+        """Three record sites, the same three temperature already reaches:
+        sweep.json, experiment.json and each attempt's metadata.json (which is
+        what becomes a per_run_metrics.csv column)."""
+        for key in ("top_p", "sampling_seed", "max_tokens"):
+            with self.subTest(key=key):
+                self.assertEqual(
+                    self.text.count(f'{key} "$(optional_number "$'), 3,
+                    f"{key} must be written to all three records",
+                )
+        # experiment.json also states that the capability was declared, so a
+        # record written before the fix is distinguishable from one after it.
+        self.assertIn("temperature_capability_declared true", self.text)
+
+    def test_unset_knobs_are_recorded_as_null_not_omitted(self):
+        self.assertIn("__JSON__:null", self.text)
+        self.assertIn("optional_number()", self.text)
+
+    def test_the_resume_guard_covers_the_new_knobs(self):
+        """Resuming into a directory sampled under different settings is the
+        same mistake as resuming at a different temperature."""
+        for key in ("top_p", "sampling_seed", "max_tokens"):
+            with self.subTest(key=key):
+                self.assertIn(f'"{key}": None if', self.text)
+
+    def test_the_help_documents_the_flags_and_the_omission(self):
+        for fragment in ("--top-p P", "--sampling-seed N", "--max-tokens N",
+                         "There is no --top-k"):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, self.text)
+
+
+class PromptAutomationNoticeTests(unittest.TestCase):
+    """The automation notice is one shared block, referenced by all three
+    templates rather than pasted into each.
+
+    It is a documented change to something the design holds constant across
+    every prompt, so it has to be identifiable as a harness addition in the
+    template itself -- not folded invisibly into the task description.
+    """
+
+    SHARED = REPO_ROOT / "prompts" / "_shared" / "automation_notice.md"
+    TEMPLATES = (
+        REPO_ROOT / "prompts" / "checkpoint_base_template.md",
+        REPO_ROOT / "prompts" / "checkpoint_feature_template.md",
+        REPO_ROOT / "prompts" / "repair_continuation_template.md",
+    )
+
+    @staticmethod
+    def unwrapped(path: Path) -> str:
+        """The prose with line wrapping collapsed, so an assertion is about
+        the wording rather than about where the lines happen to break."""
+        return " ".join(path.read_text(encoding="utf-8").split())
+
+    def test_the_shared_block_exists_and_says_what_it_is_for(self):
+        text = self.unwrapped(self.SHARED)
+        for phrase in ("fully automated and non-interactive",
+                       "No user is available",
+                       "most reasonable interpretation",
+                       "Do not produce an extended plan"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, text)
+
+    def test_the_block_is_marked_as_a_harness_addition(self):
+        text = self.unwrapped(self.SHARED)
+        self.assertIn("DELIBERATE ADDITION", text)
+        self.assertIn("not part of any utility's task description", text)
+
+    def test_every_template_references_it_by_placeholder(self):
+        for template in self.TEMPLATES:
+            text = template.read_text(encoding="utf-8")
+            with self.subTest(template=template.name):
+                self.assertIn("[AUTOMATION_NOTICE]", text)
+                self.assertIn("SHARED BLOCK", text)
+                self.assertIn("prompts/_shared/automation_notice.md", text)
+
+    def test_no_template_inlines_the_text(self):
+        """Three copies would drift, and 'held constant across every prompt'
+        would quietly stop being true."""
+        for template in self.TEMPLATES:
+            text = template.read_text(encoding="utf-8")
+            with self.subTest(template=template.name):
+                self.assertNotIn("This session is fully automated", text)
+
+    def test_the_notice_changes_no_utility_behavior(self):
+        """It must describe how the session runs, not what to implement."""
+        text = self.unwrapped(self.SHARED)
+        for leak in ("mkdir", "new_sort", "new_grep", "chmod", "-p", "-R"):
+            with self.subTest(leak=leak):
+                self.assertNotIn(f" {leak} ", text)
+
+
 class ShellLineEndingTests(unittest.TestCase):
     """`.gitattributes` says `*.sh text eol=lf`, but it was added after these
     files were committed and git never renormalized the existing blobs. Every

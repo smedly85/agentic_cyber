@@ -1,3 +1,10 @@
+<!-- SHARED BLOCK — harness addition, not part of the task description.
+     Expand [AUTOMATION_NOTICE] below from prompts/_shared/automation_notice.md,
+     verbatim and identically in all three templates. Do not inline the text
+     here: one source, no drift. -->
+
+[AUTOMATION_NOTICE]
+
 # Task: Create the initial [PROGRAM] utility
 
 Create a small [LANGUAGE] command-line program named:

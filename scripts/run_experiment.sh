@@ -63,6 +63,23 @@ Temperature:
                              Mutually exclusive with the options above.
   --runs N                   Attempts per temperature point (default: 1)
 
+Other sampling parameters (each optional; unset means the flag is absent from
+the request and the server's own default applies, which is the behavior before
+these flags existed):
+  --top-p P                  Nucleus sampling mass, 0 <= P <= 1. Sent as
+                             top_p.
+  --sampling-seed N          Pseudorandom seed for token selection, N >= 0.
+                             Sent as seed. Deliberately NOT called --seed:
+                             --seed-file is the checkpoint source-inheritance
+                             file and the two senses must not be confused.
+  --max-tokens N             Cap on generated tokens per session, N >= 1. Sent
+                             as max_tokens, replacing the model's own output
+                             limit.
+
+                             There is no --top-k. See the SAMPLING PARAMETERS
+                             note in this script for the measurements behind
+                             that omission.
+
 Generation and repair:
   --max-loops N              Continuation sessions after the initial
                              generation (default: 3). 0 disables repair.
@@ -161,6 +178,18 @@ slugify() {
 timestamp() {
     # Portable across BSD and GNU date; `date --iso-8601` is GNU-only.
     date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+# An optional sampling knob, for write_metadata. Recorded as null when it was
+# not requested rather than omitted: a reader can then tell "left to the
+# server's default" from "this record predates the flag", and the CSV the
+# analyzer derives from these files keeps a stable column set either way.
+optional_number() {
+    if [[ -n "$1" ]]; then
+        printf '%s' "$1"
+    else
+        printf '__JSON__:null'
+    fi
 }
 
 write_metadata() {
@@ -377,6 +406,14 @@ TEMP_LIST=""
 # Tracked separately so `--temp-list ""` is rejected as the mistake it is
 # rather than silently falling through to the --temp-min/--temp-max path.
 TEMP_LIST_SET=0
+# Optional sampling parameters. Empty means "not requested": the key is left
+# out of the OpenCode agent block entirely, so the server default applies and
+# behavior matches a run from before these flags existed. See the SAMPLING
+# PARAMETERS note above the per-attempt config builder for what each one is
+# measured to do.
+TOP_P=""
+SAMPLING_SEED=""
+MAX_TOKENS=""
 RUNS=1
 MAX_LOOPS=3
 REPAIR_TEMPLATE=""
@@ -412,6 +449,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --model|--prompt|--source|--source-mode|--temperature|--temp-min| \
         --temp-max|--temp-points|--temp-list|--runs|--max-loops| \
+        --top-p|--sampling-seed|--max-tokens| \
         --repair-prompt|--agent| \
         --test-dir|--seed-file|--keep-glob|--build-cmd|--base-test-cmd| \
         --feature-test-cmd|--test-cmd|--extra-test-cmd|--timeout|--output-dir| \
@@ -433,6 +471,23 @@ while [[ $# -gt 0 ]]; do
         --temp-points) TEMP_POINTS="${2:-}"; shift 2 ;;
         --temp-list) TEMP_LIST="${2:-}"; TEMP_LIST_SET=1; shift 2 ;;
         --runs) RUNS="${2:-}"; shift 2 ;;
+        --top-p) TOP_P="${2:-}"; shift 2 ;;
+        --sampling-seed) SAMPLING_SEED="${2:-}"; shift 2 ;;
+        --max-tokens) MAX_TOKENS="${2:-}"; shift 2 ;;
+        --top-k)
+            # Measured, not assumed: OpenCode does put an agent-level top_k on
+            # the wire, but it arrives at an OpenAI-compatible /v1/chat/
+            # completions endpoint, whose schema has no top_k -- Ollama parses
+            # a fixed field set there and ignores the rest. Reaching Ollama's
+            # sampler would require its native /api/chat "options" object,
+            # which OpenCode's @ai-sdk/openai-compatible provider never speaks.
+            # A flag that is accepted, recorded and silently ignored by the
+            # server is worse than no flag, so this one refuses instead.
+            die "--top-k is not supported: top_k is not part of the OpenAI-compatible chat API that OpenCode speaks to Ollama, so it would be accepted here and ignored by the server (see the SAMPLING PARAMETERS note in this script)" ;;
+        --seed)
+            # --seed-file is the checkpoint source-inheritance file. The two
+            # senses of "seed" must never collide in this harness.
+            die "--seed is ambiguous here: use --sampling-seed for the token-selection seed, or --seed-file for the inherited source file" ;;
         --max-loops) MAX_LOOPS="${2:-}"; shift 2 ;;
         --repair-prompt) REPAIR_TEMPLATE="${2:-}"; shift 2 ;;
         --allow-no-progress) ALLOW_NO_PROGRESS=1; shift ;;
@@ -559,6 +614,29 @@ PY
 [[ "$TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || die "--timeout must be a non-negative integer"
 [[ "$SOURCE_MODE" == "existing" || "$SOURCE_MODE" == "new" ]] ||
     die "--source-mode must be existing or new"
+
+# Optional sampling parameters. Validated here so a typo fails before any
+# session starts rather than being recorded as a run condition that the server
+# then rejected or ignored.
+if [[ -n "$TOP_P" ]]; then
+    # stderr discarded so a non-numeric value reports the usage error rather
+    # than a Python traceback.
+    "$PYTHON_BIN" -c '
+import sys
+
+value = float(sys.argv[1])
+if not 0.0 <= value <= 1.0:
+    raise SystemExit(1)
+' "$TOP_P" 2>/dev/null || die "--top-p must be a number between 0 and 1 inclusive"
+fi
+if [[ -n "$SAMPLING_SEED" ]]; then
+    [[ "$SAMPLING_SEED" =~ ^[0-9]+$ ]] ||
+        die "--sampling-seed must be a non-negative integer (it is the token-selection seed, not --seed-file)"
+fi
+if [[ -n "$MAX_TOKENS" ]]; then
+    [[ "$MAX_TOKENS" =~ ^[1-9][0-9]*$ ]] ||
+        die "--max-tokens must be a positive integer"
+fi
 
 "$PYTHON_BIN" - "$SOURCE_PATH" <<'PY' ||
 import sys
@@ -830,6 +908,9 @@ write_metadata "$OUTPUT_DIR/sweep.json" \
     temp_max "$TEMP_MAX" \
     temp_points "$TEMP_POINTS" \
     temp_list "$TEMP_LIST" \
+    top_p "$(optional_number "$TOP_P")" \
+    sampling_seed "$(optional_number "$SAMPLING_SEED")" \
+    max_tokens "$(optional_number "$MAX_TOKENS")" \
     runs_per_temperature "$RUNS" \
     max_loops "$MAX_LOOPS" \
     test_dirs "$TEST_DIRS_JOINED" \
@@ -878,7 +959,9 @@ for temperature in "${TEMPERATURES_ARR[@]}"; do
                 "$EXTRA_TEST_CMD" \
                 "$RESOLVED_ARCHITECTURE_THRESHOLD" \
                 "$RESOLVED_STRATEGY_THRESHOLD" \
-                "${ANALYSIS_DIVERSITY_K_MAX:-__NONE__}" <<'PY'
+                "${ANALYSIS_DIVERSITY_K_MAX:-__NONE__}" \
+                "${TOP_P:-__NONE__}" "${SAMPLING_SEED:-__NONE__}" \
+                "${MAX_TOKENS:-__NONE__}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -900,10 +983,19 @@ data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
     architecture_threshold,
     strategy_threshold,
     diversity_k_max,
+    top_p,
+    sampling_seed,
+    max_tokens,
 ) = sys.argv[2:]
 expected = {
     "model": model,
     "temperature": float(temperature),
+    # Sampling conditions are part of what an attempt directory means, so
+    # resuming into one with a different knob is the same mistake as resuming
+    # into one at a different temperature.
+    "top_p": None if top_p == "__NONE__" else float(top_p),
+    "sampling_seed": None if sampling_seed == "__NONE__" else int(sampling_seed),
+    "max_tokens": None if max_tokens == "__NONE__" else int(max_tokens),
     "agent": agent,
     "prompt": prompt,
     "source_path": source_path,
@@ -946,6 +1038,10 @@ PY
         repository_commit "$REPO_COMMIT" \
         model "$MODEL" \
         temperature "$temperature" \
+        top_p "$(optional_number "$TOP_P")" \
+        sampling_seed "$(optional_number "$SAMPLING_SEED")" \
+        max_tokens "$(optional_number "$MAX_TOKENS")" \
+        temperature_capability_declared true \
         agent "$AGENT" \
         prompt "$PROMPT_ABS" \
         prompt_copy "$experiment_dir/prompt.md" \
@@ -1030,9 +1126,42 @@ PY
         [[ "$sandbox_root" == "$(cd "$workdir" && pwd -P)" ]] ||
             die "sandbox boundary not established for $workdir (root=$sandbox_root)"
 
+        # ---- SAMPLING PARAMETERS -----------------------------------------
+        #
+        # Measured against OpenCode 1.18.9 with @ai-sdk/openai-compatible, by
+        # pointing the provider at a recording HTTP endpoint and reading the
+        # request body it actually sent. Every claim below is an observation,
+        # not a reading of the AI SDK's option list.
+        #
+        #   temperature   agent.<name>.temperature  ->  body.temperature
+        #                 ONLY when the model declares the capability (below).
+        #   top_p         agent.<name>.top_p        ->  body.top_p
+        #   seed          agent.<name>.seed         ->  body.seed
+        #   max_tokens    agent.<name>.max_tokens   ->  body.max_tokens
+        #                 (otherwise the model's own output limit is sent)
+        #
+        # top_k is deliberately absent. It does reach the body from the same
+        # agent object, but the body is an OpenAI-compatible
+        # /v1/chat/completions request, and that API has no top_k: Ollama
+        # parses a fixed field set there and drops the rest. Its sampler is
+        # only reachable through the native /api/chat "options" object, which
+        # this provider never speaks. So --top-k is refused rather than
+        # recorded as a condition the server ignored.
+        #
+        # THE CAPABILITY DECLARATION IS NOT COSMETIC. OpenCode gates
+        # temperature on model.capabilities.temperature, which defaults to
+        # FALSE for any model defined in config rather than resolved from its
+        # own catalog -- which is every model this harness uses. Without the
+        # declaration below, the agent block's temperature is dropped before
+        # the request is built and the server applies its own default. It was
+        # measured absent from the request body in exactly the configuration
+        # this harness shipped. Declaring the capability is what makes
+        # --temperature real; runs recorded before this change carry a
+        # temperature they did not actually sample at.
         ATTEMPT_OPENCODE_CONFIG_CONTENT="$(
             "$PYTHON_BIN" - "$AGENT" "$temperature" "$workdir" \
-                "$REMOTE_BASE_URL" "$REMOTE_API_KEY_ENV" "$MODEL" <<'PY'
+                "$REMOTE_BASE_URL" "$REMOTE_API_KEY_ENV" "$MODEL" \
+                "$TOP_P" "$SAMPLING_SEED" "$MAX_TOKENS" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -1043,6 +1172,9 @@ workdir = str(Path(sys.argv[3]).resolve())
 remote_base_url = sys.argv[4]
 remote_api_key_env = sys.argv[5]
 model = sys.argv[6]
+top_p = sys.argv[7]
+sampling_seed = sys.argv[8]
+max_tokens = sys.argv[9]
 
 escaped_workdir = workdir.replace(" ", r"\ ")
 external_directory = {
@@ -1055,6 +1187,21 @@ if escaped_workdir != workdir:
     external_directory[escaped_workdir] = "allow"
     external_directory[f"{escaped_workdir}/**"] = "allow"
 
+agent_block = {
+    "temperature": temperature,
+    "permission": {
+        "external_directory": external_directory,
+    },
+}
+# Absent unless requested, so an unset knob leaves the request exactly as it
+# was before the flag existed rather than pinning a value that looks chosen.
+if top_p:
+    agent_block["top_p"] = float(top_p)
+if sampling_seed:
+    agent_block["seed"] = int(sampling_seed)
+if max_tokens:
+    agent_block["max_tokens"] = int(max_tokens)
+
 config = {
     "$schema": "https://opencode.ai/config.json",
     # Snapshots exist so an interactive user can undo a change. Nothing here
@@ -1062,18 +1209,20 @@ config = {
     # keep one snapshot repository per attempt under its shared data
     # directory, copying the whole seeded tree on every step.
     "snapshot": False,
-    "agent": {
-        agent: {
-            "temperature": temperature,
-            "permission": {
-                "external_directory": external_directory,
-            },
-        }
-    },
+    "agent": {agent: agent_block},
 }
 
+# Turn temperature on for this model. See the SAMPLING PARAMETERS note above:
+# a config-defined model's temperature capability defaults to false, and a
+# false capability silently discards the agent's temperature. Written as a
+# partial provider entry naming only the model, which merges into whatever
+# provider definition the environment already supplies -- the harness does not
+# know that provider's baseURL unless --remote-base-url was given, and must
+# not overwrite it.
+provider_id, _, model_id = model.partition("/")
+model_entry = {"temperature": True}
+
 if remote_base_url:
-    provider_id, _, model_id = model.partition("/")
     config["provider"] = {
         provider_id: {
             "npm": "@ai-sdk/openai-compatible",
@@ -1081,9 +1230,11 @@ if remote_base_url:
                 "baseURL": remote_base_url,
                 "apiKey": f"{{env:{remote_api_key_env}}}",
             },
-            "models": {model_id: {}},
+            "models": {model_id: model_entry},
         }
     }
+elif provider_id and model_id:
+    config["provider"] = {provider_id: {"models": {model_id: model_entry}}}
 
 print(json.dumps(config))
 PY
@@ -1370,6 +1521,9 @@ PY
             attempt_number "$attempt_number" \
             model "$MODEL" \
             temperature "$temperature" \
+            top_p "$(optional_number "$TOP_P")" \
+            sampling_seed "$(optional_number "$SAMPLING_SEED")" \
+            max_tokens "$(optional_number "$MAX_TOKENS")" \
             agent "$AGENT" \
             source_path "$SOURCE_FLAT" \
             source_workdir_path "$SOURCE_PATH" \
