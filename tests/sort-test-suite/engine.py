@@ -206,11 +206,21 @@ def execute(
     Returns a Result with bytes stdout/stderr and any declared output files.
     """
     faults = case.get("faults") or {}
-    if faults.get("unreadable") and is_root():
-        # chmod 000 is a no-op for root; caller (runner) should skip such
-        # cases. Signal via a sentinel Result.
+    # Faults that assert an operation is REFUSED by a permission bit. root
+    # ignores those bits, so the operation succeeds and the case's frozen
+    # expectation (a nonzero exit and a diagnostic) cannot hold. Skipping is the
+    # honest verdict: the environment cannot exercise the case, which is not the
+    # same as the binary getting it wrong.
+    #
+    # `unwritable_dir_output` was missing here, which is why a root container
+    # reported fault-o-unwritable as an oracle defect -- GNU sort had happily
+    # written to the unwritable directory, exactly as root permits.
+    PERMISSION_FAULTS = ("unreadable", "unwritable_dir_output")
+    triggered = [name for name in PERMISSION_FAULTS if faults.get(name)]
+    if triggered and is_root():
         return Result(exit_code=None, signal=None, signal_name="SKIP_ROOT",
-                      stdout=b"", stderr=b"skip: unreadable fault as root")
+                      stdout=b"",
+                      stderr=f"skip: {triggered[0]} fault as root".encode())
 
     timeout = case.get("timeout", 10)
     args = list(case.get("args", []))

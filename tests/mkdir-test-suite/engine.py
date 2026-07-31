@@ -100,6 +100,32 @@ def materialize_fixture(fixture: list[dict] | None, td: str) -> None:
             raise ValueError(f"unknown fixture type: {kind!r}")
 
 
+def canonical_tree_entry(entry: dict) -> dict:
+    """One tree entry reduced to what mkdir actually controls.
+
+    A symlink's permission bits are host-OS metadata, not mkdir behavior.
+    Linux reports 0777 for every symlink; macOS reports 0755; there is no
+    portable way to chmod a symlink and mkdir never tries. Comparing those bits
+    makes the benchmark depend on which OS froze it -- which is exactly what
+    happened: the committed corpus was frozen through a Homebrew GNU mkdir on
+    macOS and records 0755, while a Linux regeneration records 0777, for the
+    same correct behavior.
+
+    So the canonical policy is: for a symlink, compare path, type and target,
+    and ignore `mode`. Everything else is untouched -- a directory's or a
+    regular file's mode is core mkdir behavior (umask interaction, explicit
+    mode requests, setuid / setgid / sticky) and stays fully checked.
+    """
+    if entry.get("type") != "symlink":
+        return dict(entry)
+    return {key: value for key, value in entry.items() if key != "mode"}
+
+
+def canonical_tree(tree: list[dict] | None) -> list[dict]:
+    """A whole tree snapshot under `canonical_tree_entry`."""
+    return [canonical_tree_entry(entry) for entry in (tree or [])]
+
+
 def snapshot_tree(td: str) -> list[dict]:
     """Walk td AFTER the run and return every entry's path (relative to td),
     type, permission bits (st_mode & 0o7777, NOT following symlinks), and

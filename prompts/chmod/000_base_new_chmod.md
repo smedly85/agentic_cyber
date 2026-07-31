@@ -11,6 +11,8 @@ The compiled executable must be:
 Implement only the behavior described in this prompt. Do not implement any
 command-line option in this checkpoint — that happens in later checkpoints.
 
+Do not implement options or behavior outside this checkpoint's stated scope.
+
 ## Program behavior
 
 new_chmod changes the permission bits of the files named by its operands.

@@ -10,6 +10,8 @@ The executable must remain:
 
 Add only the feature described here. Do not add unrelated behavior.
 
+Do not implement options or behavior outside this checkpoint's stated scope.
+
 ## Current program
 
 Source:
@@ -80,8 +82,7 @@ before. All error exits remain status 1.
 
 `-p` only changes which directories get created and whether an
 already-existing final directory is treated as success. It does not change
-the default mode calculation (still umask-based in this checkpoint — `-m` is
-not part of this checkpoint).
+the default mode calculation, which stays umask-based in this checkpoint.
 
 ## Implementation
 

@@ -187,7 +187,55 @@ def write_csv(path: Path, rows: list[dict[str, Any]], columns: list[str]) -> Non
 # ---------------------------------------------------------------------------
 
 
-def load_run(root: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+# A lineage that started but whose record never reached a terminal state. The
+# controller marks a record `completed` or `stopped`; anything else at analysis
+# time means the controller itself died, so the lineage is counted as started
+# and reported under its own reason rather than as an implementation failure.
+INTERRUPTED_STATE = "controller_interrupted"
+
+
+def incomplete_record(directory: Path, reason: str) -> dict[str, Any]:
+    """A minimal record for a lineage whose own record is absent or unusable."""
+    return {
+        "lineage_id": directory.name,
+        "state": INTERRUPTED_STATE,
+        "incomplete_reason": reason,
+        "end_to_end_success": False,
+        "failure_stage": None,
+        "failure_reason": reason,
+        "stages": [],
+        "_dir": directory,
+    }
+
+
+def classify(record: Mapping[str, Any]) -> str:
+    """completed | stopped | controller_interrupted, from the record's state.
+
+    Older records predate the `state` field; for those the terminal flags still
+    decide, so a finished run analyzed with a newer analyzer is unaffected.
+    """
+    state = record.get("state")
+    if state in {"completed", "stopped", INTERRUPTED_STATE}:
+        return INTERRUPTED_STATE if state == INTERRUPTED_STATE else state
+    if state == "running":
+        return INTERRUPTED_STATE
+    if record.get("end_to_end_success"):
+        return "completed"
+    if record.get("finished_at") or record.get("failure_stage"):
+        return "stopped"
+    return INTERRUPTED_STATE
+
+
+def is_successful(record: Mapping[str, Any]) -> bool:
+    """A final implementation must come from a lineage that actually completed.
+
+    Both conditions are required: an interrupted record must never contribute a
+    final, even if a stale `end_to_end_success` said otherwise.
+    """
+    return bool(record.get("end_to_end_success")) and classify(record) == "completed"
+
+
+def load_run(root: Path) -> tuple[dict[str, Any], list[dict[str, Any]], list[str]]:
     if not root.is_dir():
         raise LineageError(f"lineage root not found: {root}")
 
@@ -198,33 +246,69 @@ def load_run(root: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     for directory in sorted(root.glob("lineage-*")):
         record_path = directory / "lineage.json"
         if not record_path.is_file():
-            # A lineage directory without a record is an interrupted run, not a
-            # result. Skipping it silently would quietly shrink the
-            # denominator, so it is reported instead.
-            print(f"warning: {directory.name} has no lineage.json; skipping",
-                  file=sys.stderr)
+            # The controller writes this record before checkpoint 000 begins, so
+            # its absence means the lineage died before the first transition --
+            # or predates that guarantee. Either way the lineage was STARTED,
+            # and dropping it here would shrink the reliability denominator in
+            # the one direction that flatters the result.
+            lineages.append(incomplete_record(directory, "missing_record"))
             continue
-        record = read_json(record_path)
+        try:
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            # Reported, never silently excluded: a record we cannot parse is a
+            # lineage whose outcome is unknown, not a lineage that did not run.
+            record = incomplete_record(directory, "malformed_record")
+            record["record_error"] = str(error)
+        else:
+            if not isinstance(record, dict):
+                record = incomplete_record(directory, "malformed_record")
+                record["record_error"] = "lineage.json is not a JSON object"
         record["_dir"] = directory
+        record.setdefault("lineage_id", directory.name)
         lineages.append(record)
 
-    if not lineages:
-        raise LineageError(f"no lineage-*/lineage.json under {root}")
+    # Planned is not started. lineages.json is written ONCE, before any lineage
+    # begins, and lists every id the invocation intends to run -- so treating it
+    # as evidence of a start would report ten lineages for a run interrupted
+    # after three. A lineage counts as started only when the controller left
+    # durable proof: the directory and lineage.json that lineage_state.py init
+    # creates immediately before checkpoint 000.
+    #
+    # Planned-but-never-started ids are reported separately and stay out of the
+    # reliability denominator entirely.
+    planned = run_metadata.get("planned_lineage_ids")
+    if not isinstance(planned, list):
+        planned = run_metadata.get("lineage_ids")   # pre-rename runs
+    started_ids = {record.get("lineage_id") for record in lineages}
+    never_started = (
+        sorted(set(planned) - started_ids) if isinstance(planned, list) else []
+    )
 
-    fingerprints = {record.get("config_fingerprint") for record in lineages}
+    if not lineages:
+        raise LineageError(f"no lineage-* directories under {root}")
+
+    fingerprints = {record.get("config_fingerprint") for record in lineages
+                    if record.get("config_fingerprint") is not None}
     if len(fingerprints) > 1:
         raise LineageError(
             "lineages under this root were produced under different stage "
             f"configurations ({sorted(str(f) for f in fingerprints)}); analyze "
             "them separately rather than pooling them"
         )
-    if run_metadata and run_metadata.get("config_fingerprint") not in fingerprints:
+    # Only meaningful when at least one lineage actually recorded a
+    # fingerprint. A run whose lineages were all interrupted before their first
+    # transition has none to compare, and must still be analyzable -- otherwise
+    # the very lineages this counting change exists to preserve would abort the
+    # analysis instead.
+    if (run_metadata and fingerprints
+            and run_metadata.get("config_fingerprint") not in fingerprints):
         raise LineageError(
             "lineages.json records a different configuration fingerprint than "
             "the lineages themselves; the run directory has been mixed"
         )
 
-    return run_metadata, lineages
+    return run_metadata, lineages, never_started
 
 
 def checkpoint_order(
@@ -268,32 +352,55 @@ def summarize(values: list[Any]) -> dict[str, Any]:
 
 
 def build_reliability(
-    lineages: list[dict[str, Any]], order: list[str]
+    lineages: list[dict[str, Any]], order: list[str],
+    never_started: list[str] | None = None,
 ) -> dict[str, Any]:
     started = len(lineages)
-    completed = [record for record in lineages if record.get("end_to_end_success")]
+    completed = [record for record in lineages if is_successful(record)]
+    interrupted = [record for record in lineages
+                   if classify(record) == INTERRUPTED_STATE]
 
     failure_stages: dict[str, int] = {}
     failure_reasons: dict[str, int] = {}
     for record in lineages:
-        if record.get("end_to_end_success"):
+        if is_successful(record):
             continue
-        stage = str(record.get("failure_stage") or "unknown")
+        stage = str(record.get("failure_stage")
+                    or record.get("current_checkpoint") or "unknown")
         reason = str(record.get("failure_reason") or "unknown")
         failure_stages[stage] = failure_stages.get(stage, 0) + 1
         failure_reasons[reason] = failure_reasons.get(reason, 0) + 1
 
     return {
+        # Only lineages the controller actually began. Planned ids with no
+        # directory are reported below and deliberately excluded.
         "lineages_started": started,
+        "lineages_planned_not_started": len(never_started or []),
+        "planned_not_started_lineage_ids": list(never_started or []),
         "lineages_completed": len(completed),
         "successful_final_implementations": len(completed),
+        # Denominator is every lineage started, interruptions included. A
+        # lineage is never dropped or replaced to keep the population round.
         "end_to_end_completion_rate": len(completed) / started if started else None,
         "end_to_end_completion_interval": wilson(len(completed), started),
         "completed_lineage_ids": [record["lineage_id"] for record in completed],
         "stopped_lineage_ids": [
             record["lineage_id"] for record in lineages
-            if not record.get("end_to_end_success")
+            if classify(record) == "stopped"
         ],
+        "controller_interrupted_lineage_ids": [
+            record["lineage_id"] for record in interrupted
+        ],
+        "controller_interrupted": len(interrupted),
+        # Named separately so an unreadable record is visible as such rather
+        # than looking like an ordinary validation failure.
+        "incomplete_record_reasons": dict(sorted(
+            (reason, sum(1 for record in interrupted
+                         if record.get("incomplete_reason") == reason))
+            for reason in {str(record.get("incomplete_reason"))
+                           for record in interrupted
+                           if record.get("incomplete_reason")}
+        )),
         # Keyed by checkpoint so a reader never has to guess whether a missing
         # entry means "no failures there" or "never reached".
         "failure_stage_counts": {
@@ -382,7 +489,8 @@ def build_stage_rows(lineages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             rows.append(
                 {
                     "lineage_id": record.get("lineage_id"),
-                    "end_to_end_success": record.get("end_to_end_success"),
+                    "end_to_end_success": is_successful(record),
+                    "lineage_state": classify(record),
                     "checkpoint_id": stage.get("checkpoint_id"),
                     "checkpoint_name": stage.get("checkpoint_name"),
                     "source_mode": stage.get("source_mode"),
@@ -521,7 +629,7 @@ def build_total_change(lineages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     rows: list[dict[str, Any]] = []
     for record in lineages:
-        if not record.get("end_to_end_success"):
+        if not is_successful(record):
             continue
         stages = record.get("stages", [])
         if len(stages) < 2:
@@ -592,7 +700,7 @@ def population_members(
     for record in lineages:
         stages = record.get("stages", [])
         if checkpoint is None:
-            if not record.get("end_to_end_success") or not stages:
+            if not is_successful(record) or not stages:
                 continue
             members.append((record["lineage_id"], stages[-1]))
             continue
@@ -768,6 +876,27 @@ def render_summary(report: dict[str, Any]) -> str:
         f"* **successful final implementations = "
         f"{reliability['successful_final_implementations']}**",
     ]
+    if reliability.get("lineages_planned_not_started"):
+        # Reported for transparency, deliberately NOT in the denominator: these
+        # lineages were declared by the run manifest but never begun.
+        lines.append(
+            f"* planned but never started = "
+            f"{reliability['lineages_planned_not_started']} "
+            "— excluded from the denominator"
+        )
+    if reliability.get("controller_interrupted"):
+        # Counted in the denominator, never mistaken for an implementation
+        # failure and never silently dropped.
+        detail = ", ".join(
+            f"{reason} × {count}"
+            for reason, count in reliability["incomplete_record_reasons"].items()
+        )
+        lines.append(
+            f"* controller-interrupted lineages = "
+            f"{reliability['controller_interrupted']}"
+            + (f" ({detail})" if detail else "")
+            + " — started and counted; outcome unknown"
+        )
     rate = reliability["end_to_end_completion_rate"]
     interval = reliability["end_to_end_completion_interval"]
     if rate is not None and interval:
@@ -904,10 +1033,10 @@ def main(argv: list[str] | None = None) -> int:
 
     root = args.lineage_root.resolve()
     output_dir = (args.output_dir or root / "analysis").resolve()
-    run_metadata, lineages = load_run(root)
+    run_metadata, lineages, never_started = load_run(root)
     order = checkpoint_order(run_metadata, lineages)
 
-    reliability = build_reliability(lineages, order)
+    reliability = build_reliability(lineages, order, never_started)
     checkpoints_detail = build_checkpoint_rows(lineages, order)
     stage_rows = build_stage_rows(lineages)
     provenance_problems = check_seed_provenance(lineages)

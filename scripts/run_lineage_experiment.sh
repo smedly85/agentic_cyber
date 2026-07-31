@@ -131,6 +131,52 @@ timestamp() {
     date -u +%Y-%m-%dT%H:%M:%SZ
 }
 
+# How a path is written into a record. Repository-relative only when the file is
+# genuinely inside the repository, so that an --output-dir outside it records an
+# absolute path rather than a repo-relative one that resolves nowhere. Every
+# filesystem operation uses the absolute form regardless, so nothing depends on
+# the working directory the controller was started from.
+record_path() {
+    local path="$1"
+    case "$path" in
+        "$REPO"/*) printf '%s' "${path#"$REPO"/}" ;;
+        *) printf '%s' "$path" ;;
+    esac
+}
+
+# Build the captured candidate in a throwaway tree and run the controller-only
+# checkpoint boundary gate against it. This happens AFTER public validation has
+# already succeeded and BEFORE the candidate is promoted, and its outcome is
+# never fed back to the agent: telling the model "your -u handling was rejected"
+# at checkpoint 001 would disclose the very flag the checkpoint withholds.
+#
+# The build is repeated here rather than reused because run_experiment.sh
+# discards its working directory; the candidate source is the only durable
+# artifact, and rebuilding it is cheap next to an OpenCode session.
+#
+# 0 = candidate stayed inside its checkpoint, 1 = it implemented a later flag,
+# 2 = the gate could not run.
+boundary_gate() {
+    local candidate="$1" checkpoint="$2" report="$3"
+    local work status
+    work="$(mktemp -d)" || return 2
+    mkdir -p "$work/$(dirname "$SOURCE_PATH")" || { rm -rf "$work"; return 2; }
+    cp "$candidate" "$work/$SOURCE_PATH" || { rm -rf "$work"; return 2; }
+    if ! ( cd "$work" && eval "$BUILD_CMD" ) >"${report%.json}-build.log" 2>&1; then
+        rm -rf "$work"
+        return 2
+    fi
+    "$PYTHON_BIN" "$GATE_TOOL" \
+        --repo "$REPO" \
+        --utility "$UTILITY" \
+        --checkpoint "$checkpoint" \
+        --executable "$work/$EXECUTABLE_PATH" \
+        --report "$report" >/dev/null 2>&1
+    status=$?
+    rm -rf "$work"
+    return "$status"
+}
+
 UTILITY=""
 MODEL=""
 TEMPERATURE="0"
@@ -200,6 +246,10 @@ STAGE_RUNNER="$REPO/scripts/run_experiment.sh"
 [[ -f "$STAGE_RUNNER" ]] || die "single-stage runner not found: $STAGE_RUNNER"
 BUNDLE_TOOL="$REPO/scripts/stage_test_bundle.py"
 [[ -f "$BUNDLE_TOOL" ]] || die "stage test bundle builder not found: $BUNDLE_TOOL"
+STATE_TOOL="$REPO/scripts/lineage_state.py"
+[[ -f "$STATE_TOOL" ]] || die "lineage state helper not found: $STATE_TOOL"
+GATE_TOOL="$REPO/scripts/checkpoint_boundary_gate.py"
+[[ -f "$GATE_TOOL" ]] || die "checkpoint boundary gate not found: $GATE_TOOL"
 
 if [[ "$LIST_UTILITIES" -eq 1 ]]; then
     "$PYTHON_BIN" "$PLAN_TOOL" --repo "$REPO" --emit utilities
@@ -244,6 +294,7 @@ PY
 SOURCE_PATH="$(plan_field source_path)"
 SOURCE_BASENAME="$(plan_field source_basename)"
 BUILD_CMD="$(plan_field build_command)"
+EXECUTABLE_PATH="$(plan_field executable_path)"
 TEST_DIR="$(plan_field test_dir)"
 BASE_TEST_CMD="$(plan_field base_test_command)"
 EXTRA_TEST_CMD="$(plan_field extra_test_command)"
@@ -346,6 +397,7 @@ PY
         "existing lineage run at $OUTPUT_DIR was produced under a different configuration ($mismatch); use a new --output-dir rather than mixing stage configurations"
 fi
 
+CHECKPOINT_ID_CSV="$(IFS=,; printf '%s' "${STAGE_IDS[*]}")"
 CHECKPOINT_LADDER="${STAGE_IDS[0]}"
 for (( index = 1; index < STAGE_COUNT; index++ )); do
     CHECKPOINT_LADDER+=" -> ${STAGE_IDS[index]}"
@@ -380,8 +432,14 @@ if target.is_file():
     except (OSError, UnicodeError, json.JSONDecodeError):
         record = {}
 
-lineage_ids = sorted(
-    set(record.get("lineage_ids", []))
+# What this invocation intends to run. These are PLANNED ids, written before
+# any lineage begins, so they must never be read as evidence that a lineage
+# started -- a run interrupted after three of ten lineages would otherwise
+# report ten. Durable proof of a start is the lineage directory and its
+# lineage.json, both created by lineage_state.py init immediately before
+# checkpoint 000.
+planned_lineage_ids = sorted(
+    set(record.get("planned_lineage_ids", record.get("lineage_ids", [])))
     | {f"lineage-{number:03d}" for number in range(int(start), int(start) + int(count))}
 )
 
@@ -405,8 +463,8 @@ record.update(
         "judge": plan["judge"],
         "config_fingerprint": plan["config_fingerprint"],
         "checkpoints": plan["checkpoints"],
-        "lineage_ids": lineage_ids,
-        "lineages_started": len(lineage_ids),
+        "planned_lineage_ids": planned_lineage_ids,
+        "lineages_planned": len(planned_lineage_ids),
         "updated_at": created,
     }
 )
@@ -432,11 +490,32 @@ for (( offset = 0; offset < LINEAGES; offset++ )); do
 
     printf '=== %s ===\n' "$lineage_id"
 
-    seed_repo_relative=""
+    seed_absolute=""
+    seed_recorded=""
     stage_records=()
     end_to_end_success=true
     failure_stage_json=null
     failure_reason_json=null
+    lineage_record="$lineage_dir/lineage.json"
+
+    # The record exists BEFORE checkpoint 000 runs and is rewritten after every
+    # checkpoint, so a controller that dies mid-walk still leaves a lineage that
+    # analysis counts as started. Writing it only at the end used to drop such a
+    # lineage out of the denominator entirely.
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+        "$PYTHON_BIN" "$STATE_TOOL" --path "$lineage_record" --now "$(timestamp)" \
+            init \
+            --lineage-id "$lineage_id" \
+            --utility "$UTILITY" \
+            --model "$MODEL" \
+            --temperature "$TEMPERATURE" \
+            --agent "$AGENT" \
+            --max-loops "$MAX_LOOPS" \
+            --fingerprint "$CONFIG_FINGERPRINT" \
+            --checkpoint-count "$STAGE_COUNT" \
+            --checkpoint-ids "$CHECKPOINT_ID_CSV" ||
+            die "cannot create the lineage record at $lineage_record"
+    fi
 
     for (( index = 0; index < STAGE_COUNT; index++ )); do
         stage_id="${STAGE_IDS[index]}"
@@ -504,9 +583,9 @@ for (( offset = 0; offset < LINEAGES; offset++ )); do
             # only. A cross-lineage seed would destroy the independence the
             # design is built on, so an absent seed is fatal rather than
             # silently substituted.
-            [[ -n "$seed_repo_relative" ]] ||
+            [[ -n "$seed_absolute" ]] ||
                 die "$lineage_id stage $stage_id has no seed from the previous stage"
-            runner_args+=(--seed-file "$seed_repo_relative:$SOURCE_PATH")
+            runner_args+=(--seed-file "$seed_absolute:$SOURCE_PATH")
         fi
         [[ "$FORCE" -eq 1 ]] && runner_args+=(--force)
 
@@ -516,7 +595,8 @@ for (( offset = 0; offset < LINEAGES; offset++ )); do
             printf '\n'
             # A dry run cannot produce a candidate, so fabricate the provenance
             # the next stage would inherit rather than aborting the walk.
-            seed_repo_relative="${stage_candidate#"$REPO"/}"
+            seed_absolute="$stage_candidate"
+            seed_recorded="$(record_path "$stage_candidate")"
             continue
         fi
 
@@ -530,7 +610,7 @@ for (( offset = 0; offset < LINEAGES; offset++ )); do
             if [[ "$stage_mode" == "existing" ]]; then
                 seed_drift="$(
                     "$PYTHON_BIN" - "$stage_experiment/baseline/$SOURCE_BASENAME" \
-                        "$REPO/$seed_repo_relative" <<'PY'
+                        "$seed_absolute" <<'PY'
 import hashlib
 import sys
 from pathlib import Path
@@ -566,7 +646,7 @@ PY
         stage_summary="$(
             "$PYTHON_BIN" - "$stage_attempt" "$stage_candidate" "$stage_id" \
                 "$stage_name" "$stage_prompt" "$stage_mode" "$stage_cmd" \
-                "$stage_flags" "${seed_repo_relative:-}" "$stage_reused" \
+                "$stage_flags" "${seed_recorded:-}" "${seed_absolute:-}" "$stage_reused" \
                 "$SOURCE_BASENAME" "$stage_bundle" "$stage_bundle_fingerprint" \
                 <<'PY'
 import hashlib
@@ -584,6 +664,7 @@ from pathlib import Path
     feature_test_command,
     implemented_csv,
     seed,
+    seed_absolute,
     reused,
     source_basename,
     test_bundle_dir,
@@ -683,7 +764,10 @@ if bundle_manifest.is_file():
         record["test_bundle"] = None
 
 if seed:
-    seed_file = Path(seed)
+    # Hashed through the absolute path: `seed` is what gets recorded and may be
+    # repository-relative, which only resolves when the controller happens to be
+    # running from the repository root.
+    seed_file = Path(seed_absolute or seed)
     if seed_file.is_file():
         digest = hashlib.sha256()
         with seed_file.open("rb") as handle:
@@ -695,7 +779,59 @@ print(json.dumps(record, separators=(",", ":")))
 PY
         )" || die "failed to summarize $lineage_id stage $stage_id"
 
+        # The checkpoint boundary gate runs only on a candidate that already
+        # passed public validation, and only to decide promotion. A candidate
+        # that implemented a later checkpoint's flags fails the stage here with
+        # its own reason, so it is never promoted and no final/ is written.
+        if [[ "$DRY_RUN" -eq 0 ]] &&
+           "$PYTHON_BIN" -c \
+                'import json,sys; sys.exit(0 if json.loads(sys.argv[1])["success"] else 1)' \
+                "$stage_summary"; then
+            gate_report="$stage_dir/boundary-gate.json"
+            boundary_gate "$stage_candidate" "$stage_id" "$gate_report"
+            gate_status=$?
+            if [[ "$gate_status" -ne 0 ]]; then
+                if [[ "$gate_status" -eq 1 ]]; then
+                    gate_reason="premature_feature_implementation"
+                else
+                    gate_reason="boundary_gate_error"
+                fi
+                stage_summary="$(
+                    "$PYTHON_BIN" -c '
+import json
+import sys
+from pathlib import Path
+
+record = json.loads(sys.argv[1])
+record["success"] = False
+record["failure_reason"] = sys.argv[2]
+record["boundary_gate_passed"] = False
+report = Path(sys.argv[3])
+if report.is_file():
+    try:
+        record["boundary_gate"] = json.loads(report.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        record["boundary_gate"] = None
+print(json.dumps(record, separators=(",", ":")))
+' "$stage_summary" "$gate_reason" "$gate_report"
+                )" || die "cannot record the boundary-gate result for $lineage_id stage $stage_id"
+            else
+                stage_summary="$(
+                    "$PYTHON_BIN" -c \
+                        'import json,sys; r=json.loads(sys.argv[1]); r["boundary_gate_passed"]=True; print(json.dumps(r,separators=(",",":")))' \
+                        "$stage_summary"
+                )"
+            fi
+        fi
+
         stage_records+=("$stage_summary")
+
+        # Persist this checkpoint before deciding whether to continue, so an
+        # interruption at any point leaves the record describing exactly the
+        # checkpoints that actually finished.
+        "$PYTHON_BIN" "$STATE_TOOL" --path "$lineage_record" --now "$(timestamp)" \
+            stage --stage-json "$stage_summary" ||
+            die "cannot update the lineage record at $lineage_record"
 
         stage_success="$(
             "$PYTHON_BIN" -c \
@@ -718,7 +854,8 @@ PY
         fi
 
         printf '  [%s %s] pass\n' "$stage_id" "$stage_name"
-        seed_repo_relative="${stage_candidate#"$REPO"/}"
+        seed_absolute="$stage_candidate"
+        seed_recorded="$(record_path "$stage_candidate")"
     done
 
     if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -732,58 +869,20 @@ PY
     rm -rf "$final_dir"
     if [[ "$end_to_end_success" == true ]]; then
         mkdir -p "$final_dir"
-        cp -p "$REPO/$seed_repo_relative" "$final_dir/$SOURCE_BASENAME"
+        cp -p "$seed_absolute" "$final_dir/$SOURCE_BASENAME"
         completed_lineages=$((completed_lineages + 1))
     fi
 
-    "$PYTHON_BIN" - "$lineage_dir/lineage.json" "$lineage_id" "$UTILITY" \
-        "$MODEL" "$TEMPERATURE" "$AGENT" "$MAX_LOOPS" "$CONFIG_FINGERPRINT" \
-        "$STAGE_COUNT" "$end_to_end_success" "$failure_stage_json" \
-        "$failure_reason_json" "$SOURCE_BASENAME" "$(timestamp)" \
-        "${stage_records[@]+"${stage_records[@]}"}" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-(
-    path,
-    lineage_id,
-    utility,
-    model,
-    temperature,
-    agent,
-    max_loops,
-    fingerprint,
-    checkpoint_count,
-    end_to_end,
-    failure_stage,
-    failure_reason,
-    source_basename,
-    finished,
-) = sys.argv[1:15]
-stages = [json.loads(record) for record in sys.argv[15:]]
-
-completed = end_to_end == "true"
-record = {
-    "schema_version": 1,
-    "lineage_id": lineage_id,
-    "utility": utility,
-    "model": model,
-    "temperature": float(temperature),
-    "agent": agent,
-    "max_loops": int(max_loops),
-    "config_fingerprint": fingerprint,
-    "checkpoint_count": int(checkpoint_count),
-    "checkpoints_completed": sum(1 for stage in stages if stage["success"]),
-    "end_to_end_success": completed,
-    "failure_stage": json.loads(failure_stage),
-    "failure_reason": json.loads(failure_reason),
-    "final_source": f"final/{source_basename}" if completed else None,
-    "stages": stages,
-    "finished_at": finished,
-}
-Path(path).write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
-PY
+    # Every stage was already folded into the record as it finished; this only
+    # closes the lineage out, moving it from `running` to `completed`/`stopped`.
+    finish_args=(--success "$end_to_end_success" --source-basename "$SOURCE_BASENAME")
+    if [[ "$end_to_end_success" != true ]]; then
+        finish_args+=(--failure-stage "$(printf '%s' "$failure_stage_json" | tr -d '"')")
+        finish_args+=(--failure-reason "$(printf '%s' "$failure_reason_json" | tr -d '"')")
+    fi
+    "$PYTHON_BIN" "$STATE_TOOL" --path "$lineage_record" --now "$(timestamp)" \
+        finish "${finish_args[@]}" ||
+        die "cannot finalize the lineage record at $lineage_record"
 
     if [[ "$end_to_end_success" == true ]]; then
         printf '  lineage complete: final/%s\n\n' "$SOURCE_BASENAME"

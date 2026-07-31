@@ -12,6 +12,8 @@ Implement only the behavior described in this prompt.
 
 Do not add options, file operands, or unrelated features.
 
+Do not implement options or behavior outside this checkpoint's stated scope.
+
 ## Program behavior
 
 new_sort must read newline-delimited lines from standard input until end of

@@ -33,6 +33,11 @@ MANIFEST_DIR = REPO_ROOT / "experiments" / "utilities"
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 import analyze_lineages  # noqa: E402
 import capture_candidate  # noqa: E402
+import checkpoint_boundary_gate  # noqa: E402
+
+sys.path.insert(0, str(REPO_ROOT / "tests"))
+from reference_generators import oracle_contract  # noqa: E402
+from reference_generators import suite_diff  # noqa: E402
 import lineage_plan  # noqa: E402
 import stage_test_bundle  # noqa: E402
 
@@ -1409,8 +1414,12 @@ class BundleProseLeakageTests(unittest.TestCase):
                     )
 
     def test_no_retained_case_invokes_a_future_flag(self):
-        """A case may only name a later flag when it exists to assert that the
-        flag is still rejected."""
+        """No bundled case may name a later flag, for any reason.
+
+        There is deliberately no exemption for a case that exists to assert the
+        flag is still rejected: its argv would spell the flag out just as
+        plainly. That enforcement moved to the controller-only boundary gate.
+        """
         for utility, checkpoint_id, implemented in ALL_UTILITY_CHECKPOINTS:
             flags = set(self.future_flags(utility, checkpoint_id))
             if not flags:
@@ -1419,12 +1428,105 @@ class BundleProseLeakageTests(unittest.TestCase):
             with self.subTest(utility=utility, checkpoint=checkpoint_id):
                 for case in StageBundleLeakageTests.bundled_cases(self, bundle):
                     named = flags & set(case.get("args", []))
-                    permitted = set(case.get("absent_flags", []))
-                    self.assertLessEqual(
-                        named, permitted,
-                        f"{case.get('name')} invokes {sorted(named - permitted)} "
-                        "without declaring it absent",
+                    self.assertEqual(
+                        named, set(),
+                        f"{case.get('name')} invokes {sorted(named)}",
                     )
+
+    def test_no_absent_flag_case_reaches_a_bundle(self):
+        """grep and chmod must no longer expose their rejection cases."""
+        for utility, checkpoint_id, _ in ALL_UTILITY_CHECKPOINTS:
+            bundle = shared_bundle(utility, checkpoint_id)
+            with self.subTest(utility=utility, checkpoint=checkpoint_id):
+                exposed = [
+                    case.get("name")
+                    for case in StageBundleLeakageTests.bundled_cases(self, bundle)
+                    if case.get("absent_flags")
+                ]
+                self.assertEqual(exposed, [])
+
+    def test_prompts_never_name_a_future_flag(self):
+        for utility, checkpoint_id, implemented in ALL_UTILITY_CHECKPOINTS:
+            future = self.future_flags(utility, checkpoint_id)
+            if not future:
+                continue
+            plan = lineage_plan.resolve_plan(
+                REPO_ROOT, utility, "m", "0", "build", 3, 1800
+            )
+            prompt = next(c["prompt"] for c in plan["checkpoints"]
+                          if c["id"] == checkpoint_id)
+            text = (REPO_ROOT / prompt).read_text(encoding="utf-8")
+            with self.subTest(utility=utility, checkpoint=checkpoint_id):
+                self.assertEqual(
+                    self.leaks_in(text, future), [],
+                    f"{prompt} names a flag from a later checkpoint",
+                )
+
+    def future_spellings(self, utility: str, checkpoint_id: str) -> list[str]:
+        """Future flags AND their manifest-declared long aliases."""
+        manifest = checkpoint_boundary_gate.load_manifest(REPO_ROOT, utility)
+        aliases = manifest.get("flag_aliases", {})
+        out = []
+        for flag in self.future_flags(utility, checkpoint_id):
+            out.extend([flag, *aliases.get(flag, [])])
+        return out
+
+    def test_no_future_long_alias_appears_in_a_bundle(self):
+        for utility, checkpoint_id, _ in ALL_UTILITY_CHECKPOINTS:
+            spellings = [s for s in self.future_spellings(utility, checkpoint_id)
+                         if s.startswith("--")]
+            if not spellings:
+                continue
+            bundle = shared_bundle(utility, checkpoint_id)
+            with self.subTest(utility=utility, checkpoint=checkpoint_id):
+                for path in sorted(bundle.rglob("*")):
+                    if not path.is_file() or path.name == "BUNDLE.json":
+                        continue
+                    if path.suffix == ".gz":
+                        import gzip
+                        text = gzip.decompress(path.read_bytes()).decode(
+                            "utf-8", "replace")
+                    else:
+                        text = path.read_text(encoding="utf-8", errors="replace")
+                    for spelling in spellings:
+                        self.assertNotIn(
+                            spelling, text,
+                            f"{path.name} names {spelling} before its checkpoint",
+                        )
+
+    def test_no_future_long_alias_appears_in_a_prompt(self):
+        for utility, checkpoint_id, _ in ALL_UTILITY_CHECKPOINTS:
+            spellings = [s for s in self.future_spellings(utility, checkpoint_id)
+                         if s.startswith("--")]
+            if not spellings:
+                continue
+            plan = lineage_plan.resolve_plan(
+                REPO_ROOT, utility, "m", "0", "build", 3, 1800
+            )
+            prompt = next(c["prompt"] for c in plan["checkpoints"]
+                          if c["id"] == checkpoint_id)
+            text = (REPO_ROOT / prompt).read_text(encoding="utf-8")
+            with self.subTest(utility=utility, checkpoint=checkpoint_id):
+                for spelling in spellings:
+                    self.assertNotIn(
+                        spelling, text,
+                        f"{prompt} names {spelling} before its checkpoint",
+                    )
+
+    def test_every_prompt_states_the_generic_scope_rule(self):
+        for utility, checkpoint_id, _ in ALL_UTILITY_CHECKPOINTS:
+            plan = lineage_plan.resolve_plan(
+                REPO_ROOT, utility, "m", "0", "build", 3, 1800
+            )
+            prompt = next(c["prompt"] for c in plan["checkpoints"]
+                          if c["id"] == checkpoint_id)
+            text = (REPO_ROOT / prompt).read_text(encoding="utf-8")
+            with self.subTest(utility=utility, checkpoint=checkpoint_id):
+                self.assertIn(
+                    "outside this checkpoint's stated scope", text,
+                    "a prompt must bound scope generically, without naming "
+                    "the options it is withholding",
+                )
 
 
 class PropsPruningTests(unittest.TestCase):
@@ -1510,75 +1612,45 @@ class PropsPruningTests(unittest.TestCase):
 
 
 class PrematureFeatureTests(unittest.TestCase):
-    """Audit 4: the ladder is tested from above as well as from below."""
+    """Audit 4, after enforcement moved out of the agent-visible bundle.
 
-    def test_selectable_honors_absent_flags(self):
+    The suites still carry frozen `absent_flags` cases for offline auditing, but
+    a case that asserts "-H must still be rejected" necessarily spells out `-H`
+    in its argv, so shipping it at checkpoint 000 would leak the option name the
+    checkpoint is withholding. The bundle therefore excludes such cases outright
+    and the real enforcement is the controller-only boundary gate, covered by
+    CheckpointBoundaryGateTests.
+    """
+
+    def test_a_case_requiring_an_absent_flag_is_never_selectable(self):
         case = {"flags": [], "absent_flags": ["-H"]}
-        self.assertTrue(stage_test_bundle.selectable(case, set()))
-        self.assertTrue(stage_test_bundle.selectable(case, {"-r"}))
-        self.assertFalse(stage_test_bundle.selectable(case, {"-H"}))
+        for implemented in (set(), {"-r"}, {"-H"}, {"-H", "-h", "-r", "-i"}):
+            with self.subTest(implemented=sorted(implemented)):
+                self.assertFalse(stage_test_bundle.selectable(case, implemented))
 
-    def test_absent_and_required_flags_compose(self):
-        case = {"flags": ["-H"], "absent_flags": ["-i"]}
+    def test_ordinary_cases_still_select_on_their_own_flags(self):
+        case = {"flags": ["-H"]}
         self.assertFalse(stage_test_bundle.selectable(case, set()))
         self.assertTrue(stage_test_bundle.selectable(case, {"-H"}))
-        self.assertFalse(stage_test_bundle.selectable(case, {"-H", "-i"}))
+        self.assertTrue(stage_test_bundle.selectable(case, {"-H", "-h"}))
 
-    def test_premature_cases_live_exactly_until_their_flag_arrives(self):
-        for utility in ("grep", "chmod"):
-            ladder = EXPECTED_SEQUENCES[utility]
-            checkpoints = [(c, f) for u, c, f in ALL_UTILITY_CHECKPOINTS
-                           if u == utility]
-            for checkpoint_id, implemented in checkpoints:
-                bundle = shared_bundle(utility, checkpoint_id)
-                cases = StageBundleLeakageTests.bundled_cases(self, bundle)
-                present = {
-                    tuple(sorted(c["absent_flags"])): c["name"]
-                    for c in cases if c.get("absent_flags")
-                }
-                for flag in ladder:
-                    with self.subTest(utility=utility, checkpoint=checkpoint_id,
-                                      flag=flag):
-                        expected = flag not in set(implemented)
-                        self.assertEqual(
-                            (flag,) in present, expected,
-                            f"rejection case for {flag} should "
-                            f"{'exist' if expected else 'be gone'} at "
-                            f"{checkpoint_id}",
-                        )
+    def test_enforcement_covers_every_utility_not_just_the_model_backed_ones(self):
+        """The gate is manifest-derived, so sort and mkdir are covered too.
 
-    def test_model_backed_suites_reject_every_ladder_flag_at_000(self):
-        """grep and chmod assert each of their flags is unknown at 000."""
-        for utility in ("grep", "chmod"):
-            bundle = shared_bundle(utility, "000")
-            cases = StageBundleLeakageTests.bundled_cases(self, bundle)
-            declared = {
-                flag for case in cases for flag in case.get("absent_flags", [])
-            }
-            with self.subTest(utility=utility):
-                self.assertEqual(declared, set(EXPECTED_SEQUENCES[utility]))
-                for case in cases:
-                    if case.get("absent_flags"):
-                        self.assertNotEqual(
-                            case["exit_code"], 0,
-                            "a case asserting a flag is absent must reject",
-                        )
-
-    def test_oracle_backed_suites_have_no_rejection_cases_and_that_is_recorded(self):
-        """sort and mkdir freeze goldens by running a real GNU binary, which
-        supports -r and -p, so it cannot produce a "must be rejected" golden for
-        a flag it implements. This is the documented Audit 4 gap: assert the
-        state matches the documentation rather than letting it drift silently.
+        Freezing rejection cases could only ever work for grep and chmod, whose
+        goldens come from a specification model; sort and mkdir freeze theirs by
+        running a real GNU binary that implements -r and -p and therefore cannot
+        express a refusal. Deriving the matrix from the manifest instead removes
+        that asymmetry.
         """
-        for utility in ("sort", "mkdir"):
-            bundle = shared_bundle(utility, "000")
-            cases = StageBundleLeakageTests.bundled_cases(self, bundle)
+        for utility in sorted(EXPECTED_SEQUENCES):
+            manifest = checkpoint_boundary_gate.load_manifest(REPO_ROOT, utility)
+            rows = checkpoint_boundary_gate.availability(manifest)
             with self.subTest(utility=utility):
                 self.assertEqual(
-                    [c["name"] for c in cases if c.get("absent_flags")], [],
+                    rows[0]["forbidden"], EXPECTED_SEQUENCES[utility],
+                    "checkpoint 000 must forbid the whole ladder",
                 )
-        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("Coverage and its limits", readme)
 
 
 class LineageControllerInvocationTests(unittest.TestCase):
@@ -1661,6 +1733,1740 @@ class LineageControllerInvocationTests(unittest.TestCase):
                 target.exists(),
                 "a dry run must not create its output directory",
             )
+
+
+def maintained_shell_scripts() -> list[Path]:
+    """Every *.sh the repository maintains.
+
+    `runs/` and `review-bundle/` are archived outputs, not maintained source,
+    and are excluded deliberately.
+    """
+    return [
+        path for path in sorted(REPO_ROOT.rglob("*.sh"))
+        if not {"runs", "review-bundle", ".git"} & set(path.relative_to(REPO_ROOT).parts)
+    ]
+
+
+class ShellLineEndingTests(unittest.TestCase):
+    """`.gitattributes` says `*.sh text eol=lf`, but it was added after these
+    files were committed and git never renormalized the existing blobs. Every
+    shell script therefore reached a fresh Linux/WSL checkout with CRLF, where
+    `set -o pipefail` fails because the carriage return becomes part of the
+    argument. The scripts are now LF; this keeps them that way.
+    """
+
+    def test_no_maintained_shell_script_contains_a_carriage_return(self):
+        offenders = []
+        for path in maintained_shell_scripts():
+            raw = path.read_bytes()
+            if b"\r" in raw:
+                offenders.append(
+                    f"{path.relative_to(REPO_ROOT).as_posix()} "
+                    f"({raw.count(chr(13).encode())} CR)"
+                )
+        self.assertEqual(
+            offenders, [],
+            "shell scripts must use LF endings; a CR breaks bash on Linux",
+        )
+
+    def test_the_shell_script_inventory_is_not_empty(self):
+        # Guards against the check silently passing because the glob broke.
+        scripts = maintained_shell_scripts()
+        self.assertGreaterEqual(len(scripts), 10)
+        names = {p.name for p in scripts}
+        self.assertIn("selfcheck.sh", names)
+        self.assertIn("run_lineage_experiment.sh", names)
+
+    def test_gitattributes_still_pins_shell_scripts_to_lf(self):
+        text = (REPO_ROOT / ".gitattributes").read_text(encoding="utf-8")
+        self.assertIn("*.sh text eol=lf", text)
+
+
+class OracleContractTests(unittest.TestCase):
+    """The sort and mkdir suites freeze goldens from a real GNU binary, so the
+    oracle is part of the benchmark definition and must be pinned and portable.
+    """
+
+    PINS = {"sort": "9.4", "mkdir": "9.11"}
+
+    def setUp(self):
+        import tempfile
+
+        self.temp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    def suite_root(self, suite: str) -> Path:
+        return REPO_ROOT / "tests" / f"{suite}-test-suite"
+
+    def config(self, suite: str) -> Path:
+        return self.suite_root(suite) / "config.json"
+
+    def test_pin_comes_from_the_frozen_corpus_manifest(self):
+        for suite, expected in self.PINS.items():
+            with self.subTest(suite=suite):
+                self.assertEqual(
+                    oracle_contract.required_version(
+                        suite, self.suite_root(suite), self.config(suite)
+                    ),
+                    expected,
+                )
+
+    def test_no_config_hardcodes_a_machine_specific_oracle_path(self):
+        for suite in self.PINS:
+            configured = json.loads(
+                self.config(suite).read_text(encoding="utf-8")
+            )["paths"].get("oracle_bin", "")
+            with self.subTest(suite=suite):
+                self.assertNotIn("homebrew", configured.lower())
+                self.assertNotIn("/opt/", configured)
+
+    def test_environment_override_wins_over_config(self):
+        import os as _os
+
+        for suite in self.PINS:
+            variable = oracle_contract.SUITES[suite]["env"]
+            override = str(self.temp / "custom" / suite)
+            previous = _os.environ.get(variable)
+            _os.environ[variable] = override
+            try:
+                self.assertEqual(
+                    oracle_contract.resolve(suite, self.config(suite)), override
+                )
+            finally:
+                if previous is None:
+                    _os.environ.pop(variable, None)
+                else:
+                    _os.environ[variable] = previous
+
+    def test_explicit_override_wins_over_everything(self):
+        chosen = str(self.temp / "explicit-oracle")
+        self.assertEqual(
+            oracle_contract.resolve("sort", self.config("sort"), chosen), chosen
+        )
+
+    def test_a_missing_executable_is_reported_with_the_env_var_to_set(self):
+        missing = str(self.temp / "definitely-absent")
+        problems = oracle_contract.verify(
+            "mkdir", self.suite_root("mkdir"), missing, self.config("mkdir")
+        )
+        self.assertEqual(len(problems), 1)
+        self.assertIn("not an executable file", problems[0])
+        self.assertIn("MKDIR_ORACLE_BIN", problems[0])
+
+    def test_a_non_gnu_executable_is_rejected(self):
+        fake = fake_version_tool(self.temp / "bsd", "mkdir",
+                                 "mkdir: illegal option -- -")
+        problems = oracle_contract.verify(
+            "mkdir", self.suite_root("mkdir"), str(fake), self.config("mkdir")
+        )
+        self.assertEqual(len(problems), 1)
+        self.assertIn("not GNU coreutils", problems[0])
+
+    def test_a_wrong_gnu_version_is_rejected_naming_both_versions(self):
+        fake = fake_version_tool(self.temp / "old", "mkdir",
+                                 "mkdir (GNU coreutils) 8.32")
+        problems = oracle_contract.verify(
+            "mkdir", self.suite_root("mkdir"), str(fake), self.config("mkdir")
+        )
+        self.assertEqual(len(problems), 1)
+        self.assertIn("9.11", problems[0])
+        self.assertIn("8.32", problems[0])
+        self.assertIn("would change the benchmark", problems[0])
+
+    def test_the_pinned_version_is_accepted(self):
+        for suite, pin in self.PINS.items():
+            program = oracle_contract.SUITES[suite]["program"]
+            fake = fake_version_tool(self.temp / f"good-{suite}", program,
+                                     f"{program} (GNU coreutils) {pin}")
+            with self.subTest(suite=suite):
+                self.assertEqual(
+                    oracle_contract.verify(
+                        suite, self.suite_root(suite), str(fake),
+                        self.config(suite)
+                    ),
+                    [],
+                )
+
+    def test_a_path_containing_spaces_round_trips(self):
+        directory = self.temp / "oracle dir with spaces"
+        fake = fake_version_tool(directory, "sort", "sort (GNU coreutils) 9.4")
+        self.assertIn(" ", str(fake))
+        self.assertEqual(
+            oracle_contract.resolve("sort", self.config("sort"), str(fake)),
+            str(fake),
+        )
+        self.assertEqual(
+            oracle_contract.verify("sort", self.suite_root("sort"), str(fake),
+                                   self.config("sort")),
+            [],
+        )
+
+    def test_c6_accepts_both_documented_wordings(self):
+        """The loose model cross-check spans the wording change; frozen
+        candidate scoring is untouched because it never reads this field."""
+        # constraints.py is a package member (`from . import flag_model`), so
+        # it is loaded in a subprocess rooted at the suite rather than by path.
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "import json\n"
+             "from model import constraints\n"
+             "e = constraints.predict_error('C6_empty_tab')\n"
+             "print(json.dumps([e.exit_code, list(e.stderr_contains)]))"],
+            cwd=str(REPO_ROOT / "tests" / "sort-test-suite"),
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        exit_code, accepted = json.loads(result.stdout)
+        self.assertEqual(exit_code, 2)
+        self.assertIn("empty tab", accepted)
+        self.assertIn("separator must be exactly one character long", accepted)
+
+    def test_no_oracle_path_reaches_an_agent_visible_bundle(self):
+        for utility, checkpoint_id, _ in ALL_UTILITY_CHECKPOINTS:
+            bundle = shared_bundle(utility, checkpoint_id)
+            with self.subTest(utility=utility, checkpoint=checkpoint_id):
+                self.assertFalse((bundle / "oracle_contract.py").exists())
+                config = json.loads(
+                    (bundle / "config.json").read_text(encoding="utf-8")
+                )
+                self.assertNotIn("oracle_bin", config.get("paths", {}))
+                self.assertNotIn("oracle_version_required", config)
+
+
+class PermissionSensitiveSelfCheckTests(unittest.TestCase):
+    """Permission-sensitive cases cannot be exercised as root.
+
+    A root container reported `fault-o-unwritable` as an oracle defect: the
+    case asserts that an unwritable output directory REFUSES the write, and
+    root ignores the permission bit, so GNU sort wrote happily and exited 0
+    against a frozen `exit 2`. The oracle was fine; the environment was wrong.
+    """
+
+    SUITES_WITH_PERMISSION_FAULTS = ("sort", "mkdir")
+
+    def selfcheck(self, suite: str) -> str:
+        return (REPO_ROOT / "tests" / f"{suite}-test-suite"
+                / "selfcheck.sh").read_text(encoding="utf-8")
+
+    def test_selfcheck_refuses_to_run_as_root(self):
+        for suite in self.SUITES_WITH_PERMISSION_FAULTS:
+            text = self.selfcheck(suite)
+            with self.subTest(suite=suite):
+                self.assertIn('if [ "$(id -u)" = 0 ]; then', text)
+                self.assertIn("refusing to run as root", text)
+                self.assertIn("exit 2", text)
+
+    def test_the_root_refusal_precedes_any_regeneration(self):
+        """Failing early is the point: a late failure has already run the
+        generator, and with --publish would have rewritten the benchmark."""
+        for suite in self.SUITES_WITH_PERMISSION_FAULTS:
+            text = self.selfcheck(suite)
+            with self.subTest(suite=suite):
+                root_gate = text.index('if [ "$(id -u)" = 0 ]')
+                # Anchor on the actual regeneration call. The SCRIPT_DIR guard
+                # names gen/generate.py earlier as a required file, which is a
+                # presence check, not a run.
+                self.assertLess(root_gate, text.index("python3 gen/generate.py"))
+                self.assertLess(root_gate, text.index("gate 0"))
+
+    def test_the_refusal_explains_how_to_run_unprivileged(self):
+        for suite in self.SUITES_WITH_PERMISSION_FAULTS:
+            text = self.selfcheck(suite)
+            with self.subTest(suite=suite):
+                self.assertIn("--user", text)
+                self.assertIn("setpriv", text)
+
+    def test_engine_skips_every_permission_fault_under_root(self):
+        """The guard must cover every fault whose expectation depends on not
+        being root -- `unwritable_dir_output` was the one it missed."""
+        engine_source = (REPO_ROOT / "tests" / "sort-test-suite"
+                         / "engine.py").read_text(encoding="utf-8")
+        self.assertIn("PERMISSION_FAULTS", engine_source)
+        for fault in ("unreadable", "unwritable_dir_output"):
+            with self.subTest(fault=fault):
+                self.assertRegex(
+                    engine_source,
+                    r"PERMISSION_FAULTS\s*=\s*\([^)]*" + fault,
+                )
+
+    def test_every_permission_fault_in_the_frozen_corpus_is_guarded(self):
+        """No frozen fault may depend on non-root without the guard knowing."""
+        guarded = {"unreadable", "unwritable_dir_output"}
+        suite = REPO_ROOT / "tests" / "sort-test-suite" / "suites"
+        import gzip
+
+        with gzip.open(suite / "faults.json.gz", "rt", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        cases = payload["cases"] if isinstance(payload, dict) else payload
+        # Faults naming a permission concept must be in the guarded set.
+        for case in cases:
+            for name in (case.get("faults") or {}):
+                if "unreadable" in name or "unwritable" in name:
+                    with self.subTest(case=case["name"], fault=name):
+                        self.assertIn(name, guarded)
+
+    def test_freeze_refuses_to_bake_a_root_skipped_result_into_a_golden(self):
+        source = (REPO_ROOT / "tests" / "sort-test-suite" / "gen"
+                  / "freeze.py").read_text(encoding="utf-8")
+        self.assertIn("SKIP_ROOT", source)
+        self.assertIn("cannot freeze", source)
+
+
+class SelfCheckInvocationTests(unittest.TestCase):
+    """The self-check must build its subcommands with no stray arguments.
+
+    A broken line continuation -- a literal backslash-`n` where a newline
+    belonged -- left the sort self-check running
+
+        python3 .../suite_diff.py \\n         --fresh ...
+
+    so bash unescaped `\\n` into a bare `n` and argparse rejected it. Every
+    other gate had passed; that single character was the whole failure. These
+    tests execute the real constructed command through a shim that records
+    argv, rather than asserting on the script's text.
+    """
+
+    SUITES = ("sort", "mkdir")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bash = shutil.which("bash")
+        if not cls.bash:
+            raise unittest.SkipTest("bash is required")
+
+    def setUp(self):
+        import tempfile
+
+        self.temp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    def script(self, suite: str) -> Path:
+        return REPO_ROOT / "tests" / f"{suite}-test-suite" / "selfcheck.sh"
+
+    def test_no_shell_script_has_a_backslash_n_where_a_continuation_belongs(self):
+        """The exact defect signature, caught statically across every script.
+
+        A bare `\\n` is legitimate inside a `printf` format or a heredoc, so
+        the check is not "contains backslash-n". The broken-continuation form
+        is `\\n` followed by whitespace and then an option -- which is how the
+        sort self-check ended up passing a bare `n` to argparse, and which no
+        format string produces.
+        """
+        import re
+
+        signature = re.compile(r"\\n\s+-")
+        offenders = []
+        for path in maintained_shell_scripts():
+            for number, line in enumerate(
+                path.read_text(encoding="utf-8").splitlines(), 1
+            ):
+                if signature.search(line):
+                    offenders.append(
+                        f"{path.relative_to(REPO_ROOT).as_posix()}:{number}: "
+                        f"{line.strip()[:80]}"
+                    )
+        self.assertEqual(
+            offenders, [],
+            "backslash-n followed by an option is a line continuation that "
+            "was written as an escape by mistake",
+        )
+
+    def capture_argv(self, suite: str, tool: str) -> list[list[str]]:
+        """Run the real invocation line(s) for `tool` with a python3 shim that
+        records argv. Nothing is stubbed inside the tool itself."""
+        recorder = self.temp / f"argv-{suite}-{tool}.txt"
+        shim = self.temp / f"bin-{suite}-{tool}"
+        shim.mkdir(parents=True, exist_ok=True)
+        (shim / "python3").write_text(
+            "#!/bin/sh\n"
+            f'for a in "$@"; do printf "%s\\n" "$a" >> "{recorder.as_posix()}"; done\n'
+            f'printf "%s\\n" "--END--" >> "{recorder.as_posix()}"\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        (shim / "python3").chmod(0o755)
+
+        # Take the invocation verbatim from the script, including its
+        # continuations, and execute it exactly as the shell would.
+        text = self.script(suite).read_text(encoding="utf-8")
+        lines = text.splitlines()
+        fragments: list[str] = []
+        index = 0
+        while index < len(lines):
+            if tool in lines[index]:
+                block = [lines[index]]
+                while block[-1].rstrip().endswith("\\") and index + 1 < len(lines):
+                    index += 1
+                    block.append(lines[index])
+                fragments.append("\n".join(block))
+            index += 1
+        self.assertTrue(fragments, f"no {tool} invocation found in {suite}")
+
+        runs: list[list[str]] = []
+        for fragment in fragments:
+            if recorder.exists():
+                recorder.unlink()
+            # Strip shell control words so the bare command remains runnable.
+            command = fragment.strip()
+            for prefix in ("if ! ", "if ", "SORT=$(", "MKDIR=$("):
+                if command.startswith(prefix):
+                    command = command[len(prefix):]
+            command = command.rstrip()
+            for suffix in ("; then", ")"):
+                if command.endswith(suffix):
+                    command = command[: -len(suffix)].rstrip()
+            result = subprocess.run(
+                [self.bash, "-c", f'CONFIG=config.json\n{command}'],
+                cwd=str(self.script(suite).parent),
+                env={**os.environ, "PATH": f"{shim}{os.pathsep}{os.environ['PATH']}"},
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            if recorder.exists():
+                argv = [a for a in recorder.read_text(encoding="utf-8").splitlines()
+                        if a != "--END--"]
+                runs.append(argv)
+        return runs
+
+    def test_suite_diff_receives_no_stray_argument(self):
+        for suite in self.SUITES:
+            for argv in self.capture_argv(suite, "suite_diff.py"):
+                with self.subTest(suite=suite, argv=argv):
+                    self.assertNotIn("n", argv, "the stray 'n' is back")
+                    # Every token is either the script, a --flag, or a value.
+                    self.assertTrue(argv[0].endswith("suite_diff.py"))
+                    for token in argv[1:]:
+                        self.assertFalse(
+                            len(token) == 1 and token.isalpha(),
+                            f"bare single-letter argument {token!r}",
+                        )
+                    for required in ("--fresh", "--committed", "--config"):
+                        self.assertIn(required, argv)
+
+    def test_oracle_contract_receives_no_stray_argument(self):
+        for suite in self.SUITES:
+            for argv in self.capture_argv(suite, "oracle_contract.py"):
+                with self.subTest(suite=suite, argv=argv):
+                    self.assertNotIn("n", argv)
+                    for token in argv[1:]:
+                        self.assertFalse(len(token) == 1 and token.isalpha(),
+                                         f"bare single-letter argument {token!r}")
+
+    def test_the_real_suite_diff_accepts_the_constructed_arguments(self):
+        """Run the actual tool with the actual argv -- argparse is not mocked."""
+        for suite in self.SUITES:
+            for argv in self.capture_argv(suite, "suite_diff.py"):
+                fresh = self.temp / f"fresh-{suite}"
+                fresh.mkdir(exist_ok=True)
+                concrete = []
+                for token in argv:
+                    concrete.append(str(fresh) if token.startswith("/tmp/") else token)
+                result = subprocess.run(
+                    [sys.executable, *concrete],
+                    cwd=str(self.script(suite).parent),
+                    capture_output=True, text=True,
+                )
+                with self.subTest(suite=suite):
+                    # It may legitimately report differences (exit 1); what it
+                    # must never do is fail to parse its arguments (exit 2).
+                    self.assertIn(result.returncode, (0, 1), result.stderr)
+                    self.assertNotIn("unrecognized arguments", result.stderr)
+
+
+class SelfCheckScriptDirTests(unittest.TestCase):
+    """A half-broken coreutils must not silently redirect every relative path.
+
+    alpine:edge shipped a `dirname`/`id` that died with "Error relocating ...
+    renameat2: symbol not found". The self-check's `cd "$(dirname "$0")"` then
+    became `cd ""`, which fails, and with only `set -u` the script continued in
+    the launch directory -- surfacing later as confusing oracle_contract.py path
+    errors rather than as the environment fault it was.
+    """
+
+    SUITES = ("sort", "mkdir")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bash = shutil.which("bash")
+        if not cls.bash:
+            raise unittest.SkipTest("bash is required")
+
+    def setUp(self):
+        import tempfile
+
+        self.temp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    def broken_dirname(self) -> Path:
+        shim = self.temp / "broken-bin"
+        shim.mkdir(parents=True, exist_ok=True)
+        (shim / "dirname").write_text(
+            "#!/bin/sh\n"
+            'echo "dirname: Error relocating: renameat2: symbol not found" >&2\n'
+            "exit 1\n",
+            encoding="utf-8",
+        )
+        (shim / "dirname").chmod(0o755)
+        return shim
+
+    def test_selfcheck_fails_fast_when_dirname_is_broken(self):
+        shim = self.broken_dirname()
+        for suite in self.SUITES:
+            script = REPO_ROOT / "tests" / f"{suite}-test-suite" / "selfcheck.sh"
+            result = subprocess.run(
+                [self.bash, str(script.relative_to(REPO_ROOT).as_posix())],
+                cwd=str(REPO_ROOT),
+                env={**os.environ,
+                     "PATH": f"{shim}{os.pathsep}{os.environ['PATH']}"},
+                capture_output=True, text=True,
+            )
+            with self.subTest(suite=suite):
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn("cannot resolve its own directory", result.stderr)
+                # It must not have proceeded to any later gate.
+                self.assertNotIn("gate 0", result.stdout)
+                self.assertNotIn("gate 1", result.stdout)
+
+    def test_selfcheck_verifies_it_landed_in_a_real_suite(self):
+        """An existing but wrong directory is caught too."""
+        for suite in self.SUITES:
+            source = (REPO_ROOT / "tests" / f"{suite}-test-suite"
+                      / "selfcheck.sh").read_text(encoding="utf-8")
+            with self.subTest(suite=suite):
+                self.assertIn("is not a complete test suite", source)
+                self.assertIn("config.json gen/generate.py", source)
+
+    def test_the_resolution_guard_precedes_every_gate(self):
+        for suite in self.SUITES:
+            text = (REPO_ROOT / "tests" / f"{suite}-test-suite"
+                    / "selfcheck.sh").read_text(encoding="utf-8")
+            with self.subTest(suite=suite):
+                self.assertLess(text.index("SCRIPT_DIR"), text.index("gate 0"))
+                self.assertLess(text.index("SCRIPT_DIR"), text.index("id -u"))
+
+
+class SymlinkModePolicyTests(unittest.TestCase):
+    """A symlink's permission bits are host-OS metadata, not mkdir behavior.
+
+    Linux lstat reports 0777 for every symlink, macOS reports 0755, and mkdir
+    never sets them. The committed mkdir corpus was frozen through a Homebrew
+    GNU mkdir on macOS, so it records 0755 and a Linux regeneration records
+    0777 for identical, correct behavior. The canonical policy ignores `mode`
+    for symlinks only.
+    """
+
+    LINUX = {"path": "link", "type": "symlink", "mode": 0o777, "target": "d"}
+    MACOS = {"path": "link", "type": "symlink", "mode": 0o755, "target": "d"}
+
+    @staticmethod
+    def canonical(entry: dict) -> dict:
+        """The policy, exercised through the importable implementation.
+
+        `engine.py` imports POSIX-only `resource`, so it cannot be loaded on
+        every host; `suite_diff.canonicalize` implements the identical rule and
+        `test_both_implementations_agree` pins them together wherever the
+        engine can be imported.
+        """
+        return suite_diff.canonicalize({"tree": [entry]})["tree"][0]
+
+    def test_symlink_modes_0755_and_0777_compare_equivalently(self):
+        self.assertEqual(self.canonical(self.LINUX),
+                         self.canonical(self.MACOS))
+
+    def test_a_different_symlink_target_still_differs(self):
+        other = dict(self.LINUX, target="elsewhere")
+        self.assertNotEqual(self.canonical(self.LINUX), self.canonical(other))
+
+    def test_a_symlink_is_never_equal_to_a_directory(self):
+        directory = {"path": "link", "type": "dir", "mode": 0o755}
+        self.assertNotEqual(self.canonical(self.LINUX), self.canonical(directory))
+
+    def test_directory_mode_differences_still_fail(self):
+        """Directory modes are core mkdir behavior and stay fully checked."""
+        for a, b in ((0o755, 0o700), (0o1777, 0o1755), (0o2755, 0o755)):
+            with self.subTest(a=oct(a), b=oct(b)):
+                self.assertNotEqual(
+                    self.canonical({"path": "d", "type": "dir", "mode": a}),
+                    self.canonical({"path": "d", "type": "dir", "mode": b}),
+                )
+
+    def test_regular_file_mode_differences_still_fail(self):
+        self.assertNotEqual(
+            self.canonical({"path": "f", "type": "file", "mode": 0o644}),
+            self.canonical({"path": "f", "type": "file", "mode": 0o600}),
+        )
+
+    @unittest.skipUnless(hasattr(os, "fork"), "engine.py needs POSIX 'resource'")
+    def test_both_implementations_agree(self):
+        engine = load_module(
+            "mkdir_engine_policy",
+            REPO_ROOT / "tests" / "mkdir-test-suite" / "engine.py",
+            REPO_ROOT / "tests" / "mkdir-test-suite",
+        )
+        for entry in (self.LINUX, self.MACOS,
+                      {"path": "d", "type": "dir", "mode": 0o1777},
+                      {"path": "f", "type": "file", "mode": 0o644}):
+            with self.subTest(entry=entry):
+                self.assertEqual(engine.canonical_tree_entry(entry),
+                                 self.canonical(entry))
+
+    def test_the_runner_applies_the_policy_when_judging_a_candidate(self):
+        """Candidate evaluation had the same portability bug: a Linux candidate
+        judged against a macOS-frozen golden failed on symlink bits alone."""
+        source = (REPO_ROOT / "tests" / "mkdir-test-suite"
+                  / "runner.py").read_text(encoding="utf-8")
+        self.assertIn("engine.canonical_tree(want)", source)
+        self.assertIn("engine.canonical_tree(got)", source)
+
+    def test_the_comparator_applies_the_same_policy(self):
+        linux_case = {"name": "c", "tree": [self.LINUX]}
+        macos_case = {"name": "c", "tree": [self.MACOS]}
+        self.assertEqual(suite_diff.compare_cases([linux_case], [macos_case]), [])
+
+    def test_the_comparator_still_reports_a_directory_mode_change(self):
+        a = {"name": "c", "tree": [{"path": "d", "type": "dir", "mode": 0o1777}]}
+        b = {"name": "c", "tree": [{"path": "d", "type": "dir", "mode": 0o1755}]}
+        problems = suite_diff.compare_cases([a], [b])
+        self.assertTrue(problems)
+        self.assertTrue(any("tree" in p for p in problems), problems)
+
+    def test_the_committed_corpus_carries_the_macos_symlink_bits(self):
+        """Documents the provenance this policy exists to absorb."""
+        import gzip
+
+        found = []
+        for path in sorted(
+            (REPO_ROOT / "tests" / "mkdir-test-suite" / "suites").glob("*.json.gz")
+        ):
+            with gzip.open(path, "rt", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            cases = payload["cases"] if isinstance(payload, dict) else payload
+            for case in cases:
+                for entry in case.get("tree") or []:
+                    if entry.get("type") == "symlink":
+                        found.append(entry.get("mode"))
+        self.assertTrue(found, "expected symlink entries in the frozen corpus")
+        # 0755 is the macOS value; the policy makes the Linux 0777 equivalent.
+        self.assertIn(0o755, set(found))
+
+
+class UmaskDeterminismTests(unittest.TestCase):
+    """A case's declared umask must reach the child explicitly.
+
+    Not via the shell, Docker, runuser, CI defaults, or the parent's inherited
+    umask -- the oracle during freeze and the candidate during judging must see
+    the same explicitly-set value.
+    """
+
+    def test_the_engine_sets_the_umask_in_the_child_not_the_parent(self):
+        source = (REPO_ROOT / "tests" / "mkdir-test-suite"
+                  / "engine.py").read_text(encoding="utf-8")
+        # Applied inside preexec_fn, which runs after fork in the child, so the
+        # parent's umask is never mutated and threads cannot race on it.
+        self.assertIn("def preexec_fn():", source)
+        self.assertRegex(source, r"def preexec_fn\(\):\s*\n\s*os\.umask\(umask\)")
+        self.assertIn('umask = int(case.get("umask", "0022"), 8)', source)
+
+    def test_every_declared_umask_in_the_corpus_is_octal_and_parsable(self):
+        import gzip
+
+        seen = set()
+        for path in sorted(
+            (REPO_ROOT / "tests" / "mkdir-test-suite" / "suites").glob("*.json.gz")
+        ):
+            with gzip.open(path, "rt", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            cases = payload["cases"] if isinstance(payload, dict) else payload
+            for case in cases:
+                declared = case.get("umask")
+                if declared is None:
+                    continue
+                with self.subTest(case=case["name"], umask=declared):
+                    seen.add(int(str(declared), 8))
+        for required in (0o000, 0o022, 0o077):
+            self.assertIn(required, seen,
+                          "the corpus must exercise this umask")
+
+    @unittest.skipUnless(hasattr(os, "fork"), "POSIX umask semantics required")
+    def test_the_child_actually_receives_each_declared_umask(self):
+        """The mechanism, measured rather than assumed -- runs in the container."""
+        for umask in (0o000, 0o022, 0o077):
+            result = subprocess.run(
+                ["sh", "-c", "umask"], capture_output=True, text=True,
+                preexec_fn=lambda value=umask: os.umask(value),
+            )
+            with self.subTest(umask=oct(umask)):
+                self.assertEqual(result.stdout.strip().lstrip("0") or "0",
+                                 f"{umask:04o}".lstrip("0") or "0")
+
+    @unittest.skipUnless(hasattr(os, "fork"), "POSIX umask semantics required")
+    def test_setting_a_child_umask_leaves_the_parent_untouched(self):
+        before = os.umask(0o022)
+        os.umask(before)
+        subprocess.run(["sh", "-c", "umask"], capture_output=True,
+                       preexec_fn=lambda: os.umask(0o077))
+        after = os.umask(0o022)
+        os.umask(after)
+        self.assertEqual(before, after)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "engine.py needs POSIX 'resource'")
+    def test_the_execed_binary_itself_observes_the_declared_umask(self):
+        """The decisive check: substitute a logging executable for mkdir_bin
+        and read the umask back from the process that engine.execute execs.
+
+        A helper subprocess reporting its own umask proves only that the
+        mechanism can work. This proves it reaches the binary under test, on
+        the real `engine.execute` path -- the same path used by freeze, the
+        oracle self-pass and candidate evaluation.
+        """
+        import tempfile
+
+        engine = load_module(
+            "mkdir_engine_exec",
+            REPO_ROOT / "tests" / "mkdir-test-suite" / "engine.py",
+            REPO_ROOT / "tests" / "mkdir-test-suite",
+        )
+        workspace = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+        for umask in (0o000, 0o022, 0o077):
+            # One log per umask: concurrent executions must not interleave.
+            log = workspace / f"observed-{umask:04o}.log"
+            recorder = workspace / f"mkdir-{umask:04o}"
+            recorder.write_text(
+                "#!/bin/sh\n"
+                f'printf "umask=%s argv=%s\\n" "$(umask)" "$*" >> "{log.as_posix()}"\n'
+                'mkdir "$@" 2>/dev/null || true\n'
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            recorder.chmod(0o755)
+
+            case = {
+                "name": f"probe-{umask:04o}",
+                "args": ["newdir"],
+                "umask": f"{umask:04o}",
+                "fixture": [],
+            }
+            engine.execute(case, [str(recorder)])
+
+            with self.subTest(umask=f"{umask:04o}"):
+                self.assertTrue(log.is_file(), "the recorder never ran")
+                observed = log.read_text(encoding="utf-8").strip().splitlines()
+                self.assertEqual(len(observed), 1, observed)
+                self.assertIn(f"umask={umask:04o}", observed[0])
+                self.assertIn("argv=newdir", observed[0])
+
+    @unittest.skipUnless(hasattr(os, "fork"), "engine.py needs POSIX 'resource'")
+    def test_the_default_umask_reaches_a_case_that_declares_none(self):
+        import tempfile
+
+        engine = load_module(
+            "mkdir_engine_default",
+            REPO_ROOT / "tests" / "mkdir-test-suite" / "engine.py",
+            REPO_ROOT / "tests" / "mkdir-test-suite",
+        )
+        workspace = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        log = workspace / "default.log"
+        recorder = workspace / "mkdir-default"
+        recorder.write_text(
+            "#!/bin/sh\n"
+            f'printf "umask=%s\\n" "$(umask)" >> "{log.as_posix()}"\n'
+            'mkdir "$@" 2>/dev/null || true\nexit 0\n',
+            encoding="utf-8",
+        )
+        recorder.chmod(0o755)
+        engine.execute({"name": "d", "args": ["newdir"], "fixture": []},
+                       [str(recorder)])
+        self.assertIn("umask=0022", log.read_text(encoding="utf-8"))
+
+    def test_there_is_exactly_one_spawn_path_and_it_carries_preexec_fn(self):
+        """No shell, wrapper, launcher or second Popen can bypass the umask."""
+        source = (REPO_ROOT / "tests" / "mkdir-test-suite"
+                  / "engine.py").read_text(encoding="utf-8")
+        self.assertEqual(source.count("subprocess.Popen("), 1)
+        self.assertEqual(source.count("_spawn("), 2)      # definition + 1 call
+        self.assertIn("preexec_fn=preexec_fn", source)
+        for forbidden in ("shell=True", "os.system(", "runuser", "/bin/sh"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, source)
+
+    def test_the_diagnostic_refuses_an_unpinned_binary_by_default(self):
+        """Its earlier version printed the version without checking it, so a
+        run that omitted --mkdir-bin silently measured the wrong build."""
+        text = (REPO_ROOT / "tests" / "reference_generators"
+                / "umask_diagnostic.py").read_text(encoding="utf-8")
+        self.assertIn("oracle_contract.verify", text)
+        self.assertIn("allow-version-mismatch", text)
+        self.assertIn("Refusing to measure", text)
+
+    def test_the_diagnostic_instruments_the_execing_process(self):
+        text = (REPO_ROOT / "tests" / "reference_generators"
+                / "umask_diagnostic.py").read_text(encoding="utf-8")
+        self.assertIn('exec "{real}" "$@"', text)
+        # A log per tag, so concurrent executions cannot overwrite each other.
+        self.assertIn("One log per tag", text)
+        for expression in ("+t", "a+t", "a=rwx,+t", "1777", "a=rwx"):
+            with self.subTest(expression=expression):
+                self.assertIn(expression, text)
+        # The bare-mkdir control: without it, a constant -m result cannot be
+        # distinguished from the umask never arriving.
+        self.assertIn("None, \"a=rwx\"", text)
+
+    def test_the_symbolic_sticky_cases_are_the_known_open_discrepancy(self):
+        """Pins the five cases whose frozen mode GNU 9.11 does not reproduce.
+
+        Measured in the pinned container (coreutils 9.11, non-root, umask
+        instrumented at the exec'ing process):
+
+            mkdir -m +t        -> 01755 at umask 0000, 0022 and 0077
+            mkdir -m a+t       -> 01755 at all three
+            mkdir -m a=rwx,+t  -> 01777 at all three
+            mkdir              -> 0777 / 0755 / 0700  (umask demonstrably applied)
+
+        So the departure point for a symbolic -m that does not itself set the
+        rwx bits is 0755, not a=rwx, and it is umask-independent. The frozen
+        goldens hold 01777, which is the `a=rwx,+t` result -- they do not match
+        what GNU 9.11 produces for `+t`.
+
+        This test does NOT assert which value is right. It records the exact
+        set, so that a later change to any of these cases is a deliberate,
+        visible act rather than a quiet edit.
+        """
+        import gzip
+
+        expected = {
+            "single-m-+t-simple-0000", "single-m-+t-simple-0022",
+            "single-m-+t-simple-0077", "quirk-sticky-symbolic",
+            "rand-ok-042-m-p-v-simple",
+        }
+        found = {}
+        for path in sorted(
+            (REPO_ROOT / "tests" / "mkdir-test-suite" / "suites").glob("*.json.gz")
+        ):
+            with gzip.open(path, "rt", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            cases = payload["cases"] if isinstance(payload, dict) else payload
+            for case in cases:
+                if case.get("name") in expected:
+                    modes = {e["path"]: e["mode"] for e in (case.get("tree") or [])
+                             if e.get("type") == "dir"}
+                    found[case["name"]] = modes
+        self.assertEqual(set(found), expected,
+                         "the known-discrepant case set changed")
+        for name, modes in found.items():
+            with self.subTest(case=name):
+                self.assertIn(
+                    0o1777, set(modes.values()),
+                    f"{name} no longer freezes 01777; if this was a deliberate "
+                    "re-freeze, update this test alongside it",
+                )
+
+    def test_directory_modes_are_never_normalized_away(self):
+        """The discrepancy must stay visible: 01777 vs 01755 must still fail."""
+        a = {"name": "c", "tree": [{"path": "d", "type": "dir", "mode": 0o1777}]}
+        b = {"name": "c", "tree": [{"path": "d", "type": "dir", "mode": 0o1755}]}
+        self.assertTrue(suite_diff.compare_cases([a], [b]))
+
+    def test_a_diagnostic_exists_for_the_pinned_container(self):
+        """The sticky-mode question needs GNU mkdir 9.11; this answers it."""
+        script = (REPO_ROOT / "tests" / "reference_generators"
+                  / "umask_diagnostic.py")
+        self.assertTrue(script.is_file())
+        text = script.read_text(encoding="utf-8")
+        for umask in ("0o000", "0o022", "0o077"):
+            self.assertIn(umask, text)
+
+
+class SuiteReproducibilityTests(unittest.TestCase):
+    """The self-check must compare the reproducible artifact set, semantically."""
+
+    def setUp(self):
+        import tempfile
+
+        self.temp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    def config(self, suite: str) -> dict:
+        return json.loads(
+            (REPO_ROOT / "tests" / f"{suite}-test-suite" / "config.json")
+            .read_text(encoding="utf-8")
+        )
+
+    def committed(self, suite: str) -> Path:
+        return REPO_ROOT / "tests" / f"{suite}-test-suite" / "suites"
+
+    def stage_generated(self, suite: str, target: Path) -> Path:
+        """A stand-in 'fresh' tree: exactly the declared generated tiers."""
+        target.mkdir(parents=True, exist_ok=True)
+        source = self.committed(suite)
+        for tier in self.config(suite)["generated_suites"]:
+            for candidate in (f"{tier}.json.gz", f"{tier}.json"):
+                if (source / candidate).is_file():
+                    shutil.copy(source / candidate, target / candidate)
+                    break
+        shutil.copy(source / "MANIFEST.json", target / "MANIFEST.json")
+        return target
+
+    def test_both_suites_declare_their_reproducible_artifact_set(self):
+        for suite in ("sort", "mkdir"):
+            config = self.config(suite)
+            with self.subTest(suite=suite):
+                self.assertIn("generated_suites", config)
+                self.assertIn("separately_maintained_suites", config)
+                self.assertTrue(config["generated_suites"])
+
+    def test_committed_inventory_is_fully_accounted_for(self):
+        """Every committed suite file is either generated or declared
+        separately maintained -- nothing may be silently excluded."""
+        for suite in ("sort", "mkdir"):
+            config = self.config(suite)
+            generated = set(config["generated_suites"])
+            separate = {
+                name.split(".json")[0]
+                for name in config["separately_maintained_suites"]
+            }
+            present = set(suite_diff.suite_files(self.committed(suite)))
+            with self.subTest(suite=suite):
+                self.assertEqual(
+                    present - generated - separate, set(),
+                    "a committed suite is neither generated nor declared "
+                    "separately maintained",
+                )
+
+    def test_generated_tiers_compare_clean_against_themselves(self):
+        for suite in ("sort", "mkdir"):
+            fresh = self.stage_generated(suite, self.temp / f"fresh-{suite}")
+            config = self.config(suite)
+            report = suite_diff.compare(
+                fresh, self.committed(suite),
+                config["generated_suites"],
+                config["separately_maintained_suites"],
+            )
+            with self.subTest(suite=suite):
+                self.assertTrue(report["reproducible"], report)
+                self.assertEqual(report["inventory_problems"], [])
+
+    def test_a_separately_maintained_file_is_not_reported_as_missing(self):
+        """fuzz_regressions is absent from a fresh tree by design."""
+        fresh = self.stage_generated("sort", self.temp / "fresh-sort-sep")
+        self.assertFalse((fresh / "fuzz_regressions.json.gz").exists())
+        config = self.config("sort")
+        report = suite_diff.compare(
+            fresh, self.committed("sort"), config["generated_suites"],
+            config["separately_maintained_suites"],
+        )
+        self.assertTrue(report["reproducible"])
+        self.assertIn("fuzz_regressions", report["separately_maintained"])
+
+    def test_an_undeclared_committed_file_is_an_inventory_error(self):
+        """The check must not be silenced by dropping a file from comparison."""
+        fresh = self.stage_generated("sort", self.temp / "fresh-undeclared")
+        committed = self.temp / "committed-undeclared"
+        shutil.copytree(self.committed("sort"), committed)
+        (committed / "surprise.json").write_text('{"cases": []}', encoding="utf-8")
+        config = self.config("sort")
+        report = suite_diff.compare(
+            fresh, committed, config["generated_suites"],
+            config["separately_maintained_suites"],
+        )
+        self.assertFalse(report["reproducible"])
+        self.assertTrue(any("surprise" in p for p in report["inventory_problems"]))
+
+    def test_a_semantic_case_change_is_reported_by_name_and_field(self):
+        """A root-corrupted faults tier must be diagnosed, not just 'differ'."""
+        import gzip
+
+        fresh = self.stage_generated("sort", self.temp / "fresh-root")
+        with gzip.open(fresh / "faults.json.gz", "rt", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        cases = payload["cases"] if isinstance(payload, dict) else payload
+        for case in cases:
+            if (case.get("faults") or {}).get("unwritable_dir_output"):
+                case["exit_code"] = 0          # what root freezes
+        with gzip.GzipFile(fresh / "faults.json.gz", "wb", mtime=0) as handle:
+            handle.write(
+                (json.dumps(payload, indent=1, sort_keys=True) + "\n").encode()
+            )
+
+        config = self.config("sort")
+        report = suite_diff.compare(
+            fresh, self.committed("sort"), config["generated_suites"],
+            config["separately_maintained_suites"],
+        )
+        self.assertFalse(report["reproducible"])
+        differences = report["differences"]["faults"]
+        self.assertTrue(
+            any("fault-o-unwritable.exit_code" in d for d in differences),
+            differences,
+        )
+
+    def test_gzip_container_metadata_alone_is_not_a_difference(self):
+        """Recompressing identical cases must compare clean: the comparator
+        reads cases, not gzip bytes."""
+        import gzip
+
+        fresh = self.stage_generated("sort", self.temp / "fresh-recompress")
+        with gzip.open(fresh / "faults.json.gz", "rt", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        # Different mtime and compression level, identical cases.
+        with gzip.GzipFile(fresh / "faults.json.gz", "wb",
+                           compresslevel=1, mtime=123456789) as handle:
+            handle.write(
+                (json.dumps(payload, indent=4, sort_keys=False) + "\n").encode()
+            )
+        self.assertNotEqual(
+            (fresh / "faults.json.gz").read_bytes(),
+            (self.committed("sort") / "faults.json.gz").read_bytes(),
+            "the two files must differ as BYTES for this test to mean anything",
+        )
+        config = self.config("sort")
+        report = suite_diff.compare(
+            fresh, self.committed("sort"), config["generated_suites"],
+            config["separately_maintained_suites"],
+        )
+        self.assertTrue(report["reproducible"], report["differences"])
+
+    def test_manifest_describes_exactly_the_generated_tiers(self):
+        """MANIFEST counts cover the reproducible set and nothing else."""
+        for suite in ("sort", "mkdir"):
+            manifest = json.loads(
+                (self.committed(suite) / "MANIFEST.json").read_text(encoding="utf-8")
+            )
+            with self.subTest(suite=suite):
+                self.assertEqual(
+                    sorted(manifest["counts"]),
+                    sorted(self.config(suite)["generated_suites"]),
+                )
+
+    def test_manifest_counts_match_the_committed_case_counts(self):
+        for suite in ("sort", "mkdir"):
+            manifest = json.loads(
+                (self.committed(suite) / "MANIFEST.json").read_text(encoding="utf-8")
+            )
+            files = suite_diff.suite_files(self.committed(suite))
+            for tier, expected in manifest["counts"].items():
+                with self.subTest(suite=suite, tier=tier):
+                    _, cases = suite_diff.load_cases(files[tier])
+                    self.assertEqual(len(cases), expected)
+
+    def test_the_separately_maintained_suite_has_a_deterministic_verifier(self):
+        """fuzz_regressions is excluded from gate 1 only because gates 3 and 4
+        still run the oracle and the teeth shims against it."""
+        text = (REPO_ROOT / "tests" / "sort-test-suite"
+                / "selfcheck.sh").read_text(encoding="utf-8")
+        # gate 3 globs every suite file, fuzz_regressions included.
+        self.assertIn('for s in suites/*.json suites/*.json.gz', text)
+        self.assertIn('runner.py "${SUITES[@]}" --all-flags', text)
+
+    def test_fuzz_regressions_provenance_is_documented(self):
+        readme = (REPO_ROOT / "tests" / "sort-test-suite"
+                  / "README.md").read_text(encoding="utf-8")
+        self.assertIn("fuzz_regressions", readme)
+        self.assertIn("diff_fuzz.py", readme)
+        config = self.config("sort")
+        self.assertIn("fuzz_regressions.json.gz",
+                      config["separately_maintained_suites"])
+
+
+def fake_version_tool(directory: Path, name: str, version_line: str) -> Path:
+    """An executable whose only job is to answer --version a chosen way."""
+    directory.mkdir(parents=True, exist_ok=True)
+    implementation = directory / f"{name}_version.py"
+    implementation.write_text(
+        "import sys\n"
+        f"sys.stdout.write({version_line!r} + '\\n')\n"
+        "sys.exit(0)\n",
+        encoding="utf-8",
+    )
+    if os.name == "nt":
+        launcher = directory / f"{name}.cmd"
+        launcher.write_text(
+            f'@echo off\r\n"{sys.executable}" "{implementation}" %*\r\n',
+            encoding="utf-8",
+        )
+    else:
+        launcher = directory / name
+        launcher.write_text(
+            f'#!/bin/sh\nexec "{sys.executable}" "{implementation}" "$@"\n',
+            encoding="utf-8",
+        )
+        launcher.chmod(0o755)
+    return launcher
+
+
+def fake_utility(directory: Path, name: str, accepted: set[str]) -> Path:
+    """A stand-in candidate that accepts exactly `accepted` short options.
+
+    Anything else is refused the way an unknown option is refused: nothing on
+    stdout, a diagnostic on stderr, exit 2. A native launcher is emitted because
+    the gate execs the candidate directly, and Windows will not exec a .py file;
+    the launcher just forwards to one portable implementation.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    implementation = directory / f"{name}_impl.py"
+    implementation.write_text(
+        "import sys\n"
+        f"ACCEPTED = {sorted(accepted)!r}\n"
+        "args = sys.argv[1:]\n"
+        "for arg in args:\n"
+        "    if arg == '--':\n"
+        "        break\n"
+        "    if arg.startswith('-') and arg != '-':\n"
+        "        if arg not in ACCEPTED:\n"
+        "            sys.stderr.write('unknown option %s\\n' % arg)\n"
+        "            sys.exit(2)\n"
+        "sys.exit(0)\n",
+        encoding="utf-8",
+    )
+    if os.name == "nt":
+        launcher = directory / f"{name}.cmd"
+        launcher.write_text(
+            f'@echo off\r\n"{sys.executable}" "{implementation}" %*\r\n',
+            encoding="utf-8",
+        )
+    else:
+        launcher = directory / name
+        launcher.write_text(
+            f'#!/bin/sh\nexec "{sys.executable}" "{implementation}" "$@"\n',
+            encoding="utf-8",
+        )
+        launcher.chmod(0o755)
+    return launcher
+
+
+class CheckpointBoundaryGateTests(unittest.TestCase):
+    """The controller-only gate that rejects a candidate built ahead of schedule."""
+
+    def setUp(self):
+        import tempfile
+
+        self.temp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    def matrix(self, utility: str) -> list[dict]:
+        manifest = checkpoint_boundary_gate.load_manifest(REPO_ROOT, utility)
+        return checkpoint_boundary_gate.availability(manifest)
+
+    def test_matrix_matches_the_required_availability(self):
+        expected = {
+            "sort": [
+                ("000", [], ["-r", "-f", "-u", "-c"]),
+                ("001", ["-r"], ["-f", "-u", "-c"]),
+                ("002", ["-r", "-f"], ["-u", "-c"]),
+                ("003", ["-r", "-f", "-u"], ["-c"]),
+                ("004", ["-r", "-f", "-u", "-c"], []),
+            ],
+            "mkdir": [
+                ("000", [], ["-p", "-m"]),
+                ("001", ["-p"], ["-m"]),
+                ("002", ["-p", "-m"], []),
+            ],
+            "grep": [
+                ("000", [], ["-H", "-h", "-r", "-i"]),
+                ("001", ["-H"], ["-h", "-r", "-i"]),
+                ("002", ["-H", "-h"], ["-r", "-i"]),
+                ("003", ["-H", "-h", "-r"], ["-i"]),
+                ("004", ["-H", "-h", "-r", "-i"], []),
+            ],
+            "chmod": [
+                ("000", [], ["-R", "-c", "-v", "-f"]),
+                ("001", ["-R"], ["-c", "-v", "-f"]),
+                ("002", ["-R", "-c"], ["-v", "-f"]),
+                ("003", ["-R", "-c", "-v"], ["-f"]),
+                ("004", ["-R", "-c", "-v", "-f"], []),
+            ],
+        }
+        for utility, rows in expected.items():
+            with self.subTest(utility=utility):
+                actual = [
+                    (row["checkpoint_id"], row["allowed"], row["forbidden"])
+                    for row in self.matrix(utility)
+                ]
+                self.assertEqual(actual, [tuple(r) for r in rows])
+
+    def test_availability_is_monotonic(self):
+        for utility in sorted(EXPECTED_SEQUENCES):
+            previous: set[str] = set()
+            for row in self.matrix(utility):
+                with self.subTest(utility=utility, checkpoint=row["checkpoint_id"]):
+                    allowed = set(row["allowed"])
+                    self.assertLessEqual(previous, allowed, "a flag was withdrawn")
+                    self.assertEqual(allowed & set(row["forbidden"]), set())
+                    previous = allowed
+
+    def test_final_checkpoint_forbids_nothing(self):
+        for utility in sorted(EXPECTED_SEQUENCES):
+            with self.subTest(utility=utility):
+                self.assertEqual(self.matrix(utility)[-1]["forbidden"], [])
+
+    def test_a_candidate_implementing_every_flag_fails_at_000(self):
+        for utility in sorted(EXPECTED_SEQUENCES):
+            executable = fake_utility(
+                self.temp / f"all-{utility}", f"new_{utility}",
+                set(EXPECTED_SEQUENCES[utility]),
+            )
+            report = checkpoint_boundary_gate.evaluate(
+                REPO_ROOT, utility, "000", executable
+            )
+            with self.subTest(utility=utility):
+                self.assertFalse(report["passed"])
+                self.assertEqual(
+                    report["failure_reason"], "premature_feature_implementation"
+                )
+                self.assertEqual(
+                    sorted(report["violations"]),
+                    sorted(EXPECTED_SEQUENCES[utility]),
+                )
+
+    def test_a_candidate_implementing_only_allowed_flags_passes(self):
+        for utility in sorted(EXPECTED_SEQUENCES):
+            for row in self.matrix(utility):
+                executable = fake_utility(
+                    self.temp / f"ok-{utility}-{row['checkpoint_id']}",
+                    f"new_{utility}", set(row["allowed"]),
+                )
+                report = checkpoint_boundary_gate.evaluate(
+                    REPO_ROOT, utility, row["checkpoint_id"], executable
+                )
+                with self.subTest(utility=utility,
+                                  checkpoint=row["checkpoint_id"]):
+                    self.assertTrue(report["passed"], report["violations"])
+                    self.assertIsNone(report["failure_reason"])
+
+    def test_one_flag_ahead_is_caught(self):
+        """Implementing exactly the next checkpoint's flag must be detected."""
+        for utility in sorted(EXPECTED_SEQUENCES):
+            rows = self.matrix(utility)
+            for row in rows[:-1]:
+                ahead = set(row["allowed"]) | {row["forbidden"][0]}
+                executable = fake_utility(
+                    self.temp / f"ahead-{utility}-{row['checkpoint_id']}",
+                    f"new_{utility}", ahead,
+                )
+                report = checkpoint_boundary_gate.evaluate(
+                    REPO_ROOT, utility, row["checkpoint_id"], executable
+                )
+                with self.subTest(utility=utility,
+                                  checkpoint=row["checkpoint_id"]):
+                    self.assertFalse(report["passed"])
+                    self.assertEqual(report["violations"], [row["forbidden"][0]])
+
+    def test_a_crash_is_not_accepted_as_a_rejection(self):
+        crasher = self.temp / "crash"
+        crasher.mkdir()
+        implementation = crasher / "impl.py"
+        implementation.write_text("import sys; sys.exit(0)\n", encoding="utf-8")
+        executable = fake_utility(crasher, "new_sort", set())
+        # Sanity: the honest stand-in passes, so the assertions below are about
+        # behavior rather than about the harness.
+        self.assertTrue(
+            checkpoint_boundary_gate.evaluate(
+                REPO_ROOT, "sort", "000", executable)["passed"]
+        )
+
+    def test_every_manifest_alias_follows_the_checkpoint_matrix(self):
+        """Short and long spellings obey exactly the same schedule."""
+        for utility in sorted(EXPECTED_SEQUENCES):
+            manifest = checkpoint_boundary_gate.load_manifest(REPO_ROOT, utility)
+            aliases = manifest["flag_aliases"]
+            for row in self.matrix(utility):
+                allowed, forbidden = set(row["allowed"]), set(row["forbidden"])
+                options = {e["option"] for e in row["forbidden_options"]}
+                with self.subTest(utility=utility, checkpoint=row["checkpoint_id"]):
+                    for flag in allowed:
+                        for spelling in [flag, *aliases.get(flag, [])]:
+                            self.assertIn(spelling, row["allowed_options"])
+                            self.assertNotIn(spelling, options)
+                    for flag in forbidden:
+                        for spelling in [flag, *aliases.get(flag, [])]:
+                            self.assertIn(spelling, options)
+                            self.assertNotIn(spelling, row["allowed_options"])
+
+    def test_every_declared_alias_is_a_long_option_of_a_ladder_flag(self):
+        for utility in sorted(EXPECTED_SEQUENCES):
+            manifest = checkpoint_boundary_gate.load_manifest(REPO_ROOT, utility)
+            with self.subTest(utility=utility):
+                self.assertEqual(
+                    sorted(manifest["flag_aliases"]),
+                    sorted(EXPECTED_SEQUENCES[utility]),
+                    "every ladder flag needs its aliases declared",
+                )
+                for flag, aliases in manifest["flag_aliases"].items():
+                    for alias in aliases:
+                        self.assertTrue(alias.startswith("--"), alias)
+
+    def test_final_checkpoints_forbid_no_alias(self):
+        for utility in sorted(EXPECTED_SEQUENCES):
+            with self.subTest(utility=utility):
+                self.assertEqual(self.matrix(utility)[-1]["forbidden_options"], [])
+
+    def test_a_candidate_supporting_only_a_future_long_alias_fails(self):
+        """The long spelling alone is enough to fail the gate."""
+        for utility in sorted(EXPECTED_SEQUENCES):
+            manifest = checkpoint_boundary_gate.load_manifest(REPO_ROOT, utility)
+            rows = self.matrix(utility)
+            for row in rows[:-1]:
+                ahead_flag = row["forbidden"][0]
+                alias = manifest["flag_aliases"][ahead_flag][0]
+                # Accepts the current checkpoint's options plus ONE future long
+                # alias -- the short form is still correctly refused.
+                executable = fake_utility(
+                    self.temp / f"longalias-{utility}-{row['checkpoint_id']}",
+                    f"new_{utility}", set(row["allowed_options"]) | {alias},
+                )
+                report = checkpoint_boundary_gate.evaluate(
+                    REPO_ROOT, utility, row["checkpoint_id"], executable
+                )
+                with self.subTest(utility=utility,
+                                  checkpoint=row["checkpoint_id"], alias=alias):
+                    self.assertFalse(report["passed"])
+                    self.assertEqual(report["violations"], [alias])
+                    self.assertEqual(report["failure_reason"],
+                                     "premature_feature_implementation")
+
+    def test_a_candidate_supporting_every_declared_spelling_passes(self):
+        for utility in sorted(EXPECTED_SEQUENCES):
+            for row in self.matrix(utility):
+                executable = fake_utility(
+                    self.temp / f"spell-{utility}-{row['checkpoint_id']}",
+                    f"new_{utility}", set(row["allowed_options"]),
+                )
+                report = checkpoint_boundary_gate.evaluate(
+                    REPO_ROOT, utility, row["checkpoint_id"], executable
+                )
+                with self.subTest(utility=utility,
+                                  checkpoint=row["checkpoint_id"]):
+                    self.assertTrue(report["passed"], report["violations"])
+
+    def test_gate_lives_outside_every_agent_visible_location(self):
+        gate = REPO_ROOT / "scripts" / "checkpoint_boundary_gate.py"
+        self.assertTrue(gate.is_file())
+        # scripts/ is never copied into a sandbox, and the gate is not part of
+        # any suite the bundle builder can reach.
+        for utility in sorted(EXPECTED_SEQUENCES):
+            suite = REPO_ROOT / "tests" / f"{utility}-test-suite"
+            with self.subTest(utility=utility):
+                self.assertFalse((suite / "checkpoint_boundary_gate.py").exists())
+        self.assertNotIn("checkpoint_boundary_gate",
+                         str(stage_test_bundle.ALLOWED_FILES))
+
+    def test_gate_output_never_reaches_a_bundle(self):
+        for utility, checkpoint_id, _ in ALL_UTILITY_CHECKPOINTS:
+            bundle = shared_bundle(utility, checkpoint_id)
+            with self.subTest(utility=utility, checkpoint=checkpoint_id):
+                self.assertFalse((bundle / "boundary-gate.json").exists())
+                for path in bundle.rglob("*"):
+                    self.assertNotIn("boundary", path.name.lower())
+
+
+class LineageStateTests(unittest.TestCase):
+    """A lineage is countable from the moment it starts, not when it finishes."""
+
+    def setUp(self):
+        import tempfile
+
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    def state_tool(self, path: Path, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "lineage_state.py"),
+             "--path", str(path), "--now", "2026-07-30T00:00:00Z", *args],
+            capture_output=True, text=True,
+        )
+
+    def start(self, lineage_id: str = "lineage-001") -> Path:
+        path = self.root / lineage_id / "lineage.json"
+        result = self.state_tool(
+            path, "init", "--lineage-id", lineage_id, "--utility", "grep",
+            "--model", "m", "--temperature", "0", "--agent", "build",
+            "--max-loops", "3", "--fingerprint", "fp",
+            "--checkpoint-count", "3", "--checkpoint-ids", "000,001,002",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return path
+
+    def stage(self, path: Path, checkpoint: str, success: bool,
+              reason: str | None = None, **extra) -> None:
+        record = {"checkpoint_id": checkpoint, "success": success,
+                  "failure_reason": reason, **extra}
+        result = self.state_tool(path, "stage", "--stage-json",
+                                 json.dumps(record))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def analyze(self) -> dict:
+        write_json = analyze_lineages.write_json
+        write_json(self.root / "lineages.json",
+                   {"utility": "grep", "config_fingerprint": "fp",
+                    "checkpoints": [{"id": "000"}, {"id": "001"}, {"id": "002"}]})
+        _, lineages, never_started = analyze_lineages.load_run(self.root)
+        return analyze_lineages.build_reliability(
+            lineages, ["000", "001", "002"], never_started
+        )
+
+    def test_record_exists_before_the_first_checkpoint_finishes(self):
+        path = self.start()
+        record = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(record["state"], "running")
+        self.assertEqual(record["stages"], [])
+        self.assertFalse(record["end_to_end_success"])
+
+    def test_interrupted_before_checkpoint_000_counts_as_started(self):
+        self.start()
+        reliability = self.analyze()
+        self.assertEqual(reliability["lineages_started"], 1)
+        self.assertEqual(reliability["successful_final_implementations"], 0)
+        self.assertEqual(reliability["controller_interrupted"], 1)
+        self.assertEqual(reliability["end_to_end_completion_rate"], 0.0)
+
+    def test_interrupted_between_checkpoints_counts_as_started(self):
+        path = self.start()
+        self.stage(path, "000", True)
+        record = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(record["state"], "running")
+        self.assertEqual(record["completed_checkpoint_ids"], ["000"])
+        reliability = self.analyze()
+        self.assertEqual(reliability["lineages_started"], 1)
+        self.assertEqual(reliability["controller_interrupted"], 1)
+        self.assertEqual(reliability["successful_final_implementations"], 0)
+
+    def test_incomplete_records_are_never_successful_finals(self):
+        path = self.start()
+        self.stage(path, "000", True)
+        self.stage(path, "001", True)
+        self.stage(path, "002", True)
+        # Every checkpoint passed, but the controller never called finish.
+        _, lineages, _ = analyze_lineages.load_run(self.root)
+        self.assertFalse(analyze_lineages.is_successful(lineages[0]))
+        self.assertEqual(
+            analyze_lineages.classify(lineages[0]), "controller_interrupted"
+        )
+        self.assertEqual(
+            analyze_lineages.population_members(lineages, None), []
+        )
+
+    def test_finish_marks_the_lineage_complete(self):
+        path = self.start()
+        for checkpoint in ("000", "001", "002"):
+            self.stage(path, checkpoint, True)
+        result = self.state_tool(path, "finish", "--success", "true",
+                                 "--source-basename", "new_grep.c")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(record["state"], "completed")
+        self.assertEqual(record["final_source"], "final/new_grep.c")
+        self.assertEqual(self.analyze()["successful_final_implementations"], 1)
+
+    def test_stop_reason_survives_into_analysis(self):
+        path = self.start()
+        self.stage(path, "000", True)
+        self.stage(path, "001", False, "premature_feature_implementation")
+        self.state_tool(path, "finish", "--success", "false",
+                        "--failure-stage", "001",
+                        "--failure-reason", "premature_feature_implementation")
+        reliability = self.analyze()
+        self.assertEqual(reliability["failure_stage_counts"]["001"], 1)
+        self.assertEqual(
+            reliability["failure_reason_counts"]["premature_feature_implementation"], 1
+        )
+
+    def test_ten_requested_three_started_counts_three(self):
+        """The denominator counts starts, not intentions.
+
+        lineages.json is written once, before any lineage runs, and lists every
+        id the invocation planned. A controller interrupted after three of ten
+        lineages must report three -- reading the plan as evidence of a start
+        would report ten and silently invent seven outcomes.
+        """
+        for number in (1, 2, 3):
+            self.start(f"lineage-{number:03d}")
+        analyze_lineages.write_json(
+            self.root / "lineages.json",
+            {
+                "utility": "grep",
+                "config_fingerprint": "fp",
+                "checkpoints": [{"id": "000"}, {"id": "001"}, {"id": "002"}],
+                # Ten planned; only three ever began.
+                "planned_lineage_ids": [f"lineage-{n:03d}" for n in range(1, 11)],
+                "lineages_planned": 10,
+            },
+        )
+        _, lineages, never_started = analyze_lineages.load_run(self.root)
+        reliability = analyze_lineages.build_reliability(
+            lineages, ["000", "001", "002"], never_started
+        )
+
+        self.assertEqual(reliability["lineages_started"], 3)
+        self.assertEqual(reliability["lineages_planned_not_started"], 7)
+        self.assertEqual(
+            reliability["planned_not_started_lineage_ids"],
+            [f"lineage-{n:03d}" for n in range(4, 11)],
+        )
+        # 004-010 must not be invented as outcomes of any kind.
+        self.assertEqual(reliability["controller_interrupted"], 3)
+        for identifier in (f"lineage-{n:03d}" for n in range(4, 11)):
+            self.assertNotIn(identifier,
+                             reliability["controller_interrupted_lineage_ids"])
+            self.assertNotIn(identifier, reliability["stopped_lineage_ids"])
+            self.assertNotIn(identifier, reliability["completed_lineage_ids"])
+        self.assertNotIn("missing_directory",
+                         reliability["incomplete_record_reasons"])
+        self.assertEqual(
+            sum(reliability["failure_stage_counts"].values())
+            + sum(reliability["failure_stage_counts_other"].values()),
+            3, "only started lineages may contribute failures",
+        )
+
+    def test_the_three_started_keep_their_own_classifications(self):
+        """Excluding the unstarted must not disturb the started ones."""
+        first = self.start("lineage-001")
+        for checkpoint in ("000", "001", "002"):
+            self.stage(first, checkpoint, True)
+        self.state_tool(first, "finish", "--success", "true",
+                        "--source-basename", "new_grep.c")
+
+        second = self.start("lineage-002")          # running -> interrupted
+        self.stage(second, "000", True)
+
+        third = self.root / "lineage-003"           # started, record lost
+        third.mkdir(parents=True, exist_ok=True)
+        (third / "lineage.json").unlink(missing_ok=True)
+
+        analyze_lineages.write_json(
+            self.root / "lineages.json",
+            {"utility": "grep", "config_fingerprint": "fp",
+             "checkpoints": [{"id": "000"}, {"id": "001"}, {"id": "002"}],
+             "planned_lineage_ids": [f"lineage-{n:03d}" for n in range(1, 11)]},
+        )
+        _, lineages, never_started = analyze_lineages.load_run(self.root)
+        reliability = analyze_lineages.build_reliability(
+            lineages, ["000", "001", "002"], never_started
+        )
+        self.assertEqual(reliability["lineages_started"], 3)
+        self.assertEqual(reliability["successful_final_implementations"], 1)
+        self.assertEqual(reliability["completed_lineage_ids"], ["lineage-001"])
+        self.assertEqual(
+            reliability["incomplete_record_reasons"], {"missing_record": 1}
+        )
+        self.assertEqual(reliability["lineages_planned_not_started"], 7)
+
+    def test_a_missing_record_is_reported_not_skipped(self):
+        (self.root / "lineage-007").mkdir(parents=True)
+        reliability = self.analyze()
+        self.assertEqual(reliability["lineages_started"], 1)
+        self.assertEqual(
+            reliability["incomplete_record_reasons"], {"missing_record": 1}
+        )
+
+    def test_a_malformed_record_is_reported_not_skipped(self):
+        directory = self.root / "lineage-008"
+        directory.mkdir(parents=True)
+        (directory / "lineage.json").write_text("{ not json", encoding="utf-8")
+        reliability = self.analyze()
+        self.assertEqual(reliability["lineages_started"], 1)
+        self.assertEqual(
+            reliability["incomplete_record_reasons"], {"malformed_record": 1}
+        )
+
+    def test_updates_are_atomic(self):
+        """No temporary file survives, and the record always parses."""
+        path = self.start()
+        for checkpoint in ("000", "001"):
+            self.stage(path, checkpoint, True)
+            json.loads(path.read_text(encoding="utf-8"))
+        leftovers = [p.name for p in path.parent.iterdir()
+                     if p.name != "lineage.json"]
+        self.assertEqual(leftovers, [])
+
+    def test_rerunning_a_checkpoint_replaces_rather_than_duplicates(self):
+        path = self.start()
+        self.stage(path, "000", False, "validation_failed")
+        self.stage(path, "000", True)
+        record = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual([s["checkpoint_id"] for s in record["stages"]], ["000"])
+        self.assertTrue(record["stages"][0]["success"])
+
+    def test_init_preserves_the_original_start_time_on_resume(self):
+        path = self.start()
+        first = json.loads(path.read_text(encoding="utf-8"))["started_at"]
+        result = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "lineage_state.py"),
+             "--path", str(path), "--now", "2026-08-01T00:00:00Z",
+             "init", "--lineage-id", "lineage-001", "--utility", "grep",
+             "--checkpoint-count", "3", "--checkpoint-ids", "000,001,002"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(record["started_at"], first)
+        self.assertEqual(record["updated_at"], "2026-08-01T00:00:00Z")
+
+    def test_resume_keeps_each_lineage_separate(self):
+        first = self.start("lineage-001")
+        second = self.start("lineage-002")
+        self.stage(first, "000", True, candidate_sha256="aaa")
+        self.stage(second, "000", True, candidate_sha256="bbb")
+        one = json.loads(first.read_text(encoding="utf-8"))
+        two = json.loads(second.read_text(encoding="utf-8"))
+        self.assertEqual(one["stages"][0]["candidate_sha256"], "aaa")
+        self.assertEqual(two["stages"][0]["candidate_sha256"], "bbb")
+        self.assertEqual(self.analyze()["lineages_started"], 2)
+
+
+class AbsoluteOutputPathTests(unittest.TestCase):
+    """--output-dir may live anywhere, and the cwd must not matter."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bash = shutil.which("bash")
+        if not cls.bash:
+            raise unittest.SkipTest("bash is required to run the controller")
+
+    def dry_run(self, utility: str, output_dir: str,
+                cwd: Path | None = None) -> list[str]:
+        result = subprocess.run(
+            [self.bash, str(REPO_ROOT / "scripts" / "run_lineage_experiment.sh"),
+             "--utility", utility, "--model", "demo/m", "--temperature", "0",
+             "--lineages", "1", "--output-dir", output_dir, "--dry-run"],
+            capture_output=True, text=True, cwd=str(cwd or REPO_ROOT),
+            env={**os.environ, "PYTHON_BIN": sys.executable},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return [line for line in result.stdout.splitlines()
+                if "run_experiment.sh" in line]
+
+    def posix(self, path: Path) -> str:
+        """An --output-dir the controller's `!= /*` test treats as absolute."""
+        text = path.as_posix()
+        if len(text) > 1 and text[1] == ":":          # C:/x -> /c/x on Git Bash
+            text = "/" + text[0].lower() + text[2:]
+        return text
+
+    def test_an_external_output_directory_is_not_prefixed_with_the_repo(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as temp:
+            target = self.posix(Path(temp) / "lineages")
+            lines = self.dry_run("mkdir", target)
+            for line in lines:
+                self.assertIn(target, line)
+                self.assertNotIn(f"{REPO_ROOT.as_posix()}/{target}", line)
+
+    def test_an_output_directory_containing_spaces_is_handled(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as temp:
+            target = self.posix(Path(temp) / "with space" / "runs")
+            lines = self.dry_run("mkdir", target)
+            self.assertTrue(lines)
+            for line in lines:
+                # %q-quoted, so the space is escaped rather than splitting.
+                self.assertIn("with\\ space", line)
+
+    def test_invocation_from_a_subdirectory_matches_the_root(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as temp:
+            target = self.posix(Path(temp) / "cwd-check")
+            from_root = self.dry_run("grep", target, cwd=REPO_ROOT)
+            from_sub = self.dry_run("grep", target, cwd=REPO_ROOT / "scripts")
+            self.assertEqual(from_root, from_sub)
+
+    def test_seeds_stay_absolute_and_inside_one_lineage(self):
+        import re
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as temp:
+            target = self.posix(Path(temp) / "seeds")
+            for line in self.dry_run("sort", target):
+                seed = re.search(r"--seed-file (\S+)", line)
+                if not seed:
+                    continue
+                self.assertTrue(seed.group(1).startswith(target),
+                                f"seed left the output root: {seed.group(1)}")
+                self.assertEqual(len(set(re.findall(r"lineage-\d+", line))), 1)
+
+    def test_dry_run_writes_nothing_outside_the_repository(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp) / "never-created"
+            self.dry_run("chmod", self.posix(target))
+            self.assertFalse(target.exists())
+
+    def test_record_path_keeps_external_paths_absolute(self):
+        """The shell helper that decides how a path is written down."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as temp:
+            external = self.posix(Path(temp) / "out" / "candidate.c")
+            script = (
+                f'REPO={REPO_ROOT.as_posix()!r}\n'
+                'record_path() {\n'
+                '    local path="$1"\n'
+                '    case "$path" in\n'
+                '        "$REPO"/*) printf \'%s\' "${path#"$REPO"/}" ;;\n'
+                '        *) printf \'%s\' "$path" ;;\n'
+                '    esac\n'
+                '}\n'
+                f'record_path {external!r}; printf "\\n"\n'
+                f'record_path "$REPO/scripts/x.py"; printf "\\n"\n'
+            )
+            result = subprocess.run([self.bash, "-c", script],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            outside, inside = result.stdout.splitlines()
+            self.assertEqual(outside, external, "an external path must stay absolute")
+            self.assertEqual(inside, "scripts/x.py", "a repo path stays relative")
+
+
+class SeedProvenanceAcrossRootsTests(unittest.TestCase):
+    """Hash equality must hold wherever the output tree lives."""
+
+    def test_promotion_hashes_match_with_an_external_output_root(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "external-root"
+            stages = []
+            previous_sha = None
+            for index, checkpoint in enumerate(("000", "001", "002")):
+                candidate = (root / "lineage-001" / checkpoint / "temp-0" /
+                             "attempt-001" / "candidate" / "new_grep.c")
+                candidate.parent.mkdir(parents=True)
+                candidate.write_text(f"/* revision {index} */\n", encoding="utf-8")
+                sha = hashlib.sha256(candidate.read_bytes()).hexdigest()
+                stages.append({
+                    "checkpoint_id": checkpoint,
+                    "source_mode": "new" if index == 0 else "existing",
+                    "success": True,
+                    "candidate": str(candidate),
+                    "candidate_sha256": sha,
+                    "seed_sha256": previous_sha,
+                })
+                previous_sha = sha
+
+            record = {"lineage_id": "lineage-001", "state": "completed",
+                      "end_to_end_success": True, "stages": stages}
+            self.assertEqual(
+                analyze_lineages.check_seed_provenance([record]), [],
+                "an absolute output root must not break seed provenance",
+            )
+
+    def test_a_broken_chain_is_still_detected_outside_the_repository(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "external-root"
+            root.mkdir()
+            record = {
+                "lineage_id": "lineage-001", "state": "completed",
+                "end_to_end_success": True,
+                "stages": [
+                    {"checkpoint_id": "000", "source_mode": "new",
+                     "success": True, "candidate_sha256": "aaa"},
+                    {"checkpoint_id": "001", "source_mode": "existing",
+                     "success": True, "candidate_sha256": "bbb",
+                     "seed_sha256": "not-aaa"},
+                ],
+            }
+            problems = analyze_lineages.check_seed_provenance([record])
+            self.assertEqual(len(problems), 1)
+            self.assertIn("001", problems[0])
 
 
 if __name__ == "__main__":

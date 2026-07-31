@@ -10,6 +10,8 @@ The executable must remain:
 
 Add only the feature described here. Do not add unrelated behavior.
 
+Do not implement options or behavior outside this checkpoint's stated scope.
+
 ## Current program
 
 Source:

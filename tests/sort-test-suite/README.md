@@ -3,9 +3,15 @@
 An exhaustive, GNU-sort-backed test suite for any `sort`-like binary: every
 flag alone, every valid flag pairing, curated/random higher-order combos,
 I/O fault injection, adversarial inputs, ASan/UBSan, and live differential
-fuzzing against real GNU `sort`. 751 frozen golden cases + 195 previously
-fuzz-discovered regressions ship in `suites/`, so you can judge a candidate
-without even needing GNU `sort` installed (only fuzzing/regeneration need it).
+fuzzing against real GNU `sort`. `suites/` ships **751 reproducibly generated
+golden cases** — the six tiers `gen/generate.py` produces, whose per-tier counts
+are recorded in `suites/MANIFEST.json` — alongside
+`suites/fuzz_regressions.json.gz`, a **separately maintained, accreting
+regression corpus** that `diff_fuzz.py` appends to whenever the live
+differential fuzzer finds a new distinct bug. Its size grows over time and is
+deliberately not quoted here; read it from the file or `MANIFEST.json`, which
+covers the generated tiers only. Judging a candidate needs neither the fuzzer
+nor GNU `sort` (only fuzzing/regeneration do).
 
 ## Checkpoint interface (bounded new_sort experiment)
 
@@ -27,6 +33,47 @@ for. `README.md` is never copied into a bundle. The suite as a whole still
 knows about GNU sort's full flag surface — that generic infrastructure is
 unrelated to the bounded checkpoint sequence above, and
 `scripts/stage_test_bundle.py` keeps it out of every sandbox.
+
+## Oracle contract
+
+`suites/` was frozen by running a **real GNU coreutils sort**, so the oracle
+is part of this benchmark's definition rather than an implementation detail:
+coreutils changes diagnostic wording between releases, and goldens frozen
+against one release are not what another release produces.
+
+| | |
+|---|---|
+| Pinned version | **GNU coreutils 9.4** |
+| Recorded in | `suites/MANIFEST.json` (`sort_version`), `config.json` (`oracle_version_required`) |
+| Override | `SORT_ORACLE_BIN` environment variable |
+
+Selection order, implemented by `tests/reference_generators/oracle_contract.py`:
+
+1. an explicit `--sort-bin` / `--oracle-bin` argument
+2. `$SORT_ORACLE_BIN`
+3. `paths.oracle_bin` in `config.json`
+4. conventional locations (`/usr/bin/sort`, Homebrew gnubin, …)
+
+Prefer the environment variable — it needs no edit to a tracked file, so a
+Linux, WSL and macOS checkout can each point at their own coreutils:
+
+```bash
+SORT_ORACLE_BIN=/usr/bin/sort ./selfcheck.sh
+```
+
+`selfcheck.sh` verifies **before regenerating anything** that the binary exists,
+is GNU coreutils, and matches the pin. A mismatch fails immediately and names
+both versions, instead of surfacing later as a confusing model mismatch about
+one error message.
+
+`suites/` is only overwritten when you pass `--publish`. Without it the
+self-check regenerates into a temporary directory and *compares*, which proves
+the committed goldens are reproducible without letting one machine silently
+redefine the benchmark. Re-pinning is a deliberate act: update
+`oracle_version_required`, re-freeze with `--publish`, and say so in the commit.
+
+Judging a candidate needs **no oracle at all** — it runs entirely from the
+frozen goldens. The oracle path never reaches an agent-visible stage bundle.
 
 ## 1. One-time setup
 

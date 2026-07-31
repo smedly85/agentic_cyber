@@ -30,8 +30,16 @@ CONFLICT = "CONFLICT"
 @dataclass
 class ExpectedError:
     exit_code: int
-    # a substring that must appear in stderr (loose cross-check only)
-    stderr_contains: str = ""
+    # Substring(s) that must appear in stderr -- a LOOSE cross-check only, used
+    # during freeze to confirm the model understood the rule. It is never used
+    # to score a candidate: candidates are judged against the frozen golden's
+    # byte-exact stderr, captured from the pinned oracle.
+    #
+    # A tuple means "any of these", which is how a rule whose wording GNU has
+    # changed across releases stays a check on the semantic error *category*
+    # without pretending one release's phrasing is universal. Byte-exact
+    # candidate evaluation is unaffected, because it never reads this field.
+    stderr_contains: str | tuple[str, ...] = ""
 
 
 # rule_id -> ExpectedError. Usage errors exit 2; the argmatch family
@@ -42,7 +50,14 @@ RULES: dict[str, ExpectedError] = {
     "C3_check_multifile": ExpectedError(2, "not allowed with -"),
     "C4_check_output": ExpectedError(2, "are incompatible"),
     "C5_debug_incompat": ExpectedError(2, "are incompatible"),
-    "C6_empty_tab": ExpectedError(2, "empty tab"),
+    # coreutils <= 9.x said "empty tab"; later releases replaced it with
+    # "separator must be exactly one character long: ''". Same rule, same exit
+    # status, different prose. Both are accepted here so this cross-check keeps
+    # asserting the category rather than one release's wording; which release a
+    # frozen corpus belongs to is enforced separately, by the oracle version
+    # pin in config.json / suites/MANIFEST.json.
+    "C6_empty_tab": ExpectedError(2, ("empty tab",
+                                      "separator must be exactly one character long")),
     "C7_multichar_tab": ExpectedError(2, "multi-character tab"),
     "C8_incompat_tabs": ExpectedError(2, "incompatible tabs"),
     "C9_multi_output": ExpectedError(2, "multiple output files"),

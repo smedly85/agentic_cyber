@@ -32,17 +32,86 @@ that script is copied into the agent-visible stage bundle, and naming a later
 checkpoint's flags there would disclose work the agent has not yet been asked
 for. `README.md` is never copied into a bundle.
 
+## Canonical symlink policy
+
+A symlink's permission bits are **host-OS metadata, not mkdir behavior**. Linux
+`lstat` reports `0777` for every symlink; macOS reports `0755`; there is no
+portable way to `chmod` a symlink and mkdir never tries. The committed corpus
+was frozen through a Homebrew GNU mkdir on macOS, so it records `0755`, and a
+Linux regeneration records `0777` for identical, correct behavior.
+
+The canonical policy, applied identically everywhere a tree is compared:
+
+> For an entry of type `symlink`, compare **path, type and target**, and ignore
+> **`mode`**. For every other type, compare the mode unchanged.
+
+| Where | Implementation |
+|---|---|
+| candidate evaluation | `runner.py` `_tree_diff` → `engine.canonical_tree` |
+| oracle self-pass | same path (gate 3 runs the oracle through `runner.py`) |
+| fresh-vs-committed comparison | `../reference_generators/suite_diff.py` `canonicalize` |
+| fresh generation | `engine.snapshot_tree` still records the mode; nothing is discarded, it is ignored at comparison |
+
+This deliberately does **not** touch directory or regular-file modes. Those are
+core mkdir behavior — umask interaction, `-m`, setuid/setgid/sticky — and remain
+fully checked; a directory that comes out `01755` where `01777` was frozen still
+fails, as it must.
+
+The policy is a comparator rule, not a schema change: **no frozen file was
+modified**, and the corpus keeps its recorded `0755` values.
+
+## Oracle contract
+
+`suites/` was frozen by running a **real GNU coreutils mkdir**, so the oracle
+is part of this benchmark's definition rather than an implementation detail:
+coreutils changes diagnostic wording between releases, and goldens frozen
+against one release are not what another release produces.
+
+| | |
+|---|---|
+| Pinned version | **GNU coreutils 9.11** |
+| Recorded in | `suites/MANIFEST.json` (`mkdir_version`), `config.json` (`oracle_version_required`) |
+| Override | `MKDIR_ORACLE_BIN` environment variable |
+
+Selection order, implemented by `tests/reference_generators/oracle_contract.py`:
+
+1. an explicit `--mkdir-bin` / `--oracle-bin` argument
+2. `$MKDIR_ORACLE_BIN`
+3. `paths.oracle_bin` in `config.json`
+4. conventional locations (`/usr/bin/mkdir`, Homebrew gnubin, …)
+
+Prefer the environment variable — it needs no edit to a tracked file, so a
+Linux, WSL and macOS checkout can each point at their own coreutils:
+
+```bash
+MKDIR_ORACLE_BIN=/usr/bin/mkdir ./selfcheck.sh
+```
+
+`selfcheck.sh` verifies **before regenerating anything** that the binary exists,
+is GNU coreutils, and matches the pin. A mismatch fails immediately and names
+both versions, instead of surfacing later as a confusing model mismatch about
+one error message.
+
+`suites/` is only overwritten when you pass `--publish`. Without it the
+self-check regenerates into a temporary directory and *compares*, which proves
+the committed goldens are reproducible without letting one machine silently
+redefine the benchmark. Re-pinning is a deliberate act: update
+`oracle_version_required`, re-freeze with `--publish`, and say so in the commit.
+
+Judging a candidate needs **no oracle at all** — it runs entirely from the
+frozen goldens. The oracle path never reaches an agent-visible stage bundle.
+
 ## 1. One-time setup
 
 Edit **`config.json`** -- it's the only file you should need to touch:
 
 - `paths.candidate_bin` -- path to your compiled mkdir binary. **Required.**
 - `paths.oracle_bin` -- a real GNU coreutils `mkdir`. Only needed for the
-  fuzz pass and for regenerating `suites/`. On Linux this is usually
-  `/usr/bin/mkdir` already; on macOS the system `/bin/mkdir` is BSD, not
-  GNU -- install GNU coreutils (`brew install coreutils`) and point this at
-  the gnubin `mkdir` (e.g.
-  `/opt/homebrew/opt/coreutils/libexec/gnubin/mkdir`).
+  fuzz pass and for regenerating `suites/`. Leave it empty and set
+  `MKDIR_ORACLE_BIN` instead; see [Oracle contract](#oracle-contract) for the
+  full resolution order and the pinned version. On Linux/WSL `/usr/bin/mkdir`
+  is already GNU; on macOS the system `/bin/mkdir` is BSD, so install GNU
+  coreutils (`brew install coreutils`) and point at its gnubin `mkdir`.
 - `paths.candidate_asan_bin` / `candidate_src` / `cc` / `cc_flags` --
   optional, for the ASan/UBSan pass. Either point `candidate_asan_bin` at a
   binary you already built yourself with sanitizers (any language), or, if

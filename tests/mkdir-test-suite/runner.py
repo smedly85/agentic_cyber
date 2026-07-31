@@ -145,6 +145,11 @@ def _stdout_expected(case: dict) -> bytes | None:
 
 
 def _tree_diff(want: list[dict], got: list[dict]) -> str | None:
+    # Both sides go through the canonical policy before comparison, so a
+    # symlink's host-OS permission bits cannot fail a candidate that behaved
+    # correctly. Directory and file modes are compared unchanged.
+    want = engine.canonical_tree(want)
+    got = engine.canonical_tree(got)
     want_by_path = {e["path"]: e for e in want}
     got_by_path = {e["path"]: e for e in got}
     missing = sorted(set(want_by_path) - set(got_by_path))

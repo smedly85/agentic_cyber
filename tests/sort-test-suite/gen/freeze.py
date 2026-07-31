@@ -43,6 +43,17 @@ def freeze_case(case: dict, sort_bin: str = "/usr/bin/sort",
     c = dict(case)
     res = engine.execute(c, [sort_bin], stdin_mode=stdin_mode)
 
+    if res.signal_name == "SKIP_ROOT":
+        # The engine refused to run a permission-sensitive case because we are
+        # root. Freezing whatever came back would bake root's privileges into
+        # the golden -- an "unwritable output directory" case would record a
+        # successful write. Abort instead; selfcheck.sh also refuses to run as
+        # root, so reaching here means the generator was invoked directly.
+        raise FreezeError(
+            f"cannot freeze {c['name']} as root: it asserts that a permission "
+            f"bit REFUSES the operation, and root ignores permission bits. "
+            f"Re-run the generator as an unprivileged user.")
+
     if res.timed_out:
         raise FreezeError(f"GNU sort timed out freezing {c['name']}")
     allow = set(c.get("allow_signals", []))
@@ -91,10 +102,21 @@ def freeze_case(case: dict, sort_bin: str = "/usr/bin/sort",
                 f"MODEL MISMATCH {c['name']}: rule {rule_id} predicts exit "
                 f"{exp.exit_code} but GNU exited {res.exit_code} "
                 f"(stderr={res.stderr[:120]!r})")
-        if exp.stderr_contains and exp.stderr_contains.encode() not in res.stderr:
+        # A tuple of accepted substrings means "any of these": see
+        # constraints.ExpectedError. This is a loose model cross-check, not
+        # candidate scoring, so accepting several documented wordings of one
+        # error category does not weaken how candidates are judged.
+        accepted = exp.stderr_contains
+        if isinstance(accepted, str):
+            accepted = (accepted,) if accepted else ()
+        if accepted and not any(text.encode() in res.stderr for text in accepted):
             raise FreezeError(
                 f"MODEL MISMATCH {c['name']}: rule {rule_id} expects stderr "
-                f"to contain {exp.stderr_contains!r}, got {res.stderr[:160]!r}")
+                f"to contain one of {list(accepted)!r}, got {res.stderr[:160]!r}. "
+                f"If this is a wording change in a newer GNU coreutils, add it "
+                f"to that rule in model/constraints.py; if the oracle version "
+                f"is simply wrong, the suite's oracle pin should have caught it "
+                f"first (see selfcheck.sh gate 0).")
 
     c.pop("exact_stderr", None)
     return c

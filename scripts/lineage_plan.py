@@ -228,6 +228,41 @@ def resolve_plan(
         )
         resolved.append(entry)
 
+    # Long-form spellings of the checkpoint flags. The boundary gate probes
+    # these alongside the short forms, so a candidate cannot slip a future
+    # feature in under its long name. Declared here rather than discovered, and
+    # validated against the ladder so an alias can never name a flag no
+    # checkpoint introduces.
+    flag_aliases = manifest.get("flag_aliases", {})
+    if not isinstance(flag_aliases, dict):
+        raise ManifestError(f"{manifest_path}: 'flag_aliases' must be an object")
+    ladder = {flag for entry in resolved for flag in entry["implemented_flags"]}
+    for flag, aliases in sorted(flag_aliases.items()):
+        if flag not in ladder:
+            raise ManifestError(
+                f"{manifest_path}: flag_aliases names {flag!r}, which no "
+                "checkpoint introduces"
+            )
+        if not isinstance(aliases, list) or not aliases:
+            raise ManifestError(
+                f"{manifest_path}: flag_aliases[{flag!r}] must be a non-empty list"
+            )
+        for alias in aliases:
+            if not isinstance(alias, str) or not alias.startswith("--"):
+                raise ManifestError(
+                    f"{manifest_path}: {alias!r} is not a long option"
+                )
+    duplicates = [
+        alias for alias in
+        [a for aliases in flag_aliases.values() for a in aliases]
+        if [a for aliases in flag_aliases.values() for a in aliases].count(alias) > 1
+    ]
+    if duplicates:
+        raise ManifestError(
+            f"{manifest_path}: alias {sorted(set(duplicates))} is claimed by "
+            "more than one flag"
+        )
+
     base_test_command = manifest.get("base_test_command", "")
     extra_test_command = manifest.get("extra_test_command", "")
     for label, command in (
@@ -251,6 +286,7 @@ def resolve_plan(
         "test_dir": test_dir,
         "judge": judge,
         "judge_sha256": sha256_file(judge_file),
+        "flag_aliases": {k: list(v) for k, v in sorted(flag_aliases.items())},
         "base_test_command": base_test_command,
         "extra_test_command": extra_test_command,
         "checkpoints": resolved,

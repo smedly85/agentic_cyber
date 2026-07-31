@@ -562,33 +562,54 @@ adds exactly one feature, and so on. Cumulative flag filtering tests the ladder
 from *below* — it never reaches a feature that does not exist yet — but on its
 own it cannot notice a candidate that implemented the whole option set at 000.
 
-A case may therefore declare `absent_flags`. It is selected only while none of
-those flags is implemented, which is how a checkpoint asserts a later feature is
-still missing:
+Detecting that requires asserting "`-H` is still refused here", and the obvious
+place to put such an assertion is the worst one: a frozen suite case spells the
+flag out in its own argv, so shipping it at checkpoint 000 would hand the agent
+the name of the option the checkpoint is withholding. Enforcement therefore
+lives entirely outside anything the agent can read.
+
+**`scripts/checkpoint_boundary_gate.py`** is a controller-only gate. It lives in
+`scripts/`, which is never copied into a sandbox — `run_experiment.sh` seeds a
+working directory with the prompt, the stage test bundle and the seed source,
+and nothing else. The gate:
+
+* runs **after** public validation has already succeeded, and **before** the
+  candidate is promoted;
+* is never copied into the worktree or the stage bundle;
+* never feeds the repair loop — a failure is not reported back to the agent,
+  because the diagnostic would name the flag;
+* fails the stage with `premature_feature_implementation`, so the candidate is
+  not promoted and the lineage produces no `final/` artifact.
+
+The availability matrix is derived from `experiments/utilities/<utility>.json`,
+not written twice: a checkpoint's allowed set is its own cumulative
+`implemented_flags`, and its forbidden set is every flag the manifest introduces
+later. Only the short flags the manifest declares are probed — no alias is
+invented.
+
+For each forbidden flag the gate invokes the built candidate so that the only
+thing wrong with the command line is that option, and requires a refusal:
+nonzero exit, no termination by signal, no sanitizer diagnostic, nothing on
+stdout, and a diagnostic on stderr. These are weak enough to accept any
+reasonable "unknown option" handling and strong enough that actually honouring
+the flag fails.
+
+Because the matrix comes from the manifest rather than from frozen goldens, all
+four utilities are covered uniformly. That closes an asymmetry the earlier
+suite-case approach could not: `new_grep` and `new_chmod` freeze their goldens
+from specification models that can be restricted to one checkpoint's option set,
+but `new_sort` and `new_mkdir` freeze theirs by running a real GNU binary, which
+implements `-r` and `-p` and so can never produce a "this must be rejected"
+golden.
+
+The prompts state only the current cumulative requirements plus a generic bound:
 
 ```text
-grep  base-rejects-i-before-its-checkpoint   -i must exit 2 at 000..003
-chmod base-rejects-v-before-its-checkpoint   -v must exit 2 at 000..002
+Do not implement options or behavior outside this checkpoint's stated scope.
 ```
 
-Every prompt makes an option it has not introduced an unknown option, so these
-are contract-consistent rather than extra requirements. Each case disappears at
-the checkpoint that introduces its flag, where the same invocation must now
-succeed; `gen/verify.py` asserts exactly that, and the suites' monotone-coverage
-invariant excludes them so their intended disappearance does not read as lost
-coverage.
+They never enumerate a later checkpoint's flags.
 
-**Coverage and its limits.** `new_grep` and `new_chmod` carry rejection cases for
-every flag in their ladders, because their goldens come from specification models
-that `parse_args` can restrict to one checkpoint's option set. `new_sort` and
-`new_mkdir` **do not**, and cannot without a different mechanism: their goldens
-are frozen by running a real GNU binary, and GNU `sort` supports `-r` and GNU
-`mkdir` supports `-p`, so the oracle cannot produce a "this must be rejected"
-golden for a flag it implements. Adding them there means authoring those
-expectations by hand instead of deriving them from the oracle. Until then,
-premature implementation is detected for grep and chmod only; for sort and mkdir
-the ladder is still tested from below, and the unknown-option rejection cases
-that do exist (`-Z`, `--no-such-flag`) cover options outside the experiment.
 
 ### Output layout
 
@@ -611,6 +632,37 @@ runs/lineages/<utility>/<model-slug>/temp-<slug>/
 Every stage stays inspectable, including the repair prompts and logs. Failed
 lineages are retained; `final/` exists **only** for a lineage that completed the
 whole sequence, so its presence is never ambiguous.
+
+### Lineage state, and counting every lineage that starts
+
+Reliability is measured over every lineage **started**, so a lineage has to
+become countable the moment it begins rather than when it finishes.
+`lineage.json` is therefore written by `scripts/lineage_state.py` before
+checkpoint 000 runs, rewritten after every checkpoint, and only closed out at
+the end:
+
+| state | meaning |
+|---|---|
+| `running` | created by the controller; the walk has not finished |
+| `stopped` | a checkpoint failed — the lineage ended normally, unsuccessfully |
+| `completed` | every checkpoint passed and `final/` was written |
+
+A record still in `running` at analysis time means the controller itself died,
+and the analyzer classifies it as `controller_interrupted`: counted in the
+denominator, never counted as a successful final, and reported under its own
+reason rather than as an implementation failure. A lineage directory with no
+record, an unparseable record, or a lineage the run declared but never created
+is likewise counted and reported (`missing_record`, `malformed_record`,
+`missing_directory`) instead of being silently skipped — skipping shrinks the
+denominator in exactly the direction that flatters the result, because
+interruptions are likeliest in the long, repair-heavy lineages.
+
+Every update goes through a sibling temporary file and `os.replace`, which is
+atomic on POSIX and Windows, so an interrupted write leaves either the previous
+record or the new one and never a truncated file.
+
+Failed and interrupted lineages are retained and never replaced to round out the
+final population.
 
 ### Resume safety
 

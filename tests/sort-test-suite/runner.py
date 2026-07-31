@@ -161,7 +161,7 @@ def run_one(case: dict, cmd: list[str], stdin_mode: str,
     res = engine.execute(case, cmd, stdin_mode=stdin_mode, sanitizer=sanitizer)
 
     if res.signal_name == "SKIP_ROOT":
-        return SKIP, "unreadable fault needs non-root"
+        return SKIP, "permission fault needs non-root"
     if res.timed_out:
         return TIMEOUT, f"timed out after {case.get('timeout', 10)}s"
     if sanitizer and res.sanitizer:

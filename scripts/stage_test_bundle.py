@@ -99,19 +99,21 @@ def selectable(case: Mapping[str, Any], implemented: set[str]) -> bool:
     """The judge's own rule, applied at build time instead of at run time.
 
     Mirrors `case_selected` in every suite's runner.py: a case runs only when
-    every flag it needs is implemented, and none of the flags it requires to be
-    ABSENT are. Applying it here is what turns "not executed" into "not
-    present".
+    every flag it needs is implemented. Applying it here is what turns "not
+    executed" into "not present".
 
-    `absent_flags` is what lets a checkpoint assert that a later checkpoint's
-    feature has not been built yet -- "at 000, `-H` must be rejected as an
-    unknown option" -- while that same case disappears once `-H` is introduced.
-    Without it the ladder is only ever tested from below, and a model that
-    implemented the whole sequence at 000 would pass every checkpoint.
+    A case carrying `absent_flags` is NEVER selectable into a bundle, whatever
+    the checkpoint. Such a case asserts that a later feature has not been built
+    yet, so its argv necessarily spells out a future flag -- `["-H", "alpha"]`
+    at checkpoint 000 -- and shipping it would hand the agent the name of the
+    option it has not been asked for, which is exactly what the bundle exists to
+    prevent. That enforcement lives in the controller-only boundary gate
+    (`scripts/checkpoint_boundary_gate.py`), which the agent never sees; the
+    frozen cases stay in the suite for offline auditing only.
     """
-    flags = set(case.get("flags", []))
-    absent = set(case.get("absent_flags", []))
-    return flags <= implemented and not (absent & implemented)
+    if case.get("absent_flags"):
+        return False
+    return set(case.get("flags", [])) <= implemented
 
 
 def filter_suite(payload: Any, implemented: set[str]) -> tuple[Any, int, int]:

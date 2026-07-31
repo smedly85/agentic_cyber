@@ -206,7 +206,10 @@ def main() -> None:
     parser.add_argument("--only", help="only cases with this tag")
     parser.add_argument("--jobs", type=int, default=min(8, os.cpu_count() or 4))
     parser.add_argument("--json-report")
-    parser.add_argument("--quiet", action="store_true")
+    # This module is copied into the agent-visible stage bundle, so its own
+    # option names must not collide with any long option new_chmod introduces at
+    # a later checkpoint -- the bare string would be a hint. One such unused
+    # argument was removed for that reason; do not reintroduce it.
     args = parser.parse_args(opt_argv)
 
     if not cmd:
