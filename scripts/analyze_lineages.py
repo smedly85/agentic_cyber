@@ -956,32 +956,57 @@ def render_summary(report: dict[str, Any]) -> str:
     if not report["populations"]:
         lines.append("Diversity analysis was not run.")
     else:
+        # A population with fewer than two members is skipped before any
+        # analyzer runs, so it has no report directory and no analyzer exit
+        # status. Those fields stay None, and rendering them produced
+        # "report under `None` (analyzer exit None)" -- Python placeholders
+        # printed as if they were findings. Diversity over one implementation
+        # is undefined, not failed: there is no pair to compare.
+        analyzed = [
+            population for population in report["populations"]
+            if not population.get("skipped")
+        ]
         for population in report["populations"]:
+            members = population["members"]
+            if population.get("skipped"):
+                lines.append(
+                    f"* **{population['label']}** — {members} successful "
+                    f"implementation{'' if members == 1 else 's'} from "
+                    f"{reliability['lineages_started']} lineages started. "
+                    "Diversity was not computed: it needs at least 2 "
+                    "successful implementations."
+                )
+                continue
             lines.append(
-                f"* **{population['label']}** — {population['members']} "
+                f"* **{population['label']}** — {members} "
                 f"implementation(s) from {reliability['lineages_started']} "
                 f"lineages started; report under "
                 f"`{population['analysis_dir']}`"
                 + ("" if population["returncode"] == 0
                    else f" (analyzer exit {population['returncode']})")
             )
-        baseline = report["final_population_baseline"]
-        lines += [
-            "",
-            "Final diversity compares only completed lineages. The number of "
-            "lineages started is stated above and is not replaced by the "
-            "number of finals.",
-            "",
-            f"**Baseline.** {baseline['why']}, so the view uses "
-            f"`{baseline['kind']}`. Clustering, family, Vendi, discovery, "
-            "repetition and pairwise-distance metrics are unaffected by that "
-            "choice. These metrics in the view's report are **not** maintenance "
-            "change and must not be read as such:",
-            "",
-        ]
-        lines += [f"* `{name}`" for name in baseline["unsupported_metrics"]]
-        lines.append("")
-        lines.append(baseline["unsupported_reason"].capitalize() + ".")
+        # The paragraphs below explain how to read a view's report. With every
+        # population skipped there is no view and no report, so they would be
+        # describing something that was never written. The Change section still
+        # follows either way.
+        if analyzed:
+            baseline = report["final_population_baseline"]
+            lines += [
+                "",
+                "Final diversity compares only completed lineages. The number "
+                "of lineages started is stated above and is not replaced by "
+                "the number of finals.",
+                "",
+                f"**Baseline.** {baseline['why']}, so the view uses "
+                f"`{baseline['kind']}`. Clustering, family, Vendi, discovery, "
+                "repetition and pairwise-distance metrics are unaffected by "
+                "that choice. These metrics in the view's report are **not** "
+                "maintenance change and must not be read as such:",
+                "",
+            ]
+            lines += [f"* `{name}`" for name in baseline["unsupported_metrics"]]
+            lines.append("")
+            lines.append(baseline["unsupported_reason"].capitalize() + ".")
 
     lines += ["", "## Change", ""]
     per_stage = report["per_stage_change"]

@@ -509,6 +509,112 @@ def make_lineage_root(root: Path, outcomes: list[int | None]) -> Path:
     return root
 
 
+class SingleImplementationDiversityTests(unittest.TestCase):
+    """Diversity over one implementation is undefined, and must read that way.
+
+    A smoke run with a single completed lineage correctly skipped the
+    calculation -- "fewer than two successful implementations; diversity is
+    undefined for this population" -- and then rendered the skipped entry with
+    the analyzer fields it never had:
+
+        final — 1 implementation(s) from 1 lineages started; report under
+        `None` (analyzer exit None)
+
+    Those are Python placeholders printed as findings, and `None` is not a path
+    anyone can open. Undefined is not the same as failed, so the run still
+    exits 0.
+    """
+
+    def setUp(self):
+        import tempfile
+
+        self.temp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        # One completed lineage, one that stopped: exactly one successful final
+        # implementation, which is the population size that has no pairs.
+        self.root = make_lineage_root(self.temp / "lineages", [None, 1])
+        self.output = self.temp / "analysis"
+
+    def analyze(self, *extra: str) -> tuple[int, dict, str]:
+        code = analyze_lineages.main(
+            ["--lineage-root", str(self.root),
+             "--output-dir", str(self.output), *extra]
+        )
+        report = json.loads(
+            (self.output / "lineage_report.json").read_text(encoding="utf-8")
+        )
+        summary = (self.output / "summary.md").read_text(encoding="utf-8")
+        return code, report, summary
+
+    def test_one_successful_implementation_skips_diversity(self):
+        _, report, _ = self.analyze("--skip-change")
+        self.assertEqual(report["reliability"]["successful_final_implementations"], 1)
+        final = [p for p in report["populations"] if p["label"] == "final"]
+        self.assertEqual(len(final), 1)
+        self.assertEqual(final[0]["members"], 1)
+        self.assertIn("skipped", final[0])
+        self.assertIsNone(final[0]["analysis_dir"])
+        self.assertIsNone(final[0]["returncode"])
+
+    def test_the_summary_never_prints_python_placeholders(self):
+        _, _, summary = self.analyze("--skip-change")
+        for forbidden in ("report under `None`", "analyzer exit None",
+                          "`None`", "None)"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, summary)
+
+    def test_the_summary_states_the_count_and_the_requirement(self):
+        _, _, summary = self.analyze("--skip-change")
+        diversity = summary.split("## Diversity (final population)")[1]
+        diversity = diversity.split("## Change")[0]
+        self.assertIn("1 successful implementation", diversity)
+        self.assertIn("Diversity was not computed", diversity)
+        self.assertIn("at least 2 successful implementations", diversity)
+
+    def test_no_report_path_is_invented(self):
+        """`None` is not a directory, and neither is a made-up one."""
+        _, _, summary = self.analyze("--skip-change")
+        diversity = summary.split("## Diversity (final population)")[1]
+        diversity = diversity.split("## Change")[0]
+        self.assertNotIn("report under", diversity)
+        self.assertNotIn("populations/final", diversity)
+
+    def test_an_undefined_population_is_not_an_analyzer_failure(self):
+        code, _, _ = self.analyze("--skip-change")
+        self.assertEqual(code, 0)
+
+    def test_the_change_section_still_follows_a_skipped_population(self):
+        """The skip must not truncate the rest of the report."""
+        _, _, summary = self.analyze()
+        self.assertIn("## Change", summary)
+        self.assertIn("## Reliability", summary)
+
+    def test_reliability_and_repair_numbers_are_untouched(self):
+        _, report, summary = self.analyze("--skip-change")
+        reliability = report["reliability"]
+        self.assertEqual(reliability["lineages_started"], 2)
+        self.assertEqual(reliability["successful_final_implementations"], 1)
+        self.assertAlmostEqual(reliability["end_to_end_completion_rate"], 0.5)
+        self.assertIn("lineages started = 2", summary)
+
+    def test_two_implementations_still_render_a_report_path(self):
+        """The normal path is unchanged: a real population still links out."""
+        root = make_lineage_root(self.temp / "two", [None, None])
+        output = self.temp / "analysis-two"
+        analyze_lineages.main(
+            ["--lineage-root", str(root), "--output-dir", str(output),
+             "--skip-diversity", "--skip-change"]
+        )
+        report = json.loads(
+            (output / "lineage_report.json").read_text(encoding="utf-8")
+        )
+        # --skip-diversity leaves no populations at all, which is its own
+        # message rather than a skipped entry.
+        self.assertEqual(report["populations"], [])
+        summary = (output / "summary.md").read_text(encoding="utf-8")
+        self.assertIn("Diversity analysis was not run.", summary)
+        self.assertNotIn("None", summary.split("## Diversity")[1])
+
+
 class LineageAggregationTests(unittest.TestCase):
     def setUp(self):
         import tempfile
