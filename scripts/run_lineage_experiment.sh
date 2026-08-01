@@ -291,6 +291,21 @@ PLAN_TOOL="$REPO/scripts/lineage_plan.py"
 [[ -f "$PLAN_TOOL" ]] || die "plan resolver not found: $PLAN_TOOL"
 STAGE_RUNNER="$REPO/scripts/run_experiment.sh"
 [[ -f "$STAGE_RUNNER" ]] || die "single-stage runner not found: $STAGE_RUNNER"
+# A syntax error in the stage runner must never reach lineage initialization.
+# It happened: a here-document inside a $( ) command substitution contained an
+# apostrophe, which Bash 4+ parses correctly and Apple's Bash 3.2 does not. On
+# Darwin every stage died with "unexpected end of file" before OpenCode was
+# invoked, and because the failure looked like a stage that simply produced
+# nothing, the lineage recorded checkpoint 000 as stage_run_incomplete -- a
+# model result, for what was a parse error in the controller.
+#
+# Parsed with the same `bash` that will run the stage, so the check reflects the
+# interpreter actually used rather than whichever one is newest on the host.
+# This catches the syntax class only; constructs like `declare -n` and
+# `mapfile` parse everywhere and fail at run time, which is what the static
+# guard in tests/test_lineage_tools.py covers.
+bash -n "$STAGE_RUNNER" ||
+    die "$STAGE_RUNNER does not parse under $(bash --version | head -1); no lineage was started. On Darwin this is usually an apostrophe or an unbalanced parenthesis inside a here-document that sits within a \$( ) command substitution"
 BUNDLE_TOOL="$REPO/scripts/stage_test_bundle.py"
 [[ -f "$BUNDLE_TOOL" ]] || die "stage test bundle builder not found: $BUNDLE_TOOL"
 STATE_TOOL="$REPO/scripts/lineage_state.py"
@@ -964,8 +979,8 @@ if candidate.is_file():
 
 attempt_complete = (attempt / "COMPLETE").is_file()
 public_success = bool(metadata.get("public_validation_success"))
-# A stage "successfully completed" only if the controller's own build/base/
-# checkpoint validation passed AND the source it produced was captured. The
+# A stage "successfully completed" only if the build/base/checkpoint validation
+# run by the controller passed AND the source it produced was captured. The
 # next stage inherits that file, so a missing candidate is a stage failure even
 # when validation reported success.
 success = attempt_complete and public_success and candidate_sha is not None
@@ -1011,7 +1026,7 @@ record = {
     "reused_existing_stage_run": reused == "true",
     "success": success,
     "failure_reason": reason,
-    # Reuse the single-stage runner's own metadata vocabulary rather than
+    # Reuse the metadata vocabulary of the single-stage runner rather than
     # inventing a second classification.
     "public_validation_success": public_success,
     "initial_success": bool(metadata.get("initial_success")),

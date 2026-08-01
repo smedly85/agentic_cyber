@@ -1179,6 +1179,22 @@ PY
         # this harness shipped. Declaring the capability is what makes
         # --temperature real; runs recorded before this change carry a
         # temperature they did not actually sample at.
+        # APOSTROPHES AND UNBALANCED PARENTHESES ARE FORBIDDEN IN THE HERE-DOC
+        # BELOW. It sits inside a $( ) command substitution, and Bash 3.2 --
+        # Apple's /bin/bash, which Darwin runs -- does not skip a here-document
+        # body while scanning for the closing paren. It keeps lexing the body as
+        # shell text, so an apostrophe opens a single-quoted string that never
+        # closes and the parse runs to end of file:
+        #
+        #   run_experiment.sh: line <EOF>: syntax error: unexpected end of file
+        #
+        # reported against the line that opened the substitution, with no other
+        # clue. Bash 4+ parses it correctly, so this is invisible on Linux and
+        # fatal on macOS: it aborted a real run before any OpenCode session
+        # started, and the lineage recorded checkpoint 000 as
+        # stage_run_incomplete. Write "the model of the agent", never
+        # "the agent's model".
+        # tests/test_lineage_tools.py::Bash32HeredocQuotingTests enforces this.
         ATTEMPT_OPENCODE_CONFIG_CONTENT="$(
             "$PYTHON_BIN" - "$AGENT" "$temperature" "$workdir" \
                 "$REMOTE_BASE_URL" "$REMOTE_API_KEY_ENV" "$MODEL" \
@@ -1234,12 +1250,12 @@ config = {
 }
 
 # Turn temperature on for this model. See the SAMPLING PARAMETERS note above:
-# a config-defined model's temperature capability defaults to false, and a
-# false capability silently discards the agent's temperature. Written as a
-# partial provider entry naming only the model, which merges into whatever
-# provider definition the environment already supplies -- the harness does not
-# know that provider's baseURL unless --remote-base-url was given, and must
-# not overwrite it.
+# the temperature capability of a config-defined model defaults to false, and a
+# false capability silently discards the temperature set in the agent block.
+# Written as a partial provider entry naming only the model, which merges into
+# whatever provider definition the environment already supplies -- the harness
+# does not know the baseURL of that provider unless --remote-base-url was
+# given, and must not overwrite it.
 provider_id, _, model_id = model.partition("/")
 model_entry = {"temperature": True}
 

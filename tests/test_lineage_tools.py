@@ -20,6 +20,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -3503,33 +3504,66 @@ class StageArrayPreflightTests(unittest.TestCase):
                     "namerefs are Bash 4.3+; Darwin's /bin/bash is 3.2.57",
                 )
 
-    def test_no_maintained_script_uses_a_bash_4_only_construct(self):
-        """Darwin's /bin/bash is 3.2.57. Namerefs are covered above; these are
-        the other constructs that parse on a modern bash and fail there."""
-        constructs = (
-            "declare -A",       # associative arrays: Bash 4.0+
-            "mapfile",          # Bash 4.0+
-            "readarray",        # Bash 4.0+
-            "${!",              # only the array-key form is 4.0+, see below
-            ",,}", "^^}",       # case modification: Bash 4.0+
-            "&>>",              # append-both-streams: Bash 4.0+
-        )
+    # Two different failure modes, measured against a real Bash 3.2.0 rather
+    # than assumed. `bash -n` catches only the first group, which is exactly why
+    # `declare -n` once reached Vessel despite a passing syntax check: it parses
+    # everywhere and fails when the line executes.
+    PARSE_TIME_3_2_FAILURES = (
+        "|&",           # pipe both streams: Bash 4.0+
+        ";;&",          # case: test the next pattern too: Bash 4.0+
+        ";&",           # case: fall through: Bash 4.0+
+        "coproc",       # Bash 4.0+
+        "&>>",          # append both streams: Bash 4.0+
+    )
+    RUN_TIME_3_2_FAILURES = (
+        "declare -A",   # associative arrays: Bash 4.0+
+        "local -A",
+        "declare -n",   # namerefs: Bash 4.3+
+        "local -n",
+        "typeset -n",
+        "mapfile",      # Bash 4.0+
+        "readarray",
+        ",,}",          # lowercase parameter transformation: Bash 4.0+
+        "^^}",          # uppercase parameter transformation: Bash 4.0+
+        "@U}", "@L}",   # Bash 5.0+ transformations
+    )
+
+    def test_no_maintained_script_uses_a_construct_bash_3_2_cannot_parse(self):
+        """The group `bash -n` would catch, kept out so the preflight passes."""
+        self.assert_absent(self.PARSE_TIME_3_2_FAILURES,
+                           "Bash 3.2 fails to PARSE this")
+
+    def test_no_maintained_script_uses_a_construct_bash_3_2_cannot_run(self):
+        """The dangerous group: these parse on 3.2 and fail when executed, so no
+        syntax check anywhere will find them."""
+        self.assert_absent(self.RUN_TIME_3_2_FAILURES,
+                           "Bash 3.2 parses but cannot RUN this")
+
+    def assert_absent(self, constructs, reason: str) -> None:
         for name in self.MAINTAINED_SCRIPTS:
             text = (REPO_ROOT / "scripts" / name).read_text(encoding="utf-8")
             code = [line for line in text.splitlines()
                     if not line.lstrip().startswith("#")]
             for construct in constructs:
                 offenders = [line.strip() for line in code if construct in line]
-                if construct == "${!":
-                    # `${!name}` is indirect expansion and is fine in 3.2;
-                    # `${!array[@]}` (key list) is not. Only flag the latter.
-                    offenders = [line for line in offenders
-                                 if "[@]" in line or "[*]" in line]
+                if construct == ";&":
+                    # `;;&` also contains `;&`; it has its own entry.
+                    offenders = [line for line in offenders if ";;&" not in line]
                 with self.subTest(script=name, construct=construct):
-                    self.assertEqual(
-                        offenders, [],
-                        f"{construct} is not available in Bash 3.2",
-                    )
+                    self.assertEqual(offenders, [], f"{reason}: {construct}")
+
+    def test_the_array_key_expansion_form_is_not_used(self):
+        """`${!name}` is indirect expansion and is fine in 3.2; `${!array[@]}`
+        is the 4.0+ key list and is not."""
+        for name in self.MAINTAINED_SCRIPTS:
+            text = (REPO_ROOT / "scripts" / name).read_text(encoding="utf-8")
+            offenders = [
+                line.strip() for line in text.splitlines()
+                if not line.lstrip().startswith("#")
+                and "${!" in line and ("[@]" in line or "[*]" in line)
+            ]
+            with self.subTest(script=name):
+                self.assertEqual(offenders, [])
 
     def test_the_lookup_is_an_explicit_case_over_the_known_arrays(self):
         source = self.region(self.controller_text(),
@@ -3605,6 +3639,192 @@ class SystemBashStageArrayPreflightTests(StageArrayPreflightTests):
         self.assertRegex(result.stdout, r"^\d+\.\d+$")
         self.assertEqual(self.run_preflight().returncode, 0,
                          f"the guard must run under Bash {result.stdout}")
+
+
+class Bash32HeredocQuotingTests(unittest.TestCase):
+    """A here-doc inside `$( )` must not contain an apostrophe or an unbalanced
+    parenthesis, because Apple's Bash 3.2 cannot parse it.
+
+    This is the defect itself, written down. Bash 3.2 does not skip a
+    here-document body while scanning for the closing paren of a command
+    substitution -- it keeps lexing the body as shell text. Three apostrophes in
+    Python comments (`model's`, `agent's`, `provider's`) inside the OpenCode
+    config builder therefore opened a single-quoted string that never closed,
+    and the parse ran to end of file:
+
+        run_experiment.sh: line 1626: syntax error: unexpected end of file
+
+    reported against line 1182, the line that opened the substitution. Bash 4+
+    parses the same file cleanly, so `bash -n` on Linux said nothing. On Vessel
+    every stage aborted before OpenCode started and checkpoint 000 was recorded
+    as stage_run_incomplete -- an environment fault booked as a model result.
+
+    Verified against a Bash 3.2.0 built from source: with an odd apostrophe
+    count the file fails to parse, with an even count it happens to re-sync, and
+    with none it is safe regardless.
+    """
+
+    MAINTAINED_SCRIPTS = ("run_lineage_experiment.sh", "run_experiment.sh")
+    HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+    def heredocs_inside_substitutions(self, path: Path):
+        """Every here-doc body that lies inside a `$( )`, with its position."""
+        lines = path.read_text(encoding="utf-8").splitlines()
+        depth = 0
+        opened_at = 0
+        index = 0
+        found = []
+        while index < len(lines):
+            line = lines[index]
+            match = self.HEREDOC.search(line)
+            if match and depth > 0:
+                terminator = match.group(2)
+                start = index + 1
+                body = []
+                index += 1
+                while index < len(lines) and lines[index].strip() != terminator:
+                    body.append(lines[index])
+                    index += 1
+                found.append((opened_at, start, terminator, "\n".join(body)))
+                index += 1
+                continue
+            for _ in re.finditer(r"\$\(", line):
+                if depth == 0:
+                    opened_at = index + 1
+                depth += 1
+            if depth:
+                depth -= min(depth, line.count(")"))
+            index += 1
+        return found
+
+    def test_no_heredoc_in_a_substitution_carries_an_apostrophe(self):
+        for name in self.MAINTAINED_SCRIPTS:
+            path = REPO_ROOT / "scripts" / name
+            for opened, start, terminator, body in \
+                    self.heredocs_inside_substitutions(path):
+                offenders = [
+                    f"{start + offset}: {line.strip()}"
+                    for offset, line in enumerate(body.splitlines())
+                    if "'" in line
+                ]
+                with self.subTest(script=name, heredoc=terminator):
+                    self.assertEqual(
+                        offenders, [],
+                        f"apostrophe inside the here-doc opened at line "
+                        f"{start}, which sits in the command substitution at "
+                        f"line {opened}. Bash 3.2 reads it as an opening quote "
+                        f"and the parse runs to EOF. Reword it: "
+                        f'"the model of the agent", not "the agent\'s model"',
+                    )
+
+    def test_no_heredoc_in_a_substitution_has_unbalanced_parentheses(self):
+        for name in self.MAINTAINED_SCRIPTS:
+            path = REPO_ROOT / "scripts" / name
+            for opened, start, terminator, body in \
+                    self.heredocs_inside_substitutions(path):
+                balance = body.count("(") - body.count(")")
+                with self.subTest(script=name, heredoc=terminator):
+                    self.assertEqual(
+                        balance, 0,
+                        f"the here-doc opened at line {start} (inside the "
+                        f"substitution at line {opened}) has a paren imbalance "
+                        f"of {balance:+d}; Bash 3.2 counts these while looking "
+                        f"for the closing paren of the substitution",
+                    )
+
+    def test_the_guard_would_have_caught_the_original_defect(self):
+        """The check has teeth: reintroducing the exact text must fail it."""
+        body = "# a config-defined model's temperature capability\n"
+        self.assertIn("'", body)
+        offenders = [line for line in body.splitlines() if "'" in line]
+        self.assertEqual(len(offenders), 1)
+
+    def test_the_config_builder_documents_the_constraint(self):
+        """A future editor has to be told, at the site, not to add one."""
+        text = (REPO_ROOT / "scripts" / "run_experiment.sh").read_text(
+            encoding="utf-8"
+        )
+        marker = text.index("ATTEMPT_OPENCODE_CONFIG_CONTENT=\"$(")
+        preamble = text[max(0, marker - 1200):marker]
+        self.assertIn("APOSTROPHES", preamble.upper())
+        self.assertIn("3.2", preamble)
+
+
+class LineageSyntaxPreflightTests(unittest.TestCase):
+    """A syntax error in the stage runner must never reach lineage init."""
+
+    CONTROLLER = REPO_ROOT / "scripts" / "run_lineage_experiment.sh"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bash = shutil.which("bash")
+        if not cls.bash:
+            raise unittest.SkipTest("bash is required")
+
+    def setUp(self):
+        import tempfile
+
+        self.temp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    def posix(self, path: Path) -> str:
+        text = path.as_posix()
+        return "/" + text[0].lower() + text[2:] if text[1:2] == ":" else text
+
+    def test_the_controller_parses_the_stage_runner_before_starting(self):
+        text = self.CONTROLLER.read_text(encoding="utf-8")
+        self.assertIn('bash -n "$STAGE_RUNNER"', text)
+        # Before every side effect that would make a lineage count as started.
+        guard = text.index('bash -n "$STAGE_RUNNER"')
+        for side_effect in ("for (( offset = 0", '--path "$lineage_record"',
+                            'bash "$STAGE_RUNNER"', "mkdir -p \"$OUTPUT_DIR\""):
+            with self.subTest(side_effect=side_effect):
+                self.assertLess(guard, text.index(side_effect))
+
+    def test_a_broken_stage_runner_stops_the_run_with_no_lineage(self):
+        """The exact Vessel scenario: the stage runner does not parse."""
+        fake_repo = self.temp / "repo"
+        shutil.copytree(REPO_ROOT, fake_repo, symlinks=True, ignore=(
+            shutil.ignore_patterns("runs", ".git", "__pycache__", "build",
+                                   "*.tar.gz", "review-bundle")
+        ))
+        # The controller resolves paths through git, and the copy carries no
+        # .git, so give it one. Nothing is committed.
+        subprocess.run(["git", "init", "-q", str(fake_repo)],
+                       capture_output=True, check=False)
+        broken = fake_repo / "scripts" / "run_experiment.sh"
+        # An unterminated command substitution: the same failure class, minus
+        # the 1600 lines of context.
+        broken.write_text('#!/usr/bin/env bash\nx="$(\necho hi\n', encoding="utf-8")
+        output = self.temp / "out"
+        result = subprocess.run(
+            [self.bash, str(fake_repo / "scripts" / "run_lineage_experiment.sh"),
+             "--utility", "grep", "--model", "demo/m", "--temperature", "0.2",
+             "--lineages", "3", "--output-dir", self.posix(output)],
+            cwd=str(fake_repo), capture_output=True, text=True,
+            env={**os.environ, "PYTHON_BIN": sys.executable},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not parse", result.stderr)
+        self.assertIn("no lineage was started", result.stderr)
+        for pattern in ("lineage-*", "lineage.json", "lineages.json"):
+            with self.subTest(pattern=pattern):
+                self.assertEqual(
+                    [] if not output.exists() else list(output.rglob(pattern)),
+                    [],
+                    f"{pattern} exists after a stage-runner syntax failure",
+                )
+
+    def test_a_healthy_stage_runner_passes_the_preflight(self):
+        """The guard must not block the normal path."""
+        result = subprocess.run(
+            [self.bash, str(self.CONTROLLER),
+             "--utility", "grep", "--model", "demo/m", "--temperature", "0.2",
+             "--lineages", "1", "--dry-run"],
+            cwd=str(REPO_ROOT), capture_output=True, text=True,
+            env={**os.environ, "PYTHON_BIN": sys.executable},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("does not parse", result.stderr)
 
 
 class LineageSamplingParameterTests(unittest.TestCase):
