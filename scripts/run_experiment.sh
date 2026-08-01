@@ -1300,6 +1300,24 @@ PY
         stop_reason=""
         previous_source_sha=""
         loop_records=()
+        # Timeout provenance. A session that runs out of time may still have
+        # written a usable source, and the controller builds and tests that
+        # source itself -- so the attempt can have real public-test feedback
+        # even though the agent never finished. These record which of those two
+        # timeouts happened, and are never used to erase the timeout itself:
+        # opencode_exit_code stays 124 and timeout_enforced stays true either
+        # way.
+        initial_session_completed=false
+        # opencode_exit_code records the LAST session, so after a successful
+        # repair it reads 0 and the initial timeout would survive only inside
+        # loops[0]. Kept at the top level too, so "this candidate came out of a
+        # session that ran out of time" is never lost to a later success.
+        initial_opencode_exit=""
+        candidate_available_after_initial_session=false
+        candidate_available_after_timeout=false
+        validation_completed_after_timeout=false
+        repair_eligible=false
+        repair_eligibility_reason="not_evaluated"
 
         # ---- generate / validate / continue -------------------------------
         # Loop 0 is the initial generation; loops 1..MAX_LOOPS are repairs, so
@@ -1332,15 +1350,56 @@ PY
                 opencode_permission_rejected=true
             fi
 
+            # Did this session leave a source behind? A timeout is only fatal
+            # when it did not. The controller compiles and tests the source
+            # itself, so a session that ran out of time after writing one still
+            # produced something with a real, actionable validation result --
+            # observed: exit 124 with build 0 and checkpoint tests 1, which the
+            # controller then refused to repair. Non-empty, because an empty
+            # file is not an implementation.
+            invocation_candidate_present=false
+            if [[ -s "$workdir/$SOURCE_PATH" ]]; then
+                invocation_candidate_present=true
+            fi
+            invocation_timed_out=false
+            if [[ "$opencode_exit" -eq 124 ]]; then
+                invocation_timed_out=true
+            fi
+            if [[ "$validation_loop" -eq 0 ]]; then
+                initial_opencode_exit="$opencode_exit"
+                candidate_available_after_initial_session="$invocation_candidate_present"
+                if [[ "$opencode_exit" -eq 0 &&
+                      "$invocation_permission_rejected" == false ]]; then
+                    initial_session_completed=true
+                fi
+                if [[ "$invocation_timed_out" == true &&
+                      "$invocation_candidate_present" == true ]]; then
+                    candidate_available_after_timeout=true
+                fi
+            fi
+
             invocation_agent_execution_failed=false
             if [[ "$invocation_permission_rejected" == true ]]; then
+                # A rejected permission means the sandbox boundary held, not
+                # that the model produced work. Unchanged.
                 invocation_agent_execution_failed=true
                 agent_execution_failed=true
                 agent_execution_failure_stage_json='"permission"'
+            elif [[ "$invocation_timed_out" == true &&
+                    "$invocation_candidate_present" == true ]]; then
+                # Repair-eligible timeout: fall through to controller
+                # validation and, if that fails, to the repair loop. Nothing is
+                # rewritten -- the exit code, timeout_enforced and
+                # initial_session_completed all still say the session was cut
+                # short, so reliability analysis can tell this apart from a
+                # session that finished on its own.
+                :
             elif [[ "$opencode_exit" -ne 0 ]]; then
                 invocation_agent_execution_failed=true
                 agent_execution_failed=true
-                if [[ "$opencode_exit" -eq 124 ]]; then
+                if [[ "$invocation_timed_out" == true ]]; then
+                    # Timed out with nothing to show for it: no implementation
+                    # exists, so there is nothing to repair.
                     agent_execution_failure_stage_json='"timeout"'
                 else
                     agent_execution_failure_stage_json='"opencode"'
@@ -1371,6 +1430,14 @@ PY
             total_build_ms=$((total_build_ms + build_ms))
             total_base_test_ms=$((total_base_test_ms + base_test_ms))
             total_feature_test_ms=$((total_feature_test_ms + feature_test_ms))
+
+            # The controller ran its own build and tests against the source a
+            # timed-out session left behind, so this attempt has a validation
+            # verdict rather than nothing.
+            if [[ "$invocation_timed_out" == true &&
+                  "$invocation_candidate_present" == true ]]; then
+                validation_completed_after_timeout=true
+            fi
 
             validation_success=false
             if [[ "$build_exit" -eq 0 &&
@@ -1472,6 +1539,31 @@ PY
         # Every path above breaks with a reason; this only guards a future edit
         # that lets the bound expire instead.
         [[ -n "$stop_reason" ]] || stop_reason="loop_limit"
+
+        # Was this attempt in a state a continuation session could act on after
+        # its initial generation? Recorded whether or not repair was configured,
+        # so a run with --max-loops 0 still says why nothing was retried, and so
+        # the repair-recovery denominator can be reconstructed from metadata
+        # alone rather than inferred from exit codes.
+        if [[ "$agent_execution_failed" == true ]]; then
+            repair_eligibility_reason="agent_execution_failure"
+        elif [[ "$initial_success" == true ]]; then
+            repair_eligibility_reason="initial_validation_passed"
+        elif [[ "$candidate_available_after_initial_session" != true ]]; then
+            repair_eligibility_reason="no_candidate_after_initial_session"
+        elif [[ "$MAX_LOOPS" -eq 0 ]]; then
+            # The candidate is real and failed public validation; only the
+            # budget is missing. It is a failed implementation, not an absent
+            # one.
+            repair_eligibility_reason="no_repair_budget"
+        else
+            repair_eligible=true
+            if [[ "$candidate_available_after_timeout" == true ]]; then
+                repair_eligibility_reason="controller_validation_after_timeout"
+            else
+                repair_eligibility_reason="controller_validation_feedback"
+            fi
+        fi
 
         llm_invocations=${#loop_records[@]}
         loops_json="$("$PYTHON_BIN" - "${loop_records[@]}" <<'PY'
@@ -1599,6 +1691,13 @@ PY
             infrastructure_failure_classification_inferred false \
             agent_execution_failure "$agent_execution_failed" \
             agent_execution_failure_stage "__JSON__:$agent_execution_failure_stage_json" \
+            initial_session_completed "$initial_session_completed" \
+            initial_opencode_exit_code "$(optional_number "$initial_opencode_exit")" \
+            candidate_available_after_initial_session "$candidate_available_after_initial_session" \
+            candidate_available_after_timeout "$candidate_available_after_timeout" \
+            validation_completed_after_timeout "$validation_completed_after_timeout" \
+            repair_eligible "$repair_eligible" \
+            repair_eligibility_reason "$repair_eligibility_reason" \
             agent_execution_failure_classification_inferred false \
             timeout_seconds "$TIMEOUT_SECONDS" \
             timeout_enforced "$TIMEOUT_ENFORCED" \

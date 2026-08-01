@@ -1177,6 +1177,12 @@ def main(argv: list[str] | None = None) -> int:
             "initial_success", "repair_loops", "llm_invocations", "success_loop",
             "stop_reason", "loop_limit_reached", "infrastructure_failure",
             "agent_execution_failure", "build_exit_code", "feature_test_exit_code",
+            # A stage can now succeed, or be repaired, after a session that ran
+            # out of time. These keep that visible per stage rather than only in
+            # the attempt metadata underneath it.
+            "opencode_exit_code", "initial_session_completed",
+            "candidate_available_after_timeout", "repair_eligible",
+            "repair_eligibility_reason",
             "seed", "seed_sha256", "candidate", "candidate_sha256",
             "total_opencode_runtime_ms",
         ],

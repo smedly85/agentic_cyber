@@ -1040,6 +1040,19 @@ record = {
     "infrastructure_failure_stage": metadata.get("infrastructure_failure_stage"),
     "agent_execution_failure": bool(metadata.get("agent_execution_failure")),
     "agent_execution_failure_stage": metadata.get("agent_execution_failure_stage"),
+    # Timeout provenance, carried into the lineage record so a stage that
+    # succeeded or was repaired after a cut-short session is still
+    # distinguishable from one whose session finished normally.
+    "opencode_exit_code": metadata.get("opencode_exit_code"),
+    "initial_session_completed": metadata.get("initial_session_completed"),
+    "candidate_available_after_timeout": metadata.get(
+        "candidate_available_after_timeout"
+    ),
+    "validation_completed_after_timeout": metadata.get(
+        "validation_completed_after_timeout"
+    ),
+    "repair_eligible": metadata.get("repair_eligible"),
+    "repair_eligibility_reason": metadata.get("repair_eligibility_reason"),
     "build_exit_code": metadata.get("build_exit_code"),
     "base_test_exit_code": metadata.get("base_test_exit_code"),
     "feature_test_exit_code": metadata.get("feature_test_exit_code"),

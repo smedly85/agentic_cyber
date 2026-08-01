@@ -22,6 +22,7 @@ import json
 import os
 import re
 import shutil
+from shlex import quote as shlex_quote
 import subprocess
 import sys
 import unittest
@@ -55,6 +56,22 @@ EXPECTED_SEQUENCES = {
 
 def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def analyzer_or_none():
+    """`scripts/analyze_experiment.py`, or None when its stack is missing.
+
+    This file is deliberately NumPy-free (see the module docstring) so it runs
+    on a machine that never installed scripts/analysis-requirements.txt. The
+    analyzer imports NumPy through analysis/diversity_metrics, so the tests that
+    check controller-and-analyzer agreement skip rather than fail there.
+    """
+    try:
+        import analyze_experiment
+
+        return analyze_experiment
+    except Exception:                                   # noqa: BLE001
+        return None
 
 
 class ManifestTests(unittest.TestCase):
@@ -3639,6 +3656,307 @@ class SystemBashStageArrayPreflightTests(StageArrayPreflightTests):
         self.assertRegex(result.stdout, r"^\d+\.\d+$")
         self.assertEqual(self.run_preflight().returncode, 0,
                          f"the guard must run under Bash {result.stdout}")
+
+
+class TimeoutRepairEligibilityTests(unittest.TestCase):
+    """A session that ran out of time may still have produced an implementation.
+
+    Observed: exit 124, build 0, checkpoint tests 1, candidate/new_grep.c on
+    disk, repair_loops 0, stop_reason agent_execution_failure. The model had
+    looped on a hanging manual command until the session limit, but the source
+    it left compiled, and the controller had already built and tested it -- so
+    there was concrete public-test feedback and a configured repair budget, and
+    neither was used. The attempt was scored as though no implementation had
+    ever existed.
+
+    These drive the real controller with a stub OpenCode that exits 124 after
+    writing a chosen source, and assert the four outcomes plus the two cases
+    that must NOT change.
+    """
+
+    RUNNER = REPO_ROOT / "scripts" / "run_experiment.sh"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bash = shutil.which("bash")
+        if not cls.bash:
+            raise unittest.SkipTest("bash is required to run the controller")
+        if not shutil.which("cc") and not shutil.which("gcc"):
+            raise unittest.SkipTest("a C compiler is required")
+
+    def setUp(self):
+        import tempfile
+
+        self.temp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.prompt = self.temp / "prompt.md"
+        self.prompt.write_text("Write the program.\n", encoding="utf-8")
+
+    def posix(self, path: Path) -> str:
+        text = path.as_posix()
+        return "/" + text[0].lower() + text[2:] if text[1:2] == ":" else text
+
+    # Sources chosen for what the CONTROLLER's own build and tests make of
+    # them, which is the whole point: the agent never reports success here.
+    SOURCES = {
+        "none": None,
+        "broken": "int main(void) { return\n",          # does not compile
+        "failing": "int main(void){return 1;}\n",       # compiles, tests fail
+        "passing": "int main(void){return 0;}\n",       # compiles, tests pass
+    }
+
+    def stub_opencode(self, behavior: str, *, repair_fixes: bool = False) -> Path:
+        """An OpenCode that writes a source and then times out (exit 124)."""
+        source = self.SOURCES[behavior]
+        write = ""
+        if source is not None:
+            write = (f'mkdir -p "$(dirname "$src")"\n'
+                     f'printf %s {shlex_quote(source)} > "$src"\n')
+        repair_branch = ""
+        if repair_fixes:
+            # The continuation session behaves like a normal one: it fixes the
+            # source and exits 0, so a repaired success is observable.
+            repair_branch = (
+                'if [ -f "$workdir/.repaired" ]; then\n'
+                '  mkdir -p "$(dirname "$src")"\n'
+                f'  printf %s {shlex_quote(self.SOURCES["passing"])} > "$src"\n'
+                '  exit 0\n'
+                'fi\n'
+                'touch "$workdir/.repaired"\n'
+            )
+        path = self.temp / f"opencode-{behavior}"
+        path.write_text(
+            '#!/bin/bash\n'
+            'workdir=""\n'
+            'while [ $# -gt 0 ]; do\n'
+            '  case "$1" in --dir) workdir="$2"; shift 2 ;; *) shift ;; esac\n'
+            'done\n'
+            'src="$workdir/src/x.c"\n'
+            + repair_branch + write +
+            'exit 124\n',
+            encoding="utf-8", newline="\n",
+        )
+        path.chmod(0o755)
+        return path
+
+    def run_attempt(self, behavior: str, *, max_loops: int = 3,
+                    repair_fixes: bool = False) -> dict:
+        output = self.temp / f"out-{behavior}-{max_loops}-{repair_fixes}"
+        result = subprocess.run(
+            [self.bash, str(self.RUNNER),
+             "--model", "probe/test", "--prompt", self.posix(self.prompt),
+             "--source", "src/x.c", "--source-mode", "new",
+             "--temperature", "0", "--runs", "1",
+             "--max-loops", str(max_loops), "--timeout", "30",
+             "--build-cmd", "cc src/x.c -o prog",
+             "--feature-test-cmd", "./prog",
+             "--output-dir", self.posix(output), "--no-analysis"],
+            cwd=str(REPO_ROOT), capture_output=True, text=True,
+            env={**os.environ, "PYTHON_BIN": sys.executable,
+                 "OPENCODE_BIN": str(self.stub_opencode(
+                     behavior, repair_fixes=repair_fixes))},
+        )
+        found = sorted(output.glob("temp-*/attempt-001/metadata.json"))
+        self.assertTrue(found, f"no metadata written\n{result.stdout[-800:]}")
+        return json.loads(found[0].read_text(encoding="utf-8"))
+
+    # --- the timeout must never be erased ----------------------------------
+
+    def assert_timeout_recorded(self, meta: dict) -> None:
+        self.assertEqual(meta["opencode_exit_code"], 124)
+        self.assertEqual(meta["initial_opencode_exit_code"], 124)
+        self.assertTrue(meta["timeout_enforced"])
+        self.assertFalse(meta["initial_session_completed"])
+
+    # --- 1. timeout with no source: no repair ------------------------------
+
+    def test_timeout_without_a_source_stays_an_agent_execution_failure(self):
+        meta = self.run_attempt("none")
+        self.assert_timeout_recorded(meta)
+        self.assertFalse(meta["candidate_available_after_initial_session"])
+        self.assertFalse(meta["candidate_available_after_timeout"])
+        self.assertFalse(meta["validation_completed_after_timeout"])
+        self.assertTrue(meta["agent_execution_failure"])
+        self.assertEqual(meta["agent_execution_failure_stage"], "timeout")
+        self.assertFalse(meta["repair_eligible"])
+        self.assertEqual(meta["repair_eligibility_reason"],
+                         "agent_execution_failure")
+        self.assertEqual(meta["repair_loops"], 0)
+        self.assertEqual(meta["stop_reason"], "agent_execution_failure")
+
+    # --- 2. timeout with a source that fails to build ----------------------
+
+    def test_timeout_with_an_uncompilable_source_is_repair_eligible(self):
+        """Controller feedback exists -- the build log names the error."""
+        meta = self.run_attempt("broken")
+        self.assert_timeout_recorded(meta)
+        self.assertTrue(meta["candidate_available_after_timeout"])
+        self.assertTrue(meta["validation_completed_after_timeout"])
+        self.assertNotEqual(meta["build_exit_code"], 0)
+        self.assertFalse(meta["agent_execution_failure"])
+        self.assertTrue(meta["repair_eligible"])
+        self.assertGreaterEqual(meta["repair_loops"], 1)
+
+    # --- 3. timeout, compiles, tests fail: the observed run ----------------
+
+    def test_timeout_with_a_failing_candidate_runs_the_repair_loop(self):
+        meta = self.run_attempt("failing")
+        self.assert_timeout_recorded(meta)
+        self.assertEqual(meta["build_exit_code"], 0)
+        self.assertNotEqual(meta["feature_test_exit_code"], 0)
+        self.assertTrue(meta["candidate_available_after_timeout"])
+        self.assertTrue(meta["validation_completed_after_timeout"])
+        self.assertFalse(meta["agent_execution_failure"])
+        self.assertTrue(meta["repair_eligible"])
+        self.assertEqual(meta["repair_eligibility_reason"],
+                         "controller_validation_after_timeout")
+        self.assertGreaterEqual(
+            meta["repair_loops"], 1,
+            "the configured repair budget must actually be used",
+        )
+        self.assertNotEqual(meta["stop_reason"], "agent_execution_failure")
+
+    def test_a_repair_after_a_timeout_can_succeed(self):
+        meta = self.run_attempt("failing", repair_fixes=True)
+        self.assertTrue(meta["public_validation_success"])
+        self.assertFalse(meta["initial_success"],
+                         "the initial generation still failed")
+        self.assertGreaterEqual(meta["repair_loops"], 1)
+        # The success does not hide where the candidate came from.
+        self.assertEqual(meta["initial_opencode_exit_code"], 124)
+        self.assertFalse(meta["initial_session_completed"])
+        self.assertTrue(meta["candidate_available_after_timeout"])
+
+    # --- 4. timeout with a candidate that passes ---------------------------
+
+    def test_timeout_with_a_passing_candidate_may_succeed_with_provenance(self):
+        meta = self.run_attempt("passing")
+        self.assertTrue(meta["public_validation_success"])
+        self.assertTrue(meta["initial_success"])
+        self.assertEqual(meta["stop_reason"], "success")
+        self.assertFalse(meta["agent_execution_failure"])
+        # Requirement 7: a success must still be distinguishable from a run
+        # whose session finished on its own.
+        self.assert_timeout_recorded(meta)
+        self.assertTrue(meta["candidate_available_after_timeout"])
+        self.assertEqual(meta["repair_eligibility_reason"],
+                         "initial_validation_passed")
+
+    # --- 5. no repair budget -----------------------------------------------
+
+    def test_max_loops_zero_records_the_candidate_without_repairing(self):
+        meta = self.run_attempt("failing", max_loops=0)
+        self.assert_timeout_recorded(meta)
+        self.assertTrue(meta["candidate_available_after_timeout"])
+        self.assertEqual(meta["repair_loops"], 0)
+        self.assertFalse(meta["repair_eligible"])
+        self.assertEqual(meta["repair_eligibility_reason"], "no_repair_budget")
+        # A failed implementation, not an absent one.
+        self.assertFalse(meta["agent_execution_failure"])
+        self.assertFalse(meta["public_validation_success"])
+        self.assertEqual(meta["build_exit_code"], 0)
+
+    # --- 6. metadata and analysis stay consistent --------------------------
+
+    def test_the_analyzer_agrees_with_the_recorded_classification(self):
+        analyzer = analyzer_or_none()
+        if analyzer is None:
+            self.skipTest("the analysis stack is not installed")
+
+        for behavior, expect_agent_failure, expect_status in (
+            ("none", True, "timeout"),
+            ("failing", False, "timeout_with_candidate"),
+            ("passing", False, "timeout_with_candidate"),
+        ):
+            meta = self.run_attempt(behavior, max_loops=0)
+            normalized = analyzer.normalize_repair_metadata(dict(meta))
+            with self.subTest(behavior=behavior):
+                self.assertEqual(normalized["agent_execution_failure"],
+                                 expect_agent_failure)
+                self.assertEqual(
+                    analyzer.initial_agent_invocation_status(normalized),
+                    expect_status,
+                )
+                # The controller and the analyzer must not disagree.
+                self.assertEqual(meta["agent_execution_failure"],
+                                 normalized["agent_execution_failure"])
+
+
+class TimeoutRepairAnalysisTests(unittest.TestCase):
+    """The analyzer's repair denominator and attrition counts."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.analyzer = analyzer_or_none()
+        if cls.analyzer is None:
+            raise unittest.SkipTest(
+                "scripts/analyze_experiment.py needs the analysis stack "
+                "(scripts/analysis-requirements.txt)"
+            )
+
+    def row(self, **overrides) -> dict:
+        base = {
+            "run_id": "attempt-001",
+            "opencode_exit_code": 124,
+            "initial_opencode_exit_code": 124,
+            "timeout_enforced": True,
+            "initial_session_completed": False,
+            "candidate_available_after_timeout": True,
+            "validation_completed_after_timeout": True,
+            "repair_eligible": True,
+            "repair_eligibility_reason": "controller_validation_after_timeout",
+            "agent_execution_failure": False,
+            "infrastructure_failure": False,
+            "build_exit_code": 0,
+            "base_test_exit_code": 0,
+            "feature_test_exit_code": 1,
+            "initial_success": False,
+            "public_validation_success": False,
+            "repair_loops": 1,
+            "llm_invocations": 2,
+            "success_loop": None,
+        }
+        base.update(overrides)
+        return base
+
+    def test_a_candidate_producing_timeout_is_in_the_repair_denominator(self):
+        summary = self.analyzer.build_repair_summary([self.row()])
+        self.assertEqual(summary["repair_eligible_initial_failures"], 1)
+        self.assertEqual(summary["repair_ineligible_initial_failures"], 0)
+
+    def test_a_repaired_timeout_counts_as_a_repair_assisted_success(self):
+        summary = self.analyzer.build_repair_summary([
+            self.row(public_validation_success=True, success_loop=1)
+        ])
+        self.assertEqual(summary["recovered_repair_eligible_failures"], 1)
+        self.assertEqual(summary["repair_recovery_rate"], 1.0)
+        self.assertEqual(summary["initial_public_successes"], 0,
+                         "the initial generation still failed")
+
+    def test_a_timeout_with_no_candidate_stays_out_of_the_denominator(self):
+        summary = self.analyzer.build_repair_summary([
+            self.row(candidate_available_after_timeout=False,
+                     agent_execution_failure=True, repair_loops=0,
+                     repair_eligible=False, llm_invocations=1)
+        ])
+        self.assertEqual(summary["repair_eligible_initial_failures"], 0)
+        self.assertEqual(summary["repair_ineligible_initial_failures"], 1)
+        self.assertIn("timeout",
+                      summary["repair_ineligible_initial_failure_stages"])
+
+    def test_a_candidate_producing_timeout_is_not_agent_attrition(self):
+        normalized = self.analyzer.normalize_repair_metadata(self.row())
+        self.assertFalse(normalized["agent_execution_failure"])
+        reliability = self.analyzer.build_reliability_summary([normalized])
+        self.assertEqual(reliability["n_infrastructure_failures"], 0)
+
+    def test_the_status_name_keeps_the_timeout_visible(self):
+        """It must not be folded into 'completed': the session did not finish."""
+        self.assertEqual(
+            self.analyzer.initial_agent_invocation_status(self.row()),
+            "timeout_with_candidate",
+        )
+        self.assertIn("timeout_with_candidate",
+                      self.analyzer.REPAIR_ELIGIBLE_INITIAL_STATUSES)
 
 
 class Bash32HeredocQuotingTests(unittest.TestCase):

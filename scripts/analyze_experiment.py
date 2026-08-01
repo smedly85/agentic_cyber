@@ -605,8 +605,21 @@ def normalize_repair_metadata(
         and opencode_exit is None
     )
     infrastructure_stage = "setup" if infrastructure_failure else None
+
+    # A timed-out session that still produced a source is not an agent
+    # execution failure. The controller compiled and tested that source itself,
+    # so the attempt carries a genuine public-validation verdict and belongs in
+    # the repair denominator rather than in agent attrition. The timeout is not
+    # erased by this: opencode_exit_code stays 124, initial_session_completed
+    # stays false, and initial_agent_invocation_status still reports
+    # "timeout_with_candidate", so a candidate-producing timeout is never
+    # counted as a clean run.
+    candidate_producing_timeout = opencode_exit == 124 and bool(
+        normalized.get("candidate_available_after_timeout")
+    )
     agent_execution_failure = (
         not infrastructure_failure
+        and not candidate_producing_timeout
         and (
             permission_rejected
             or opencode_exit not in (None, 0)
@@ -676,10 +689,19 @@ def normalize_repair_metadata(
     return normalized
 
 
+# Initial-invocation outcomes that leave the controller holding a validated
+# candidate, and therefore something a continuation session could repair.
+# "timeout_with_candidate" is deliberately kept distinct from "completed": both
+# are repair eligible, but only one of them is a session that finished.
+REPAIR_ELIGIBLE_INITIAL_STATUSES = frozenset({"completed", "timeout_with_candidate"})
+
+
 def initial_agent_invocation_status(row: Mapping[str, Any]) -> str:
     """Classify whether the initial agent invocation completed confidently."""
     if bool(row.get("infrastructure_failure")):
         return "infrastructure_failure"
+
+    candidate_after_timeout = bool(row.get("candidate_available_after_timeout"))
 
     loops = row.get("loops")
     if isinstance(loops, Sequence) and not isinstance(loops, (str, bytes)) and loops:
@@ -691,12 +713,29 @@ def initial_agent_invocation_status(row: Mapping[str, Any]) -> str:
             if isinstance(exit_code, (int, float)) and not isinstance(exit_code, bool):
                 if exit_code == 0:
                     return "completed"
-                return "timeout" if exit_code == 124 else "opencode_error"
+                if exit_code == 124:
+                    return ("timeout_with_candidate" if candidate_after_timeout
+                            else "timeout")
+                return "opencode_error"
         # Reaching a later invocation proves that the initial invocation
         # completed and produced validation feedback.
         if len(loops) > 1:
             return "completed"
         return "unknown_initial_invocation"
+
+    # No per-loop records: fall back to what the controller recorded for the
+    # INITIAL session specifically. The top-level opencode_exit_code is the
+    # LAST session's, so after a successful repair it reads 0 -- this is what
+    # keeps a repaired candidate-producing timeout from being scored as a clean
+    # first run.
+    initial_exit = row.get("initial_opencode_exit_code")
+    if isinstance(initial_exit, (int, float)) and not isinstance(initial_exit, bool):
+        if initial_exit == 0:
+            return "completed"
+        if initial_exit == 124:
+            return ("timeout_with_candidate" if candidate_after_timeout
+                    else "timeout")
+        return "opencode_error"
 
     repair_loops = row.get("repair_loops")
     if (
@@ -712,7 +751,10 @@ def initial_agent_invocation_status(row: Mapping[str, Any]) -> str:
     if isinstance(exit_code, (int, float)) and not isinstance(exit_code, bool):
         if exit_code == 0:
             return "completed"
-        return "timeout" if exit_code == 124 else "opencode_error"
+        if exit_code == 124:
+            return ("timeout_with_candidate" if candidate_after_timeout
+                    else "timeout")
+        return "opencode_error"
     if bool(row.get("agent_execution_failure")):
         stage = row.get("agent_execution_failure_stage")
         if stage == "permission":
@@ -745,10 +787,14 @@ def build_repair_summary(
         (row, initial_agent_invocation_status(row))
         for row in initially_failed_rows
     ]
+    # A candidate-producing timeout that failed public validation had feedback
+    # to repair from, so it is part of the denominator: excluding it would
+    # credit the repair loop with a recovery rate measured only over the runs
+    # where the agent happened to finish.
     repair_eligible_rows = [
         row
         for row, status in initially_failed_with_status
-        if status == "completed"
+        if status in REPAIR_ELIGIBLE_INITIAL_STATUSES
     ]
     recovered_repair_eligible_rows = [
         row
@@ -771,7 +817,7 @@ def build_repair_summary(
     ineligible_stages = Counter(
         status
         for _, status in initially_failed_with_status
-        if status != "completed"
+        if status not in REPAIR_ELIGIBLE_INITIAL_STATUSES
     )
     repair_runtimes = [
         float(row.get("repair_opencode_runtime_ms", 0)) / 1000.0
