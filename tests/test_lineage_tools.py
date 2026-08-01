@@ -39,6 +39,7 @@ sys.path.insert(0, str(REPO_ROOT / "tests"))
 from reference_generators import oracle_contract  # noqa: E402
 from reference_generators import suite_diff  # noqa: E402
 import lineage_plan  # noqa: E402
+import prompt_render  # noqa: E402
 import stage_test_bundle  # noqa: E402
 
 # The feature surfaces the redesign fixed. BusyBox selects which flags are in
@@ -261,6 +262,15 @@ class TemporaryRepo:
         root = Path(self._temp.name)
         (root / "experiments" / "utilities").mkdir(parents=True)
         (root / "prompts" / "demo").mkdir(parents=True)
+        # The shared automation notice is part of the required repository
+        # layout: it is expanded into every prompt and hashed into the
+        # configuration fingerprint, so resolving a plan without one fails
+        # rather than quietly producing prompts that lack it.
+        (root / "prompts" / "_shared").mkdir(parents=True)
+        (root / "prompts" / "_shared" / "automation_notice.md").write_text(
+            "## Session conditions\n\nThis session is fully automated.\n",
+            encoding="utf-8",
+        )
         suite = root / "tests" / "demo-test-suite"
         (suite / "suites").mkdir(parents=True)
         for name in ("000.md", "001.md"):
@@ -3493,6 +3503,34 @@ class StageArrayPreflightTests(unittest.TestCase):
                     "namerefs are Bash 4.3+; Darwin's /bin/bash is 3.2.57",
                 )
 
+    def test_no_maintained_script_uses_a_bash_4_only_construct(self):
+        """Darwin's /bin/bash is 3.2.57. Namerefs are covered above; these are
+        the other constructs that parse on a modern bash and fail there."""
+        constructs = (
+            "declare -A",       # associative arrays: Bash 4.0+
+            "mapfile",          # Bash 4.0+
+            "readarray",        # Bash 4.0+
+            "${!",              # only the array-key form is 4.0+, see below
+            ",,}", "^^}",       # case modification: Bash 4.0+
+            "&>>",              # append-both-streams: Bash 4.0+
+        )
+        for name in self.MAINTAINED_SCRIPTS:
+            text = (REPO_ROOT / "scripts" / name).read_text(encoding="utf-8")
+            code = [line for line in text.splitlines()
+                    if not line.lstrip().startswith("#")]
+            for construct in constructs:
+                offenders = [line.strip() for line in code if construct in line]
+                if construct == "${!":
+                    # `${!name}` is indirect expansion and is fine in 3.2;
+                    # `${!array[@]}` (key list) is not. Only flag the latter.
+                    offenders = [line for line in offenders
+                                 if "[@]" in line or "[*]" in line]
+                with self.subTest(script=name, construct=construct):
+                    self.assertEqual(
+                        offenders, [],
+                        f"{construct} is not available in Bash 3.2",
+                    )
+
     def test_the_lookup_is_an_explicit_case_over_the_known_arrays(self):
         source = self.region(self.controller_text(),
                              "stage_array_length() (", "\n)\n")
@@ -3567,6 +3605,389 @@ class SystemBashStageArrayPreflightTests(StageArrayPreflightTests):
         self.assertRegex(result.stdout, r"^\d+\.\d+$")
         self.assertEqual(self.run_preflight().returncode, 0,
                          f"the guard must run under Bash {result.stdout}")
+
+
+class LineageSamplingParameterTests(unittest.TestCase):
+    """The lineage controller's sampling surface.
+
+    A lineage is the experimental unit, so a sampling knob has to reach every
+    stage of it -- checkpoint 000, every later checkpoint, and the repair
+    sessions run_experiment.sh drives inside each stage -- and has to be part of
+    the configuration identity, or two runs sampled differently could land in
+    one output directory and be averaged together.
+    """
+
+    CONTROLLER = REPO_ROOT / "scripts" / "run_lineage_experiment.sh"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bash = shutil.which("bash")
+        if not cls.bash:
+            raise unittest.SkipTest("bash is required to run the controller")
+
+    def setUp(self):
+        import tempfile
+
+        self.temp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    def posix(self, path: Path) -> str:
+        text = path.as_posix()
+        return "/" + text[0].lower() + text[2:] if text[1:2] == ":" else text
+
+    def run_controller(self, *arguments: str,
+                       opencode: str = "") -> subprocess.CompletedProcess:
+        environment = {**os.environ, "PYTHON_BIN": sys.executable}
+        if opencode:
+            environment["OPENCODE_BIN"] = opencode
+        return subprocess.run(
+            [self.bash, str(self.CONTROLLER),
+             "--utility", "grep", "--model", "demo/m", "--temperature", "0.2",
+             *arguments],
+            cwd=str(REPO_ROOT), capture_output=True, text=True,
+            env=environment,
+        )
+
+    def dry_run_stages(self, *arguments: str) -> list[str]:
+        result = self.run_controller("--lineages", "2", "--dry-run", *arguments)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return [line for line in result.stdout.splitlines()
+                if "run_experiment.sh" in line]
+
+    # --- forwarding --------------------------------------------------------
+
+    def test_every_stage_receives_every_requested_knob(self):
+        stages = self.dry_run_stages("--top-p", "0.9", "--sampling-seed", "42",
+                                     "--max-tokens", "512")
+        self.assertTrue(stages)
+        for flag, value in (("--top-p", "0.9"), ("--sampling-seed", "42"),
+                            ("--max-tokens", "512")):
+            with self.subTest(flag=flag):
+                carrying = [line for line in stages
+                            if f"{flag} {value}" in line]
+                self.assertEqual(
+                    len(carrying), len(stages),
+                    f"{flag} reached {len(carrying)} of {len(stages)} stages",
+                )
+
+    def test_checkpoint_000_and_later_checkpoints_are_both_covered(self):
+        """The first stage is the one a forwarding bug is most likely to miss:
+        it is the only --source-mode new stage and takes a different path."""
+        stages = self.dry_run_stages("--top-p", "0.5")
+        first = [line for line in stages if "--source-mode new" in line]
+        later = [line for line in stages if "--source-mode existing" in line]
+        self.assertTrue(first and later)
+        for line in first + later:
+            self.assertIn("--top-p 0.5", line)
+
+    def test_omitted_knobs_are_not_forwarded_at_all(self):
+        stages = self.dry_run_stages()
+        self.assertTrue(stages)
+        for flag in ("--top-p", "--sampling-seed", "--max-tokens"):
+            with self.subTest(flag=flag):
+                self.assertEqual([line for line in stages if flag in line], [])
+
+    # --- configuration identity -------------------------------------------
+
+    def test_unset_knobs_are_null_in_the_plan_with_no_placeholder_values(self):
+        plan = lineage_plan.resolve_plan(
+            REPO_ROOT, "grep", "demo/m", "0.2", "build", 3, 1800
+        )
+        for key in ("top_p", "sampling_seed", "max_tokens"):
+            with self.subTest(key=key):
+                self.assertIn(key, plan)
+                self.assertIsNone(plan[key])
+
+    def test_explicit_knobs_keep_their_json_types(self):
+        plan = lineage_plan.resolve_plan(
+            REPO_ROOT, "grep", "demo/m", "0.2", "build", 3, 1800,
+            top_p="0.9", sampling_seed="42", max_tokens="512",
+        )
+        self.assertIsInstance(plan["top_p"], float)
+        self.assertIsInstance(plan["sampling_seed"], int)
+        self.assertIsInstance(plan["max_tokens"], int)
+        self.assertEqual(
+            (plan["top_p"], plan["sampling_seed"], plan["max_tokens"]),
+            (0.9, 42, 512),
+        )
+        # Round-trips as JSON with those types intact, which is what the
+        # durable records and the analyzer read.
+        restored = json.loads(json.dumps(plan))
+        self.assertEqual(restored["sampling_seed"], 42)
+        self.assertNotIsInstance(restored["sampling_seed"], str)
+
+    def test_each_knob_moves_the_configuration_fingerprint(self):
+        def fingerprint(**overrides):
+            return lineage_plan.resolve_plan(
+                REPO_ROOT, "grep", "demo/m", "0.2", "build", 3, 1800,
+                **overrides
+            )["config_fingerprint"]
+
+        base = fingerprint()
+        for key, first, second in (("top_p", "0.9", "0.8"),
+                                   ("sampling_seed", "1", "2"),
+                                   ("max_tokens", "256", "512")):
+            with self.subTest(key=key):
+                self.assertNotEqual(base, fingerprint(**{key: first}))
+                self.assertNotEqual(fingerprint(**{key: first}),
+                                    fingerprint(**{key: second}))
+
+    def test_the_print_plan_output_states_the_sampling_configuration(self):
+        result = self.run_controller("--lineages", "1", "--print-plan",
+                                     "--top-p", "0.9", "--sampling-seed", "42",
+                                     "--max-tokens", "512")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plan = json.loads(result.stdout.split("\nOutput dir:")[0])
+        self.assertEqual(plan["top_p"], 0.9)
+        self.assertEqual(plan["sampling_seed"], 42)
+        self.assertEqual(plan["max_tokens"], 512)
+        self.assertIn("sampling-seed=42", result.stdout)
+
+    # --- refusals ----------------------------------------------------------
+
+    def test_top_k_is_refused_with_the_documented_reason(self):
+        result = self.run_controller("--lineages", "1", "--top-k", "20")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--top-k is not supported", result.stderr)
+        self.assertIn("OpenAI-compatible", result.stderr)
+
+    def test_seed_is_refused_as_ambiguous(self):
+        result = self.run_controller("--lineages", "1", "--seed", "7")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--seed is ambiguous", result.stderr)
+        self.assertIn("--sampling-seed", result.stderr)
+        self.assertIn("--seed-file", result.stderr)
+
+    def test_invalid_values_abort_before_any_lineage_exists(self):
+        for arguments, expected in (
+            (("--top-p", "1.5"), "--top-p must be"),
+            (("--top-p", "abc"), "--top-p must be"),
+            (("--sampling-seed", "-3"), "--sampling-seed must be"),
+            (("--sampling-seed", "1.5"), "--sampling-seed must be"),
+            (("--max-tokens", "0"), "--max-tokens must be"),
+            (("--max-tokens", "abc"), "--max-tokens must be"),
+        ):
+            output = self.temp / f"bad-{abs(hash(arguments))}"
+            with self.subTest(arguments=arguments):
+                result = self.run_controller(
+                    "--lineages", "3", "--output-dir", self.posix(output),
+                    *arguments,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected, result.stderr)
+                # Nothing may have been started: no directory, no record.
+                for pattern in ("lineage-*", "lineage.json", "lineages.json"):
+                    self.assertEqual(
+                        [] if not output.exists()
+                        else list(output.rglob(pattern)), [],
+                        f"{pattern} exists after a rejected sampling value",
+                    )
+
+    # --- resume protection -------------------------------------------------
+
+    def start_run(self, output: Path, *arguments: str):
+        """Begin a real run far enough to write lineages.json.
+
+        OPENCODE_BIN points at nothing, so the first stage fails immediately --
+        but the run record and the lineage record are both written before any
+        stage starts, which is exactly the state a resume has to be checked
+        against.
+        """
+        return self.run_controller(
+            "--lineages", "1", "--max-loops", "0",
+            "--output-dir", self.posix(output), *arguments,
+            opencode=str(self.temp / "no-such-opencode"),
+        )
+
+    def test_durable_records_carry_the_sampling_configuration(self):
+        output = self.temp / "durable"
+        self.start_run(output, "--top-p", "0.9", "--sampling-seed", "42",
+                       "--max-tokens", "512")
+        record = json.loads(
+            (output / "lineages.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(record["top_p"], 0.9)
+        self.assertEqual(record["sampling_seed"], 42)
+        self.assertEqual(record["max_tokens"], 512)
+        self.assertTrue(record["automation_notice_sha256"])
+
+        lineage = json.loads(
+            (output / "lineage-001" / "lineage.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(lineage["top_p"], 0.9)
+        self.assertEqual(lineage["sampling_seed"], 42)
+        self.assertEqual(lineage["max_tokens"], 512)
+
+    def test_unset_knobs_are_recorded_as_null_not_omitted(self):
+        output = self.temp / "durable-null"
+        self.start_run(output)
+        record = json.loads(
+            (output / "lineages.json").read_text(encoding="utf-8")
+        )
+        lineage = json.loads(
+            (output / "lineage-001" / "lineage.json").read_text(encoding="utf-8")
+        )
+        for key in ("top_p", "sampling_seed", "max_tokens"):
+            with self.subTest(key=key):
+                self.assertIn(key, record)
+                self.assertIsNone(record[key])
+                self.assertIn(key, lineage)
+                self.assertIsNone(lineage[key])
+
+    def test_changing_one_sampling_value_refuses_the_output_directory(self):
+        output = self.temp / "resume"
+        self.start_run(output, "--top-p", "0.9")
+        again = self.start_run(output, "--top-p", "0.8")
+        self.assertNotEqual(again.returncode, 0)
+        self.assertIn("different configuration", again.stderr)
+        self.assertIn("top_p", again.stderr)
+
+    def test_resuming_with_the_same_values_is_allowed(self):
+        """The guard must refuse a changed condition, not every second run."""
+        output = self.temp / "resume-same"
+        self.start_run(output, "--top-p", "0.9")
+        again = self.start_run(output, "--top-p", "0.9")
+        self.assertNotIn("different configuration", again.stderr)
+
+
+class SharedAutomationNoticeRenderTests(unittest.TestCase):
+    """One canonical notice, expanded at one point, reaching every session.
+
+    The notice lives in prompts/_shared/automation_notice.md and in no prompt
+    file. scripts/prompt_render.py is the only expansion point: run_experiment.sh
+    renders the task prompt through it before anything else touches the text,
+    and repair_prompt.py renders the continuation template through it. These
+    assert the properties that make that safe.
+    """
+
+    NOTICE = REPO_ROOT / "prompts" / "_shared" / "automation_notice.md"
+    MARKER = "This session is fully automated"
+
+    def manifest_prompts(self) -> list[Path]:
+        prompts = []
+        for utility in sorted(EXPECTED_SEQUENCES):
+            plan = lineage_plan.resolve_plan(
+                REPO_ROOT, utility, "demo/m", "0", "build", 3, 1800
+            )
+            prompts.extend(REPO_ROOT / c["prompt"] for c in plan["checkpoints"])
+        return prompts
+
+    def test_every_manifest_prompt_renders_with_the_notice_exactly_once(self):
+        notice = prompt_render.notice_text(REPO_ROOT)
+        for prompt in self.manifest_prompts():
+            rendered = prompt_render.render_file(REPO_ROOT, prompt)
+            with self.subTest(prompt=prompt.name):
+                self.assertIn(notice, rendered)
+                self.assertEqual(rendered.count(self.MARKER), 1)
+                self.assertNotIn(prompt_render.PLACEHOLDER, rendered)
+
+    def test_the_rendered_prompt_keeps_the_task_text_byte_for_byte(self):
+        """Only the notice is added; the task content is untouched."""
+        for prompt in self.manifest_prompts():
+            original = prompt.read_text(encoding="utf-8")
+            rendered = prompt_render.render_file(REPO_ROOT, prompt)
+            with self.subTest(prompt=prompt.name):
+                self.assertTrue(rendered.endswith(original.lstrip()))
+
+    def test_no_manifest_prompt_file_carries_its_own_copy(self):
+        """Twenty pasted copies is the drift this design exists to avoid."""
+        for prompt in self.manifest_prompts():
+            text = prompt.read_text(encoding="utf-8")
+            with self.subTest(prompt=prompt.name):
+                self.assertNotIn(self.MARKER, text)
+
+    def test_the_repair_prompt_carries_the_notice_exactly_once(self):
+        """A repair session is a fresh session and needs the same instructions,
+        and must not restate them twice by quoting an already-rendered task."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as temp:
+            work = Path(temp)
+            original = REPO_ROOT / "prompts" / "grep" / "000_base_new_grep.md"
+            log = work / "build.log"
+            log.write_text("error: something failed\n", encoding="utf-8")
+            output = work / "repair.md"
+            result = subprocess.run(
+                [sys.executable,
+                 str(REPO_ROOT / "scripts" / "repair_prompt.py"),
+                 "--template",
+                 str(REPO_ROOT / "prompts" / "repair_continuation_template.md"),
+                 "--original-prompt", str(original),
+                 "--source-path", "src/new_grep/new_grep.c",
+                 "--loop-number", "1", "--max-loops", "3",
+                 "--build-log", str(log), "--build-exit", "1",
+                 "--repo", str(REPO_ROOT)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output.write_text(result.stdout, encoding="utf-8")
+            rendered = result.stdout
+
+        self.assertEqual(rendered.count(self.MARKER), 1)
+        self.assertNotIn(prompt_render.PLACEHOLDER, rendered)
+        self.assertIn(prompt_render.notice_text(REPO_ROOT), rendered)
+
+    def test_editing_the_notice_changes_the_configuration_fingerprint(self):
+        """The notice is part of every prompt the model sees, so it is part of
+        the configuration even though no prompt file contains it."""
+        before = lineage_plan.resolve_plan(
+            REPO_ROOT, "grep", "demo/m", "0", "build", 3, 1800
+        )["config_fingerprint"]
+        original = self.NOTICE.read_bytes()
+        try:
+            self.NOTICE.write_bytes(original + b"\nOne more sentence.\n")
+            after = lineage_plan.resolve_plan(
+                REPO_ROOT, "grep", "demo/m", "0", "build", 3, 1800
+            )["config_fingerprint"]
+        finally:
+            self.NOTICE.write_bytes(original)
+        self.assertNotEqual(before, after)
+        self.assertEqual(
+            before,
+            lineage_plan.resolve_plan(
+                REPO_ROOT, "grep", "demo/m", "0", "build", 3, 1800
+            )["config_fingerprint"],
+            "restoring the notice must restore the fingerprint",
+        )
+
+    def test_rendering_is_idempotent(self):
+        """The durable copy is itself a rendered prompt; re-rendering one must
+        not add a second notice."""
+        notice = prompt_render.notice_text(REPO_ROOT)
+        once = prompt_render.render_file(
+            REPO_ROOT, REPO_ROOT / "prompts" / "grep" / "000_base_new_grep.md"
+        )
+        twice = prompt_render.render(once, notice)
+        self.assertEqual(once, twice)
+        self.assertEqual(twice.count(self.MARKER), 1)
+
+    def test_the_notice_body_excludes_its_maintainer_comment(self):
+        """The header names other prompt files and explains the experimental
+        contract; it is documentation for the repository, not for the model."""
+        notice = prompt_render.notice_text(REPO_ROOT)
+        self.assertNotIn("<!--", notice)
+        self.assertNotIn("checkpoint_feature_template.md", notice)
+        self.assertTrue(notice.startswith("## Session conditions"))
+
+    def test_the_notice_introduces_no_future_checkpoint_information(self):
+        for leak in ("-H", "-h", "-r", "-i", "-p", "-m", "-R", "-c", "-v",
+                     "-f", "-u", "grep", "sort", "mkdir", "chmod"):
+            with self.subTest(leak=leak):
+                self.assertNotIn(
+                    f" {leak} ", prompt_render.notice_text(REPO_ROOT)
+                )
+
+    def test_run_experiment_uses_the_rendered_prompt_everywhere(self):
+        """Durable copy, sandbox copy and the text sent to OpenCode all come
+        from the one rendered file, so they cannot disagree."""
+        text = (REPO_ROOT / "scripts" / "run_experiment.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('cp "$RENDERED_PROMPT" "$experiment_dir/prompt.md"', text)
+        self.assertIn('cp "$RENDERED_PROMPT" "$workdir/', text)
+        self.assertIn('prompt_text="$(cat "$RENDERED_PROMPT")"', text)
+        # And the unrendered file is what the repair renderer quotes, so the
+        # notice is not stated twice in a continuation prompt.
+        self.assertIn('--original-prompt "$PROMPT_ABS"', text)
 
 
 class SystemBashStagePlanValidationTests(StagePlanValidationTests):

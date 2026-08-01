@@ -27,6 +27,9 @@ import re
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import prompt_render  # noqa: E402
+
 VALIDATION_MARKER = re.compile(
     r"^===== VALIDATION LOOP \d+:[^\n]*=====\s*$", re.M
 )
@@ -313,13 +316,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-failures", type=int, default=25)
     parser.add_argument("--max-detail-chars", type=int, default=300)
     parser.add_argument("--tail-chars", type=int, default=16000)
+    parser.add_argument(
+        "--repo",
+        type=Path,
+        default=None,
+        help="Repository root, used to locate the shared automation notice. "
+             "Defaults to this script's parent directory.",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
 
-    template = args.template.read_text(encoding="utf-8")
+    # A repair session is a fresh OpenCode session, so it needs the same
+    # operating instructions the initial session got. Expanded through the one
+    # renderer rather than restated here: the continuation template carries
+    # [AUTOMATION_NOTICE], and --original-prompt is deliberately the UNrendered
+    # task file, so the notice lands exactly once.
+    repo = args.repo or Path(__file__).resolve().parent.parent
+    template = prompt_render.render(
+        args.template.read_text(encoding="utf-8"),
+        prompt_render.notice_text(repo),
+    )
     original_prompt = demote_headings(
         args.original_prompt.read_text(encoding="utf-8", errors="replace").strip()
     )

@@ -12,10 +12,12 @@ not silently mix stage configurations, and comparing one hash is both cheaper
 and harder to get wrong than comparing a dozen fields: the fingerprint covers
 the resolved manifest, the *contents* of every checkpoint prompt, the contents
 of the judge script, each checkpoint's cumulative implemented flags, each
-checkpoint's visible test bundle, and the model/agent/temperature/repair
-settings the stages run under. The number of lineages is deliberately excluded,
-so extending an existing run from 10 lineages to 15 is allowed while editing a
-prompt is not.
+checkpoint's visible test bundle, the model/agent/repair settings the stages run
+under, the whole sampling configuration (temperature, top_p, sampling_seed,
+max_tokens), and the shared automation notice that is expanded into every
+prompt. The number of lineages is deliberately excluded, so extending an
+existing run from 10 lineages to 15 is allowed while editing a prompt, changing
+a sampling knob or rewording the notice is not.
 
 Each checkpoint additionally resolves the fingerprint of the test bundle the
 agent will be able to read there (`scripts/stage_test_bundle.py`). That is the
@@ -35,6 +37,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import prompt_render  # noqa: E402
 import stage_test_bundle  # noqa: E402
 
 SCHEMA_VERSION = 1
@@ -99,6 +102,27 @@ def available_utilities(repo: Path) -> list[str]:
     return [entry.stem for entry in sorted(directory.glob("*.json"))]
 
 
+def optional_float(value: Any, label: str) -> float | None:
+    """A sampling knob that may be unset. Unset stays None -- a real JSON null
+    in the plan -- rather than 0 or "", so "left to the server default" and
+    "explicitly set to zero" never collapse into the same recorded condition."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise ManifestError(f"{label} must be numeric, got {value!r}") from None
+
+
+def optional_int(value: Any, label: str) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise ManifestError(f"{label} must be an integer, got {value!r}") from None
+
+
 def resolve_plan(
     repo: Path,
     utility: str,
@@ -107,6 +131,9 @@ def resolve_plan(
     agent: str,
     max_loops: int,
     timeout_seconds: int,
+    top_p: Any = None,
+    sampling_seed: Any = None,
+    max_tokens: Any = None,
 ) -> dict[str, Any]:
     manifest_path, manifest = load_manifest(repo, utility)
 
@@ -323,9 +350,23 @@ def resolve_plan(
         "checkpoints": resolved,
         "model": model,
         "temperature": float(temperature),
+        # The rest of the sampling configuration, carried the same way
+        # temperature is. Null means the flag was not passed, so the server's
+        # own default applied; a number means this run pinned it. Both are
+        # conditions a resume must not cross, which is why they are in the
+        # fingerprint rather than only in the console output.
+        "top_p": optional_float(top_p, "top_p"),
+        "sampling_seed": optional_int(sampling_seed, "sampling_seed"),
+        "max_tokens": optional_int(max_tokens, "max_tokens"),
         "agent": agent,
         "max_loops": max_loops,
         "timeout_seconds": timeout_seconds,
+        # The shared automation notice is expanded into every prompt the model
+        # sees (scripts/prompt_render.py). It is therefore part of the prompt
+        # configuration even though no checkpoint prompt file contains it, so
+        # its hash is carried here: editing the notice moves the fingerprint
+        # exactly as editing a checkpoint prompt does.
+        "automation_notice_sha256": prompt_render.notice_sha256(repo),
     }
     plan["config_fingerprint"] = fingerprint(plan)
     return plan
@@ -339,9 +380,13 @@ def fingerprint(plan: dict[str, Any]) -> str:
     test directory, judge path, ordered checkpoint list); the *contents* of
     every checkpoint prompt and of the judge script, via their SHA-256; each
     checkpoint's cumulative implemented flags and its resolved judge command;
-    each checkpoint's visible test bundle, via its bundle fingerprint; and the
-    model, agent, temperature, repair budget and per-session timeout the stages
-    run under.
+    each checkpoint's visible test bundle, via its bundle fingerprint; the
+    model, agent, repair budget and per-session timeout the stages run under;
+    the full sampling configuration (temperature, top_p, sampling_seed,
+    max_tokens -- a null among them is itself a condition, meaning the server
+    default applied); and the shared automation notice, via
+    automation_notice_sha256, since it is expanded into every prompt the model
+    sees without appearing in any prompt file.
 
     Deliberately excluded: the number of lineages (extending a run is a valid
     resume) and the output directory (relocating results is not a condition
@@ -398,6 +443,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--agent", default="build")
     parser.add_argument("--max-loops", type=int, default=3)
     parser.add_argument("--timeout-seconds", type=int, default=1800)
+    # Passed through as strings so "unset" survives the shell as an empty
+    # argument and becomes a JSON null rather than 0.
+    parser.add_argument("--top-p", default="")
+    parser.add_argument("--sampling-seed", default="")
+    parser.add_argument("--max-tokens", default="")
     parser.add_argument(
         "--emit",
         choices=("plan", "stages", "utilities", "fingerprint"),
@@ -425,6 +475,9 @@ def main(argv: list[str] | None = None) -> int:
         args.agent,
         args.max_loops,
         args.timeout_seconds,
+        top_p=args.top_p,
+        sampling_seed=args.sampling_seed,
+        max_tokens=args.max_tokens,
     )
 
     if args.emit == "stages":

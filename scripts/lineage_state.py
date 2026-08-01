@@ -94,6 +94,25 @@ def read_record(path: Path) -> dict[str, Any]:
     return data
 
 
+def optional_float(value: str | None) -> float | None:
+    """An unset sampling knob stays null rather than becoming 0."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise StateError(f"expected a number, got {value!r}") from None
+
+
+def optional_int(value: str | None) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise StateError(f"expected an integer, got {value!r}") from None
+
+
 def init_record(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
@@ -101,6 +120,12 @@ def init_record(args: argparse.Namespace) -> dict[str, Any]:
         "utility": args.utility,
         "model": args.model,
         "temperature": float(args.temperature),
+        # Recorded as null when the flag was not passed: "the server default
+        # applied" is a different condition from "pinned to 0", and a lineage
+        # record has to be readable on its own years later.
+        "top_p": optional_float(args.top_p),
+        "sampling_seed": optional_int(args.sampling_seed),
+        "max_tokens": optional_int(args.max_tokens),
         "agent": args.agent,
         "max_loops": int(args.max_loops),
         "config_fingerprint": args.fingerprint,
@@ -185,6 +210,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     start.add_argument("--utility", required=True)
     start.add_argument("--model", default="")
     start.add_argument("--temperature", default="0")
+    start.add_argument("--top-p", default="")
+    start.add_argument("--sampling-seed", default="")
+    start.add_argument("--max-tokens", default="")
     start.add_argument("--agent", default="build")
     start.add_argument("--max-loops", default="0")
     start.add_argument("--fingerprint", default="")

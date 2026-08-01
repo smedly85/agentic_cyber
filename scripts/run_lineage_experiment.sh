@@ -60,6 +60,29 @@ Experiment size:
   --max-loops N              Repair sessions allowed WITHIN each stage after its
                              initial generation (default: 3). 0 disables repair.
 
+Sampling (optional; each is forwarded unchanged to every stage and every repair
+session, and unset means the flag is absent from the request so the server's own
+default applies):
+  --top-p P                  Nucleus sampling mass, 0 <= P <= 1
+  --sampling-seed N          Token-selection seed, N >= 0. Named this way on
+                             purpose: --seed-file is the checkpoint
+                             source-inheritance file and the two senses of
+                             "seed" must not be confused.
+  --max-tokens N             Cap on generated tokens per session, N >= 1
+
+                             There is no --top-k. The OpenCode provider in use
+                             speaks OpenAI-compatible /v1/chat/completions,
+                             whose schema has no top_k, and Ollama drops it
+                             there; reaching its sampler would need the native
+                             /api/chat options object, which this provider does
+                             not speak. --top-k is refused rather than recorded
+                             as a condition the server ignored.
+
+                             Every sampling value is part of the lineage
+                             configuration fingerprint, so changing one refuses
+                             to resume an existing --output-dir rather than
+                             mixing conditions.
+
 Passed through to scripts/run_experiment.sh:
   --agent NAME               OpenCode agent (default: build)
   --timeout SECONDS          Per-session timeout; 0 disables (default: 1800)
@@ -180,6 +203,12 @@ boundary_gate() {
 UTILITY=""
 MODEL=""
 TEMPERATURE="0"
+# Optional sampling knobs. Empty means "not requested": the value is recorded as
+# a JSON null and no flag is forwarded, so the stage runs exactly as it did
+# before these options existed. See the help text for why there is no --top-k.
+TOP_P=""
+SAMPLING_SEED=""
+MAX_TOKENS=""
 LINEAGES=1
 LINEAGE_START=1
 MAX_LOOPS=3
@@ -201,6 +230,7 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --utility|--model|--temperature|--lineages|--lineage-start|--max-loops| \
+        --top-p|--sampling-seed|--max-tokens| \
         --agent|--timeout|--repair-prompt|--remote-base-url| \
         --remote-api-key-env|--output-dir)
             [[ $# -ge 2 ]] || die "$1 requires a value"
@@ -211,6 +241,23 @@ while [[ $# -gt 0 ]]; do
         --utility) UTILITY="${2:-}"; shift 2 ;;
         --model) MODEL="${2:-}"; shift 2 ;;
         --temperature) TEMPERATURE="${2:-}"; shift 2 ;;
+        --top-p) TOP_P="${2:-}"; shift 2 ;;
+        --sampling-seed) SAMPLING_SEED="${2:-}"; shift 2 ;;
+        --max-tokens) MAX_TOKENS="${2:-}"; shift 2 ;;
+        --top-k)
+            # Fail closed, matching scripts/run_experiment.sh. top_k does reach
+            # the request body, but the body is an OpenAI-compatible
+            # /v1/chat/completions request whose schema has no top_k, and
+            # Ollama parses a fixed field set there and drops the rest. Its
+            # sampler is only reachable through the native /api/chat "options"
+            # object, which this provider never speaks. A flag that is
+            # accepted, recorded and then ignored by the server is worse than
+            # no flag.
+            die "--top-k is not supported: top_k is not part of the OpenAI-compatible chat API that OpenCode speaks to Ollama, so it would be recorded here and ignored by the server" ;;
+        --seed)
+            # --seed-file is the checkpoint source-inheritance file. The two
+            # senses of "seed" must never collide in this harness.
+            die "--seed is ambiguous here: use --sampling-seed for the token-selection seed, or --seed-file for the inherited source file" ;;
         --lineages) LINEAGES="${2:-}"; shift 2 ;;
         --lineage-start) LINEAGE_START="${2:-}"; shift 2 ;;
         --max-loops) MAX_LOOPS="${2:-}"; shift 2 ;;
@@ -266,6 +313,30 @@ fi
 "$PYTHON_BIN" -c 'import sys; float(sys.argv[1])' "$TEMPERATURE" ||
     die "--temperature must be numeric"
 
+# Sampling knobs, validated with the same rules scripts/run_experiment.sh uses.
+# This happens BEFORE the plan is resolved and therefore long before any lineage
+# directory or lineage.json exists, so a typo can never leave a started lineage
+# behind that analysis would have to count.
+if [[ -n "$TOP_P" ]]; then
+    # stderr discarded so a non-numeric value reports the usage error rather
+    # than a Python traceback.
+    "$PYTHON_BIN" -c '
+import sys
+
+value = float(sys.argv[1])
+if not 0.0 <= value <= 1.0:
+    raise SystemExit(1)
+' "$TOP_P" 2>/dev/null || die "--top-p must be a number between 0 and 1 inclusive"
+fi
+if [[ -n "$SAMPLING_SEED" ]]; then
+    [[ "$SAMPLING_SEED" =~ ^[0-9]+$ ]] ||
+        die "--sampling-seed must be a non-negative integer (it is the token-selection seed, not --seed-file)"
+fi
+if [[ -n "$MAX_TOKENS" ]]; then
+    [[ "$MAX_TOKENS" =~ ^[1-9][0-9]*$ ]] ||
+        die "--max-tokens must be a positive integer"
+fi
+
 # ---------------------------------------------------------------------------
 # Resolve the stage plan
 # ---------------------------------------------------------------------------
@@ -276,6 +347,9 @@ PLAN_JSON="$(
         --utility "$UTILITY" \
         --model "$MODEL" \
         --temperature "$TEMPERATURE" \
+        --top-p "$TOP_P" \
+        --sampling-seed "$SAMPLING_SEED" \
+        --max-tokens "$MAX_TOKENS" \
         --agent "$AGENT" \
         --max-loops "$MAX_LOOPS" \
         --timeout-seconds "$TIMEOUT_SECONDS" \
@@ -308,6 +382,9 @@ STAGE_TABLE="$(
         --utility "$UTILITY" \
         --model "$MODEL" \
         --temperature "$TEMPERATURE" \
+        --top-p "$TOP_P" \
+        --sampling-seed "$SAMPLING_SEED" \
+        --max-tokens "$MAX_TOKENS" \
         --agent "$AGENT" \
         --max-loops "$MAX_LOOPS" \
         --timeout-seconds "$TIMEOUT_SECONDS" \
@@ -413,10 +490,17 @@ elif [[ "$OUTPUT_DIR" != /* ]]; then
 fi
 
 if [[ "$PRINT_PLAN" -eq 1 ]]; then
+    # The plan JSON already carries top_p, sampling_seed, max_tokens and the
+    # automation-notice hash, all of which are inside config_fingerprint; these
+    # lines restate the sampling settings in the same human-readable form the
+    # run banner uses.
     printf '%s\n' "$PLAN_JSON"
     printf '\nOutput dir: %s\n' "$OUTPUT_DIR"
     printf 'Lineages:   %s..%s\n' \
         "$LINEAGE_START" "$((LINEAGE_START + LINEAGES - 1))"
+    printf 'Sampling:   temperature=%s top-p=%s sampling-seed=%s max-tokens=%s\n' \
+        "$TEMPERATURE" "${TOP_P:-null}" "${SAMPLING_SEED:-null}" \
+        "${MAX_TOKENS:-null}"
     exit 0
 fi
 
@@ -521,12 +605,15 @@ RUN_METADATA="$OUTPUT_DIR/lineages.json"
 if [[ -f "$RUN_METADATA" && "$DRY_RUN" -eq 0 ]]; then
     mismatch="$(
         "$PYTHON_BIN" - "$RUN_METADATA" "$CONFIG_FINGERPRINT" "$UTILITY" \
-            "$MODEL" "$TEMPERATURE" "$AGENT" "$MAX_LOOPS" <<'PY'
+            "$MODEL" "$TEMPERATURE" "$AGENT" "$MAX_LOOPS" \
+            "${TOP_P:-__NONE__}" "${SAMPLING_SEED:-__NONE__}" \
+            "${MAX_TOKENS:-__NONE__}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-path, fingerprint, utility, model, temperature, agent, max_loops = sys.argv[1:]
+(path, fingerprint, utility, model, temperature, agent, max_loops,
+ top_p, sampling_seed, max_tokens) = sys.argv[1:]
 try:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
 except (OSError, UnicodeError, json.JSONDecodeError) as error:
@@ -538,6 +625,14 @@ expected = {
     "utility": utility,
     "model": model,
     "temperature": float(temperature),
+    # Named individually as well as covered by the fingerprint: a changed
+    # sampling knob then reports "top_p" rather than only "config_fingerprint",
+    # which is the difference between a diagnosable refusal and a puzzle. An
+    # unset knob compares as null, so a record written before these options
+    # existed still resumes cleanly when they are not passed.
+    "top_p": None if top_p == "__NONE__" else float(top_p),
+    "sampling_seed": None if sampling_seed == "__NONE__" else int(sampling_seed),
+    "max_tokens": None if max_tokens == "__NONE__" else int(max_tokens),
     "agent": agent,
     "max_loops": int(max_loops),
 }
@@ -560,6 +655,11 @@ printf 'Utility:      %s (%s checkpoints)\n' "$UTILITY" "$STAGE_COUNT"
 printf 'Checkpoints:  %s\n' "$CHECKPOINT_LADDER"
 printf 'Model:        %s\n' "$MODEL"
 printf 'Temperature:  %s\n' "$TEMPERATURE"
+# Printed as "(server default)" rather than omitted, so the console record of a
+# run states every sampling condition instead of leaving three of them implied.
+printf 'Top-p:        %s\n' "${TOP_P:-(server default)}"
+printf 'Sampling seed: %s\n' "${SAMPLING_SEED:-(server default)}"
+printf 'Max tokens:   %s\n' "${MAX_TOKENS:-(server default)}"
 printf 'Lineages:     %s (numbered %s..%s)\n' \
     "$LINEAGES" "$LINEAGE_START" "$((LINEAGE_START + LINEAGES - 1))"
 printf 'Max loops:    %s per stage\n' "$MAX_LOOPS"
@@ -605,6 +705,13 @@ record.update(
         "program": plan["program"],
         "model": plan["model"],
         "temperature": plan["temperature"],
+        # Taken from the plan rather than re-read from the shell, so the run
+        # record and the fingerprint cannot describe different conditions.
+        # Null means the flag was not passed and the server default applied.
+        "top_p": plan["top_p"],
+        "sampling_seed": plan["sampling_seed"],
+        "max_tokens": plan["max_tokens"],
+        "automation_notice_sha256": plan["automation_notice_sha256"],
         "agent": plan["agent"],
         "max_loops": plan["max_loops"],
         "timeout_seconds": plan["timeout_seconds"],
@@ -663,6 +770,9 @@ for (( offset = 0; offset < LINEAGES; offset++ )); do
             --utility "$UTILITY" \
             --model "$MODEL" \
             --temperature "$TEMPERATURE" \
+            --top-p "$TOP_P" \
+            --sampling-seed "$SAMPLING_SEED" \
+            --max-tokens "$MAX_TOKENS" \
             --agent "$AGENT" \
             --max-loops "$MAX_LOOPS" \
             --fingerprint "$CONFIG_FINGERPRINT" \
@@ -723,6 +833,15 @@ for (( offset = 0; offset < LINEAGES; offset++ )); do
             --output-dir "$stage_dir"
             --no-analysis
         )
+        # Sampling knobs are forwarded only when requested, so an unset one
+        # leaves the stage command exactly as it was before these options
+        # existed. Added to runner_args, which is the single command every
+        # stage uses -- checkpoint 000, every later checkpoint, and the repair
+        # sessions run_experiment.sh drives inside that stage -- so a knob
+        # cannot reach one kind of session and miss another.
+        [[ -n "$TOP_P" ]] && runner_args+=(--top-p "$TOP_P")
+        [[ -n "$SAMPLING_SEED" ]] && runner_args+=(--sampling-seed "$SAMPLING_SEED")
+        [[ -n "$MAX_TOKENS" ]] && runner_args+=(--max-tokens "$MAX_TOKENS")
         [[ -n "$BASE_TEST_CMD" ]] && runner_args+=(--base-test-cmd "$BASE_TEST_CMD")
         [[ -n "$EXTRA_TEST_CMD" ]] && runner_args+=(--extra-test-cmd "$EXTRA_TEST_CMD")
         [[ "$ALLOW_NO_PROGRESS" -eq 1 ]] && runner_args+=(--allow-no-progress)

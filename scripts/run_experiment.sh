@@ -729,6 +729,22 @@ fi
 PROMPT_ABS="$(resolve_repo_path "$PROMPT")"
 [[ -f "$PROMPT_ABS" ]] || die "prompt not found: $PROMPT_ABS"
 
+# The agent-visible prompt is the task file with the shared automation notice
+# expanded into it (scripts/prompt_render.py, the single expansion point). It is
+# rendered ONCE here and then used for every downstream purpose -- the durable
+# experiment copy, the copy placed in the sandbox, and the text handed to
+# `opencode run` -- so those cannot disagree: they are the same file.
+RENDER_TOOL="$REPO/scripts/prompt_render.py"
+[[ -f "$RENDER_TOOL" ]] || die "prompt renderer not found: $RENDER_TOOL"
+RENDERED_PROMPT="$(mktemp)" || die "cannot create the rendered prompt file"
+trap 'rm -f "$RENDERED_PROMPT"' EXIT
+"$PYTHON_BIN" "$RENDER_TOOL" --repo "$REPO" --prompt "$PROMPT_ABS" \
+    --output "$RENDERED_PROMPT" ||
+    die "cannot render the automation notice into $PROMPT_ABS"
+AUTOMATION_NOTICE_SHA256="$(
+    "$PYTHON_BIN" "$RENDER_TOOL" --repo "$REPO" --emit sha256
+)" || die "cannot hash the shared automation notice"
+
 if [[ -z "$REPAIR_TEMPLATE" ]]; then
     REPAIR_TEMPLATE="$REPO/prompts/repair_continuation_template.md"
 else
@@ -1030,7 +1046,9 @@ PY
         baseline_kind="empty_new_source"
     fi
 
-    cp "$PROMPT_ABS" "$experiment_dir/prompt.md"
+    # The durable copy is the RENDERED prompt, so what provenance records is
+    # exactly what the model was shown, notice included.
+    cp "$RENDERED_PROMPT" "$experiment_dir/prompt.md"
 
     write_metadata "$experiment_dir/experiment.json" \
         schema_version 2 \
@@ -1045,6 +1063,7 @@ PY
         agent "$AGENT" \
         prompt "$PROMPT_ABS" \
         prompt_copy "$experiment_dir/prompt.md" \
+        automation_notice_sha256 "$AUTOMATION_NOTICE_SHA256" \
         source_path "$SOURCE_FLAT" \
         source_workdir_path "$SOURCE_PATH" \
         source_mode "$SOURCE_MODE" \
@@ -1089,7 +1108,9 @@ PY
         mkdir -p "$workdir"
 
         # Seed the working directory. This is everything the agent can see.
-        cp "$PROMPT_ABS" "$workdir/$(basename "$PROMPT_ABS")"
+        # Rendered, under the task file's own name: the copy the agent can read
+        # must match the text it was sent.
+        cp "$RENDERED_PROMPT" "$workdir/$(basename "$PROMPT_ABS")"
         for (( test_dir_index = 0;
                test_dir_index < ${#TEST_DIR_SOURCES[@]};
                test_dir_index++ )); do
@@ -1240,7 +1261,7 @@ print(json.dumps(config))
 PY
         )" || die "failed to build per-attempt OpenCode configuration"
 
-        prompt_text="$(cat "$PROMPT_ABS")"
+        prompt_text="$(cat "$RENDERED_PROMPT")"
         : >"$attempt_dir/opencode.log"
         : >"$attempt_dir/build.log"
         : >"$attempt_dir/base-tests.log"
@@ -1394,6 +1415,12 @@ PY
 
             repair_args=(
                 --template "$REPAIR_TEMPLATE"
+                # The UNrendered task file on purpose. The continuation
+                # template carries its own [AUTOMATION_NOTICE], which
+                # repair_prompt.py expands through the same renderer, so the
+                # notice is stated once at the top of the repair prompt rather
+                # than twice -- once there and again inside the quoted original
+                # task.
                 --original-prompt "$PROMPT_ABS"
                 --program "$PROGRAM_NAME"
                 --source-path "$SOURCE_PATH"
