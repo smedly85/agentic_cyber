@@ -34,6 +34,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gzip
+import json
 import sys
 from pathlib import Path
 
@@ -54,7 +56,18 @@ PATTERN_DUALS = {
     "alphabetical": "deltaesque", "": "",
     "a.c": "x.z", "[abc]": "[xyz]", "[ABC]": "[XYZ]",
     "key": "tag", "ALPHA": "DELTA", "aLpHa": "dElTa", "GAMMA": "SIGMA",
-    "BETA": "OMEGA", "NEEDLE": "MARKER", "COLE": "RENE", "omega": "kappa",
+    # An uppercase pattern's dual must be the uppercase of the dual of the word
+    # it folds onto, or the `-i` checkpoint's cases stop matching: `BETA` folds
+    # onto "beta", "beta" maps to "gamma", so `BETA` must map to `GAMMA`. It
+    # used to map to `OMEGA`, which matched nothing and flipped `ih-combined`
+    # from exit 0 to exit 1.
+    "BETA": "GAMMA", "NEEDLE": "MARKER", "COLE": "RENE",
+    # A negative case's pattern must stay ABSENT from the dual payload, which is
+    # a constraint on the pair, not on either table alone. `omega` used to map
+    # to `kappa` -- and the ALPHA payload's dual contains "kappa", so
+    # `i-no-match-even-folded` started matching and flipped from exit 1 to 0.
+    # `zulu` appears in no payload dual.
+    "omega": "zulu",
     "-alpha": "-delta",
 }
 
@@ -83,6 +96,19 @@ STDIN_DUALS = {
     b"\xc3\x89cole\n\xc3\xa9COLE\nplain\n": b"\xc3\x89lan\n\xc3\xa9LAN\nquiet\n",
     b"key:value\nother\n": b"tag:value\nspare\n",
     b"x-alpha\ny\n": b"x-delta\nz\n",
+    # The recursive-tree fixtures. These were missing, and their absence did
+    # real damage rather than merely weakening the corpus: the pattern `needle`
+    # WAS mapped to `marker` while these file bodies were left alone, so eight
+    # duals ended up searching for a string none of their files contained.
+    # `r-directory-is-traversed-in-name-order` stopped testing traversal order
+    # and became a case about finding nothing, flipping its exit code from 0 to
+    # 1. Every replacement below keeps `marker` where `needle` was, so the match
+    # count, the matching lines and the exit code all survive.
+    b"alpha needle\n": b"delta marker\n",
+    b"beta needle\nplain\n": b"gamma marker\nquiet\n",
+    b"deep needle\n": b"under marker\n",
+    b"also needle\n": b"else marker\n",
+    b"locked needle\n": b"sealed marker\n",
 }
 
 UNMAPPED: dict[str, set] = {"patterns": set(), "stdin": set()}
@@ -159,6 +185,62 @@ def dual_of(definition: dict) -> dict:
     return held
 
 
+class HeldoutGapError(RuntimeError):
+    """A dual came out meaning something its visible twin did not."""
+
+
+def check_dual(definition: dict, frozen: dict, oracle_bin: str | None) -> None:
+    """Reject a dual whose outcome no longer matches its twin's.
+
+    The strongest invariant available without re-deriving the case by hand: a
+    dual is supposed to walk the same path with different values, so if the
+    twin found matches and the dual finds none, the substitution changed what
+    the case is about. This is what caught the unmapped fixture bodies -- eight
+    duals had flipped their exit code and nothing complained, because every
+    individual piece of the pipeline had done exactly what it was told.
+
+    Only meaningful when the twin's own expectation is available, which is why
+    it compares against the frozen visible case rather than the definition.
+    """
+    twin = VISIBLE.get(definition["name"])
+    if twin is None or "exit_code" not in twin or "exit_code" not in frozen:
+        return
+    if twin["exit_code"] != frozen["exit_code"]:
+        raise HeldoutGapError(
+            f"{frozen['name']} exits {frozen['exit_code']} but its twin "
+            f"{definition['name']} exits {twin['exit_code']}: the dual is no "
+            f"longer the same kind of case. Check that every pattern and every "
+            f"payload it touches has a mapping."
+        )
+
+
+def _visible_cases() -> dict[str, dict]:
+    """Frozen visible cases by name, for the outcome comparison above."""
+    found: dict[str, dict] = {}
+    suites = SUITE_ROOT / "suites"
+    if not suites.is_dir():
+        return found
+    for path in sorted(suites.iterdir()):
+        if path.name == "MANIFEST.json" or path.suffix not in (".json", ".gz"):
+            continue
+        opener = gzip.open if path.suffix == ".gz" else open
+        try:
+            with opener(path, "rt", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            continue
+        cases = data.get("cases") if isinstance(data, dict) else data
+        if not isinstance(cases, list):
+            continue
+        for case in cases:
+            if isinstance(case, dict) and "name" in case:
+                found[case["name"]] = case
+    return found
+
+
+VISIBLE = _visible_cases()
+
+
 def select(definitions: list[dict]) -> list[dict]:
     """One dual per structural family per checkpoint.
 
@@ -188,7 +270,22 @@ def build_corpus(oracle_bin: str | None) -> dict:
             frozen = generate.freeze_case(held, oracle_bin)
             frozen["dual_of"] = definition["name"]
             frozen["group"] = group
+            check_dual(definition, frozen, oracle_bin)
             held_cases.append(frozen)
+
+    # Checked after the loop, so the message names every gap at once rather
+    # than failing on the first. Leaving a payload unmapped is not a cosmetic
+    # shortfall: the pattern is mapped whether or not the file bodies are, so an
+    # unmapped body produces a case searching for a string it does not contain.
+    if UNMAPPED["stdin"] or UNMAPPED["patterns"]:
+        raise HeldoutGapError(
+            "every payload needs a dual, or the case stops testing what it "
+            "was written to test:\n"
+            + "".join(f"  stdin/fixture: {value}\n"
+                      for value in sorted(UNMAPPED["stdin"]))
+            + "".join(f"  pattern: {value!r}\n"
+                      for value in sorted(UNMAPPED["patterns"]))
+        )
     return heldout_contract.build(
         "grep",
         {

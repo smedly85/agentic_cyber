@@ -183,6 +183,16 @@ def build_corpus(sort_bin: str) -> dict:
                 f"input contains nothing the rotation changes")
         frozen = freeze.freeze_case(held, sort_bin=sort_bin)
         frozen["dual_of"] = case["name"]
+        # A different outcome means the rotation changed what the case is
+        # about, not just its data. grep's corpus had eight duals flip their
+        # exit code this way before the check existed.
+        if "exit_code" in case and "exit_code" in frozen \
+                and case["exit_code"] != frozen["exit_code"]:
+            raise RuntimeError(
+                f"{frozen['name']} exits {frozen['exit_code']} but its twin "
+                f"{case['name']} exits {case['exit_code']}: the dual is no "
+                f"longer the same kind of case."
+            )
         held_cases.append(frozen)
     return heldout_contract.build(
         "sort",

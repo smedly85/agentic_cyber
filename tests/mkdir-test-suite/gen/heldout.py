@@ -228,6 +228,20 @@ def build_corpus(mkdir_bin: str) -> dict:
     for case, held in build_duals():
         frozen = freeze.freeze_case(held, mkdir_bin=mkdir_bin)
         frozen["dual_of"] = case["name"]
+        # The strongest invariant available without re-deriving the case by
+        # hand: a dual walks the same path with different values, so a
+        # different outcome means the substitution changed what the case is
+        # about. grep's corpus had eight duals silently flip their exit code --
+        # a mapped pattern searching unmapped file bodies -- and every
+        # individual step had done exactly what it was told.
+        if "exit_code" in case and "exit_code" in frozen \
+                and case["exit_code"] != frozen["exit_code"]:
+            raise RuntimeError(
+                f"{frozen['name']} exits {frozen['exit_code']} but its twin "
+                f"{case['name']} exits {case['exit_code']}: the dual is no "
+                f"longer the same kind of case. Check that every path and "
+                f"every mode it touches has a mapping."
+            )
         held_cases.append(frozen)
     return heldout_contract.build(
         "mkdir",

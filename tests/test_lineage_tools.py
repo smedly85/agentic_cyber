@@ -5709,6 +5709,45 @@ class HeldOutCorpusTests(unittest.TestCase):
                         f"{case['name']} has the same inputs as its twin",
                     )
 
+    def test_a_dual_reaches_the_same_outcome_as_the_case_it_came_from(self):
+        """A dual that exits differently has stopped testing the same thing.
+
+        Enforced here rather than only in each generator, so it covers every
+        committed corpus however it was produced. It caught eight broken grep
+        duals: the pattern `needle` was mapped to `marker` while the fixture
+        file bodies were not, so `r-directory-is-traversed-in-name-order`
+        searched for a string none of its files contained and became a case
+        about finding nothing -- exit 0 turned into exit 1. Nothing else
+        noticed, because every individual step had done what it was told.
+        """
+        for utility, corpus in self._each_corpus():
+            visible = {}
+            for path in sorted((REPO_ROOT / "tests" / f"{utility}-test-suite"
+                                / "suites").iterdir()):
+                if path.name == "MANIFEST.json" or path.suffix not in (".json", ".gz"):
+                    continue
+                opener = gzip.open if path.suffix == ".gz" else open
+                with opener(path, "rt", encoding="utf-8") as handle:
+                    data = json.load(handle)
+                cases = (data["cases"] if isinstance(data, dict) and "cases" in data
+                         else data)
+                if not isinstance(cases, list):
+                    continue
+                for case in cases:
+                    if isinstance(case, dict) and "name" in case:
+                        visible[case["name"]] = case
+
+            for case in heldout_contract.cases(corpus):
+                twin = visible.get(case["dual_of"])
+                if twin is None or "exit_code" not in twin \
+                        or "exit_code" not in case:
+                    continue
+                with self.subTest(utility=utility, case=case["name"]):
+                    self.assertEqual(
+                        case["exit_code"], twin["exit_code"],
+                        f"{case['name']} no longer matches {case['dual_of']}",
+                    )
+
     def test_the_corpus_lives_nowhere_the_bundle_would_copy_it(self):
         """The guarantee, checked against the allowlist rather than intent."""
         allowlisted = set(stage_test_bundle.ALLOWED_FILES)

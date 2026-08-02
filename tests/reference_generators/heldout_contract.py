@@ -68,6 +68,23 @@ CORPUS_FILENAME = "heldout_cases.json.gz"
 # hit is a real exposure rather than a coincidental substring of a visible case.
 NAME_PREFIX = "heldout-"
 
+# Case fields that are metadata rather than case-identifying content, and so
+# are NOT searched for. Every one of them is drawn from vocabulary the visible
+# suite already uses, so scanning them would manufacture leaks rather than find
+# them -- `dual_of` in particular names the VISIBLE case a held-out case was
+# derived from, which is in the bundle by design.
+#
+# An exclusion list rather than an inclusion list on purpose: a suite that grows
+# a new field gets scanned automatically, so the failure direction is "we
+# checked something we did not need to" rather than "we silently stopped
+# checking". Only the top level is excluded; a `path` nested inside `fixture`
+# is still content and is still searched.
+NON_IDENTIFYING_KEYS = frozenset({
+    "dual_of", "group", "tags", "check", "schema", "stderr_class",
+    "stdin_modes", "faults", "allow_signals", "env", "timeout", "umask",
+    "exit_code", "nondet_exit", "rule_id", "flags", "absent_flags",
+})
+
 # Expected values shorter than this are not searched for during the leak scan.
 # A one-byte expected stdout would match nearly any file and drown the signal;
 # case names and fixture values carry the identifying information instead.
@@ -239,41 +256,55 @@ def corpus_invariants(payload: dict[str, Any],
 def scannable_values(case: dict[str, Any]) -> list[str]:
     """The strings a leak scan should look for in bundle bytes.
 
-    The case name always, plus concrete inputs and expected outputs long enough
+    The case name always, plus every string anywhere in the case long enough
     that a hit means exposure rather than coincidence.
+
+    Structural rather than a list of key names, and deliberately so. Two
+    versions of this function enumerated the keys they knew about, and both had
+    the same defect: they were written against one suite's case shape and went
+    quietly blind on another. The first knew chmod's and grep's keys, so for
+    sort it searched the case NAME and nothing else -- it would have reported
+    clean with the entire input payload sitting in the bundle. The second added
+    `*_b64` but still missed mkdir's `tree` and `targets`, where that suite
+    keeps its paths.
+
+    A key-name allowlist has to be updated every time a suite grows a field,
+    and nothing fails when it is not -- the scan just silently checks less. So
+    this walks the whole case instead. A suite can add any field it likes and
+    the guarantee still covers it.
     """
     values = [case["name"]]
-    for key in ("args", "stdin", "expected_stdout", "expected_stderr"):
-        value = case.get(key)
-        if isinstance(value, str) and len(value) >= MIN_SCANNABLE_VALUE:
-            values.append(value)
-        elif isinstance(value, list):
-            values.extend(
-                item for item in value
-                if isinstance(item, str) and len(item) >= MIN_SCANNABLE_VALUE
-            )
-    # Suites that store payloads base64-encoded (sort keeps its inputs and
-    # expected outputs as `stdin_b64` / `stdout_b64` / `files_b64`, since they
-    # contain NULs and deliberately invalid UTF-8). Without this the scan sees
-    # only the case NAME for those suites -- it would report clean while the
-    # entire input payload sat in the bundle. Both forms are searched: the
-    # encoded text, because that is how a suite file would carry it, and the
-    # decoded bytes, because that is how a fixture or a comment would.
+
+    def walk(node: Any) -> None:
+        # Top-level metadata is skipped by `walk`'s caller, not here.
+        if isinstance(node, str):
+            if len(node) >= MIN_SCANNABLE_VALUE:
+                values.append(node)
+        elif isinstance(node, dict):
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                walk(item)
+
+    for key, value in case.items():
+        # `_`-prefixed keys are this repo's convention for annotations kept
+        # alongside a case -- sort's fuzz regressions carry `_reason` ("exit 1
+        # vs GNU 0"), which the visible suite carries verbatim too.
+        if key not in NON_IDENTIFYING_KEYS and not key.startswith("_"):
+            walk(value)
+
+    # Base64 payloads are searched decoded as well as encoded: a suite file
+    # carries them in encoded form, but a fixture or a stray comment would
+    # carry the bytes themselves. (sort stores inputs and expected outputs this
+    # way because they contain NULs and deliberately invalid UTF-8.)
     for key, value in case.items():
         if not key.endswith("_b64") or not isinstance(value, str):
             continue
-        if len(value) >= MIN_SCANNABLE_VALUE:
-            values.append(value)
         try:
             raw = base64.b64decode(value, validate=True)
         except (binascii.Error, ValueError):
             continue
         if len(raw) >= MIN_SCANNABLE_VALUE:
             values.append(raw.decode("utf-8", "surrogateescape"))
-    for entry in case.get("fixture") or []:
-        if isinstance(entry, dict):
-            for key in ("path", "contents"):
-                value = entry.get(key)
-                if isinstance(value, str) and len(value) >= MIN_SCANNABLE_VALUE:
-                    values.append(value)
     return values
