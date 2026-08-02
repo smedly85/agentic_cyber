@@ -45,13 +45,46 @@ This suite previously claimed GNU grep could not be an oracle at all, because
 That was incomplete: `grep -F` (`--fixed-strings`) treats PATTERN as a literal
 substring, which *is* `new_grep`'s matching contract.
 
+### Platform contract: none, and that is a measured result
+
+**This suite is deliberately ungated — it declares no `required_platform`.**
+The sort and mkdir suites each do, so the absence here is a finding rather than
+an omission.
+
+Checked directly rather than assumed, using the same method that settled sort's
+gate: GNU grep 3.12 was built from source on Darwin, the full corpus was
+regenerated there through the oracle path, and the result was compared against
+the committed Linux-derived goldens.
+
+| | |
+|---|---|
+| Method | oracle-backed regeneration on Darwin 3.12 vs committed Linux 3.12 |
+| Cases compared | 88 (78 oracle-derived, 10 specification-model) |
+| Result | `diff -r` byte-identical across every tier |
+
+So `grep` is gated nowhere, because there is nothing to gate against. Adding
+`required_platform` here would be protection theater: a check that can never
+fire, obscuring the two suites where the gate is load-bearing.
+
+The likeliest source of divergence is already neutralised by construction —
+`engine.py` and `gen/oracle.py`'s `ORACLE_ENV` both pin `LC_ALL`, `LANG` and
+`LC_CTYPE` to `C`, so locale-dependent case folding and binary detection cannot
+vary by host. The behavioral precheck in `gen/oracle.py` runs on whatever
+platform regenerates, and refuses a binary that drops CR, mis-folds under
+`LC_ALL=C`, or sits on a filesystem that ignores mode 0000 — so a future
+platform difference would surface as a refusal, not as silently wrong goldens.
+
 ### Oracle contract
 
 Pinned to **GNU grep 3.12** (`oracle_version_required` in `config.json`, echoed
-as `grep_version` in `suites/MANIFEST.json`). Resolution order, matching the
-other suites: `--oracle-bin` > `$GREP_ORACLE_BIN` > `config.json`
-`paths.oracle_bin` > a conventional location. On Linux/WSL `/usr/bin/grep` is
-already GNU; on macOS the system grep is BSD, so `brew install grep` and point
+as `grep_version` in `suites/MANIFEST.json`). Note that grep is **not** part of
+GNU coreutils: the sort and mkdir suites pin coreutils 9.11, and grep's 3.12 is
+its own project's version series. There is no coreutils-numbered grep.
+
+Resolution order, matching the other suites: `--oracle-bin` >
+`$GREP_ORACLE_BIN` > `config.json` `paths.oracle_bin` > a conventional
+location. On Linux/WSL `/usr/bin/grep` is already GNU; on macOS the system grep
+is BSD, so build 3.12 from source or `brew install grep` and point
 `GREP_ORACLE_BIN` at its `gnubin/grep` (or `ggrep`).
 
 Three invocation-level adjustments make a live grep speak this contract. Each
