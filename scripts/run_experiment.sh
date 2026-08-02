@@ -1580,6 +1580,15 @@ PY
         fi
 
         # Hidden/sanitizer evaluation: after the loop, never fed back as repair.
+        #
+        # HELDOUT_ROOT lets a committed manifest name a path OUTSIDE the
+        # sandbox. The command is eval'd in the controller's shell with the
+        # working directory set to the attempt sandbox, so a relative path
+        # would resolve inside it -- exactly where held-out material must never
+        # be. Exported rather than relying on $REPO so the contract a manifest
+        # depends on is explicit and greppable, not an internal variable of
+        # this script.
+        export HELDOUT_ROOT="$REPO"
         read -r extra_test_exit extra_test_ms < <(
             cd "$workdir" &&
             run_final_command "$attempt_dir/extra-tests.log" "$EXTRA_TEST_CMD"
