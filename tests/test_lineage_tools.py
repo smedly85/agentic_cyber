@@ -2055,7 +2055,7 @@ class OracleContractTests(unittest.TestCase):
     oracle is part of the benchmark definition and must be pinned and portable.
     """
 
-    PINS = {"sort": "9.4", "mkdir": "9.11"}
+    PINS = {"sort": "9.11", "mkdir": "9.11"}
 
     def setUp(self):
         import tempfile
@@ -2156,7 +2156,7 @@ class OracleContractTests(unittest.TestCase):
 
     def test_a_path_containing_spaces_round_trips(self):
         directory = self.temp / "oracle dir with spaces"
-        fake = fake_version_tool(directory, "sort", "sort (GNU coreutils) 9.4")
+        fake = fake_version_tool(directory, "sort", "sort (GNU coreutils) 9.11")
         self.assertIn(" ", str(fake))
         self.assertEqual(
             oracle_contract.resolve("sort", self.config("sort"), str(fake)),
@@ -2863,8 +2863,23 @@ class PlatformContractTests(unittest.TestCase):
         self.assertEqual(config["oracle_version_required"], "9.11")
         self.assertIn("_platform_contract", config)
 
-    def test_only_the_platform_specific_suite_declares_one(self):
-        for utility in ("sort", "grep", "chmod"):
+    # Two suites are platform-specific, in opposite directions, each for a
+    # measured reason: mkdir needs Darwin (symbolic -m mode resolution), sort
+    # needs Linux (obsolete +POS handling, and /dev/full for fault-devfull).
+    # grep and chmod have no measured platform dependence and must stay
+    # ungated -- gating with nothing to protect against is protection theater.
+    PLATFORM_SPECIFIC = {"mkdir": "Darwin", "sort": "Linux"}
+    PLATFORM_NEUTRAL = ("grep", "chmod")
+
+    def test_exactly_the_measured_suites_declare_a_platform(self):
+        for utility, expected in self.PLATFORM_SPECIFIC.items():
+            path = REPO_ROOT / "tests" / f"{utility}-test-suite" / "config.json"
+            config = json.loads(path.read_text(encoding="utf-8"))
+            with self.subTest(utility=utility):
+                self.assertEqual(config["required_platform"], expected)
+                self.assertIn("_platform_contract", config,
+                              "a gate must state what it protects against")
+        for utility in self.PLATFORM_NEUTRAL:
             path = REPO_ROOT / "tests" / f"{utility}-test-suite" / "config.json"
             if not path.is_file():
                 continue
@@ -2872,22 +2887,67 @@ class PlatformContractTests(unittest.TestCase):
                 self.assertNotIn(
                     "required_platform",
                     json.loads(path.read_text(encoding="utf-8")),
-                    "only mkdir has a measured platform dependence",
+                    "no measured platform dependence, so no gate",
                 )
 
+    def test_the_two_gates_point_in_opposite_directions(self):
+        """The split is deliberate: one suite cannot satisfy both."""
+        self.assertNotEqual(self.PLATFORM_SPECIFIC["mkdir"],
+                            self.PLATFORM_SPECIFIC["sort"])
+
     def test_the_selfcheck_gate_precedes_regeneration_and_the_oracle(self):
-        text = (self.SUITE / "selfcheck.sh").read_text(encoding="utf-8")
-        gate = text.index("REQUIRED_PLATFORM")
-        self.assertLess(gate, text.index("python3 gen/generate.py"))
-        self.assertLess(gate, text.index("gate 0"))
-        self.assertIn('uname -s', text)
-        self.assertIn("refusing to run on", text)
+        for utility in self.PLATFORM_SPECIFIC:
+            suite = REPO_ROOT / "tests" / f"{utility}-test-suite"
+            text = (suite / "selfcheck.sh").read_text(encoding="utf-8")
+            with self.subTest(utility=utility):
+                gate = text.index("platform_contract.py")
+                self.assertLess(gate, text.index("python3 gen/generate.py"))
+                self.assertLess(gate, text.index("gate 0"))
 
     def test_the_selfcheck_gate_explains_all_three_consequences(self):
-        text = (self.SUITE / "selfcheck.sh").read_text(encoding="utf-8")
+        """The wording now lives in the shared checker, which both suites call
+        rather than each restating it."""
+        text = (REPO_ROOT / "tests" / "reference_generators"
+                / "platform_contract.py").read_text(encoding="utf-8")
         self.assertIn("produced AND validated on", text)
         self.assertIn("redefine the benchmark", text)
         self.assertIn("belongs to the platform, not to the binary", text)
+        self.assertIn("refusing to run on", text)
+
+    def test_the_shared_gate_is_used_by_both_suites(self):
+        """Duplication removed where it could be: selfcheck.sh is offline and
+        never bundled, so one implementation serves both."""
+        for utility in self.PLATFORM_SPECIFIC:
+            text = (REPO_ROOT / "tests" / f"{utility}-test-suite"
+                    / "selfcheck.sh").read_text(encoding="utf-8")
+            with self.subTest(utility=utility):
+                self.assertIn(
+                    "reference_generators/platform_contract.py", text)
+
+    def test_the_shared_gate_prints_the_suite_specific_reason(self):
+        from reference_generators import platform_contract
+
+        for utility, required in self.PLATFORM_SPECIFIC.items():
+            config = (REPO_ROOT / "tests" / f"{utility}-test-suite"
+                      / "config.json")
+            with self.subTest(utility=utility):
+                self.assertEqual(
+                    platform_contract.required_platform(config), required)
+                self.assertTrue(platform_contract.contract_reason(config))
+
+    def test_the_runner_gate_is_not_shared_and_says_why(self):
+        """runner.py ships inside the sandbox, where only the bundle allowlist
+        exists, so its copy cannot import the shared module."""
+        import stage_test_bundle
+
+        self.assertNotIn("platform_contract.py", stage_test_bundle.ALLOWED_FILES)
+        for utility in self.PLATFORM_SPECIFIC:
+            source = (REPO_ROOT / "tests" / f"{utility}-test-suite"
+                      / "runner.py").read_text(encoding="utf-8")
+            with self.subTest(utility=utility):
+                self.assertIn("PLATFORM_INCOMPATIBLE_EXIT = 3", source)
+                self.assertIn("def check_platform(", source)
+                self.assertIn("check_platform(manifest)", source)
 
     def test_candidate_evaluation_has_a_distinct_platform_exit(self):
         source = (self.SUITE / "runner.py").read_text(encoding="utf-8")
@@ -3104,8 +3164,11 @@ class PlatformPreflightTests(unittest.TestCase):
                 self.assertNotIn(wrong, summary)
 
     def test_a_platform_neutral_utility_is_unaffected(self):
-        """sort, grep and chmod declare no contract and must run normally."""
-        for utility in ("sort", "grep", "chmod"):
+        """grep and chmod declare no contract and must run normally.
+
+        sort is no longer here: it is gated to Linux, for the obsolete +POS and
+        /dev/full reasons recorded in its config."""
+        for utility in ("grep", "chmod"):
             result = subprocess.run(
                 [self.bash,
                  str(REPO_ROOT / "scripts" / "run_lineage_experiment.sh"),
@@ -3144,7 +3207,12 @@ class PlatformPreflightTests(unittest.TestCase):
         # The shell condition is: required is non-empty, not "None", and differs
         # from host. On Darwin the third clause is false, so the run proceeds.
         self.assertNotEqual(plan["required_platform"], "None")
-        for utility in ("sort", "grep", "chmod"):
+        # sort is gated too, in the opposite direction.
+        linux_gated = lineage_plan.resolve_plan(
+            REPO_ROOT, "sort", "m", "0", "build", 3, 1800
+        )
+        self.assertEqual(linux_gated["required_platform"], "Linux")
+        for utility in ("grep", "chmod"):
             with self.subTest(utility=utility):
                 neutral = lineage_plan.resolve_plan(
                     REPO_ROOT, utility, "m", "0", "build", 3, 1800

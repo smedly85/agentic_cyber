@@ -87,6 +87,24 @@ ROOTMSG
   exit 2
 fi
 
+# Platform gate, before regeneration and before the oracle self-pass. This
+# suite's frozen goldens are Linux-specific for two independent reasons, both
+# recorded in config.json's _platform_contract, which the shared checker prints:
+# the obsolete +POS key syntax resolves differently on Darwin (obs-pos-posixly),
+# and fault-devfull needs /dev/full, which Darwin does not provide at all.
+#
+# Regenerating on the wrong host would redefine the benchmark; running the
+# oracle self-pass there would report the ORACLE as broken for a difference that
+# is the host's, not the binary's. Stop before either.
+#
+# Shared with the mkdir suite: selfcheck.sh is offline and never bundled, so the
+# mechanism lives in one place. runner.py's equivalent cannot be shared -- it
+# ships inside the sandbox and must run from the bundle's five-file allowlist.
+if ! python3 ../reference_generators/platform_contract.py check \
+        --config "$CONFIG" --suite sort; then
+  exit 2
+fi
+
 echo "== gate 0: oracle identity and version =="
 if ! python3 "$ORACLE_TOOL" verify --suite sort --config "$CONFIG" \
                             --suite-root . --oracle-bin "$SORT"; then

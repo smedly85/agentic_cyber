@@ -55,6 +55,51 @@ SEVERITY = {PASS: 0, SKIP: 0, XFAIL: 0,
             FAIL: 1, TIMEOUT: 2, SANITIZER: 3, CRASH: 4}
 FAILING = {FAIL, TIMEOUT, SANITIZER, CRASH}
 
+# Distinct from 1 (a case failed) and 2 (usage error). The lineage controller
+# classifies this exit as platform_incompatible rather than validation_failed,
+# so a host mismatch is never counted against the candidate.
+PLATFORM_INCOMPATIBLE_EXIT = 3
+
+
+def check_platform(manifest: dict) -> None:
+    """Refuse to judge when the frozen goldens are not valid for this host.
+
+    Some frozen expectations are platform-specific: the same utility version can
+    resolve the same arguments differently on different operating systems, so a
+    corpus produced on one platform does not describe another. Judging a
+    candidate against goldens from a different platform would report defects
+    that are properties of the host, not of the candidate.
+
+    `required_platform` is set by the suite's config.json; when it is absent the
+    suite is platform-neutral and nothing is enforced.
+
+    Intentionally a copy of the mkdir suite's function rather than an import:
+    runner.py ships inside the sandbox, where the only files present are the
+    five in scripts/stage_test_bundle.py's allowlist. A shared module would have
+    to join that allowlist and would then be copied into the chmod and grep
+    bundles too, which have no platform contract to enforce. The offline half of
+    this gate IS shared -- see tests/reference_generators/platform_contract.py,
+    which both selfcheck.sh scripts call.
+    """
+    required = manifest.get("required_platform")
+    if not required:
+        return
+    import platform as _platform
+
+    actual = _platform.system()
+    if actual == required:
+        return
+    for line in (
+        f"runner.py: PLATFORM INCOMPATIBLE -- this frozen suite requires "
+        f"{required}, but this host is {actual}.",
+        f"  Its expected results were produced and validated on {required} "
+        f"and do not describe {actual}.",
+        "  This is an infrastructure/platform incompatibility, NOT a "
+        "candidate failure: no verdict is reported.",
+    ):
+        print(line, file=sys.stderr)
+    sys.exit(PLATFORM_INCOMPATIBLE_EXIT)
+
 
 def load_manifest(path: str | None, all_flags: bool) -> dict:
     """Load the flag/tag-filtering manifest out of config.json (or whatever
@@ -262,6 +307,8 @@ def main():
     cmd = [os.path.abspath(t) if os.path.exists(t) else t for t in cmd]
 
     manifest = load_manifest(args.config, args.all_flags)
+    # Before any case runs: goldens from another platform describe another host.
+    check_platform(manifest)
     xfail = manifest.get("unimplemented_policy") == "xfail"
 
     files = []

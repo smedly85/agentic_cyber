@@ -34,6 +34,52 @@ knows about GNU sort's full flag surface — that generic infrastructure is
 unrelated to the bounded checkpoint sequence above, and
 `scripts/stage_test_bundle.py` keeps it out of every sandbox.
 
+## Platform contract
+
+> **This suite's frozen goldens require Linux *and* GNU coreutils 9.11.**
+> Both halves are load-bearing; the version alone is not enough.
+
+Two independent reasons, each measured rather than assumed.
+
+**1. Obsolete `+POS` key syntax resolves differently by platform.** The same
+9.11 binary honours `+1` as an obsolete key specification on Linux and reads it
+as a filename on Darwin:
+
+| invocation | Linux 9.11 | Darwin 9.11 |
+|---|---|---|
+| `sort +1`, `POSIXLY_CORRECT=1` (case `obs-pos-posixly`) | exit **0**, sorted output, empty stderr | exit **2**, empty stdout, `sort: cannot read: +1: No such file or directory` |
+
+Confirmed by generating the corpus with the *same* coreutils 9.11 build on both
+platforms: every other case in all six generated tiers is byte-identical across
+the two hosts, so this is a genuine platform difference rather than a suite,
+engine or locale defect. (Collation, the usual source of platform variance in
+`sort`, is already neutralised — `engine.py` pins `LC_ALL`, `LANG` and
+`LANGUAGE` to `C` for every judged invocation.)
+
+**2. The corpus cannot be generated on Darwin at all.** The `fault-devfull`
+case writes to `/dev/full` to provoke ENOSPC on output. `/dev/full` is a
+Linux-only device node; on macOS `engine.py` fails with `PermissionError:
+Operation not permitted: '/dev/full'` and generation aborts partway, so the
+`faults` and `random` tiers are never written.
+
+This is why **`sort` is gated to Linux while `mkdir` is gated to Darwin**. The
+two suites are platform-specific in opposite directions, each for a recorded
+reason: mkdir's is symbolic `-m` mode resolution, sort's is the two above. The
+split is deliberate, not an artifact of the machines they were first built on.
+
+| Enforced at | Behavior on a non-Linux host |
+|---|---|
+| `selfcheck.sh` | stops **before** regeneration and before the oracle self-pass, exit 2 |
+| `runner.py` (candidate evaluation) | `check_platform` exits **3 = PLATFORM INCOMPATIBLE**, distinct from 1 (a case failed) |
+| `scripts/run_lineage_experiment.sh` | records exit 3 as `platform_incompatible`, **not** `validation_failed` |
+| `scripts/lineage_plan.py` | `required_platform` and `host_platform` join the configuration fingerprint |
+
+`required_platform` is declared once, in `config.json`, and inherited
+everywhere else. The offline half of the gate is shared with the mkdir suite in
+`tests/reference_generators/platform_contract.py`; `runner.py`'s copy is
+deliberately separate, because it ships inside the sandbox and must run from the
+five files `scripts/stage_test_bundle.py` allows.
+
 ## Oracle contract
 
 `suites/` was frozen by running a **real GNU coreutils sort**, so the oracle
@@ -43,9 +89,25 @@ against one release are not what another release produces.
 
 | | |
 |---|---|
-| Pinned version | **GNU coreutils 9.4** |
-| Recorded in | `suites/MANIFEST.json` (`sort_version`), `config.json` (`oracle_version_required`) |
+| Pinned version | **GNU coreutils 9.11** |
+| Required platform | **Linux** (see the platform contract above) |
+| Recorded in | `suites/MANIFEST.json` (`sort_version`), `config.json` (`oracle_version_required`, `required_platform`) |
 | Override | `SORT_ORACLE_BIN` environment variable |
+
+### Re-pin history
+
+Re-pinned from 9.4 to 9.11 to match the mkdir suite, which was already on 9.11.
+Regenerating all 751 generated cases against 9.11 on the same platform changed
+**two**, both of which quote the version by construction:
+
+| case | 9.4 | 9.11 |
+|---|---|---|
+| `single-version-x-none` | `sort (GNU coreutils) 9.4`, © 2023 | `sort (GNU coreutils) 9.11`, © 2026 |
+| `single-help-x-none` | `--help` text, 5548 bytes | `--help` text, 9368 bytes |
+
+The other 749 were byte-identical, so the re-pin carried **no behavioral
+change**. `fuzz_regressions.json.gz` is separately maintained and was not
+regenerated.
 
 Selection order, implemented by `tests/reference_generators/oracle_contract.py`:
 

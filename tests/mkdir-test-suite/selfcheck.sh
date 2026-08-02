@@ -85,32 +85,19 @@ ROOTMSG
   exit 2
 fi
 
-# Platform gate. This suite's frozen goldens are platform-specific: GNU
-# coreutils 9.11 resolves a symbolic mode argument that does not itself set the
-# rwx bits from a different departure point on Linux than on Darwin, so the same
-# binary version produces different directory modes on the two platforms. The
-# corpus was produced and validated on Darwin.
+# Platform gate, before regeneration and before the oracle self-pass. This
+# suite's frozen goldens are Darwin-specific; the reason is recorded in
+# config.json's _platform_contract, which the shared checker prints.
 #
-# Regenerating here would redefine the benchmark; running the oracle self-pass
-# here would report the ORACLE as broken for a difference that is the host's,
-# not the binary's. Stop before either.
-REQUIRED_PLATFORM=$(python3 config.py "$CONFIG" required_platform --default "")
-if [ -n "$REQUIRED_PLATFORM" ] && [ "$(uname -s)" != "$REQUIRED_PLATFORM" ]; then
-  cat >&2 <<PLATMSG
-selfcheck.sh: refusing to run on $(uname -s); this suite requires $REQUIRED_PLATFORM.
-
-  The frozen goldens under suites/ were produced AND validated on
-  $REQUIRED_PLATFORM. GNU mkdir 9.11 resolves a plain symbolic mode argument
-  differently on Linux than on Darwin, so on this host:
-
-    * regeneration would silently redefine the benchmark, and
-    * the oracle self-pass would report GNU mkdir as broken for a difference
-      that belongs to the platform, not to the binary.
-
-  Run this self-check on $REQUIRED_PLATFORM. Judging a candidate on another
-  platform is reported by runner.py as an infrastructure incompatibility
-  rather than as a candidate failure.
-PLATMSG
+# Regenerating on the wrong host would redefine the benchmark; running the
+# oracle self-pass there would report the ORACLE as broken for a difference that
+# is the host's, not the binary's. Stop before either.
+#
+# Shared with the sort suite: selfcheck.sh is offline and never bundled, so the
+# mechanism lives in one place. runner.py's equivalent cannot be shared -- it
+# ships inside the sandbox and must run from the bundle's five-file allowlist.
+if ! python3 ../reference_generators/platform_contract.py check \
+        --config "$CONFIG" --suite mkdir; then
   exit 2
 fi
 
