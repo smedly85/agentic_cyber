@@ -84,6 +84,21 @@ MODE_DUALS = {
 
 UNMAPPED_MODES: set[str] = set()
 
+# Fault keys whose value names a path in the case's own fixture, and so has to
+# be rotated with it. Named explicitly rather than "rotate every string in
+# faults": sort's fault block carries sentinels like `/dev/full`, `closed-pipe`
+# and `missing` which are not fixture paths at all, and rotating one would
+# produce a case about a device node that does not exist. mkdir's other faults
+# are an int (`rlimit_nofile`) and a bool (`unwritable_cwd`).
+PATH_VALUED_FAULTS = frozenset({"readonly_parent"})
+
+# String-valued fault keys this generator does not know how to map. Any entry
+# here is a hard failure rather than a shrug: `readonly_parent` was already
+# copied through verbatim once while the fixture around it was rotated, so the
+# engine made `ro` read-only, the dual had created `yv`, the parent stayed
+# writable and `fault-readonly-parent` exited 0 where its twin exits 1.
+UNMAPPED_FAULTS: set[str] = set()
+
 
 def _rotation() -> bytes:
     """Rotate a-z, A-Z and 0-9 within class; fix every other byte."""
@@ -158,6 +173,51 @@ def dual_entry(entry: dict) -> dict:
     return mapped
 
 
+def dual_faults(faults: dict | None) -> dict | None:
+    """Rotate the paths a fault block points at, so it still points at them."""
+    if not faults:
+        return faults
+    mapped = dict(faults)
+    for key, value in faults.items():
+        if not isinstance(value, str):
+            continue                      # ints and bools carry no path
+        if key in PATH_VALUED_FAULTS:
+            mapped[key] = dual_path(value)
+        else:
+            UNMAPPED_FAULTS.add(key)
+    return mapped
+
+
+def dual_preserve_mode(preserve: dict | None, fixture: list[dict] | None) -> dict | None:
+    """Rotate a `preserve_mode` block, which is KEYED by path.
+
+    Easy to miss, and missing it is silent: this case asserts that `-p -m` on an
+    existing directory leaves its mode alone. Rotate the fixture and argv while
+    leaving this behind, and the assertion names a path the dual never creates,
+    so the one thing the case exists to check is simply not checked -- and the
+    exit code stays 0, so the outcome guard sees nothing wrong.
+
+    The value is the mode the directory should still have afterwards, so it has
+    to agree with the (already mapped) fixture entry for the same path.
+    """
+    if not preserve:
+        return preserve
+    modes = {entry["path"]: entry.get("mode") for entry in (fixture or [])}
+    mapped = {}
+    for path, expected in preserve.items():
+        held_path = dual_path(path)
+        held_mode = dual_mode(expected) if isinstance(expected, str) else expected
+        fixture_mode = modes.get(held_path)
+        if isinstance(fixture_mode, str) and fixture_mode != held_mode:
+            raise RuntimeError(
+                f"preserve_mode for {held_path} says {held_mode} but its "
+                f"fixture entry says {fixture_mode}; the two mode tables have "
+                f"drifted apart"
+            )
+        mapped[held_path] = held_mode
+    return mapped
+
+
 def visible_cases() -> list[dict]:
     """Frozen visible cases that fall inside the bounded ladder."""
     found: list[dict] = []
@@ -202,6 +262,13 @@ def dual_of(case: dict) -> dict:
             held[key] = [dual_entry(entry) for entry in case[key]]
     if case.get("targets"):
         held["targets"] = [dual_path(target) for target in case["targets"]]
+    # Both of these REFERENCE paths the rotation just renamed. Leaving either
+    # behind leaves the case pointing at something the dual never creates.
+    if case.get("faults"):
+        held["faults"] = dual_faults(case["faults"])
+    if case.get("preserve_mode"):
+        held["preserve_mode"] = dual_preserve_mode(
+            case["preserve_mode"], held.get("fixture"))
     held["tags"] = list(case.get("tags") or []) + ["heldout"]
     return held
 
@@ -218,6 +285,14 @@ def build_duals() -> list[tuple[dict, dict]]:
                 f"{held['name']} is identical to {case['name']}: nothing in it "
                 f"is affected by the rotation or the mode table")
         pairs.append((case, held))
+    if UNMAPPED_FAULTS:
+        raise RuntimeError(
+            f"fault keys with a string value this generator does not know how "
+            f"to map: {sorted(UNMAPPED_FAULTS)}. If the value names a path in "
+            f"the case's fixture, add it to PATH_VALUED_FAULTS so it is "
+            f"rotated with the fixture; if it is a sentinel, add it to the "
+            f"comment there saying so."
+        )
     return pairs
 
 

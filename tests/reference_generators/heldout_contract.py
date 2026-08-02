@@ -81,9 +81,12 @@ NAME_PREFIX = "heldout-"
 # is still content and is still searched.
 NON_IDENTIFYING_KEYS = frozenset({
     "dual_of", "group", "tags", "check", "schema", "stderr_class",
-    "stdin_modes", "faults", "allow_signals", "env", "timeout", "umask",
+    "stdin_modes", "allow_signals", "env", "timeout", "umask",
     "exit_code", "nondet_exit", "rule_id", "flags", "absent_flags",
 })
+# `faults` is deliberately NOT excluded: its values name fixture paths, which
+# are case content. Only values are collected, never keys, so vocabulary like
+# `rlimit_nofile` never becomes a needle.
 
 # Expected values shorter than this are not searched for during the leak scan.
 # A one-byte expected stdout would match nearly any file and drown the signal;
