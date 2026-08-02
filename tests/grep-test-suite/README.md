@@ -205,11 +205,67 @@ tests/grep-test-suite/
 │   ├── oracle.py        # live-grep harness + the fitness precheck
 │   ├── generate.py      # freeze suites/ from the oracle, cross-checked
 │   └── verify.py        # freshness + invariants + checkpoint reachability
+├── diff_fuzz.py         # live differential fuzzer against real GNU grep
 └── suites/
     ├── MANIFEST.json
     ├── base.json  with_filename.json  no_filename.json
     └── recursive.json  ignore_case.json
 ```
+
+## Live differential fuzzing
+
+`diff_fuzz.py` compares two implementations on randomly generated input and
+reports any disagreement in **exit status or stdout bytes**. It is the same
+mechanism sort's `diff_fuzz.py` provides, adapted to grep's case schema.
+
+Each round samples a flag combination from `config.json`'s `implemented` list,
+builds an input from the curated fixtures (`ALPHA`, `BETA`, `MIXED`, `BINARY`,
+`NO_TRAILING`, `CRLF`) plus random byte strings, mutates it, and runs both
+sides. Mutations deliberately *create* the awkward cases rather than merely
+preserving them — inserting NUL, inserting a byte ≥ 0x80, and removing the
+trailing newline are each things the contract makes a promise about. A
+disagreement is minimized by line bisection (each payload in turn, since a grep
+case may have several files) and appended to `suites/fuzz_regressions.json.gz`
+as a permanent frozen regression case.
+
+The oracle is never invoked directly. Every oracle result comes from
+`gen/generate.py:oracle_case`, the same function `freeze_case` uses, so the
+pinned invocation — `grep -a -F -e PATTERN -- OPERAND`, `-i` when folding,
+`-H`/`-h` resolved from the contract, `LC_ALL=C` — stays defined in exactly one
+place. A fuzzer that rebuilt the argv itself could drift from the generator and
+then report its own drift as a bug.
+
+Two comparison modes:
+
+| `--against` | under test | use |
+|---|---|---|
+| `model` (default) | `tests/reference_generators/grep_reference.py` | the freeze-time model/oracle agreement check, run on random input instead of the 88 curated cases |
+| `candidate` | a candidate binary | what sort's fuzzer does; use once a `new_grep` exists |
+
+`model` is the default because this repository has no `new_grep` candidate —
+no `src/new_grep/`, no build artifact, no experiment output. A model/oracle
+disagreement is still a real defect: it is precisely the condition
+`freeze_case` refuses to write on, so it would silently corrupt any future
+golden frozen over that input.
+
+```bash
+GREP_ORACLE_BIN=/usr/bin/grep python3 diff_fuzz.py --time-budget 120 --record
+python3 diff_fuzz.py --against candidate --candidate build/new_grep
+```
+
+**Result of the run recorded here:** 139,738 rounds against GNU grep 3.12 over
+four seeds (120 s each) found **zero disagreements**, so no
+`suites/fuzz_regressions.json.gz` exists — the file is created on the first
+finding, not before. The fuzzer's teeth were verified separately by pointing
+`--against candidate` at plain `/usr/bin/grep`, which speaks regex rather than
+fixed strings and suppresses binary output: that run produced 269
+disagreements in 1,382 rounds, concentrated exactly where expected (`[abc]`
+treated as a character class, bytes ≥ 0x80, NUL-bearing input).
+
+Patterns are generated without a leading `-` and without NUL. A NUL cannot
+cross `execve`, and a leading `-` parses as an option, which puts the case in
+the suite's oracle-exempt argument-grammar region where GNU grep implements a
+different option set and there is nothing to compare against.
 
 ## Regenerating
 

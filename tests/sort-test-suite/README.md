@@ -1,10 +1,11 @@
 # sort-test-suite
 
 An exhaustive, GNU-sort-backed test suite for any `sort`-like binary: every
-flag alone, every valid flag pairing, curated/random higher-order combos,
+flag alone, every valid flag pairing, every 3- and 4-flag combination of the
+bounded ladder, curated/random higher-order combos,
 I/O fault injection, adversarial inputs, ASan/UBSan, and live differential
-fuzzing against real GNU `sort`. `suites/` ships **751 reproducibly generated
-golden cases** — the six tiers `gen/generate.py` produces, whose per-tier counts
+fuzzing against real GNU `sort`. `suites/` ships **756 reproducibly generated
+golden cases** — the seven tiers `gen/generate.py` produces, whose per-tier counts
 are recorded in `suites/MANIFEST.json` — alongside
 `suites/fuzz_regressions.json.gz`, a **separately maintained, accreting
 regression corpus** that `diff_fuzz.py` appends to whenever the live
@@ -50,7 +51,7 @@ as a filename on Darwin:
 | `sort +1`, `POSIXLY_CORRECT=1` (case `obs-pos-posixly`) | exit **0**, sorted output, empty stderr | exit **2**, empty stdout, `sort: cannot read: +1: No such file or directory` |
 
 Confirmed by generating the corpus with the *same* coreutils 9.11 build on both
-platforms: every other case in all six generated tiers is byte-identical across
+platforms: every other case in all seven generated tiers is byte-identical across
 the two hosts, so this is a genuine platform difference rather than a suite,
 engine or locale defect. (Collation, the usual source of platform variance in
 `sort`, is already neutralised — `engine.py` pins `LC_ALL`, `LANG` and
@@ -97,7 +98,7 @@ against one release are not what another release produces.
 ### Re-pin history
 
 Re-pinned from 9.4 to 9.11 to match the mkdir suite, which was already on 9.11.
-Regenerating all 751 generated cases against 9.11 on the same platform changed
+Regenerating all 756 generated cases against 9.11 on the same platform changed
 **two**, both of which quote the version by construction:
 
 | case | 9.4 | 9.11 |
@@ -174,6 +175,38 @@ your own reporting.
 ```
 
 Requires `paths.oracle_bin` to be a working GNU `sort`.
+
+## Combinatorial coverage of the bounded ladder
+
+`new_sort`'s checkpoint ladder implements four flags — `-r`, `-f`, `-u`, `-c` —
+so the space a candidate is actually judged on is the 16-subset power set of
+those four. `gen_singles` and `gen_pairs` reach the empty, 1- and 2-flag
+subsets: 11 of 16. The four triples and the full quad had **no case at all**,
+which meant the two checkpoints that implement three and four flags were judged
+only on combinations of at most two of them.
+
+The `kwise` tier closes that. `gen/combos.py:gen_kwise` enumerates every
+k-subset of the ladder for k ≥ 3 — 5 cases — built exactly the way `gen_pairs`
+builds its own: each flag contributes its default value, the set is routed to
+positive or negative by `model/constraints.py:is_valid`, and the result is
+frozen through the same oracle pipeline, with the same freeze-time model/oracle
+disagreement check, as every other tier.
+
+| subset size | subsets | covered by |
+|---|---|---|
+| 0, 1, 2 | 11 | `singles`, `pairs`, and the curated/adversarial tiers |
+| 3 | 4 | `kwise` |
+| 4 | 1 | `kwise` |
+
+They need no runner support: the cumulative flag filter in
+`judge_candidate.sh` already withholds a case until every flag it uses is
+implemented. One case, `kwise-r-f-u-discrim`, becomes reachable at checkpoint
+**003** (which implements exactly `-r -f -u`); the other four use `-c` and so
+are reachable only at **004**.
+
+It is a separate tier rather than an extension of `pairs` so that adding it
+leaves every pre-existing suite file byte-identical — the goldens it
+supplements were never wrong, they were missing.
 
 ## Extending the suite
 

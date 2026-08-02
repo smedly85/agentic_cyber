@@ -15,7 +15,7 @@ plain, diffable JSON (e.g. while debugging the generator itself).
 Usage:
   gen/generate.py                       # write to ../suites, using config.json
   gen/generate.py --out /tmp/scratch --no-gzip   # determinism check target
-  gen/generate.py --tiers singles pairs
+  gen/generate.py --tiers singles pairs kwise
   gen/generate.py --seed 1 --sort-bin /usr/bin/sort
 """
 from __future__ import annotations
@@ -72,6 +72,11 @@ def write_suite(path, header, cases, gzipped=True):
 TIER_BUILDERS = {
     "singles": lambda corpus: combos.gen_singles(corpus),
     "pairs": lambda corpus: combos.gen_pairs(corpus),
+    # The 3- and 4-flag subsets of the bounded ladder. Its own tier rather than
+    # an extension of `pairs` so that adding it leaves every existing suite file
+    # byte-identical -- the goldens this closes a gap in were never wrong, they
+    # were absent.
+    "kwise": lambda corpus: combos.gen_kwise(corpus),
     "curated": lambda corpus: curated_cases.build(corpus),
     "adversarial": lambda corpus: curated_cases.build_adversarial(corpus),
     "faults": lambda corpus: curated_cases.build_faults(corpus),
@@ -99,7 +104,7 @@ def main():
     ap.add_argument("--no-gzip", action="store_true",
                     help="write plain, diffable .json instead of .json.gz")
     ap.add_argument("--tiers", nargs="*",
-                    default=["singles", "pairs", "curated",
+                    default=["singles", "pairs", "kwise", "curated",
                              "adversarial", "faults", "random"])
     args = ap.parse_args()
     sort_bin = args.sort_bin or _default_sort_bin()

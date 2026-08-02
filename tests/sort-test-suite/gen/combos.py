@@ -308,6 +308,92 @@ def _pair_case(a, b, corpus):
                          exact_stderr=True, stdin_modes=["pipe"])
 
 
+# --- k-wise combos over the bounded ladder ----------------------------------
+
+# The flags `new_sort`'s checkpoint ladder actually implements, in order
+# (experiments/utilities/sort.json). This is deliberately NOT the suite's full
+# flag model: the suite models far more of GNU sort than the experiment asks a
+# candidate to build, and combinations outside this set are the random tier's
+# job.
+#
+# Written down here rather than read from the manifest because `gen/` must keep
+# working standalone -- the experiment manifest is not part of the suite and is
+# never staged with it. The test at tests/test_lineage_tools.py cross-checks the
+# two so this cannot drift silently.
+BOUNDED_LADDER_FLAGS = ("-r", "-f", "-u", "-c")
+
+
+def gen_kwise(corpus, flag_ids=BOUNDED_LADDER_FLAGS, min_k=3):
+    """Every k-subset of `flag_ids` for k >= min_k, one case each.
+
+    `gen_singles` and `gen_pairs` between them cover the empty, 1- and 2-flag
+    subsets, which for a 4-flag ladder is 11 of the 16 subsets in the power set.
+    The remaining five -- the four triples and the full quad -- had no case at
+    all, so the checkpoints that implement three and four flags were judged
+    only on combinations of at most two of them.
+
+    Same construction as `gen_pairs`, generalised past k=2: each flag
+    contributes its default value, the whole set is routed to positive or
+    negative by `constraints.is_valid`, and the result is frozen through the
+    same oracle pipeline as every other tier.
+    """
+    cases = []
+    for k in range(min_k, len(flag_ids) + 1):
+        for combo in itertools.combinations(flag_ids, k):
+            case = _kwise_case(combo, corpus)
+            if case:
+                cases.append(case)
+    return cases
+
+
+def _kwise_case(fids, corpus):
+    # Same bespoke-setup exclusion gen_pairs applies: flags needing their own
+    # file plumbing belong to the curated tier, not a mechanical combinator.
+    bespoke = {"-o", "-m", "--files0-from", "--random-source",
+               "--compress-program", "-T"}
+    if any(f in bespoke for f in fids):
+        return None
+
+    values = {}
+    argv = []
+    for fid in fids:
+        value = fm.default_value(fid)
+        if value is not None:
+            if value.startswith("@"):
+                return None          # placeholder needing a materialised file
+            values.setdefault(fid, []).append(value)
+        argv += fm.to_argv(fid, value)
+
+    iname = _kwise_input(fids, corpus)
+    inp = corpus[iname]
+    verdict = ct.is_valid(list(fids), values)
+
+    tags = ["kwise"]
+    for fid in fids:
+        for tag in fm.tags_for(fid):
+            if tag not in tags:      # a tag repeated per flag says nothing
+                tags.append(tag)
+
+    if verdict == ct.OK:
+        check = shuffle_check(argv) or "golden"
+        nondet_exit = _random_mode(argv) and _check_mode_only(argv)
+        return make_case(_cn("kwise", *fids, iname), argv, list(fids),
+                         iname, inp, tags=tags, check=check,
+                         stdin_modes=["pipe"], nondet_exit=nondet_exit)
+    return make_case(_cn("kwiseneg", *fids, iname), argv, list(fids),
+                     iname, inp, tags=tags + ["negative"],
+                     rule_id=verdict[1], exact_stderr=True,
+                     stdin_modes=["pipe"])
+
+
+def _kwise_input(fids, corpus):
+    for fid in fids:
+        for name in fm.preferred_inputs(fid):
+            if name in corpus:
+                return name
+    return "discrim"
+
+
 # --- random higher-order combos ---------------------------------------------
 
 # flags safe to combine without bespoke file/output setup in the random tier
