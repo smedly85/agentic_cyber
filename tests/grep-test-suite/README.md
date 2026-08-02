@@ -230,3 +230,38 @@ Do that only alongside the corresponding prompt change, and regenerate. Note
 that regenerating changes the lineage configuration fingerprint recorded by
 `scripts/lineage_plan.py`, so an in-progress lineage run cannot be resumed
 across such a change — which is the intended protection, not an obstacle.
+
+## Held-out corpus
+
+`heldout/heldout_cases.json.gz` holds **29 cases** that no agent ever sees. They are
+scored once, after the repair loop has finished, by `scripts/heldout_judge.py`
+via this utility's `extra_test_command`; the result lands in the attempt
+metadata and is never rendered back into a prompt.
+
+Each held-out case is a *dual* of a visible one — the same checkpoint, the same
+cumulative flag list, the same structural shape, different concrete values — so
+the hidden pass measures the same functional scope the checkpoint declares.
+Patterns are replaced by patterns of the same kind and stdin payloads by
+payloads of the same structure: same line count, same trailing-newline shape,
+same NUL and high-byte content.
+
+Provenance splits exactly the way the visible corpus splits it. `gen/heldout.py`
+calls the same `gen/generate.py:freeze_case`, which consults
+`gen/oracle.py:model_only_reason` per case, so oracle-derived cases come from
+the pinned GNU grep and the specification model covers the rest. Duals of the
+oracle-exempt argument-grammar cases are deliberately not generated: they assert
+which options `new_grep` rejects, which is a statement about the bounded option
+set rather than about matching, so a dual would restate it without adding
+generalisation signal.
+
+```bash
+GREP_ORACLE_BIN=/usr/bin/grep python3 gen/heldout.py   # rewrite heldout/
+python3 gen/heldout.py --check                         # stale check, offline
+python3 ../../scripts/check_heldout_isolation.py --utility grep
+```
+
+Neither the cases nor their counts per checkpoint are documented here. What the
+isolation check enforces is stronger than documentation discipline: it builds
+every checkpoint's bundle payload and searches the bytes, so the guarantee rests
+on what `stage_test_bundle.py` actually copies rather than on what this file
+says.

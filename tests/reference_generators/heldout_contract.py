@@ -44,6 +44,9 @@ by building every checkpoint's bundle and searching its bytes.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import gzip
 import hashlib
 import json
 from pathlib import Path
@@ -53,7 +56,12 @@ SCHEMA_VERSION = 1
 
 # The directory name, per suite. Deliberately NOT "suites": that one is copied.
 HELDOUT_DIRNAME = "heldout"
-CORPUS_FILENAME = "heldout_cases.json"
+# Gzipped, like the visible suites and for the same reason. sort's held-out
+# cases include megabyte-long single-line inputs; stored as raw base64 JSON that
+# corpus is 78M, which has no business in a git history. Compressed it is a
+# fraction of that, and `write()` pins the gzip mtime so identical content
+# always produces identical bytes.
+CORPUS_FILENAME = "heldout_cases.json.gz"
 
 # Every held-out case name carries this prefix. It makes a leak unambiguous:
 # the isolation checker can search bundle bytes for one token and know that any
@@ -76,8 +84,27 @@ def corpus_path(suite_root: Path) -> Path:
 
 
 def render(payload: dict[str, Any]) -> str:
-    """Deterministic on-disk form, so a freshness check can compare bytes."""
+    """Deterministic on-disk form, so a freshness check can compare content."""
     return json.dumps(payload, indent=1, sort_keys=True) + "\n"
+
+
+def write(path: Path, text: str) -> None:
+    """Write the rendered corpus, compressed and byte-reproducible.
+
+    `mtime=0` matters: gzip stores a timestamp by default, so the same corpus
+    written twice would differ in bytes and show up as a spurious diff on every
+    regeneration.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(gzip.compress(text.encode("utf-8"), mtime=0))
+
+
+def read(path: Path) -> str:
+    """The rendered text of a corpus, whether it is compressed or not."""
+    raw = path.read_bytes()
+    if raw[:2] == b"\x1f\x8b":
+        raw = gzip.decompress(raw)
+    return raw.decode("utf-8")
 
 
 def load(suite_root: Path) -> dict[str, Any]:
@@ -85,7 +112,7 @@ def load(suite_root: Path) -> dict[str, Any]:
     if not path.is_file():
         raise HeldoutError(f"no held-out corpus at {path}")
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(read(path))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise HeldoutError(f"cannot read {path}: {error}") from error
     if not isinstance(data, dict):
@@ -225,6 +252,24 @@ def scannable_values(case: dict[str, Any]) -> list[str]:
                 item for item in value
                 if isinstance(item, str) and len(item) >= MIN_SCANNABLE_VALUE
             )
+    # Suites that store payloads base64-encoded (sort keeps its inputs and
+    # expected outputs as `stdin_b64` / `stdout_b64` / `files_b64`, since they
+    # contain NULs and deliberately invalid UTF-8). Without this the scan sees
+    # only the case NAME for those suites -- it would report clean while the
+    # entire input payload sat in the bundle. Both forms are searched: the
+    # encoded text, because that is how a suite file would carry it, and the
+    # decoded bytes, because that is how a fixture or a comment would.
+    for key, value in case.items():
+        if not key.endswith("_b64") or not isinstance(value, str):
+            continue
+        if len(value) >= MIN_SCANNABLE_VALUE:
+            values.append(value)
+        try:
+            raw = base64.b64decode(value, validate=True)
+        except (binascii.Error, ValueError):
+            continue
+        if len(raw) >= MIN_SCANNABLE_VALUE:
+            values.append(raw.decode("utf-8", "surrogateescape"))
     for entry in case.get("fixture") or []:
         if isinstance(entry, dict):
             for key in ("path", "contents"):

@@ -149,3 +149,33 @@ that only alongside the corresponding prompt change, and regenerate. Note that
 regenerating changes the lineage configuration fingerprint recorded by
 `scripts/lineage_plan.py`, so an in-progress lineage run cannot be resumed
 across such a change — which is the intended protection, not an obstacle.
+
+## Held-out corpus
+
+`heldout/heldout_cases.json.gz` holds **31 cases** that no agent ever sees. They are
+scored once, after the repair loop has finished, by `scripts/heldout_judge.py`
+via this utility's `extra_test_command`; the result lands in the attempt
+metadata and is never rendered back into a prompt.
+
+Each held-out case is a *dual* of a visible one — the same checkpoint, the same
+cumulative flag list, the same structural shape, different concrete values — so
+the hidden pass measures the same functional scope the checkpoint declares. If
+it probed broader behavior, a failure would report a scope mismatch as a
+generalisation failure.
+
+Provenance is identical to the visible corpus: `gen/heldout.py` calls
+`gen/generate.py:freeze_case`, which derives every expectation from
+`tests/reference_generators/chmod_reference.py`. There is no second
+implementation of the contract for the two corpora to drift apart on.
+
+```bash
+python3 gen/heldout.py            # rewrite heldout/
+python3 gen/heldout.py --check    # fail if it is stale (offline)
+python3 ../../scripts/check_heldout_isolation.py --utility chmod
+```
+
+Neither the cases nor their counts per checkpoint are documented here. What the
+isolation check enforces is stronger than documentation discipline: it builds
+every checkpoint's bundle payload and searches the bytes, so the guarantee rests
+on what `stage_test_bundle.py` actually copies rather than on what this file
+says.

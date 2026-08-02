@@ -16,6 +16,7 @@ which does need that stack.
 from __future__ import annotations
 
 import ast
+import gzip
 import hashlib
 import importlib.util
 import json
@@ -38,6 +39,7 @@ import capture_candidate  # noqa: E402
 import checkpoint_boundary_gate  # noqa: E402
 
 sys.path.insert(0, str(REPO_ROOT / "tests"))
+from reference_generators import heldout_contract  # noqa: E402
 from reference_generators import oracle_contract  # noqa: E402
 from reference_generators import suite_diff  # noqa: E402
 import lineage_plan  # noqa: E402
@@ -5610,6 +5612,171 @@ class SeedProvenanceAcrossRootsTests(unittest.TestCase):
             problems = analyze_lineages.check_seed_provenance([record])
             self.assertEqual(len(problems), 1)
             self.assertIn("001", problems[0])
+
+
+class HeldOutCorpusTests(unittest.TestCase):
+    """The held-out pool: shape, scope, and the thing that must never happen.
+
+    Offline throughout. No candidate is built and no oracle is consulted -- the
+    corpora are read as committed, exactly the way the audit for the visible
+    suites works.
+    """
+
+    LADDERS = {
+        "chmod": [[], ["-R"], ["-R", "-c"], ["-R", "-c", "-v"],
+                  ["-R", "-c", "-v", "-f"]],
+        "grep": [[], ["-H"], ["-H", "-h"], ["-H", "-h", "-r"],
+                 ["-H", "-h", "-r", "-i"]],
+        "sort": [[], ["-r"], ["-r", "-f"], ["-r", "-f", "-u"],
+                 ["-r", "-f", "-u", "-c"]],
+        "mkdir": [[], ["-p"], ["-p", "-m"]],
+    }
+
+    @staticmethod
+    def _corpus(utility):
+        root = REPO_ROOT / "tests" / f"{utility}-test-suite"
+        path = heldout_contract.corpus_path(root)
+        return heldout_contract.load(root) if path.is_file() else None
+
+    def _each_corpus(self):
+        found = 0
+        for utility in self.LADDERS:
+            corpus = self._corpus(utility)
+            if corpus is None:
+                continue        # generated per host; absence is not a failure
+            found += 1
+            yield utility, corpus
+        self.assertGreater(found, 0, "no held-out corpus is committed at all")
+
+    def test_every_case_satisfies_the_shared_invariants(self):
+        for utility, corpus in self._each_corpus():
+            with self.subTest(utility=utility):
+                self.assertEqual(
+                    heldout_contract.corpus_invariants(
+                        corpus, self.LADDERS[utility]),
+                    [],
+                )
+
+    def test_no_case_leaves_the_bounded_ladder(self):
+        """A dual outside the ladder would report scope drift as a failure."""
+        for utility, corpus in self._each_corpus():
+            ladder = {flag for stage in self.LADDERS[utility] for flag in stage}
+            for case in heldout_contract.cases(corpus):
+                with self.subTest(utility=utility, case=case["name"]):
+                    self.assertLessEqual(set(case.get("flags") or []), ladder)
+
+    def test_every_case_names_the_visible_case_it_is_a_dual_of(self):
+        for utility, corpus in self._each_corpus():
+            for case in heldout_contract.cases(corpus):
+                with self.subTest(utility=utility, case=case["name"]):
+                    self.assertTrue(case.get("dual_of"))
+                    self.assertTrue(
+                        case["name"].startswith(heldout_contract.NAME_PREFIX),
+                        "the prefix is what makes a leak scan unambiguous",
+                    )
+
+    def test_a_dual_is_never_identical_to_the_case_it_came_from(self):
+        """An unchanged dual is not held out: its values are in the bundle.
+
+        This caught a real defect. sort's first generator substituted whole
+        lines from a hand-written table, and 14 of 24 duals came out
+        byte-identical to their visible twin -- that corpus would have measured
+        nothing while appearing to pass.
+        """
+        for utility, corpus in self._each_corpus():
+            visible = {}
+            for path in sorted((REPO_ROOT / "tests" / f"{utility}-test-suite"
+                                / "suites").iterdir()):
+                if path.name == "MANIFEST.json" or path.suffix not in (".json", ".gz"):
+                    continue
+                opener = gzip.open if path.suffix == ".gz" else open
+                with opener(path, "rt", encoding="utf-8") as handle:
+                    data = json.load(handle)
+                cases = (data["cases"] if isinstance(data, dict) and "cases" in data
+                         else data)
+                for case in cases:
+                    visible[case["name"]] = case
+
+            for case in heldout_contract.cases(corpus):
+                twin = visible.get(case["dual_of"])
+                if twin is None:
+                    continue
+                with self.subTest(utility=utility, case=case["name"]):
+                    inputs = ("args", "stdin", "stdin_b64", "fixture", "tree",
+                              "targets")
+                    self.assertTrue(
+                        any(case.get(key) != twin.get(key) for key in inputs),
+                        f"{case['name']} has the same inputs as its twin",
+                    )
+
+    def test_the_corpus_lives_nowhere_the_bundle_would_copy_it(self):
+        """The guarantee, checked against the allowlist rather than intent."""
+        allowlisted = set(stage_test_bundle.ALLOWED_FILES)
+        self.assertNotIn(heldout_contract.CORPUS_FILENAME, allowlisted)
+        for entry in allowlisted:
+            self.assertFalse(
+                entry.startswith(heldout_contract.HELDOUT_DIRNAME),
+                f"{entry} would copy the held-out corpus into a sandbox",
+            )
+
+    def test_the_isolation_check_passes_for_every_committed_corpus(self):
+        """The real guard, run for real -- not a re-implementation of it."""
+        completed = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" /
+                                 "check_heldout_isolation.py")],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(completed.returncode, 0,
+                         f"{completed.stdout}\n{completed.stderr}")
+
+    def test_the_isolation_check_fails_when_a_case_really_does_leak(self):
+        """A guard nobody has seen fail is not evidence of anything.
+
+        Planting a held-out value in a file the bundle copies verbatim must turn
+        the check red. `engine.py` is used rather than `props.py` because
+        `props.py` is regenerated and pruned per checkpoint, so a canary planted
+        there legitimately never propagates -- which once made the guard look
+        toothless when it was not.
+        """
+        utility = next(iter(u for u, c in self._each_corpus()), None)
+        corpus = self._corpus(utility)
+        case = heldout_contract.cases(corpus)[0]
+        needle = max(heldout_contract.scannable_values(case), key=len)
+
+        engine = REPO_ROOT / "tests" / f"{utility}-test-suite" / "engine.py"
+        original = engine.read_bytes()
+        try:
+            with engine.open("wb") as handle:
+                handle.write(b"# canary " +
+                             needle.encode("utf-8", "surrogateescape") + b"\n")
+                handle.write(original)
+            completed = subprocess.run(
+                [sys.executable, str(REPO_ROOT / "scripts" /
+                                     "check_heldout_isolation.py"),
+                 "--utility", utility],
+                capture_output=True, text=True,
+            )
+        finally:
+            engine.write_bytes(original)
+        self.assertEqual(completed.returncode, 1,
+                         "a planted held-out value must be reported as a leak")
+        self.assertIn("LEAK", completed.stderr)
+
+    def test_every_utility_is_wired_to_run_its_held_out_pass(self):
+        for utility in self.LADDERS:
+            manifest = json.loads(
+                (MANIFEST_DIR / f"{utility}.json").read_text(encoding="utf-8"))
+            with self.subTest(utility=utility):
+                command = manifest.get("extra_test_command", "")
+                self.assertIn("heldout_judge.py", command)
+                self.assertIn(f"--utility {utility}", command)
+                self.assertIn("$HELDOUT_ROOT", command,
+                              "a relative path would resolve inside the sandbox")
+
+    def test_the_controller_exports_the_root_the_command_depends_on(self):
+        text = (REPO_ROOT / "scripts" / "run_experiment.sh").read_text(
+            encoding="utf-8")
+        self.assertIn("export HELDOUT_ROOT=", text)
 
 
 if __name__ == "__main__":

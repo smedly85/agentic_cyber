@@ -187,3 +187,48 @@ python3 gen/generate.py            # regenerates suites/ using config.json's ora
 
 `diff_fuzz.py` auto-records every new distinct bug it finds into
 `suites/fuzz_regressions.json.gz` as a permanent regression test.
+
+## Held-out corpus
+
+`heldout/heldout_cases.json.gz` holds **24 cases** that no agent ever sees. They are
+scored once, after the repair loop has finished, by `scripts/heldout_judge.py`
+via this utility's `extra_test_command`; the result lands in the attempt
+metadata and is never rendered back into a prompt.
+
+Each held-out case is a *dual* of a visible one — the same checkpoint, the same
+cumulative flag list, the same structural shape, different concrete values.
+
+Two things are specific to this suite. First, **scope**: the visible corpus
+covers far more of GNU sort than the `new_sort` ladder asks for, so duals are
+drawn only from visible cases whose flags fall inside `-r -f -u -c`. A dual
+using `-k` would test something no checkpoint introduces, and its failure would
+report a scope mismatch as a generalisation failure. Second, **how values
+change**: a lexical substitution table cannot reach a corpus that is largely
+generated, so inputs are transformed by a byte map that rotates within character
+class and fixes everything else. Upper and lower rotate by the same amount, so
+case-variant lines stay case-variants (which is what `-f` probes); the map is a
+function, so duplicates stay duplicates (which is what `-u` probes); and tabs,
+NULs, blank lines and every byte ≥ 0x80 are fixed points, so field structure,
+line lengths and deliberately invalid UTF-8 survive. Check-mode cases whose twin
+asserts that already-sorted input is *accepted* are re-ordered by the oracle
+afterwards, since rotation is not order-preserving and the dual would otherwise
+have quietly become a case about rejection. The generator refuses to write a
+dual that came out byte-identical to its twin.
+
+Provenance is identical to the visible corpus: `gen/heldout.py` calls
+`gen/freeze.py:freeze_case` against the same pinned oracle, under the same
+version and platform contract (see *Oracle contract* above). Both generation and
+the freshness check need that oracle — every expectation here comes from
+executing sort, so there is no offline model to check against.
+
+```bash
+SORT_ORACLE_BIN=~/opt/cu-9.11/bin/sort python3 gen/heldout.py
+SORT_ORACLE_BIN=~/opt/cu-9.11/bin/sort python3 gen/heldout.py --check
+python3 ../../scripts/check_heldout_isolation.py --utility sort
+```
+
+Neither the cases nor their counts per checkpoint are documented here. What the
+isolation check enforces is stronger than documentation discipline: it builds
+every checkpoint's bundle payload and searches the bytes, so the guarantee rests
+on what `stage_test_bundle.py` actually copies rather than on what this file
+says.

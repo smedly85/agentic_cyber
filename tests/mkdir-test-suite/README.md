@@ -229,3 +229,46 @@ has none) and always runs inside a per-case sandboxed temp dir -- any
 mutation that would resolve outside that sandbox (e.g. an unbalanced `..`)
 is rejected before either binary is invoked, so fuzzing never touches the
 real filesystem.
+
+## Held-out corpus
+
+`heldout/heldout_cases.json.gz` holds **25 cases** that no agent ever sees. They are
+scored once, after the repair loop has finished, by `scripts/heldout_judge.py`
+via this utility's `extra_test_command`; the result lands in the attempt
+metadata and is never rendered back into a prompt.
+
+Each held-out case is a *dual* of a visible one — the same checkpoint, the same
+cumulative flag list, the same structural shape, different concrete values.
+Duals are drawn only from visible cases whose flags fall inside the bounded
+ladder (`-p`, `-m`); the suite covers more of GNU mkdir than the experiment asks
+for, and a dual using `-v` would report a scope mismatch as a generalisation
+failure.
+
+Path components are rewritten by a byte map that rotates within character class
+and fixes everything else. Being length-preserving matters more here than
+anywhere else in the repository: `/`, `.` and `-` are fixed points, so path
+depth, `.`/`..` components, leading-dash operands and any case sitting exactly
+on a NAME_MAX or PATH_MAX boundary all keep their meaning — where a rename like
+`d0` → `hd0` would quietly move the boundary cases off the boundary. Modes are
+not rotated but mapped by an explicit table, since rotating digits can yield an
+`8` or a `9` and would turn `-m 0644` into an invalid-mode parse error.
+
+Provenance is identical to the visible corpus: `gen/heldout.py` calls
+`gen/freeze.py:freeze_case` against the same pinned oracle, under the same
+version and platform contract (see *Oracle contract* above). Both generation and
+the freshness check need that oracle — every expectation here comes from
+executing mkdir, so there is no offline model to check against. `--preview` is
+the exception: it shows the duals without an oracle and writes nothing.
+
+```bash
+MKDIR_ORACLE_BIN=~/opt/coreutils-9.11/bin/mkdir python3 gen/heldout.py
+MKDIR_ORACLE_BIN=~/opt/coreutils-9.11/bin/mkdir python3 gen/heldout.py --check
+python3 gen/heldout.py --preview
+python3 ../../scripts/check_heldout_isolation.py --utility mkdir
+```
+
+Neither the cases nor their counts per checkpoint are documented here. What the
+isolation check enforces is stronger than documentation discipline: it builds
+every checkpoint's bundle payload and searches the bytes, so the guarantee rests
+on what `stage_test_bundle.py` actually copies rather than on what this file
+says.

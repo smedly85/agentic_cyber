@@ -41,6 +41,9 @@ import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "tests"))
+
+from reference_generators import heldout_contract  # noqa: E402
 
 
 def bundled_config(workdir: Path, test_dir: str) -> Path:
@@ -85,7 +88,9 @@ def main(argv: list[str] | None = None) -> int:
 
     repo = args.repo.resolve()
     suite_root = repo / "tests" / f"{args.utility}-test-suite"
-    corpus = suite_root / "heldout" / "heldout_cases.json"
+    # The suite's runner reads `.json.gz` transparently, so the corpus is handed
+    # over compressed exactly as it is committed.
+    corpus = heldout_contract.corpus_path(suite_root)
     if not corpus.is_file():
         print(f"heldout_judge: no held-out corpus for {args.utility} "
               f"({corpus}); nothing to run", file=sys.stderr)

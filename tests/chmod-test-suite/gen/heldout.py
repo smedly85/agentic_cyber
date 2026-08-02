@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Freeze the held-out new_chmod corpus into heldout/heldout_cases.json.
+"""Freeze the held-out new_chmod corpus into heldout/heldout_cases.json.gz.gz.
 
 **Never copied into an agent-visible bundle.** `gen/` is outside
 `scripts/stage_test_bundle.py`'s allowlist, and the corpus it writes lives in
@@ -22,7 +22,7 @@ Ground truth comes from the same place the visible cases get it:
 implementation of the contract to drift from the first.
 
 Usage:
-  python3 gen/heldout.py            # rewrite heldout/heldout_cases.json
+  python3 gen/heldout.py            # rewrite heldout/heldout_cases.json.gz
   python3 gen/heldout.py --check    # fail if it is stale
 """
 
@@ -188,14 +188,13 @@ def main(argv: list[str] | None = None) -> int:
     path = heldout_contract.corpus_path(SUITE_ROOT)
 
     if args.check:
-        if not path.is_file() or path.read_text(encoding="utf-8") != text:
+        if not path.is_file() or heldout_contract.read(path) != text:
             print(f"stale: {path}", file=sys.stderr)
             return 1
         print(f"held-out corpus is up to date ({corpus['total_cases']} cases)")
         return 0
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+    heldout_contract.write(path, text)
     print(f"wrote {corpus['total_cases']} held-out cases to {path}")
     return 0
 

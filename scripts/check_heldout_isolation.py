@@ -28,7 +28,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gzip
 import sys
+import zlib
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +61,34 @@ class NoCorpus(Exception):
     """This utility has no held-out corpus yet -- absence, not a leak."""
 
 
+def searchable(filename: str, blob: bytes) -> list[bytes]:
+    """Every form of a bundle file a needle could actually appear in.
+
+    A substring search over compressed bytes is vacuous -- it reports clean
+    whatever the file contains. sort names its suite files `.json.gz`, so this
+    inflates anything that really is gzip rather than trusting the extension.
+
+    As it happens `build_payload` hands back sort's suites as plain JSON under
+    their `.gz` names -- filtering per checkpoint requires parsing them anyway --
+    so today every form searched here is already text. The branch stays because
+    the guarantee should not depend on that: if the bundle ever carries a member
+    compressed, this check must keep having teeth instead of quietly losing them.
+    """
+    forms = [blob]
+    if blob[:2] == b"\x1f\x8b":
+        try:
+            forms.append(gzip.decompress(blob))
+        except (OSError, EOFError, zlib.error) as error:
+            # Never silently searched-nothing: a member that claims to be gzip
+            # and will not inflate is an unreadable file in the sandbox, and the
+            # scan cannot honestly call it clean.
+            raise SystemExit(
+                f"check_heldout_isolation: {filename} is gzip but will not "
+                f"inflate ({error}); cannot verify it carries no held-out data"
+            )
+    return forms
+
+
 def scan_utility(repo: Path, utility: str) -> tuple[list[str], int, int]:
     """Returns (leaks, checkpoints_checked, values_searched)."""
     root, plan = suite_root(repo, utility)
@@ -78,8 +108,10 @@ def scan_utility(repo: Path, utility: str) -> tuple[list[str], int, int]:
         files = bundle_files(repo, plan, checkpoint)
         checked += 1
         for filename, blob in files.items():
+            forms = searchable(filename, blob)
             for case_name, value in needles:
-                if value.encode("utf-8", "surrogateescape") in blob:
+                needle = value.encode("utf-8", "surrogateescape")
+                if any(needle in form for form in forms):
                     leaks.append(
                         f"{utility} checkpoint {checkpoint['id']}: held-out "
                         f"case {case_name} leaked into bundle file "
