@@ -319,6 +319,140 @@ def test_judging_config_carries_the_suites_platform_gate(measure, tmp_path: Path
 
 
 # ---------------------------------------------------------------------------
+# Visible-pass scope: the corpus the checkpoint was really judged on
+# ---------------------------------------------------------------------------
+
+SUITE_ROOTS = {
+    utility: REPO_ROOT / "tests" / f"{utility}-test-suite"
+    for utility in ("sort", "mkdir", "grep", "chmod")
+}
+
+
+def visible_config(measure, suite_root: Path, destination: Path) -> dict:
+    measure.judging_config(
+        suite_root,
+        destination.parent / "bin",
+        [],
+        destination,
+        scope_overrides=measure.visible_scope_overrides(suite_root),
+    )
+    return json.loads(destination.read_text())
+
+
+@pytest.mark.parametrize(
+    "utility, excluded_tags, stdin_only",
+    [
+        # sort and mkdir commit real exclusions that the real judgement honours.
+        ("sort", ["debug", "doc", "compress", "files0", "obsolete"], True),
+        ("mkdir", ["selinux", "doc"], False),
+        ("grep", [], False),
+        ("chmod", [], False),
+    ],
+)
+def test_visible_config_reproduces_the_real_judging_scope(
+    measure, tmp_path: Path, utility, excluded_tags, stdin_only
+):
+    """The visible fingerprint must describe the corpus that drove the repair loop.
+
+    Judging a broader corpus than `judge_candidate.sh` did would put a
+    `visible_case_count` next to a `feature_test_exit_code` that came from a
+    different set of cases.
+    """
+    config = visible_config(
+        measure, SUITE_ROOTS[utility], tmp_path / f"{utility}.json"
+    )
+    assert config["excluded_tags"] == excluded_tags
+    if stdin_only:
+        assert config["scope"] == {"stdin_only": True}
+    else:
+        assert "scope" not in config
+    # The scope fix must not disturb anything else about the pass.
+    assert config["unimplemented_policy"] == "skip"
+    assert config["implemented"] == []
+
+
+@pytest.mark.parametrize("utility", ["sort", "mkdir", "grep", "chmod"])
+def test_heldout_config_still_matches_heldout_judge(
+    measure, tmp_path: Path, utility
+):
+    """The held-out pass must keep matching `scripts/heldout_judge.py` exactly.
+
+    That script is what actually ran the held-out corpus during the experiment,
+    and it applies no exclusions and no stdin-only scope. Leaking the
+    visible-only fix into this pass would make the held-out fingerprint describe
+    a pass the experiment never performed.
+    """
+    destination = tmp_path / f"{utility}-heldout.json"
+    measure.judging_config(SUITE_ROOTS[utility], tmp_path / "bin", [], destination)
+    config = json.loads(destination.read_text())
+    assert config["excluded_tags"] == []
+    assert "scope" not in config
+    assert config["unimplemented_policy"] == "skip"
+    # Nothing beyond the minimal shape plus the platform abort gate.
+    assert set(config) <= {
+        "paths",
+        "implemented",
+        "unimplemented_policy",
+        "excluded_tags",
+        "required_platform",
+    }
+
+
+def test_visible_and_heldout_configs_diverge_only_where_intended(
+    measure, tmp_path: Path
+):
+    visible = visible_config(measure, SORT_SUITE, tmp_path / "visible.json")
+    heldout_path = tmp_path / "heldout.json"
+    measure.judging_config(SORT_SUITE, tmp_path / "bin", [], heldout_path)
+    heldout = json.loads(heldout_path.read_text())
+    differing = {
+        key
+        for key in set(visible) | set(heldout)
+        if visible.get(key) != heldout.get(key)
+    }
+    assert differing == {"excluded_tags", "scope"}
+
+
+def test_stdin_only_scope_is_detected_from_the_wrapper_not_hardcoded(
+    measure, tmp_path: Path
+):
+    assert measure.judge_wrapper_pins_stdin_only(SORT_SUITE) is True
+    for utility in ("mkdir", "grep", "chmod"):
+        assert measure.judge_wrapper_pins_stdin_only(SUITE_ROOTS[utility]) is False
+
+    # Prose alone must not trigger it -- sort's wrapper documents the pin in a
+    # comment as well as performing it, and so may others.
+    mentions_only = tmp_path / "mentions-only"
+    mentions_only.mkdir()
+    (mentions_only / "judge_candidate.sh").write_text(
+        "# this wrapper does not pin scope.stdin_only\n", encoding="utf-8"
+    )
+    assert measure.judge_wrapper_pins_stdin_only(mentions_only) is False
+
+    injects = tmp_path / "injects"
+    injects.mkdir()
+    (injects / "judge_candidate.sh").write_text(
+        'config.setdefault("scope", {})["stdin_only"] = True\n', encoding="utf-8"
+    )
+    assert measure.judge_wrapper_pins_stdin_only(injects) is True
+    # A suite with no wrapper at all is simply unrestricted.
+    assert measure.judge_wrapper_pins_stdin_only(tmp_path / "absent") is False
+
+
+def test_visible_scope_overrides_names_only_what_differs(measure):
+    assert measure.visible_scope_overrides(SUITE_ROOTS["grep"]) == {
+        "excluded_tags": []
+    }
+    assert measure.visible_scope_overrides(SUITE_ROOTS["mkdir"]) == {
+        "excluded_tags": ["selinux", "doc"]
+    }
+    assert measure.visible_scope_overrides(SORT_SUITE) == {
+        "excluded_tags": ["debug", "doc", "compress", "files0", "obsolete"],
+        "scope": {"stdin_only": True},
+    }
+
+
+# ---------------------------------------------------------------------------
 # Real rebuild + real runner.py, against a real frozen suite
 # ---------------------------------------------------------------------------
 
@@ -495,6 +629,85 @@ def test_a_candidate_that_does_not_compile_is_recorded_not_dropped(
     )
     assert result["status"] == measure.UNMEASURED_REBUILD_FAILED
     assert result["detail"]
+
+
+def sort_measure_run(measure, tmp_path: Path, source_text: str, **overrides):
+    source = tmp_path / "candidate.c"
+    source.write_text(source_text, encoding="utf-8")
+    arguments = {
+        "candidate_source": source,
+        "workdir": tmp_path / "work",
+        "source_workdir_path": "src/new_sort/new_sort.c",
+        "build_command": SORT_BUILD_COMMAND,
+        "binary_relative_path": "build/new_sort",
+        "suite_root": SORT_SUITE,
+        "visible_corpora": measure.visible_suite_files(SORT_SUITE),
+        "heldout_corpus": measure.heldout_contract.corpus_path(SORT_SUITE),
+        "flags": [],
+    }
+    return measure.measure_run(**{**arguments, **overrides})
+
+
+@pytest.mark.skipif(
+    platform.system() == "Windows",
+    reason="the build command runs through /bin/sh, so `sleep` is POSIX-only",
+)
+def test_a_build_that_hangs_is_recorded_not_left_to_stall_the_batch(
+    measure, tmp_path: Path, monkeypatch
+):
+    """A hang is one candidate's outcome, not a reason to abandon the condition.
+
+    Uses a real sleeping build command so the `timeout=` argument itself is
+    exercised, rather than only the handler that catches its expiry.
+    """
+    monkeypatch.setattr(measure, "BUILD_TIMEOUT_SECONDS", 0.5)
+    result = sort_measure_run(
+        measure,
+        tmp_path,
+        "int main(void) { return 0; }\n",
+        build_command="sleep 30",
+    )
+    assert result["status"] == measure.UNMEASURED_REBUILD_FAILED
+    assert "timed out" in result["detail"]
+    assert "0.5s" in result["detail"]
+
+
+@pytest.mark.skipif(
+    shutil.which("cc") is None, reason="no C compiler on PATH to rebuild candidates"
+)
+def test_a_judging_pass_that_hangs_is_recorded_not_left_to_stall_the_batch(
+    measure, tmp_path: Path, monkeypatch
+):
+    """Same for the judge pass, whose bound is the backstop for a whole corpus."""
+    monkeypatch.setattr(measure, "JUDGE_TIMEOUT_SECONDS", 0.01)
+    result = sort_measure_run(
+        measure, tmp_path, "int main(void) { return 0; }\n"
+    )
+    assert result["status"] == measure.UNMEASURED_JUDGE_FAILED
+    assert "timed out" in result["detail"]
+
+
+def test_a_build_timeout_does_not_escape_measure_run(
+    measure, tmp_path: Path, monkeypatch
+):
+    """The taxonomy folding holds even where no compiler is available."""
+
+    def hang(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="cc", timeout=300, output="partial\n")
+
+    monkeypatch.setattr(measure, "rebuild_candidate", hang)
+    result = sort_measure_run(measure, tmp_path, "int main(void) { return 0; }\n")
+    assert result["status"] == measure.UNMEASURED_REBUILD_FAILED
+    assert "timed out after 300s" in result["detail"]
+    assert "partial" in result["detail"]
+
+
+def test_output_tail_handles_a_killed_process_with_nothing_captured(measure):
+    # `TimeoutExpired.output` is None when the process was killed before it
+    # wrote anything, which must not turn into an AttributeError.
+    assert measure.output_tail(None) == ""
+    assert measure.output_tail(b"bytes output\n") == "bytes output"
+    assert measure.output_tail("x" * 900, limit=10) == "x" * 10
 
 
 def test_a_missing_candidate_source_is_recorded_not_dropped(measure, tmp_path: Path):

@@ -64,9 +64,18 @@ rebuilds and both judging passes produce a report. A run that cannot be measured
 is recorded with its reason and excluded from the fingerprint statistics:
 
 - `candidate_source_missing` — no `attempt-*/candidate/<source_path>`;
-- `rebuild_failed` — the recorded `build_command` did not produce the binary;
+- `rebuild_failed` — the recorded `build_command` did not produce the binary, or
+  exceeded its time bound;
 - `judge_failed` — `runner.py` produced no report (a usage error, or its
-  platform gate refusing to judge).
+  platform gate refusing to judge), or exceeded its time bound.
+
+Both subprocesses are bounded, because this runs unattended over a whole
+population and a candidate that sends the compiler into a blowup would otherwise
+stall the batch with nothing to recover it. An expiry is folded into the status
+above with its reason, exactly as a compile error is; it does not abort the
+condition. The judge bound is much the more generous of the two, since one judge
+call runs an entire corpus through `runner.py`'s thread pool where each case
+already carries its own per-case timeout.
 
 None is silently dropped. `measurement_coverage` is measured runs over
 successful runs, and a condition whose candidates mostly fail to rebuild has a
@@ -101,23 +110,41 @@ comparator could disagree with the recorded verdict and nobody would know which
 was right.
 
 Each pass gets a throwaway config carrying `paths.candidate_bin`, the
-checkpoint's cumulative `implemented` flag list, `unimplemented_policy: "skip"`
-and `excluded_tags: []`. The flag list is parsed out of the recorded
-`feature_test_command`, whose shape is fixed by
-`experiments/utilities/<utility>.json` as `<judge script> <binary> [FLAG...]`,
-so the measurement is scoped to the rung the experiment actually ran rather than
-to the ladder. The suite's `required_platform` is copied across when it declares
-one: that key is not a scope filter but an abort gate, and without it the sort
-and mkdir suites would fingerprint the host instead of the candidate. Nothing in
-the repository is modified.
+checkpoint's cumulative `implemented` flag list and `unimplemented_policy:
+"skip"`. The flag list is parsed out of the recorded `feature_test_command`,
+whose shape is fixed by `experiments/utilities/<utility>.json` as
+`<judge script> <binary> [FLAG...]`, so the measurement is scoped to the rung
+the experiment actually ran rather than to the ladder. The suite's
+`required_platform` is copied across when it declares one: that key is not a
+scope filter but an abort gate, and without it the sort and mkdir suites would
+fingerprint the host instead of the candidate. Nothing in the repository is
+modified.
 
-Two consequences of the minimal config are deliberate and worth stating. It does
-not adopt `judge_candidate.sh`'s wrapper-level `scope.stdin_only`, and it does
-not adopt the suites' committed `excluded_tags`. The measured corpus is
-therefore the full flag-filtered case set rather than the narrower set the pass/
-fail judgement used. This broadens the behavioral probe, is identical across
-every candidate in the condition, and cannot alter any recorded outcome, because
-no verdict produced here is written back.
+The two passes differ in one respect, deliberately, because they reproduce two
+different real judging paths.
+
+The **visible** pass reproduces the scope `judge_candidate.sh` applied when the
+checkpoint was actually judged, so that `visible_case_count` and the visible
+fingerprint describe the same corpus that produced `feature_test_exit_code` and
+drove the repair loop. Two suites need this: `sort` and `mkdir` commit real
+`excluded_tags` in their own `config.json` (`["debug", "doc", "compress",
+"files0", "obsolete"]` and `["selinux", "doc"]`), which every wrapper inherits by
+loading that committed config as its base; and `sort`'s wrapper additionally
+injects `scope.stdin_only = True`, which `runner.py`'s `modes_for()` reads to
+decide whether to run the file-redirect invocation mode. `grep` and `chmod`
+commit `excluded_tags: []` and pin no scope, so nothing changes for them. Both
+overrides are read from the suite and its wrapper rather than hardcoded per
+utility, so a suite that changes its exclusions or its wrapper's scope carries
+the measurement with it.
+
+The **held-out** pass takes none of those overrides, and keeps
+`excluded_tags: []` with no `scope` key. That is not an oversight: it matches
+`scripts/heldout_judge.py`, which is what actually ran the held-out corpus
+during the experiment. A held-out fingerprint judged under different filtering
+would describe a pass the experiment never performed.
+
+Neither pass can alter a recorded outcome, because no verdict produced here is
+written back.
 
 ## Fingerprints
 

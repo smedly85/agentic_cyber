@@ -76,6 +76,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import shlex
 import shutil
 import subprocess
@@ -107,6 +108,25 @@ UNMEASURED_JUDGE_FAILED = "judge_failed"
 # "failed visible case X" and "failed held-out case X" distinct inputs.
 VISIBLE_NAMESPACE = "visible"
 HELDOUT_NAMESPACE = "heldout"
+
+# This runs unattended over a whole population, so neither subprocess may be
+# unbounded: a candidate that sends the compiler into a preprocessor blowup
+# would otherwise stall the entire batch with nothing to recover it. Bounding
+# unattended work is the repository's existing convention -- see
+# `run_experiment.sh --timeout` and `scripts/timeout.py`.
+#
+# The judge bound is far more generous than the build bound because one judge
+# call runs an entire corpus through `runner.py`'s thread pool, where every case
+# already carries its own per-case timeout. This is only the backstop for the
+# pass as a whole.
+BUILD_TIMEOUT_SECONDS = 300
+JUDGE_TIMEOUT_SECONDS = 900
+
+# Matches the assignment `judge_candidate.sh` uses to pin stdin-only scope, and
+# deliberately not prose: sort's wrapper also *documents* `scope.stdin_only` in
+# a comment, and a bare substring search would fire on any suite that merely
+# mentions it.
+STDIN_ONLY_INJECTION = re.compile(r"""\[['"]stdin_only['"]\]\s*=\s*True""")
 
 FINGERPRINT_CSV_FIELDS = (
     "run_id",
@@ -212,6 +232,19 @@ def namespaced_failures(
     return [(f"{namespace}::{name}", verdict) for name, verdict in failures]
 
 
+def output_tail(output: str | bytes | None, limit: int = 800) -> str:
+    """The last of a subprocess's captured output, for a failure `detail`.
+
+    A timed-out process reports whatever it had written before the kill, which
+    may be nothing, so `None` is an ordinary case rather than an error.
+    """
+    if output is None:
+        return ""
+    if isinstance(output, bytes):
+        output = output.decode("utf-8", "replace")
+    return output.strip()[-limit:]
+
+
 # ---------------------------------------------------------------------------
 # Reading what the rest of the pipeline already determined
 # ---------------------------------------------------------------------------
@@ -289,17 +322,83 @@ def visible_suite_files(suite_root: Path) -> list[Path]:
     return files
 
 
-def judging_config(
-    suite_root: Path, candidate_bin: Path, flags: Sequence[str], destination: Path
-) -> Path:
-    """A throwaway config carrying this checkpoint's scope. Nothing is modified.
+def judge_wrapper_pins_stdin_only(suite_root: Path) -> bool:
+    """Whether this suite's `judge_candidate.sh` restricts judging to stdin.
 
-    The same minimal shape `heldout_judge.py` writes, plus the suite's
-    `required_platform` when it declares one. That key is not a scope filter but
-    an abort gate: sort's goldens describe Linux and mkdir's describe Darwin, so
-    on the wrong host the runner must refuse rather than report host artifacts
-    as behavior. Omitting it would let this measurement silently fingerprint the
-    platform instead of the candidate.
+    Detected from the wrapper rather than hardcoded per utility. Only sort does
+    this today -- new_sort is a bounded stdin-only utility with no file operands
+    -- but a suite that gains or loses the restriction should carry this
+    measurement with it instead of silently reopening the divergence this
+    function exists to close.
+    """
+    wrapper = suite_root / "judge_candidate.sh"
+    if not wrapper.is_file():
+        return False
+    return bool(STDIN_ONLY_INJECTION.search(wrapper.read_text(encoding="utf-8")))
+
+
+def visible_scope_overrides(suite_root: Path) -> dict[str, Any]:
+    """The scope the checkpoint's real visible judgement applied, per suite.
+
+    The visible pass must reproduce the corpus the candidate was actually scored
+    and repaired against, and for two suites that corpus is narrower than "every
+    case whose flags are implemented":
+
+      * `sort` and `mkdir` commit real `excluded_tags` in their own
+        `config.json` (`["debug", "doc", "compress", "files0", "obsolete"]` and
+        `["selinux", "doc"]`). Every `judge_candidate.sh` loads that committed
+        config as its base, so those exclusions are in force during the real
+        judgement. (`grep` and `chmod` commit `[]`, so nothing changes there.)
+      * `sort`'s `judge_candidate.sh` additionally injects
+        `scope.stdin_only = True`. `runner.py`'s `modes_for()` reads it to decide
+        whether to also run the file-redirect invocation mode, so without it the
+        visible pass scores invocation modes the real judgement never did.
+
+    Without both, `visible_case_count` and the visible fingerprint would not
+    describe the corpus that produced `feature_test_exit_code` and drove the
+    repair loop -- numbers that may well be read side by side. Only keys that
+    actually need overriding are returned.
+
+    The held-out pass deliberately gets none of this; see `judging_config`.
+    """
+    overrides: dict[str, Any] = {}
+    suite_config = suite_root / "config.json"
+    if suite_config.is_file():
+        committed = read_json(suite_config)
+        # Absent means the suite declares no exclusions, which is the base
+        # config's `[]` already; an empty committed list is carried through
+        # identically. Only a populated list actually changes anything.
+        if "excluded_tags" in committed:
+            overrides["excluded_tags"] = list(committed["excluded_tags"])
+    if judge_wrapper_pins_stdin_only(suite_root):
+        overrides["scope"] = {"stdin_only": True}
+    return overrides
+
+
+def judging_config(
+    suite_root: Path,
+    candidate_bin: Path,
+    flags: Sequence[str],
+    destination: Path,
+    *,
+    scope_overrides: Mapping[str, Any] | None = None,
+) -> Path:
+    """A throwaway config for one judging pass. Nothing in the repository is modified.
+
+    The base is the minimal shape `heldout_judge.py` writes, and the held-out
+    pass must keep matching it: that script is what actually ran the held-out
+    corpus during the experiment, so a held-out fingerprint judged under
+    different filtering would not describe the pass the experiment recorded. The
+    held-out pass therefore passes no overrides.
+
+    Both passes carry the suite's `required_platform` when it declares one. That
+    key is not a scope filter but an abort gate: sort's goldens describe Linux
+    and mkdir's describe Darwin, so on the wrong host the runner must refuse
+    rather than report host artifacts as behavior. Omitting it would let this
+    measurement silently fingerprint the platform instead of the candidate.
+
+    `scope_overrides` is how the visible pass narrows to the corpus the
+    checkpoint was really judged on; see `visible_scope_overrides`.
     """
     config: dict[str, Any] = {
         "paths": {"candidate_bin": str(candidate_bin)},
@@ -312,6 +411,7 @@ def judging_config(
         required_platform = read_json(suite_config).get("required_platform")
         if required_platform:
             config["required_platform"] = required_platform
+    config.update(scope_overrides or {})
     destination.write_text(json.dumps(config), encoding="utf-8")
     return destination
 
@@ -336,6 +436,7 @@ def rebuild_candidate(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         check=False,
+        timeout=BUILD_TIMEOUT_SECONDS,
     )
 
 
@@ -370,11 +471,12 @@ def judge(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         check=False,
+        timeout=JUDGE_TIMEOUT_SECONDS,
     )
     if not report_path.is_file():
         raise RuntimeError(
             f"runner.py wrote no report (exit {completed.returncode}): "
-            f"{(completed.stdout or '').strip()[-800:]}"
+            f"{output_tail(completed.stdout)}"
         )
     try:
         return read_json(report_path)
@@ -408,29 +510,65 @@ def measure_run(
         }
 
     workdir.mkdir(parents=True, exist_ok=True)
-    build = rebuild_candidate(
-        candidate_source, workdir, source_workdir_path, build_command
-    )
+    try:
+        build = rebuild_candidate(
+            candidate_source, workdir, source_workdir_path, build_command
+        )
+    except subprocess.TimeoutExpired as error:
+        # A hang deserves the same treatment as a compile error: it is one
+        # candidate's outcome, recorded, not a reason to abandon the condition.
+        return {
+            "status": UNMEASURED_REBUILD_FAILED,
+            "detail": (
+                f"build timed out after {BUILD_TIMEOUT_SECONDS}s: "
+                f"{output_tail(error.output)}"
+            ),
+        }
     binary = workdir / binary_relative_path
     if build.returncode != 0 or not binary.is_file():
         return {
             "status": UNMEASURED_REBUILD_FAILED,
             "detail": (
-                f"build exited {build.returncode}: "
-                f"{(build.stdout or '').strip()[-800:]}"
+                f"build exited {build.returncode}: {output_tail(build.stdout)}"
             ),
         }
 
-    config = judging_config(
-        suite_root, binary, flags, workdir / "execution-consistency-config.json"
+    # Two configs, deliberately. The visible pass reproduces the scope the
+    # checkpoint was really judged and repaired under; the held-out pass keeps
+    # matching `heldout_judge.py`'s config exactly.
+    visible_config = judging_config(
+        suite_root,
+        binary,
+        flags,
+        workdir / "visible-config.json",
+        scope_overrides=visible_scope_overrides(suite_root),
+    )
+    heldout_config = judging_config(
+        suite_root, binary, flags, workdir / "heldout-config.json"
     )
     try:
         visible = judge(
-            suite_root, visible_corpora, config, binary, workdir / "visible-report.json"
+            suite_root,
+            visible_corpora,
+            visible_config,
+            binary,
+            workdir / "visible-report.json",
         )
         heldout = judge(
-            suite_root, [heldout_corpus], config, binary, workdir / "heldout-report.json"
+            suite_root,
+            [heldout_corpus],
+            heldout_config,
+            binary,
+            workdir / "heldout-report.json",
         )
+    except subprocess.TimeoutExpired as error:
+        return {
+            "status": UNMEASURED_JUDGE_FAILED,
+            "detail": (
+                f"judging timed out after {JUDGE_TIMEOUT_SECONDS}s: "
+                f"{output_tail(error.output)}"
+            ),
+        }
     except RuntimeError as error:
         return {"status": UNMEASURED_JUDGE_FAILED, "detail": str(error)}
 
