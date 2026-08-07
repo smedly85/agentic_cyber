@@ -50,6 +50,7 @@ from analysis.diversity_metrics import (
     exact_repetition_summary,
     family_discovery_auc_summary,
     family_discovery_curve,
+    primary_population,
     threshold_sensitivity as family_threshold_sensitivity,
     wilson_interval,
 )
@@ -3262,12 +3263,16 @@ def main() -> int:
         for row in rows
         if bool(row.get("overall_success"))
     ]
-    passing_architecture_ids = [
-        run_id for run_id in passing_ids if run_id in complete_architecture_ids
-    ]
-    passing_strategy_ids = [
-        run_id for run_id in passing_ids if run_id in complete_strategy_ids
-    ]
+    # One definition of "the primary population", in diversity_metrics, rather
+    # than one here and one there: successful runs whose representation was
+    # measured completely, with the coverage that implies. The counts reported
+    # in the summary below come from the same call.
+    architecture_primary = primary_population(
+        rows, "complete_architecture_measurement"
+    )
+    strategy_primary = primary_population(rows, "complete_strategy_measurement")
+    passing_architecture_ids = architecture_primary["run_ids"]
+    passing_strategy_ids = strategy_primary["run_ids"]
 
     population_ids = {
         "all_runs": run_ids,
@@ -3847,14 +3852,14 @@ def main() -> int:
         "runs_analyzed": n,
         "successful_runs": successful,
         "reliability": reliability_summary,
-        "architecture_population_n": len(passing_architecture_ids),
-        "architecture_measurement_coverage": (
-            len(passing_architecture_ids) / successful if successful else None
-        ),
-        "strategy_population_n": len(passing_strategy_ids),
-        "strategy_measurement_coverage": (
-            len(passing_strategy_ids) / successful if successful else None
-        ),
+        "architecture_population_n": architecture_primary["population_n"],
+        "architecture_measurement_coverage": architecture_primary[
+            "measurement_coverage"
+        ],
+        "strategy_population_n": strategy_primary["population_n"],
+        "strategy_measurement_coverage": strategy_primary[
+            "measurement_coverage"
+        ],
         "success_ratio": successful / n if n else None,
         "diversity_k_max": diversity_k_max,
         "analysis_configuration": analysis_configuration,

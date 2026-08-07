@@ -183,6 +183,91 @@ def write_csv(path: Path, rows: list[dict[str, Any]], columns: list[str]) -> Non
 
 
 # ---------------------------------------------------------------------------
+# Locating a stage's files
+# ---------------------------------------------------------------------------
+
+
+def lineage_directory(record: Mapping[str, Any]) -> Path:
+    """Where this lineage actually lives, as `load_run` resolved it.
+
+    `load_run` is the only thing that knows the root the caller asked for, so a
+    record that did not come through it cannot be located on disk and must say
+    so rather than fall back to a recorded string.
+    """
+    directory = record.get("_dir")
+    if not isinstance(directory, Path):
+        raise LineageError(
+            f"lineage {record.get('lineage_id')!r} was not loaded through "
+            "load_run(), so its location under --lineage-root is unknown"
+        )
+    return directory
+
+
+def resolve_stage_paths(
+    lineage_dir: Path, stage: Mapping[str, Any]
+) -> dict[str, Path]:
+    """Where one stage's files are NOW, derived from the root being analyzed.
+
+    A stage record stores `stage_dir`, `attempt_dir`, `candidate` and
+    `test_bundle_dir` as absolute paths baked in when the run was generated.
+    Those are provenance -- what happened, on the machine it happened on -- and
+    they are wrong as filesystem locations the moment the run is copied to
+    another host or the run directory is renamed, both of which have already
+    happened to runs in this repository. Opening them directly made an analysis
+    fail on a run whose files were all present and intact.
+
+    So every location is rebuilt here from `--lineage-root` (which `load_run`
+    resolved into `_dir`), the stage's own `checkpoint_id`, and the layout
+    `run_lineage_experiment.sh` writes:
+
+        <lineage_dir>/<checkpoint_id>/temp-<slug>/attempt-NNN/candidate/<basename>
+        <lineage_dir>/<checkpoint_id>/test-bundle
+
+    The temperature slug and attempt number are found by globbing rather than by
+    editing the recorded string, because the recorded string is exactly what
+    cannot be trusted. A stage that does not resolve to exactly one attempt
+    directory is an error: picking one of several would silently attribute a
+    measurement to whichever the filesystem happened to list first.
+    """
+    checkpoint_id = stage.get("checkpoint_id")
+    if checkpoint_id is None:
+        raise LineageError(
+            f"a stage of {lineage_dir.name} has no checkpoint_id, so its files "
+            "cannot be located under the lineage root"
+        )
+    stage_dir = lineage_dir / str(checkpoint_id)
+    attempts = sorted(
+        path for path in stage_dir.glob("temp-*/attempt-*") if path.is_dir()
+    )
+    if not attempts:
+        raise LineageError(
+            f"no temp-*/attempt-* directory under {stage_dir}; the stage's "
+            "files are not present under --lineage-root"
+        )
+    if len(attempts) > 1:
+        raise LineageError(
+            f"{len(attempts)} temp-*/attempt-* directories under {stage_dir} "
+            f"({', '.join(path.name for path in attempts)}); a stage must have "
+            "exactly one, and guessing which one produced the recorded "
+            "candidate would be a fabricated measurement"
+        )
+    attempt_dir = attempts[0]
+
+    basename = stage.get("candidate_source_basename")
+    if not basename:
+        raise LineageError(
+            f"stage {checkpoint_id} of {lineage_dir.name} records no "
+            "candidate_source_basename, so its candidate cannot be named"
+        )
+    return {
+        "stage_dir": stage_dir,
+        "attempt_dir": attempt_dir,
+        "test_bundle_dir": stage_dir / "test-bundle",
+        "candidate": attempt_dir / "candidate" / str(basename),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Loading
 # ---------------------------------------------------------------------------
 
@@ -576,9 +661,16 @@ def change_between(before: Path, after: Path) -> dict[str, Any]:
     return metrics
 
 
-def stage_source(stage: Mapping[str, Any]) -> Path | None:
-    candidate = stage.get("candidate")
-    return Path(str(candidate)) if candidate else None
+def stage_source(lineage_dir: Path, stage: Mapping[str, Any]) -> Path | None:
+    """The candidate this stage produced, located under the root being analyzed.
+
+    The recorded `candidate` field decides only WHETHER a candidate exists: the
+    controller writes null there for a stage that produced none. Where it is is
+    resolved locally; see `resolve_stage_paths`.
+    """
+    if not stage.get("candidate"):
+        return None
+    return resolve_stage_paths(lineage_dir, stage)["candidate"]
 
 
 def build_transitions(lineages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -590,13 +682,14 @@ def build_transitions(lineages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     rows: list[dict[str, Any]] = []
     for record in lineages:
+        lineage_dir = lineage_directory(record)
         previous: dict[str, Any] | None = None
         for stage in record.get("stages", []):
             if not stage.get("success"):
                 break
-            after = stage_source(stage)
+            after = stage_source(lineage_dir, stage)
             if previous is not None and after is not None:
-                before = stage_source(previous)
+                before = stage_source(lineage_dir, previous)
                 row = {
                     "lineage_id": record.get("lineage_id"),
                     "from_checkpoint": previous.get("checkpoint_id"),
@@ -639,7 +732,9 @@ def build_total_change(lineages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         stages = record.get("stages", [])
         if len(stages) < 2:
             continue
-        first, last = stage_source(stages[0]), stage_source(stages[-1])
+        lineage_dir = lineage_directory(record)
+        first = stage_source(lineage_dir, stages[0])
+        last = stage_source(lineage_dir, stages[-1])
         if first is None or last is None:
             continue
         row = {
@@ -694,8 +789,12 @@ def check_seed_provenance(lineages: list[dict[str, Any]]) -> list[str]:
 
 def population_members(
     lineages: list[dict[str, Any]], checkpoint: str | None
-) -> list[tuple[str, dict[str, Any]]]:
-    """(lineage_id, stage) pairs for one population.
+) -> list[tuple[str, Path, dict[str, Any]]]:
+    """(lineage_id, lineage_dir, stage) triples for one population.
+
+    The lineage's own directory travels with the member because a stage's files
+    are located from it, never from the paths the stage recorded at generation
+    time; see `resolve_stage_paths`.
 
     checkpoint=None selects the FINAL population: the last stage of every
     lineage that completed every checkpoint. Otherwise it selects every lineage
@@ -707,18 +806,22 @@ def population_members(
         if checkpoint is None:
             if not is_successful(record) or not stages:
                 continue
-            members.append((record["lineage_id"], stages[-1]))
+            members.append(
+                (record["lineage_id"], lineage_directory(record), stages[-1])
+            )
             continue
         for stage in stages:
             if str(stage.get("checkpoint_id")) == checkpoint and stage.get("success"):
-                members.append((record["lineage_id"], stage))
+                members.append(
+                    (record["lineage_id"], lineage_directory(record), stage)
+                )
                 break
     return members
 
 
 def materialize_view(
     view_dir: Path,
-    members: list[tuple[str, dict[str, Any]]],
+    members: list[tuple[str, Path, dict[str, Any]]],
     run_metadata: dict[str, Any],
     label: str,
 ) -> Path:
@@ -742,14 +845,18 @@ def materialize_view(
     if view_dir.exists():
         shutil.rmtree(view_dir)
     source_basename = run_metadata.get("source_basename") or (
-        members[0][1].get("candidate_source_basename") if members else "source.c"
+        members[0][2].get("candidate_source_basename") if members else "source.c"
     )
     (view_dir / "baseline").mkdir(parents=True, exist_ok=True)
     (view_dir / "baseline" / source_basename).write_bytes(b"")
 
     index = []
-    for number, (lineage_id, stage) in enumerate(members, start=1):
-        attempt_source = Path(str(stage.get("attempt_dir")))
+    for number, (lineage_id, lineage_dir, stage) in enumerate(members, start=1):
+        # Resolved from the lineage root, never from the stage's recorded
+        # absolute paths: those were written on the generating machine and are
+        # stale on any other one, or after the run directory is renamed.
+        located = resolve_stage_paths(lineage_dir, stage)
+        attempt_source = located["attempt_dir"]
         attempt_target = view_dir / f"attempt-{number:03d}"
         (attempt_target / "candidate").mkdir(parents=True, exist_ok=True)
 
@@ -768,9 +875,9 @@ def materialize_view(
         )
         write_json(attempt_target / "metadata.json", metadata)
 
-        candidate = Path(str(stage.get("candidate")))
+        candidate = located["candidate"]
         if not candidate.is_file():
-            raise LineageError(f"recorded candidate is missing: {candidate}")
+            raise LineageError(f"candidate is missing: {candidate}")
         shutil.copy2(candidate, attempt_target / "candidate" / source_basename)
         for name in VIEW_ATTEMPT_FILES:
             origin = attempt_source / name
@@ -1126,7 +1233,7 @@ def main(argv: list[str] | None = None) -> int:
                 "label": label,
                 "checkpoint_id": checkpoint,
                 "members": len(members),
-                "lineage_ids": [lineage_id for lineage_id, _ in members],
+                "lineage_ids": [lineage_id for lineage_id, _, _ in members],
                 "analysis_dir": None,
                 "returncode": None,
             }

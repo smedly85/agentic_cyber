@@ -722,27 +722,24 @@ class PopulationViewTests(unittest.TestCase):
         self.root = make_lineage_root(
             Path(self.temp.name) / "lineages", [None, None, 2]
         )
-        self.run_metadata = json.loads(
-            (self.root / "lineages.json").read_text(encoding="utf-8")
-        )
-        self.lineages = [
-            json.loads((self.root / f"lineage-{n:03d}" / "lineage.json").read_text(
-                encoding="utf-8"))
-            for n in (1, 2, 3)
-        ]
+        # Through load_run, because that is what resolves each lineage's
+        # location under --lineage-root; a stage's files are found from there.
+        self.run_metadata, self.lineages, _ = analyze_lineages.load_run(self.root)
 
     def test_final_population_holds_only_completed_lineages(self):
         members = analyze_lineages.population_members(self.lineages, None)
         self.assertEqual(
-            [lineage_id for lineage_id, _ in members],
+            [lineage_id for lineage_id, _, _ in members],
             ["lineage-001", "lineage-002"],
         )
-        self.assertTrue(all(stage["checkpoint_id"] == "002" for _, stage in members))
+        self.assertTrue(
+            all(stage["checkpoint_id"] == "002" for _, _, stage in members)
+        )
 
     def test_intermediate_population_includes_lineages_that_later_stopped(self):
         members = analyze_lineages.population_members(self.lineages, "001")
         self.assertEqual(
-            [lineage_id for lineage_id, _ in members],
+            [lineage_id for lineage_id, _, _ in members],
             ["lineage-001", "lineage-002", "lineage-003"],
         )
 
@@ -1319,14 +1316,11 @@ class FinalPopulationBaselineTests(unittest.TestCase):
             self.assertIn(name, baseline["unsupported_metrics"])
 
     def test_view_metadata_carries_the_rationale_and_the_exclusions(self):
+        run_metadata, lineages, _ = analyze_lineages.load_run(self.root)
         view = analyze_lineages.materialize_view(
             Path(self.temp.name) / "view",
-            analyze_lineages.population_members(
-                [json.loads((self.root / f"lineage-{n:03d}" / "lineage.json")
-                            .read_text(encoding="utf-8")) for n in (1, 2, 3)],
-                None,
-            ),
-            json.loads((self.root / "lineages.json").read_text(encoding="utf-8")),
+            analyze_lineages.population_members(lineages, None),
+            run_metadata,
             "final",
         )
         metadata = json.loads((view / "experiment.json").read_text(encoding="utf-8"))
@@ -1339,18 +1333,16 @@ class FinalPopulationBaselineTests(unittest.TestCase):
         # diff-numstat records churn against the stage's own seed. Copying it
         # into a view with a different baseline would make an inconsistent
         # number look consistent.
-        members = analyze_lineages.population_members(
-            [json.loads((self.root / f"lineage-{n:03d}" / "lineage.json")
-                        .read_text(encoding="utf-8")) for n in (1, 2)],
-            None,
-        )
-        attempt = Path(members[0][1]["attempt_dir"])
+        run_metadata, lineages, _ = analyze_lineages.load_run(self.root)
+        members = analyze_lineages.population_members(lineages, None)
+        _, lineage_dir, stage = members[0]
+        attempt = analyze_lineages.resolve_stage_paths(lineage_dir, stage)[
+            "attempt_dir"
+        ]
         (attempt / "diff-numstat.txt").write_text("9\t9\tnew_demo.c\n",
                                                   encoding="utf-8")
         view = analyze_lineages.materialize_view(
-            Path(self.temp.name) / "view2", members,
-            json.loads((self.root / "lineages.json").read_text(encoding="utf-8")),
-            "final",
+            Path(self.temp.name) / "view2", members, run_metadata, "final",
         )
         self.assertFalse((view / "attempt-001" / "diff-numstat.txt").exists())
 
@@ -1366,11 +1358,7 @@ class ChangeBaselineTests(unittest.TestCase):
         self.root = make_lineage_root(
             Path(self.temp.name) / "lineages", [None, None, 2]
         )
-        self.lineages = [
-            json.loads((self.root / f"lineage-{n:03d}" / "lineage.json")
-                       .read_text(encoding="utf-8"))
-            for n in (1, 2, 3)
-        ]
+        _, self.lineages, _ = analyze_lineages.load_run(self.root)
         self.recorded: list[tuple[str, str]] = []
 
         def recorder(before: Path, after: Path) -> dict:
@@ -1439,6 +1427,208 @@ class ChangeBaselineTests(unittest.TestCase):
     def test_a_stopped_lineage_contributes_no_total_change(self):
         rows = analyze_lineages.build_total_change(self.lineages)
         self.assertNotIn("lineage-003", [row["lineage_id"] for row in rows])
+
+
+class StaleRecordedPathTests(unittest.TestCase):
+    """A stage's recorded paths are provenance, not filesystem locations.
+
+    `run_lineage_experiment.sh` bakes absolute `stage_dir`, `attempt_dir`,
+    `candidate` and `test_bundle_dir` into every stage record at generation
+    time. Opening those directly made the analysis fail on any machine but the
+    generating one, and on any run directory that was renamed after the fact --
+    both of which happened to
+    `runs/formal/grep-qwen3-topk40-t0-p05-seed42-maxtok32768-loops1-n10`, whose
+    records still name a different home directory and an older run name, in
+    more than one mangled variant. Every file must therefore be located from
+    `--lineage-root` instead.
+
+    The corruption here is deliberately worse than the real one: two different
+    bogus prefixes, neither of which exists, while the actual files sit intact
+    under the root the test controls.
+    """
+
+    STALE_PREFIXES = (
+        "/nonexistent/other-machine/agentic_cyber/runs/old-run-name",
+        "/nonexistent/third-machine/checkouts/agentic_cyber/runs/renamed-run",
+    )
+
+    def setUp(self):
+        import tempfile
+
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = make_lineage_root(
+            Path(self.temp.name) / "lineages", [None, None, 2]
+        )
+        self.output = Path(self.temp.name) / "analysis"
+        self.corrupt_recorded_paths()
+
+        # What is under test is which files get opened, not what the churn
+        # formulas return, so the measurement itself is stubbed to keep these
+        # cases independent of Tree-sitter and GumTree being installed.
+        original = analyze_lineages.change_between
+        analyze_lineages.change_between = lambda before, after: {
+            "available": before.is_file() and after.is_file()
+        }
+        self.addCleanup(setattr, analyze_lineages, "change_between", original)
+
+    def corrupt_recorded_paths(self) -> None:
+        """Point every recorded location at a machine that does not exist."""
+        for number, directory in enumerate(sorted(self.root.glob("lineage-*"))):
+            prefix = self.STALE_PREFIXES[number % len(self.STALE_PREFIXES)]
+            record_path = directory / "lineage.json"
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            for stage in record["stages"]:
+                checkpoint = stage["checkpoint_id"]
+                stem = f"{prefix}/{directory.name}/{checkpoint}"
+                stage["stage_dir"] = stem
+                stage["attempt_dir"] = f"{stem}/temp-9p9/attempt-007"
+                stage["test_bundle_dir"] = f"{stem}/test-bundle"
+                if stage["candidate"]:
+                    stage["candidate"] = (
+                        f"{stem}/temp-9p9/attempt-007/candidate/new_demo.c"
+                    )
+                if stage["seed"]:
+                    stage["seed"] = f"{prefix}/{directory.name}/seed/new_demo.c"
+            record_path.write_text(json.dumps(record), encoding="utf-8")
+
+    def load(self):
+        return analyze_lineages.load_run(self.root)
+
+    def test_no_recorded_path_survives_the_corruption(self):
+        # Guards the fixture itself: if any recorded location still happened to
+        # exist, the tests below would pass without exercising anything.
+        _, lineages, _ = self.load()
+        for record in lineages:
+            for stage in record["stages"]:
+                for key in ("stage_dir", "attempt_dir", "test_bundle_dir",
+                            "candidate"):
+                    if stage.get(key):
+                        self.assertFalse(
+                            Path(stage[key]).exists(),
+                            f"{key} should be unusable in this fixture",
+                        )
+
+    def test_stage_paths_resolve_under_the_lineage_root(self):
+        _, lineages, _ = self.load()
+        record = lineages[0]
+        stage = record["stages"][0]
+        located = analyze_lineages.resolve_stage_paths(record["_dir"], stage)
+        self.assertEqual(located["stage_dir"], self.root / "lineage-001" / "000")
+        self.assertEqual(
+            located["attempt_dir"],
+            self.root / "lineage-001" / "000" / "temp-0" / "attempt-001",
+        )
+        self.assertEqual(
+            located["test_bundle_dir"],
+            self.root / "lineage-001" / "000" / "test-bundle",
+        )
+        self.assertTrue(located["candidate"].is_file())
+
+    def test_view_materializes_from_the_root_not_the_record(self):
+        run_metadata, lineages, _ = self.load()
+        members = analyze_lineages.population_members(lineages, None)
+        view = analyze_lineages.materialize_view(
+            Path(self.temp.name) / "view", members, run_metadata, "final"
+        )
+        attempts = sorted(view.glob("attempt-*"))
+        self.assertEqual(len(attempts), 2)
+        # The bytes must be the completed lineages' own final sources, not some
+        # other member's and not the empty baseline.
+        self.assertEqual(
+            [(attempt / "candidate" / "new_demo.c").read_text(encoding="utf-8")
+             for attempt in attempts],
+            ["int main(void){return 12;}\n", "int main(void){return 22;}\n"],
+        )
+        for attempt in attempts:
+            metadata = json.loads(
+                (attempt / "metadata.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(metadata["lineage_checkpoint_id"], "002")
+
+    def test_the_view_index_still_reports_what_the_record_said(self):
+        # Provenance is not silently rewritten to the local path: the index
+        # records where the file was written when the run was generated.
+        run_metadata, lineages, _ = self.load()
+        view = analyze_lineages.materialize_view(
+            Path(self.temp.name) / "view-index",
+            analyze_lineages.population_members(lineages, None),
+            run_metadata,
+            "final",
+        )
+        members = json.loads((view / "members.json").read_text(encoding="utf-8"))
+        self.assertTrue(
+            all(entry["candidate"].startswith("/nonexistent/")
+                for entry in members)
+        )
+
+    def test_change_measures_read_the_sources_under_the_root(self):
+        _, lineages, _ = self.load()
+        rows = analyze_lineages.build_transitions(lineages)
+        self.assertEqual(len(rows), 5)
+        for row in rows:
+            for key in ("baseline_source", "candidate_source"):
+                with self.subTest(row=row["lineage_id"], column=key):
+                    path = Path(row[key])
+                    self.assertTrue(path.is_file())
+                    self.assertTrue(path.is_relative_to(self.root))
+        total = analyze_lineages.build_total_change(lineages)
+        self.assertEqual([row["lineage_id"] for row in total],
+                         ["lineage-001", "lineage-002"])
+
+    def test_analysis_completes_and_writes_the_population_view(self):
+        # The analyzer subprocess is stubbed: what is under test is that the
+        # view is built at all, which is where the stale paths used to crash.
+        views: list[Path] = []
+
+        def fake_run_analyzer(view_dir, args):
+            views.append(view_dir)
+            return {"command": [], "returncode": 0,
+                    "analysis_dir": str(view_dir / "analysis")}
+
+        original = analyze_lineages.run_analyzer
+        analyze_lineages.run_analyzer = fake_run_analyzer
+        self.addCleanup(setattr, analyze_lineages, "run_analyzer", original)
+
+        code = analyze_lineages.main(
+            ["--lineage-root", str(self.root), "--output-dir", str(self.output),
+             "--checkpoint-diversity"]
+        )
+        self.assertEqual(code, 0)
+        report = json.loads(
+            (self.output / "lineage_report.json").read_text(encoding="utf-8")
+        )
+        final = next(p for p in report["populations"] if p["label"] == "final")
+        self.assertEqual(final["members"], 2)
+        self.assertNotIn("skipped", final)
+        self.assertEqual(
+            sorted(view.name for view in views),
+            ["checkpoint-000", "checkpoint-001", "checkpoint-002", "final"],
+        )
+        for view in views:
+            self.assertTrue(any(view.glob("attempt-*/candidate/new_demo.c")))
+
+    def test_an_ambiguous_attempt_directory_is_refused(self):
+        # Two attempt directories under one stage: which produced the recorded
+        # candidate is unknowable, and picking one would fabricate the answer.
+        (self.root / "lineage-001" / "000" / "temp-1" / "attempt-001").mkdir(
+            parents=True
+        )
+        _, lineages, _ = self.load()
+        with self.assertRaises(analyze_lineages.LineageError) as caught:
+            analyze_lineages.resolve_stage_paths(
+                lineages[0]["_dir"], lineages[0]["stages"][0]
+            )
+        self.assertIn("exactly one", str(caught.exception))
+
+    def test_a_missing_attempt_directory_is_refused(self):
+        shutil.rmtree(self.root / "lineage-001" / "000" / "temp-0")
+        _, lineages, _ = self.load()
+        with self.assertRaises(analyze_lineages.LineageError) as caught:
+            analyze_lineages.resolve_stage_paths(
+                lineages[0]["_dir"], lineages[0]["stages"][0]
+            )
+        self.assertIn("not present under --lineage-root", str(caught.exception))
 
 
 class RunnerTestDirDestinationTests(unittest.TestCase):
