@@ -27,6 +27,7 @@ from shlex import quote as shlex_quote
 import subprocess
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 from typing import Any
 
@@ -72,6 +73,21 @@ def analyzer_or_none():
         import analyze_experiment
 
         return analyze_experiment
+    except Exception:                                   # noqa: BLE001
+        return None
+
+
+def measure_or_none():
+    """`scripts/measure_execution_consistency.py`, or None when its stack is missing.
+
+    The same gate as `analyzer_or_none`, for the same reason: that module
+    imports `analysis/diversity_metrics`, which imports NumPy, and this file is
+    deliberately NumPy-free (see the module docstring).
+    """
+    try:
+        import measure_execution_consistency
+
+        return measure_execution_consistency
     except Exception:                                   # noqa: BLE001
         return None
 
@@ -378,6 +394,37 @@ CHECKPOINTS = [
 ]
 
 
+def program_of(basename: str) -> str:
+    """`new_grep.c` -> `new_grep`, the repository's candidate-binary name."""
+    return Path(basename).stem
+
+
+def utility_of(basename: str) -> str:
+    """`new_grep.c` -> `grep`, which names the suite that judges it."""
+    stem = program_of(basename)
+    return stem[len("new_"):] if stem.startswith("new_") else stem
+
+
+def stage_build_command(basename: str) -> str:
+    program = program_of(basename)
+    return (
+        f"mkdir -p build && cc -std=c11 -Wall -Wextra -Werror -pedantic -O2 "
+        f"src/{program}/{basename} -o build/{program}"
+    )
+
+
+def stage_feature_test_command(basename: str, flags: list[str]) -> str:
+    """The judge call a stage records, in the shape the manifests fix:
+    `<judge script> <candidate binary> [FLAG...]`."""
+    return " ".join(
+        [
+            f"tests/{utility_of(basename)}-test-suite/judge_candidate.sh",
+            f"build/{program_of(basename)}",
+            *flags,
+        ]
+    )
+
+
 def make_stage(
     root: Path,
     lineage_id: str,
@@ -388,6 +435,7 @@ def make_stage(
     source: str,
     seed: Path | None,
     repair_loops: int = 0,
+    basename: str = "new_demo.c",
 ) -> dict:
     attempt = root / lineage_id / checkpoint["id"] / "temp-0" / "attempt-001"
     (attempt / "candidate").mkdir(parents=True, exist_ok=True)
@@ -405,7 +453,28 @@ def make_stage(
         ),
         encoding="utf-8",
     )
-    candidate = attempt / "candidate" / "new_demo.c"
+    flags = [f"-f{n}" for n in range(index)]
+    # The per-checkpoint experiment.json the stage run writes next to its
+    # attempt. It is where the build command lives -- the stage record does not
+    # carry one -- so a fixture without it cannot exercise what a view has to
+    # carry across to measure_execution_consistency.py.
+    (attempt.parent / "experiment.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "model": "demo/model",
+                "temperature": 0.0,
+                "source_path": basename,
+                "source_workdir_path": f"src/{program_of(basename)}/{basename}",
+                "source_mode": "new" if index == 0 else "existing",
+                "build_command": stage_build_command(basename),
+                "base_test_command": "",
+                "feature_test_command": stage_feature_test_command(basename, flags),
+            }
+        ),
+        encoding="utf-8",
+    )
+    candidate = attempt / "candidate" / basename
     candidate_sha = None
     if success:
         candidate.write_text(source, encoding="utf-8")
@@ -416,11 +485,12 @@ def make_stage(
         "checkpoint_name": checkpoint["name"],
         "prompt": f"prompts/demo/{checkpoint['id']}.md",
         "source_mode": "new" if index == 0 else "existing",
-        "implemented_flags": [f"-f{n}" for n in range(index)],
+        "implemented_flags": flags,
+        "feature_test_command": stage_feature_test_command(basename, flags),
         "attempt_dir": attempt.as_posix(),
         "stage_dir": (root / lineage_id / checkpoint["id"]).as_posix(),
         "candidate": candidate.as_posix() if success else None,
-        "candidate_source_basename": "new_demo.c",
+        "candidate_source_basename": basename,
         "candidate_sha256": candidate_sha,
         "seed": seed.as_posix() if seed else None,
         "seed_sha256": sha256_text(seed.read_text(encoding="utf-8")) if seed else None,
@@ -438,23 +508,30 @@ def make_stage(
     }
 
 
-def make_lineage_root(root: Path, outcomes: list[int | None]) -> Path:
+def make_lineage_root(
+    root: Path, outcomes: list[int | None], *, basename: str = "new_demo.c"
+) -> Path:
     """Build a lineage run. Each entry in `outcomes` is a lineage: None means it
-    completed, an integer is the index of the checkpoint it stopped at."""
+    completed, an integer is the index of the checkpoint it stopped at.
+
+    `basename` names the candidate source, and through it the utility. It stays
+    `new_demo.c` by default because most of these tests care only about
+    aggregation; a test that hands the materialized view to a tool which looks
+    up `tests/<utility>-test-suite/` passes a real utility instead."""
     root.mkdir(parents=True, exist_ok=True)
     (root / "lineages.json").write_text(
         json.dumps(
             {
                 "schema_version": 1,
                 "experiment_unit": "lineage",
-                "utility": "demo",
-                "program": "new_demo",
+                "utility": utility_of(basename),
+                "program": program_of(basename),
                 "model": "demo/model",
                 "temperature": 0.0,
                 "agent": "build",
                 "max_loops": 3,
-                "source_path": "src/new_demo/new_demo.c",
-                "source_basename": "new_demo.c",
+                "source_path": f"src/{program_of(basename)}/{basename}",
+                "source_basename": basename,
                 "config_fingerprint": "fp",
                 "checkpoints": CHECKPOINTS,
             }
@@ -474,6 +551,7 @@ def make_lineage_root(root: Path, outcomes: list[int | None]) -> Path:
                 source=f"int main(void){{return {number}{index};}}\n",
                 seed=seed,
                 repair_loops=1 if index == 1 else 0,
+                basename=basename,
             )
             stages.append(stage)
             if not success:
@@ -498,7 +576,7 @@ def make_lineage_root(root: Path, outcomes: list[int | None]) -> Path:
                     "failure_stage": None if completed
                     else CHECKPOINTS[stop_at]["id"],
                     "failure_reason": None if completed else "validation_failed",
-                    "final_source": "final/new_demo.c" if completed else None,
+                    "final_source": f"final/{basename}" if completed else None,
                     "stages": stages,
                 }
             ),
@@ -507,7 +585,7 @@ def make_lineage_root(root: Path, outcomes: list[int | None]) -> Path:
         if completed:
             final = root / lineage_id / "final"
             final.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(Path(stages[-1]["candidate"]), final / "new_demo.c")
+            shutil.copy2(Path(stages[-1]["candidate"]), final / basename)
     return root
 
 
@@ -780,6 +858,196 @@ class PopulationViewTests(unittest.TestCase):
         )
         for entry in members:
             self.assertTrue(Path(entry["candidate"]).is_file())
+
+
+class ViewFeedsEveryDownstreamAnalysisTests(unittest.TestCase):
+    """A materialized population is an input to every analysis, not just one.
+
+    `materialize_view` was written to satisfy `analyze_experiment.py`, and was
+    only ever tested against it -- so the view recorded exactly the keys the
+    diversity analyzer reads and nothing else.
+    `docs/execution_consistency_methodology.md` meanwhile tells a reader to
+    point `scripts/measure_execution_consistency.py --experiment` at "whatever
+    population directory scripts/analyze_lineages.py materialized, exactly as
+    the diversity measurement is pointed at one". Doing that crashed with
+    `KeyError: 'feature_test_command'`, and would have crashed next on
+    `build_command`: the two things that tool needs to know the checkpoint's
+    cumulative flag scope and how to rebuild a candidate.
+
+    Asserting the two keys exist would not have caught this, because nobody
+    knew to assert them. So the test runs the other consumer against the view.
+
+    The rebuild-and-judge pass is stubbed: it needs a C toolchain and several
+    minutes per candidate, and what is under test is whether the view is a
+    valid input, not whether the suite judges correctly -- that is
+    tests/test_execution_consistency.py's job.
+    """
+
+    def setUp(self):
+        import tempfile
+
+        self.temp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        # A real utility: measure_execution_consistency.py resolves
+        # tests/<utility>-test-suite/ from the view's source_path, and refuses
+        # a utility whose suite or held-out corpus does not exist.
+        self.root = make_lineage_root(
+            self.temp / "lineages", [None, None, 2], basename="new_grep.c"
+        )
+        self.run_metadata, self.lineages, _ = analyze_lineages.load_run(self.root)
+
+    def materialize(self, label: str = "final", checkpoint: str | None = None) -> Path:
+        return analyze_lineages.materialize_view(
+            self.temp / f"view-{label}",
+            analyze_lineages.population_members(self.lineages, checkpoint),
+            self.run_metadata,
+            label,
+        )
+
+    def test_the_view_records_the_checkpoints_judge_call_and_build_command(self):
+        experiment = json.loads(
+            (self.materialize() / "experiment.json").read_text(encoding="utf-8")
+        )
+        # Carried from the checkpoint the population was drawn from -- the
+        # final one, which the fixture gives two cumulative flags.
+        self.assertEqual(
+            experiment["feature_test_command"],
+            "tests/grep-test-suite/judge_candidate.sh build/new_grep -f0 -f1",
+        )
+        self.assertIn("-o build/new_grep", experiment["build_command"])
+
+    def test_an_intermediate_view_records_that_checkpoints_own_scope(self):
+        """The flag scope is the population's, not the run's last one."""
+        experiment = json.loads(
+            (self.materialize("checkpoint-001", "001") / "experiment.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            experiment["feature_test_command"],
+            "tests/grep-test-suite/judge_candidate.sh build/new_grep -f0",
+        )
+
+    def measured(self, **kwargs) -> dict[str, Any]:
+        """Stand in for the rebuild-and-judge pass, with a fingerprint per run."""
+        run_id = Path(kwargs["candidate_source"]).parent.parent.name
+        return {
+            "status": "measured",
+            "visible_case_count": 51,
+            "heldout_case_count": 29,
+            "visible_failure_count": 0,
+            "heldout_failure_count": 1,
+            "visible_fingerprint_sha256": "V1",
+            "heldout_fingerprint_sha256": f"H-{run_id}",
+            "combined_fingerprint_sha256": f"C-{run_id}",
+        }
+
+    def test_measure_execution_consistency_runs_against_the_view(self):
+        measure = measure_or_none()
+        if measure is None:
+            self.skipTest(
+                "measure_execution_consistency.py needs "
+                "scripts/analysis-requirements.txt"
+            )
+        view = self.materialize()
+        # Stands in for analyze_experiment.py, which normally runs over the
+        # view first and whose determination of success and of family
+        # membership this tool reads rather than re-derives. Running the real
+        # analyzer here would pull in the clustering stack this file avoids.
+        (view / "analysis").mkdir(parents=True, exist_ok=True)
+        (view / "analysis" / "per_run_metrics.csv").write_text(
+            "run_id,overall_success,architecture_cluster_id,strategy_cluster_id\n"
+            "attempt-001,True,0,0\n"
+            "attempt-002,True,0,1\n",
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(measure, "measure_run", self.measured):
+            code = measure.main(["--experiment", str(view), "--clean-output"])
+        self.assertEqual(code, 0)
+
+        summary = json.loads(
+            (view / "analysis" / "execution_consistency" / "summary.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        # Every one of these came out of the view rather than out of a manifest,
+        # and each is a value the view did not previously carry.
+        self.assertEqual(summary["utility"], "grep")
+        self.assertEqual(summary["implemented_flags"], ["-f0", "-f1"])
+        self.assertEqual(summary["candidate_binary"], "build/new_grep")
+        self.assertEqual(summary["population"]["measured_runs"], 2)
+        self.assertEqual(summary["population"]["unmeasured_runs"], [])
+
+    def test_members_that_disagree_on_the_build_command_are_refused(self):
+        """Corrupted data must not be resolved by picking a value.
+
+        Every member of one population is the same checkpoint of the same
+        condition, so one build command describes all of them. If that stops
+        being true the view cannot describe itself, and silently taking the
+        first member's would attribute every rebuild to a configuration the
+        others were not produced under.
+        """
+        stage_experiment = (
+            self.root / "lineage-002" / "002" / "temp-0" / "experiment.json"
+        )
+        recorded = json.loads(stage_experiment.read_text(encoding="utf-8"))
+        recorded["build_command"] = "cc -O0 src/new_grep/new_grep.c -o build/new_grep"
+        stage_experiment.write_text(json.dumps(recorded), encoding="utf-8")
+
+        with self.assertRaises(analyze_lineages.LineageError) as caught:
+            self.materialize("mixed")
+        message = str(caught.exception)
+        self.assertIn("build_command", message)
+        self.assertIn("-O0", message)
+        # Names the population, so a reader knows which view was refused.
+        self.assertIn("mixed", message)
+
+    def test_members_that_disagree_on_the_judge_call_are_refused(self):
+        record_path = self.root / "lineage-002" / "lineage.json"
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        record["stages"][-1]["feature_test_command"] = (
+            "tests/grep-test-suite/judge_candidate.sh build/new_grep -f0 -f1 -f2"
+        )
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+        _, lineages, _ = analyze_lineages.load_run(self.root)
+
+        with self.assertRaises(analyze_lineages.LineageError) as caught:
+            analyze_lineages.materialize_view(
+                self.temp / "view-flags",
+                analyze_lineages.population_members(lineages, None),
+                self.run_metadata,
+                "final",
+            )
+        message = str(caught.exception)
+        self.assertIn("feature_test_command", message)
+        self.assertIn("-f2", message)
+
+    def test_a_run_that_recorded_neither_still_materializes(self):
+        """Absence is not disagreement.
+
+        `materialize_view` is on the diversity path, so a run predating either
+        field must still produce a view: the keys are written as null, which is
+        a view that cannot be measured for execution consistency rather than a
+        lineage analysis that cannot run at all.
+        """
+        for lineage in ("lineage-001", "lineage-002"):
+            (self.root / lineage / "002" / "temp-0" / "experiment.json").unlink()
+            record_path = self.root / lineage / "lineage.json"
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            for stage in record["stages"]:
+                stage.pop("feature_test_command", None)
+            record_path.write_text(json.dumps(record), encoding="utf-8")
+        _, lineages, _ = analyze_lineages.load_run(self.root)
+
+        view = analyze_lineages.materialize_view(
+            self.temp / "view-legacy",
+            analyze_lineages.population_members(lineages, None),
+            self.run_metadata,
+            "final",
+        )
+        experiment = json.loads((view / "experiment.json").read_text(encoding="utf-8"))
+        self.assertIsNone(experiment["feature_test_command"])
+        self.assertIsNone(experiment["build_command"])
 
 
 # ---------------------------------------------------------------------------

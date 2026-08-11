@@ -819,6 +819,31 @@ def population_members(
     return members
 
 
+def agreed_value(values: set[str], key: str, label: str) -> str | None:
+    """The one value a population's members share for `key`, or None.
+
+    Every member of a materialized population is the same checkpoint of the
+    same condition by construction, so a population has exactly one of these.
+    That is verified rather than assumed: picking one of several would describe
+    the view with a configuration it does not have, and a reader of the view's
+    report would have no way to see it. Refused the same way `load_run` refuses
+    to pool lineages recorded under different `config_fingerprint` values.
+
+    Absent is not disagreement. `values` is collected from the members that
+    recorded something, so a run that recorded nothing yields None and the key
+    is written as null -- which keeps such a run analyzable for diversity,
+    where making it fatal would break analyses that work today.
+    """
+    if len(values) > 1:
+        raise LineageError(
+            f"members of population {label!r} disagree on {key} "
+            f"({sorted(values)}); every member of a population is the same "
+            "checkpoint under the same condition, so choosing one of them "
+            "would describe the view with a configuration it does not have"
+        )
+    return next(iter(values), None)
+
+
 def materialize_view(
     view_dir: Path,
     members: list[tuple[str, Path, dict[str, Any]]],
@@ -841,6 +866,16 @@ def materialize_view(
     churn metric measures the program's size rather than a maintenance step.
     Those are listed by name in `baseline_dependent_metrics_unsupported` so a
     reader of the view's report cannot mistake them for change.
+
+    The view must be a valid input to EVERY downstream analysis, not only the
+    diversity analyzer it was first written for. `feature_test_command` and
+    `build_command` are therefore carried across as well: they are what
+    `scripts/measure_execution_consistency.py` reads to recover the
+    checkpoint's cumulative flag scope and to rebuild each candidate, and a
+    view without them crashed that tool on a population it is documented to
+    accept. Both are recorded per checkpoint rather than per run, and every
+    member of a population is the same checkpoint, so each has exactly one
+    value here; see `agreed_value`.
     """
     if view_dir.exists():
         shutil.rmtree(view_dir)
@@ -851,12 +886,33 @@ def materialize_view(
     (view_dir / "baseline" / source_basename).write_bytes(b"")
 
     index = []
+    # Collected across every member and checked for agreement below, never
+    # sampled from the first member. See `agreed_value`.
+    feature_test_commands: set[str] = set()
+    build_commands: set[str] = set()
     for number, (lineage_id, lineage_dir, stage) in enumerate(members, start=1):
         # Resolved from the lineage root, never from the stage's recorded
         # absolute paths: those were written on the generating machine and are
         # stale on any other one, or after the run directory is renamed.
         located = resolve_stage_paths(lineage_dir, stage)
         attempt_source = located["attempt_dir"]
+
+        # The judge call is on the stage record; the build command is not, and
+        # lives in the per-checkpoint experiment.json the stage run wrote
+        # alongside its attempt. Located from the same resolved attempt
+        # directory as everything else, so there is one way to find a stage's
+        # files rather than two that can disagree. A checkpoint that recorded
+        # no experiment.json contributes nothing rather than failing: this
+        # function is on the diversity path, which does not need either value.
+        recorded_judge = stage.get("feature_test_command")
+        if recorded_judge is not None:
+            feature_test_commands.add(str(recorded_judge))
+        stage_experiment = attempt_source.parent / "experiment.json"
+        if stage_experiment.is_file():
+            recorded_build = read_json(stage_experiment).get("build_command")
+            if recorded_build is not None:
+                build_commands.add(str(recorded_build))
+
         attempt_target = view_dir / f"attempt-{number:03d}"
         (attempt_target / "candidate").mkdir(parents=True, exist_ok=True)
 
@@ -895,6 +951,11 @@ def materialize_view(
             }
         )
 
+    feature_test_command = agreed_value(
+        feature_test_commands, "feature_test_command", label
+    )
+    build_command = agreed_value(build_commands, "build_command", label)
+
     write_json(
         view_dir / "experiment.json",
         {
@@ -916,6 +977,13 @@ def materialize_view(
             "source_workdir_path": run_metadata.get("source_path"),
             "source_mode": "new",
             "baseline_source_kind": "empty_new_source",
+            # Carried from the checkpoint the population was drawn from, and
+            # deliberately NOT synthesized: measure_execution_consistency.py
+            # recovers the checkpoint's cumulative flag scope from the first
+            # and rebuilds each candidate with the second, so a wrong value
+            # would be a wrong measurement rather than a missing one.
+            "feature_test_command": feature_test_command,
+            "build_command": build_command,
             "requested_runs": len(members),
             "config_fingerprint": run_metadata.get("config_fingerprint"),
             "baseline_rationale": (
