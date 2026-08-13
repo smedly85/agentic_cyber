@@ -45,31 +45,6 @@ Two denominators are reported and never conflated:
 A stopped lineage is never replaced with another attempt to round out the number
 of finished implementations.
 
-### Stage files are located from the root being analyzed
-
-Each stage record in `lineage.json` stores `stage_dir`, `attempt_dir`,
-`candidate` and `test_bundle_dir` as absolute paths, baked in on the machine
-that generated the run. Those are **provenance**, not addresses: they stop
-resolving the moment a run is copied to another host or its directory renamed,
-both of which have happened to runs kept here.
-
-`analyze_lineages.py` therefore never opens a recorded path. Its
-`resolve_stage_paths` rebuilds every location from `--lineage-root`, the stage's
-own `checkpoint_id`, and the layout the controller writes:
-
-```text
-<lineage_dir>/<checkpoint_id>/temp-<slug>/attempt-NNN/candidate/<basename>
-<lineage_dir>/<checkpoint_id>/test-bundle
-```
-
-The temperature slug and attempt number are found by globbing rather than by
-editing the recorded string, because the recorded string is exactly what cannot
-be trusted. A stage that resolves to zero or to more than one attempt directory
-is an error: choosing one of several would silently attribute a measurement to
-whichever the filesystem happened to list first. The recorded `candidate` field
-still decides *whether* a candidate exists — the controller writes null there
-for a stage that produced none — but never where it is.
-
 ### Materialized populations are valid input to every downstream tool
 
 Diversity is not reimplemented at the lineage level. For each population
