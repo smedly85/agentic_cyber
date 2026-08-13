@@ -7,6 +7,13 @@ separate forms of structural diversity among successful implementations. No
 single composite score combines correctness, diversity, cost, validation, or
 security diagnostics.
 
+Both forms of diversity defined here are **structural**. A third,
+non-structural dimension — behavioral and execution consistency, which compares
+successful candidates by the verdicts they produce when rebuilt and re-judged
+rather than by their source structure — is measured separately by
+`scripts/measure_execution_consistency.py` and defined in
+`docs/execution_consistency_methodology.md`.
+
 The methodology addresses a narrower question than semantic equivalence or
 vulnerability independence: given candidates that satisfy the configured
 validation contract, how reliably are they generated, and how varied are their
@@ -143,7 +150,12 @@ utility, where each stage inherits only the source produced by the previous
 stage of that same lineage, and where a stage that fails after its allowed
 repairs stops the lineage. `scripts/analyze_lineages.py` aggregates that level
 and then delegates every diversity measurement here by materializing each
-population as an ordinary experiment directory.
+population as an ordinary experiment directory. That materialized view also
+carries the checkpoint's own `build_command` and `feature_test_command` into its
+`experiment.json`, so the same directory is a valid input to the behavioral
+measurement of `docs/execution_consistency_methodology.md`, which recovers the
+checkpoint's cumulative flag scope and rebuilds each candidate from exactly
+those recorded values.
 
 Two denominators result, and both are reported rather than reconciled:
 

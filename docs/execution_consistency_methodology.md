@@ -279,8 +279,14 @@ only comparable within a fixed case set. Populations from different conditions
 are never pooled.
 
 For a lineage experiment, point it at whatever population directory
-`scripts/analyze_lineages.py` materialized, exactly as the diversity
-measurement is pointed at one. Nothing in this document changes for that case.
+`scripts/analyze_lineages.py` materialized — `<lineage-root>/analysis/populations/<label>/`
+— exactly as the diversity measurement is pointed at one. Nothing in this
+document changes for that case. The prerequisite above is satisfied by that same
+step rather than by a separate invocation: `analyze_lineages.py` runs
+`analyze_experiment.py` on each view it materializes, which is what writes the
+`analysis/per_run_metrics.csv` this measurement reads. It also carries the
+checkpoint's `build_command` and `feature_test_command` into the view's
+`experiment.json`, which is where the flag scope and the rebuild come from here.
 
 ## Limitations
 

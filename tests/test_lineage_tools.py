@@ -1050,6 +1050,176 @@ class ViewFeedsEveryDownstreamAnalysisTests(unittest.TestCase):
         self.assertIsNone(experiment["build_command"])
 
 
+class RematerializationGuardsExecutionConsistencyTests(unittest.TestCase):
+    """Rebuilding a population view must not silently destroy a measurement.
+
+    `materialize_view` clears its view directory before rewriting it, and
+    `scripts/measure_execution_consistency.py` writes into
+    `<view>/analysis/execution_consistency/` -- inside that very tree. So a
+    second `analyze_lineages.py --checkpoint-diversity`, run for any reason at
+    all including one unrelated to the population in question, deleted a
+    completed behavioral measurement with no warning. That is not hypothetical:
+    it destroyed a real, fully measured (7/7 coverage) population in this
+    repository, which had to be recovered from an earlier commit.
+
+    Recomputing one is expensive and, per
+    `docs/execution_consistency_methodology.md`, sometimes impossible: the
+    rebuild is not portable across host families. So the collision is refused,
+    and discarding the old result is something the caller has to say out loud.
+
+    The prior measurement is a marker file rather than a real
+    `measure_execution_consistency.py` run. What is under test is whether the
+    refusal fires on that directory's presence and what happens to it either
+    way, not what the tool writes inside it.
+    """
+
+    def setUp(self):
+        import tempfile
+
+        self.temp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.root = make_lineage_root(self.temp / "lineages", [None, None, 2])
+        self.run_metadata, self.lineages, _ = analyze_lineages.load_run(self.root)
+
+    def materialize(
+        self, label: str = "final", checkpoint: str | None = None, **kwargs
+    ) -> Path:
+        """Materialize one population, at a path fixed by its label.
+
+        The same label resolves to the same directory every time, which is what
+        makes a second call a re-materialization rather than a new view.
+        """
+        return analyze_lineages.materialize_view(
+            self.temp / f"view-{label}",
+            analyze_lineages.population_members(self.lineages, checkpoint),
+            self.run_metadata,
+            label,
+            **kwargs,
+        )
+
+    def plant_measurement(self, view: Path) -> Path:
+        """A stand-in for a completed measurement, at the path the real tool writes."""
+        marker = view / "analysis" / "execution_consistency" / "summary.json"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text('{"measured": true}\n', encoding="utf-8")
+        return marker
+
+    def test_rematerializing_over_a_measurement_is_refused(self):
+        view = self.materialize()
+        marker = self.plant_measurement(view)
+
+        with self.assertRaises(analyze_lineages.LineageError) as caught:
+            self.materialize()
+        message = str(caught.exception)
+        # The exact directory about to be destroyed, so the reader can go and
+        # move it rather than having to work out where it was.
+        self.assertIn(str(view / "analysis" / "execution_consistency"), message)
+        self.assertIn("--allow-execution-consistency-loss", message)
+        # Refused means nothing happened: the measurement and the view it
+        # describes are both still on disk.
+        self.assertTrue(marker.is_file())
+        self.assertEqual(marker.read_text(encoding="utf-8"), '{"measured": true}\n')
+        self.assertTrue((view / "experiment.json").is_file())
+
+    def test_every_population_is_guarded_not_only_the_final_one(self):
+        """`--checkpoint-diversity` materializes intermediate populations too.
+
+        Their measurements are no cheaper to reproduce than the final one's, so
+        a guard that only knew about `final` would leave most of the populations
+        in a run exposed.
+        """
+        view = self.materialize("checkpoint-001", "001")
+        marker = self.plant_measurement(view)
+
+        with self.assertRaises(analyze_lineages.LineageError) as caught:
+            self.materialize("checkpoint-001", "001")
+        self.assertIn("checkpoint-001", str(caught.exception))
+        self.assertTrue(marker.is_file())
+
+    def test_the_override_lets_the_rebuild_clear_the_measurement(self):
+        """The escape hatch for "I changed the data; that result is stale"."""
+        view = self.materialize()
+        marker = self.plant_measurement(view)
+
+        rebuilt = self.materialize(allow_execution_consistency_loss=True)
+
+        self.assertEqual(rebuilt, view)
+        self.assertFalse(marker.exists())
+        self.assertFalse((view / "analysis").exists())
+        # And the view really was rebuilt, not merely left alone.
+        self.assertTrue((view / "experiment.json").is_file())
+        self.assertEqual(len(sorted(view.glob("attempt-*"))), 2)
+
+    def test_a_population_never_measured_rematerializes_freely(self):
+        """The common case must not acquire any friction from this.
+
+        A first materialization, and every later one for a population nobody has
+        measured, has nothing to lose and is not asked about it.
+        """
+        first = self.materialize()
+        self.assertFalse((first / "analysis").exists())
+
+        second = self.materialize()
+
+        self.assertEqual(second, first)
+        self.assertTrue((second / "experiment.json").is_file())
+        self.assertEqual(len(sorted(second.glob("attempt-*"))), 2)
+
+    def test_an_unrelated_analysis_directory_is_not_treated_as_a_measurement(self):
+        """Only the execution-consistency output is protected.
+
+        `analyze_experiment.py` writes the rest of `<view>/analysis/` on every
+        run and regenerates it from the same inputs, so guarding that too would
+        refuse every ordinary re-analysis.
+        """
+        view = self.materialize()
+        (view / "analysis" / "diversity").mkdir(parents=True, exist_ok=True)
+        (view / "analysis" / "summary.json").write_text("{}", encoding="utf-8")
+
+        rebuilt = self.materialize()
+
+        self.assertFalse((rebuilt / "analysis").exists())
+        self.assertTrue((rebuilt / "experiment.json").is_file())
+
+    def test_the_command_line_flag_reaches_the_materialization(self):
+        """The refusal and the override both have to survive the CLI.
+
+        `run_analyzer` is stubbed: it shells out to `analyze_experiment.py`,
+        which needs the clustering stack this file deliberately does not import.
+        What matters here is which populations were materialized and what
+        happened to the measurement sitting in one of them.
+        """
+        output = self.temp / "analysis"
+        argv = [
+            "--lineage-root", str(self.root),
+            "--output-dir", str(output),
+            "--skip-change",
+        ]
+        def stub(view_dir, args):
+            return {
+                "command": [], "returncode": 0,
+                "analysis_dir": str(view_dir / "analysis"),
+            }
+
+        with mock.patch.object(analyze_lineages, "run_analyzer", stub):
+            self.assertEqual(analyze_lineages.main(argv), 0)
+        view = output / "populations" / "final"
+        marker = self.plant_measurement(view)
+
+        with self.assertRaises(analyze_lineages.LineageError) as caught:
+            with mock.patch.object(analyze_lineages, "run_analyzer", stub):
+                analyze_lineages.main(argv)
+        self.assertIn(str(view / "analysis" / "execution_consistency"),
+                      str(caught.exception))
+        self.assertTrue(marker.is_file())
+
+        with mock.patch.object(analyze_lineages, "run_analyzer", stub):
+            code = analyze_lineages.main(
+                argv + ["--allow-execution-consistency-loss"]
+            )
+        self.assertEqual(code, 0)
+        self.assertFalse(marker.exists())
+
+
 # ---------------------------------------------------------------------------
 # chmod suite: the specification model and the mode-tree comparison
 # ---------------------------------------------------------------------------

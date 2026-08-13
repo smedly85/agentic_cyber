@@ -844,11 +844,66 @@ def agreed_value(values: set[str], key: str, label: str) -> str | None:
     return next(iter(values), None)
 
 
+# Where `scripts/measure_execution_consistency.py` writes its results, relative
+# to the population view it was pointed at. That tool's output lands INSIDE the
+# view, which is the same tree `materialize_view` clears before rebuilding.
+EXECUTION_CONSISTENCY_OUTPUT = ("analysis", "execution_consistency")
+
+
+def check_execution_consistency_loss(
+    view_dir: Path, label: str, allow_loss: bool
+) -> None:
+    """Refuse to rebuild a population view over an existing behavioral measurement.
+
+    `materialize_view` clears `view_dir` before rewriting it, and
+    `scripts/measure_execution_consistency.py` writes into
+    `<view_dir>/analysis/execution_consistency/`. So re-running this script --
+    for any reason, including one that has nothing to do with the population in
+    question -- used to delete a completed behavioral measurement without ever
+    saying so. That is not hypothetical: it destroyed a real, fully measured
+    population in this repository, which had to be recovered from an earlier
+    commit.
+
+    Losing one is not a small cost. Reproducing it rebuilds and re-judges every
+    candidate in the population, and per
+    `docs/execution_consistency_methodology.md` a rebuild is not portable: a
+    candidate that used an extension its original compiler provided will not
+    build elsewhere, so the measurement may not be reproducible on the machine
+    now doing the analysis at all.
+
+    Deletion is therefore refused rather than performed silently -- and refused
+    rather than worked around, because quietly preserving the old directory
+    would leave a behavioral measurement sitting beside a population that may no
+    longer be the one it described. `allow_loss` is the deliberate escape hatch
+    for the case where the lineage data really did change.
+
+    A population with no such directory -- one being materialized for the first
+    time, or one nobody has measured -- is untouched by any of this, and the
+    ordinary rebuild proceeds exactly as before.
+    """
+    measurement = view_dir.joinpath(*EXECUTION_CONSISTENCY_OUTPUT)
+    if allow_loss or not measurement.exists():
+        return
+    raise LineageError(
+        f"refusing to rebuild the population view {view_dir}: "
+        f"{measurement} already holds an execution-consistency measurement for "
+        f"the {label!r} population, and rebuilding the view would delete it. "
+        "That measurement rebuilds and re-judges every candidate and is not "
+        "reproducible on a different host family, so it is never discarded "
+        "silently. Move or copy that directory aside to keep it, or pass "
+        "--allow-execution-consistency-loss to discard it deliberately -- which "
+        "is the right choice when the underlying lineage data changed and the "
+        "old measurement no longer describes this population."
+    )
+
+
 def materialize_view(
     view_dir: Path,
     members: list[tuple[str, Path, dict[str, Any]]],
     run_metadata: dict[str, Any],
     label: str,
+    *,
+    allow_execution_consistency_loss: bool = False,
 ) -> Path:
     """Write a population as an experiment directory analyze_experiment.py can
     read: experiment.json, an empty baseline, and one attempt per member.
@@ -876,7 +931,15 @@ def materialize_view(
     accept. Both are recorded per checkpoint rather than per run, and every
     member of a population is the same checkpoint, so each has exactly one
     value here; see `agreed_value`.
+
+    Rebuilding clears `view_dir` first, which would take an
+    execution-consistency measurement written into it with everything else;
+    `check_execution_consistency_loss` refuses that rather than letting it
+    happen quietly.
     """
+    check_execution_consistency_loss(
+        view_dir, label, allow_execution_consistency_loss
+    )
     if view_dir.exists():
         shutil.rmtree(view_dir)
     source_basename = run_metadata.get("source_basename") or (
@@ -1220,6 +1283,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--skip-change", action="store_true",
                         help="Skip the per-stage and total-lineage change "
                              "measures, which reparse every retained source")
+    parser.add_argument("--allow-execution-consistency-loss", action="store_true",
+                        help="Rebuild a population view even when it holds an "
+                             "execution-consistency measurement that the "
+                             "rebuild will delete. Without this, such a "
+                             "population is refused rather than overwritten")
     parser.add_argument("--cluster-threshold", type=float, default=None)
     parser.add_argument("--strategy-threshold", type=float, default=None)
     parser.add_argument("--diversity-k-max", type=int, default=None)
@@ -1314,7 +1382,10 @@ def main(argv: list[str] | None = None) -> int:
                 populations.append(entry)
                 continue
             view = materialize_view(
-                output_dir / "populations" / label, members, run_metadata, label
+                output_dir / "populations" / label, members, run_metadata, label,
+                allow_execution_consistency_loss=(
+                    args.allow_execution_consistency_loss
+                ),
             )
             entry.update(run_analyzer(view, args))
             entry["view_dir"] = str(view)
