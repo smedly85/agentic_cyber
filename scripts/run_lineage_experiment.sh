@@ -69,6 +69,9 @@ default applies):
                              source-inheritance file and the two senses of
                              "seed" must not be confused.
   --max-tokens N             Cap on generated tokens per session, N >= 1
+  --model-provenance-json J  Metadata-only JSON object for model-definition
+                             controls, e.g. base_model/top_k/top_k_control.
+                             It is fingerprinted and never sent in requests.
 
                              There is no --top-k. The OpenCode provider in use
                              speaks OpenAI-compatible /v1/chat/completions,
@@ -209,6 +212,7 @@ TEMPERATURE="0"
 TOP_P=""
 SAMPLING_SEED=""
 MAX_TOKENS=""
+MODEL_PROVENANCE_JSON=""
 LINEAGES=1
 LINEAGE_START=1
 MAX_LOOPS=3
@@ -230,7 +234,7 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --utility|--model|--temperature|--lineages|--lineage-start|--max-loops| \
-        --top-p|--sampling-seed|--max-tokens| \
+        --top-p|--sampling-seed|--max-tokens|--model-provenance-json| \
         --agent|--timeout|--repair-prompt|--remote-base-url| \
         --remote-api-key-env|--output-dir)
             [[ $# -ge 2 ]] || die "$1 requires a value"
@@ -244,6 +248,7 @@ while [[ $# -gt 0 ]]; do
         --top-p) TOP_P="${2:-}"; shift 2 ;;
         --sampling-seed) SAMPLING_SEED="${2:-}"; shift 2 ;;
         --max-tokens) MAX_TOKENS="${2:-}"; shift 2 ;;
+        --model-provenance-json) MODEL_PROVENANCE_JSON="${2:-}"; shift 2 ;;
         --top-k)
             # Fail closed, matching scripts/run_experiment.sh. top_k does reach
             # the request body, but the body is an OpenAI-compatible
@@ -365,6 +370,7 @@ PLAN_JSON="$(
         --top-p "$TOP_P" \
         --sampling-seed "$SAMPLING_SEED" \
         --max-tokens "$MAX_TOKENS" \
+        --model-provenance-json "$MODEL_PROVENANCE_JSON" \
         --agent "$AGENT" \
         --max-loops "$MAX_LOOPS" \
         --timeout-seconds "$TIMEOUT_SECONDS" \
@@ -400,6 +406,7 @@ STAGE_TABLE="$(
         --top-p "$TOP_P" \
         --sampling-seed "$SAMPLING_SEED" \
         --max-tokens "$MAX_TOKENS" \
+        --model-provenance-json "$MODEL_PROVENANCE_JSON" \
         --agent "$AGENT" \
         --max-loops "$MAX_LOOPS" \
         --timeout-seconds "$TIMEOUT_SECONDS" \
@@ -719,6 +726,7 @@ record.update(
         "utility": plan["utility"],
         "program": plan["program"],
         "model": plan["model"],
+        "model_provenance": plan.get("model_provenance"),
         "temperature": plan["temperature"],
         # Taken from the plan rather than re-read from the shell, so the run
         # record and the fingerprint cannot describe different conditions.
@@ -784,6 +792,7 @@ for (( offset = 0; offset < LINEAGES; offset++ )); do
             --lineage-id "$lineage_id" \
             --utility "$UTILITY" \
             --model "$MODEL" \
+            --model-provenance-json "$MODEL_PROVENANCE_JSON" \
             --temperature "$TEMPERATURE" \
             --top-p "$TOP_P" \
             --sampling-seed "$SAMPLING_SEED" \
@@ -848,6 +857,8 @@ for (( offset = 0; offset < LINEAGES; offset++ )); do
             --output-dir "$stage_dir"
             --no-analysis
         )
+        [[ -n "$MODEL_PROVENANCE_JSON" ]] &&
+            runner_args+=(--model-provenance-json "$MODEL_PROVENANCE_JSON")
         # Sampling knobs are forwarded only when requested, so an unset one
         # leaves the stage command exactly as it was before these options
         # existed. Added to runner_args, which is the single command every

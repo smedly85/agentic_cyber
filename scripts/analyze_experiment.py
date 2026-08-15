@@ -119,14 +119,19 @@ def require_diagnostic_packages() -> tuple[Any, Any, Any, Any, Any]:
     return plt, levenshtein_ratio, linkage, dendrogram, squareform
 
 
-ANALYZER_VERSION = "4.1.2"
-PAPER_SCHEMA_VERSION = 5
+ANALYZER_VERSION = "5.0.0"
+PAPER_SCHEMA_VERSION = 6
 
 PAPER_METRICS_COLUMNS = [
     "Issue",
     "Checkpoint",
     "Model",
     "Temp",
+    "Reliability Scope",
+    "Population N",
+    "Lineages Started",
+    "Lineages Completed",
+    "Lineage Completion Rate",
     "N Attempts",
     "Valid Agent Trials",
     "Infrastructure Failures",
@@ -143,11 +148,11 @@ PAPER_METRICS_COLUMNS = [
     "Architecture Population N",
     "Effective Architecture Families",
     "Dominant Architecture Family Share",
-    "Architecture Family-Discovery AUC@K",
+    "Mean Pairwise Architecture Distance",
     "Strategy Population N",
     "Effective Strategy Families",
     "Dominant Strategy Family Share",
-    "Strategy Family-Discovery AUC@K",
+    "Mean Pairwise Strategy Distance",
     "Diversity K Max",
 ]
 
@@ -157,10 +162,10 @@ PAPER_DESCRIPTIVE_COLUMNS = [
     "Model",
     "Temp",
     "Raw Architecture Families",
-    "Mean Pairwise Architecture Distance",
+    "Architecture Family-Discovery AUC@K",
     "Architecture Vendi Score",
     "Raw Strategy Families",
-    "Mean Pairwise Strategy Distance",
+    "Strategy Family-Discovery AUC@K",
     "Strategy Vendi Score",
     "Exact Unique Rate",
     "Exact Modal Share",
@@ -177,6 +182,7 @@ PAPER_DESCRIPTIVE_COLUMNS = [
     "Mean Functions Created",
     "Mean Functions Deleted",
     "Mean Normalized GumTree Edit-Action Magnitude",
+    "Maintenance Change Scope",
 ]
 
 
@@ -216,6 +222,22 @@ class ParsedSource:
 DEFAULT_STRATEGY_EXCLUDE_REGEX = (
     r"^(?:.*(?:parse|parser|argument|arguments|argv|option|options|"
     r"usage|help|flag|error|report|diagnostic).*)$"
+)
+ANALYSIS_CONFIGURATION_VERSION = 1
+FORMAL_ANALYSIS_CONFIGURATION_KEYS = frozenset(
+    {
+        "schema_version",
+        "architecture_threshold",
+        "strategy_threshold",
+        "threshold_sensitivity",
+        "bootstrap_repetitions",
+        "bootstrap_seed",
+        "strategy_exclusion_regex",
+        "strategy_include_functions",
+        "include_main",
+        "clang_extra_arguments",
+        "fixed_diversity_k",
+    }
 )
 
 
@@ -350,6 +372,20 @@ def parse_args() -> argparse.Namespace:
             "row."
         ),
     )
+    parser.add_argument(
+        "--analysis-config",
+        type=Path,
+        default=None,
+        help="Versioned JSON file freezing all formal analysis settings.",
+    )
+    parser.add_argument(
+        "--formal-analysis",
+        action="store_true",
+        help=(
+            "Require every scientific analysis setting from a complete "
+            "versioned analysis configuration; no scientific defaults."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -461,6 +497,99 @@ def safe_numeric_mean(values: Iterable[Any]) -> float | None:
         and math.isfinite(float(value))
     ]
     return statistics.fmean(numeric) if numeric else None
+
+
+def load_frozen_analysis_configuration(
+    path: Path | None,
+    experiment_metadata: Mapping[str, Any],
+    *,
+    formal: bool,
+) -> dict[str, Any] | None:
+    value: Any = None
+    if path is not None:
+        if not path.is_file():
+            raise SystemExit(f"analysis configuration not found: {path}")
+        value = read_json(path)
+    elif isinstance(experiment_metadata.get("frozen_analysis_configuration"), Mapping):
+        value = experiment_metadata["frozen_analysis_configuration"]
+    if value is None:
+        if formal:
+            raise SystemExit(
+                "--formal-analysis requires --analysis-config or embedded "
+                "frozen_analysis_configuration metadata"
+            )
+        return None
+    if not isinstance(value, Mapping):
+        raise SystemExit("analysis configuration must be a JSON object")
+    configuration = dict(value)
+    missing = sorted(FORMAL_ANALYSIS_CONFIGURATION_KEYS - configuration.keys())
+    if configuration.get("schema_version") != ANALYSIS_CONFIGURATION_VERSION:
+        raise SystemExit(
+            "analysis configuration schema_version must be "
+            f"{ANALYSIS_CONFIGURATION_VERSION}"
+        )
+    if missing:
+        raise SystemExit(
+            "analysis configuration is incomplete; missing: " + ", ".join(missing)
+        )
+    return configuration
+
+
+def apply_frozen_analysis_configuration(
+    args: argparse.Namespace, configuration: Mapping[str, Any]
+) -> None:
+    args.cluster_threshold = configuration["architecture_threshold"]
+    args.strategy_threshold = configuration["strategy_threshold"]
+    sensitivity = configuration["threshold_sensitivity"]
+    if not isinstance(sensitivity, Mapping):
+        raise SystemExit("threshold_sensitivity must be an object")
+    if "grid" in sensitivity:
+        grid = sensitivity["grid"]
+        if not isinstance(grid, list) or not grid:
+            raise SystemExit("threshold_sensitivity.grid must be a non-empty list")
+        args.thresholds = ",".join(str(value) for value in grid)
+    elif sensitivity.get("rule") == "deterministic_local_grid":
+        args.thresholds = None
+    else:
+        raise SystemExit(
+            "threshold_sensitivity must define grid or rule=deterministic_local_grid"
+        )
+    repetitions = configuration["bootstrap_repetitions"]
+    seed = configuration["bootstrap_seed"]
+    if (
+        isinstance(repetitions, bool) or not isinstance(repetitions, int)
+        or repetitions < 0
+    ):
+        raise SystemExit("bootstrap_repetitions must be a non-negative integer")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise SystemExit("bootstrap_seed must be an integer")
+    if not isinstance(configuration["include_main"], bool):
+        raise SystemExit("include_main must be boolean")
+    args.bootstrap_repetitions = repetitions
+    args.bootstrap_seed = seed
+    args.strategy_exclude_regex = configuration["strategy_exclusion_regex"]
+    include_functions = configuration["strategy_include_functions"]
+    clang_arguments = configuration["clang_extra_arguments"]
+    if not isinstance(include_functions, list) or not all(
+        isinstance(value, str) for value in include_functions
+    ):
+        raise SystemExit("strategy_include_functions must be a list of strings")
+    if not isinstance(clang_arguments, list) or not all(
+        isinstance(value, str) for value in clang_arguments
+    ):
+        raise SystemExit("clang_extra_arguments must be a list of strings")
+    args.strategy_include_function = list(include_functions)
+    args.clang_extra_arg = list(clang_arguments)
+    args.diversity_k_max = configuration["fixed_diversity_k"]
+
+
+def analysis_configuration_fingerprint(configuration: Mapping[str, Any]) -> str:
+    material = json.dumps(
+        configuration, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    )
+    return hashlib.sha256(
+        ("agentic-cyber.analysis-configuration.v1\n" + material).encode("utf-8")
+    ).hexdigest()
 
 
 def resolve_analysis_configuration(
@@ -684,6 +813,24 @@ def normalize_repair_metadata(
             "agent_execution_failure_stage": agent_execution_stage,
             "agent_execution_failure_classification_inferred": (
                 agent_execution_inferred
+            ),
+            "agent_invocation_completed": (
+                bool(normalized.get("initial_session_completed"))
+                if isinstance(normalized.get("initial_session_completed"), bool)
+                else normalized.get("initial_opencode_exit_code", opencode_exit) == 0
+            ),
+            "agent_invocation_timed_out": (
+                normalized.get("initial_opencode_exit_code", opencode_exit) == 124
+            ),
+            "candidate_available_after_timeout": bool(
+                normalized.get("candidate_available_after_timeout")
+            ),
+            "artifact_public_validation_success": public_success,
+            "workflow_stage_success": bool(
+                normalized.get(
+                    "workflow_stage_success",
+                    normalized.get("overall_success", public_success),
+                )
             ),
         }
     )
@@ -1033,6 +1180,8 @@ def select_primary_cluster_population(
 
 
 ANALYSIS_SIGNATURE_KEYS = (
+    "configuration_version",
+    "configuration_fingerprint",
     "architecture_threshold",
     "strategy_threshold",
     "diversity_k_max",
@@ -1040,6 +1189,9 @@ ANALYSIS_SIGNATURE_KEYS = (
     "strategy_include_functions",
     "strategy_main_included",
     "clang_extra_args",
+    "threshold_sensitivity",
+    "bootstrap_repetitions",
+    "bootstrap_seed",
 )
 
 
@@ -1047,6 +1199,14 @@ def build_analysis_signature(
     analysis_configuration: Mapping[str, Any],
 ) -> dict[str, Any]:
     return {
+        "configuration_version": int(
+            analysis_configuration.get(
+                "configuration_version", ANALYSIS_CONFIGURATION_VERSION
+            )
+        ),
+        "configuration_fingerprint": str(
+            analysis_configuration.get("configuration_fingerprint", "legacy")
+        ),
         "architecture_threshold": float(
             analysis_configuration["architecture_threshold"]
         ),
@@ -1070,6 +1230,16 @@ def build_analysis_signature(
             str(argument)
             for argument in analysis_configuration.get("clang_extra_args", [])
         ],
+        "threshold_sensitivity": analysis_configuration.get(
+            "threshold_sensitivity",
+            {"grid": None, "rule": "deterministic_local_grid"},
+        ),
+        "bootstrap_repetitions": int(
+            analysis_configuration.get("bootstrap_repetitions", 1000)
+        ),
+        "bootstrap_seed": int(
+            analysis_configuration.get("bootstrap_seed", 20260723)
+        ),
     }
 
 
@@ -1091,6 +1261,32 @@ def confirmatory_configuration_status(
 ) -> tuple[bool, list[dict[str, Any]]]:
     """Compare resolved analysis settings with the Git experiment record."""
     mismatches: list[dict[str, Any]] = []
+    frozen = experiment_metadata.get("frozen_analysis_configuration")
+    if isinstance(frozen, Mapping):
+        expected = {
+            "architecture_threshold": frozen.get("architecture_threshold"),
+            "strategy_threshold": frozen.get("strategy_threshold"),
+            "diversity_k_max": frozen.get("fixed_diversity_k"),
+            "strategy_exclude_regex": frozen.get("strategy_exclusion_regex"),
+            "strategy_include_functions": frozen.get("strategy_include_functions"),
+            "strategy_main_included": frozen.get("include_main"),
+            "clang_extra_args": frozen.get("clang_extra_arguments"),
+            "threshold_sensitivity": frozen.get("threshold_sensitivity"),
+            "bootstrap_repetitions": frozen.get("bootstrap_repetitions"),
+            "bootstrap_seed": frozen.get("bootstrap_seed"),
+        }
+        for setting, recorded in expected.items():
+            resolved = analysis_configuration.get(setting)
+            if recorded != resolved:
+                mismatches.append(
+                    {
+                        "setting": setting,
+                        "metadata_key": "frozen_analysis_configuration",
+                        "recorded": recorded,
+                        "resolved": resolved,
+                    }
+                )
+        return not mismatches, mismatches
 
     def compare(setting: str, metadata_key: str, expected_default: Any = ...) -> None:
         if metadata_key in experiment_metadata:
@@ -1152,8 +1348,16 @@ def build_paper_metrics_row(
     _, strategy_primary = select_primary_cluster_population(strategy.get("populations", {}))
     pass_values = summary.get("pass_at_k", {})
     repair = summary.get("repair", {})
-    reliability = summary.get("reliability", {})
-    if summary.get("experiment_format") == "git_experiment":
+    reliability = summary.get("reliability") or {}
+    is_lineage_view = summary.get("experiment_format") == "lineage_population_view"
+    is_formal_analysis = bool(
+        summary.get("analysis_configuration", {}).get("formal_analysis")
+    )
+    if (
+        summary.get("experiment_format")
+        in {"git_experiment", "lineage_population_view"}
+        and is_formal_analysis
+    ):
         confirmatory_match, confirmatory_mismatches = (
             confirmatory_configuration_status(
                 experiment_metadata,
@@ -1164,9 +1368,15 @@ def build_paper_metrics_row(
         confirmatory_match = False
         confirmatory_mismatches = [
             {
-                "setting": "experiment_format",
-                "recorded": summary.get("experiment_format"),
-                "resolved": "git_experiment",
+                "setting": "formal_analysis_configuration",
+                "recorded": experiment_metadata.get(
+                    "frozen_analysis_configuration"
+                ),
+                "resolved": summary.get("analysis_configuration"),
+                "reason": (
+                    "paper-confirmatory rows require --formal-analysis and a "
+                    "complete frozen analysis configuration"
+                ),
             }
         ]
     return {
@@ -1181,34 +1391,41 @@ def build_paper_metrics_row(
         "Checkpoint": infer_paper_checkpoint(experiment_metadata, checkpoint_label),
         "Model": experiment_metadata.get("model", summary.get("model")),
         "Temp": experiment_metadata.get("temperature", summary.get("temperature")),
-        "N Attempts": reliability.get("n_attempts", len(rows)),
-        "Valid Agent Trials": reliability.get("n_valid_agent_trials"),
-        "Infrastructure Failures": reliability.get("n_infrastructure_failures"),
-        "Infrastructure Attrition Rate": reliability.get(
+        "Reliability Scope": (
+            "parent_lineage_experiment" if is_lineage_view else "current_experiment"
+        ),
+        "Population N": summary.get("population_size", len(rows)),
+        "Lineages Started": None,
+        "Lineages Completed": None,
+        "Lineage Completion Rate": None,
+        "N Attempts": None if is_lineage_view else reliability.get("n_attempts", len(rows)),
+        "Valid Agent Trials": None if is_lineage_view else reliability.get("n_valid_agent_trials"),
+        "Infrastructure Failures": None if is_lineage_view else reliability.get("n_infrastructure_failures"),
+        "Infrastructure Attrition Rate": None if is_lineage_view else reliability.get(
             "infrastructure_attrition_rate"
         ),
-        "Successful Runs": summary.get("successful_runs"),
-        "End-to-End Success Rate": reliability.get("end_to_end_success_rate"),
-        "Conditional Agent Success Rate": reliability.get(
+        "Successful Runs": None if is_lineage_view else summary.get("successful_runs"),
+        "End-to-End Success Rate": None if is_lineage_view else reliability.get("end_to_end_success_rate"),
+        "Conditional Agent Success Rate": None if is_lineage_view else reliability.get(
             "conditional_agent_success_rate"
         ),
-        "Initial Public Success Rate": repair.get("initial_public_success_rate"),
-        "Final Public Success Rate": repair.get("final_public_success_rate"),
-        "Repair Recovery Rate": repair.get("repair_recovery_rate"),
-        "Pass@1": pass_values.get("pass@1"),
-        "Pass@5": pass_values.get("pass@5"),
-        "Pass@10": pass_values.get("pass@10"),
+        "Initial Public Success Rate": None if is_lineage_view else repair.get("initial_public_success_rate"),
+        "Final Public Success Rate": None if is_lineage_view else repair.get("final_public_success_rate"),
+        "Repair Recovery Rate": None if is_lineage_view else repair.get("repair_recovery_rate"),
+        "Pass@1": None if is_lineage_view else pass_values.get("pass@1"),
+        "Pass@5": None if is_lineage_view else pass_values.get("pass@5"),
+        "Pass@10": None if is_lineage_view else pass_values.get("pass@10"),
         "Architecture Population N": architecture_primary.get("run_count"),
         "Effective Architecture Families": architecture_primary.get("effective_family_count"),
         "Dominant Architecture Family Share": architecture_primary.get("dominant_family_share"),
-        "Architecture Family-Discovery AUC@K": architecture_primary.get(
-            "family_discovery_auc_at_kmax"
+        "Mean Pairwise Architecture Distance": architecture_primary.get(
+            "mean_pairwise_distance"
         ),
         "Strategy Population N": strategy_primary.get("run_count"),
         "Effective Strategy Families": strategy_primary.get("effective_family_count"),
         "Dominant Strategy Family Share": strategy_primary.get("dominant_family_share"),
-        "Strategy Family-Discovery AUC@K": strategy_primary.get(
-            "family_discovery_auc_at_kmax"
+        "Mean Pairwise Strategy Distance": strategy_primary.get(
+            "mean_pairwise_distance"
         ),
         "Diversity K Max": summary.get("diversity_k_max"),
     }
@@ -1230,17 +1447,29 @@ def build_paper_descriptive_row(
     repair = summary.get("repair", {})
     exact = summary.get("exact_generation_convergence", {})
     runtime = summary.get("runtime_seconds", {})
-    successful_rows = [row for row in rows if bool(row.get("overall_success"))]
+    is_lineage_view = summary.get("experiment_format") == "lineage_population_view"
+    membership_key = (
+        "analysis_population_member" if is_lineage_view else "overall_success"
+    )
+    successful_rows = [row for row in rows if bool(row.get(membership_key))]
+    maintenance_reason = (
+        "unsupported_for_lineage_population_empty_baseline"
+        if is_lineage_view else "baseline_backed_experiment"
+    )
     return {
         "Issue": infer_paper_issue(experiment_metadata, issue_label),
         "Checkpoint": infer_paper_checkpoint(experiment_metadata, checkpoint_label),
         "Model": experiment_metadata.get("model", summary.get("model")),
         "Temp": experiment_metadata.get("temperature", summary.get("temperature")),
         "Raw Architecture Families": architecture_primary.get("raw_family_count"),
-        "Mean Pairwise Architecture Distance": architecture_primary.get("mean_pairwise_distance"),
+        "Architecture Family-Discovery AUC@K": architecture_primary.get(
+            "family_discovery_auc_at_kmax"
+        ),
         "Architecture Vendi Score": architecture_primary.get("vendi_score"),
         "Raw Strategy Families": strategy_primary.get("raw_family_count"),
-        "Mean Pairwise Strategy Distance": strategy_primary.get("mean_pairwise_distance"),
+        "Strategy Family-Discovery AUC@K": strategy_primary.get(
+            "family_discovery_auc_at_kmax"
+        ),
         "Strategy Vendi Score": strategy_primary.get("vendi_score"),
         "Exact Unique Rate": exact.get("exact_unique_rate"),
         "Exact Modal Share": exact.get("exact_modal_share"),
@@ -1251,14 +1480,15 @@ def build_paper_descriptive_row(
         "Mean Repair LLM Runtime (s)": repair.get("mean_repair_llm_runtime_seconds"),
         "Mean Total Runtime (s)": runtime.get("mean"),
         "Median Total Runtime (s)": runtime.get("median"),
-        "Mean Lines Edited": safe_numeric_mean(row.get("lines_edited") for row in successful_rows),
-        "Mean Files Edited": safe_numeric_mean(row.get("files_edited") for row in successful_rows),
-        "Mean Functions Edited": safe_numeric_mean(row.get("functions_edited_count") for row in successful_rows),
-        "Mean Functions Created": safe_numeric_mean(row.get("functions_created_count") for row in successful_rows),
-        "Mean Functions Deleted": safe_numeric_mean(row.get("functions_deleted_count") for row in successful_rows),
-        "Mean Normalized GumTree Edit-Action Magnitude": safe_numeric_mean(
+        "Mean Lines Edited": None if is_lineage_view else safe_numeric_mean(row.get("lines_edited") for row in successful_rows),
+        "Mean Files Edited": None if is_lineage_view else safe_numeric_mean(row.get("files_edited") for row in successful_rows),
+        "Mean Functions Edited": None if is_lineage_view else safe_numeric_mean(row.get("functions_edited_count") for row in successful_rows),
+        "Mean Functions Created": None if is_lineage_view else safe_numeric_mean(row.get("functions_created_count") for row in successful_rows),
+        "Mean Functions Deleted": None if is_lineage_view else safe_numeric_mean(row.get("functions_deleted_count") for row in successful_rows),
+        "Mean Normalized GumTree Edit-Action Magnitude": None if is_lineage_view else safe_numeric_mean(
             row.get("gumtree_normalized_edit_distance") for row in successful_rows
         ),
+        "Maintenance Change Scope": maintenance_reason,
     }
 
 
@@ -1269,9 +1499,11 @@ def paper_metrics_schema() -> dict[str, Any]:
         "primary_csv_columns": PAPER_METRICS_COLUMNS,
         "descriptive_csv_columns": PAPER_DESCRIPTIVE_COLUMNS,
         "notes": {
-            "primary_population": "successful final candidates with complete measurement for that representation; no fallback",
+            "primary_population": "ordinary successful candidates, or explicit lineage-stage population members, with complete measurement for that representation; no fallback",
+            "lineage_population_reliability": "not applicable in a survivor view; use the parent lineage paper row",
+            "lineage_population_change": "empty-baseline maintenance-change fields are unsupported and null",
             "effective_families": "exp(Shannon entropy) of empirical family shares",
-            "fixed_budget_family_discovery_auc": "null unless a resolved fixed K is configured and supported by the population",
+            "fixed_budget_family_discovery_auc": "supporting; null unless a resolved fixed K is configured and supported by the population",
             "excluded_from_clustering": "lexical, APTED, API-call, security, complexity, runtime, and patch-size information",
             "missing_values": "Unavailable measurements are null in JSON and blank in CSV.",
         },
@@ -2754,8 +2986,13 @@ def main() -> int:
     experiment_metadata_path = experiment / "experiment.json"
     sandbox_metadata = None if experiment_metadata_path.exists() else sandbox_run_metadata(experiment)
     if experiment_metadata_path.exists():
-        experiment_format = "git_experiment"
         experiment_metadata = read_json(experiment_metadata_path)
+        experiment_format = (
+            "lineage_population_view"
+            if experiment_metadata.get("experiment_format")
+            == "lineage_population_view"
+            else "git_experiment"
+        )
         run_root = experiment
     elif sandbox_metadata is not None:
         experiment_format = "sandbox_run"
@@ -2765,13 +3002,33 @@ def main() -> int:
         raise SystemExit(
             f"Missing experiment.json and no enclosing sandbox run.json: {experiment}"
         )
+    frozen_analysis_configuration = load_frozen_analysis_configuration(
+        args.analysis_config,
+        experiment_metadata,
+        formal=args.formal_analysis,
+    )
+    if frozen_analysis_configuration is not None:
+        apply_frozen_analysis_configuration(args, frozen_analysis_configuration)
+    if args.bootstrap_repetitions < 0:
+        raise SystemExit("--bootstrap-repetitions must be non-negative")
     analysis_configuration = resolve_analysis_configuration(
         cli_architecture_threshold=args.cluster_threshold,
         cli_strategy_threshold=args.strategy_threshold,
         cli_diversity_k_max=args.diversity_k_max,
         experiment_metadata=experiment_metadata,
-        inherit_experiment_metadata=experiment_format == "git_experiment",
+        inherit_experiment_metadata=(
+            frozen_analysis_configuration is None
+            and experiment_format in {"git_experiment", "lineage_population_view"}
+        ),
     )
+    if frozen_analysis_configuration is not None:
+        analysis_configuration.update(
+            {
+                "architecture_threshold_source": "frozen_analysis_configuration",
+                "strategy_threshold_source": "frozen_analysis_configuration",
+                "diversity_k_max_source": "frozen_analysis_configuration",
+            }
+        )
     architecture_threshold = analysis_configuration["architecture_threshold"]
     strategy_threshold = analysis_configuration["strategy_threshold"]
     diversity_k_max = analysis_configuration["diversity_k_max"]
@@ -2812,7 +3069,7 @@ def main() -> int:
     source_path = Path(str(configured_source))
     if source_path.is_absolute():
         raise SystemExit("source_path must be relative to the candidate workspace")
-    if experiment_format == "git_experiment":
+    if experiment_format in {"git_experiment", "lineage_population_view"}:
         baseline_source = (
             args.baseline_source.resolve()
             if args.baseline_source is not None
@@ -2857,11 +3114,45 @@ def main() -> int:
     )
     analysis_configuration.update(
         {
+            "configuration_version": ANALYSIS_CONFIGURATION_VERSION,
+            "formal_analysis": args.formal_analysis,
+            "threshold_sensitivity": (
+                dict(frozen_analysis_configuration["threshold_sensitivity"])
+                if frozen_analysis_configuration is not None
+                else {
+                    "grid": deterministic_threshold_grid(
+                        architecture_threshold, args.thresholds
+                    )
+                    if args.thresholds is not None else None,
+                    "rule": (
+                        None if args.thresholds is not None
+                        else "deterministic_local_grid"
+                    ),
+                }
+            ),
+            "bootstrap_repetitions": args.bootstrap_repetitions,
+            "bootstrap_seed": args.bootstrap_seed,
             "strategy_exclude_regex": args.strategy_exclude_regex,
             "strategy_include_functions": sorted(forced_strategy_functions),
             "strategy_main_included": strategy_main_included,
             "clang_extra_args": list(args.clang_extra_arg),
         }
+    )
+    if (
+        frozen_analysis_configuration is not None
+        and bool(frozen_analysis_configuration["include_main"])
+        != strategy_main_included
+    ):
+        raise SystemExit(
+            "frozen include_main disagrees with the resolved strategy regex/include list"
+        )
+    fingerprint_material = {
+        key: value
+        for key, value in analysis_configuration.items()
+        if not key.endswith("_source") and key != "configuration_fingerprint"
+    }
+    analysis_configuration["configuration_fingerprint"] = (
+        analysis_configuration_fingerprint(fingerprint_material)
     )
 
     tool_paths = {
@@ -2947,7 +3238,11 @@ def main() -> int:
             else None
         )
 
-        candidate_source = attempt / ("candidate" if experiment_format == "git_experiment" else "workdir") / source_path
+        candidate_source = attempt / (
+            "candidate"
+            if experiment_format in {"git_experiment", "lineage_population_view"}
+            else "workdir"
+        ) / source_path
         candidate_missing = not candidate_source.exists()
         measured_source = candidate_source if not candidate_missing else baseline_source
 
@@ -2971,7 +3266,7 @@ def main() -> int:
         )
         patch_metrics = (
             parse_change_metrics(attempt)
-            if experiment_format == "git_experiment"
+            if experiment_format in {"git_experiment", "lineage_population_view"}
             else source_change_metrics(baseline_source, measured_source)
         )
 
@@ -3101,7 +3396,7 @@ def main() -> int:
             else {},
         }
 
-        if experiment_format == "git_experiment":
+        if experiment_format in {"git_experiment", "lineage_population_view"}:
             base_test = parse_test_log(attempt / "base-tests.log")
             feature_test = parse_test_log(attempt / "feature-tests.log")
             extra_test = parse_test_log(attempt / "extra-tests.log")
@@ -3230,6 +3525,11 @@ def main() -> int:
         print(f"[{index:3d}/{len(attempts):3d}] {run_id}", flush=True)
 
     run_ids = [str(row["run_id"]) for row in rows]
+    population_membership_key = (
+        "analysis_population_member"
+        if experiment_format == "lineage_population_view"
+        else "overall_success"
+    )
 
     architecture_matrix, architecture_features, architecture_schema = (
         build_feature_matrix(
@@ -3261,16 +3561,18 @@ def main() -> int:
     passing_ids = [
         str(row["run_id"])
         for row in rows
-        if bool(row.get("overall_success"))
+        if bool(row.get(population_membership_key))
     ]
     # One definition of "the primary population", in diversity_metrics, rather
     # than one here and one there: successful runs whose representation was
     # measured completely, with the coverage that implies. The counts reported
     # in the summary below come from the same call.
     architecture_primary = primary_population(
-        rows, "complete_architecture_measurement"
+        rows, "complete_architecture_measurement", population_membership_key
     )
-    strategy_primary = primary_population(rows, "complete_strategy_measurement")
+    strategy_primary = primary_population(
+        rows, "complete_strategy_measurement", population_membership_key
+    )
     passing_architecture_ids = architecture_primary["run_ids"]
     passing_strategy_ids = strategy_primary["run_ids"]
 
@@ -3431,7 +3733,9 @@ def main() -> int:
         ["k", "expected_distinct_families"],
     )
 
-    successful_candidate_rows = [row for row in rows if bool(row.get("overall_success"))]
+    successful_candidate_rows = [
+        row for row in rows if bool(row.get(population_membership_key))
+    ]
     successful_hash_rows = [
         row
         for row in successful_candidate_rows
@@ -3795,7 +4099,7 @@ def main() -> int:
         )
 
     n = len(rows)
-    successful = sum(bool(row.get("overall_success")) for row in rows)
+    successful = sum(bool(row.get(population_membership_key)) for row in rows)
     reliability_summary = build_reliability_summary(rows)
     valid_agent_trials = reliability_summary["n_valid_agent_trials"]
     successful_valid_trials = reliability_summary[
@@ -3807,6 +4111,32 @@ def main() -> int:
     ):
         configured_max_loops = None
     repair_summary = build_repair_summary(rows, configured_max_loops)
+    is_lineage_population_view = experiment_format == "lineage_population_view"
+    if is_lineage_population_view:
+        reliability_summary = {
+            "reliability_scope": "parent_lineage_experiment",
+            "applicable": False,
+            "unavailable_reason": (
+                "this directory is a materialized survivor population; "
+                "reliability belongs to the parent started-lineage experiment"
+            ),
+            "n_attempts": None,
+            "n_infrastructure_failures": None,
+            "n_valid_agent_trials": None,
+            "n_agent_execution_failures": None,
+            "successful_runs": None,
+            "successful_valid_agent_trials": None,
+            "infrastructure_attrition_rate": None,
+            "end_to_end_success_rate": None,
+            "conditional_agent_success_rate": None,
+        }
+        for key in (
+            "initial_public_success_rate",
+            "final_public_success_rate",
+            "repair_recovery_rate",
+        ):
+            repair_summary[key] = None
+        repair_summary["reliability_scope"] = "parent_lineage_experiment"
     runtime_seconds = [
         float(row["total_runtime_ms"]) / 1000.0
         for row in rows
@@ -3838,6 +4168,10 @@ def main() -> int:
             if available
             else None
         )
+    if is_lineage_population_view:
+        stage_success_ratios = {
+            key: None for key in stage_success_ratios
+        }
 
     summary = {
         "schema_version": PAPER_SCHEMA_VERSION,
@@ -3848,9 +4182,15 @@ def main() -> int:
         "experiment": str(experiment),
         "output_directory": str(output_dir),
         "model": experiment_metadata.get("model"),
+        "model_provenance": experiment_metadata.get("model_provenance"),
         "temperature": experiment_metadata.get("temperature"),
         "runs_analyzed": n,
-        "successful_runs": successful,
+        "population_size": n if is_lineage_population_view else successful,
+        "successful_runs": None if is_lineage_population_view else successful,
+        "reliability_scope": (
+            "parent_lineage_experiment"
+            if is_lineage_population_view else "current_experiment"
+        ),
         "reliability": reliability_summary,
         "architecture_population_n": architecture_primary["population_n"],
         "architecture_measurement_coverage": architecture_primary[
@@ -3860,22 +4200,37 @@ def main() -> int:
         "strategy_measurement_coverage": strategy_primary[
             "measurement_coverage"
         ],
-        "success_ratio": successful / n if n else None,
+        "success_ratio": (
+            None if is_lineage_population_view else successful / n if n else None
+        ),
         "diversity_k_max": diversity_k_max,
         "analysis_configuration": analysis_configuration,
+        "analysis_configuration_version": analysis_configuration[
+            "configuration_version"
+        ],
+        "analysis_configuration_fingerprint": analysis_configuration[
+            "configuration_fingerprint"
+        ],
         "exact_generation_convergence": exact_repetition,
         "stage_success_ratios": stage_success_ratios,
+        "stage_success_ratios_scope": (
+            "not_applicable_survivor_population"
+            if is_lineage_population_view else "current_experiment"
+        ),
         "repair": repair_summary,
         "uncertainty": {
-            "wilson_95_percent": build_reliability_wilson_intervals(
-                reliability_summary, repair_summary
+            "wilson_95_percent": (
+                {} if is_lineage_population_view
+                else build_reliability_wilson_intervals(
+                    reliability_summary, repair_summary
+                )
             ),
             "diversity_bootstrap": {
                 "architecture": architecture_summaries[architecture_primary_name]["bootstrap_95_percent_ci"],
                 "strategy": strategy_summaries[strategy_primary_name]["bootstrap_95_percent_ci"],
             },
         },
-        "pass_at_k": {
+        "pass_at_k": {} if is_lineage_population_view else {
             f"pass@{k}": pass_at_k(
                 valid_agent_trials, successful_valid_trials, k
             )
@@ -3993,20 +4348,26 @@ def main() -> int:
         return f"{float(value):.1%}" if value is not None else "unavailable"
 
     print("\nAnalysis complete")
-    print(
-        f"End-to-end success: {successful}/{n} "
-        f"({percentage(reliability_summary['end_to_end_success_rate'])})"
-    )
-    print(
-        "Infrastructure attrition: "
-        f"{reliability_summary['n_infrastructure_failures']}/{n} "
-        f"({percentage(reliability_summary['infrastructure_attrition_rate'])})"
-    )
-    print(
-        "Agent execution failures: "
-        f"{reliability_summary['n_agent_execution_failures']}/"
-        f"{valid_agent_trials}"
-    )
+    if is_lineage_population_view:
+        print(
+            f"Population size: {n}; reliability not applicable here "
+            "(scope: parent_lineage_experiment)"
+        )
+    else:
+        print(
+            f"End-to-end success: {successful}/{n} "
+            f"({percentage(reliability_summary['end_to_end_success_rate'])})"
+        )
+        print(
+            "Infrastructure attrition: "
+            f"{reliability_summary['n_infrastructure_failures']}/{n} "
+            f"({percentage(reliability_summary['infrastructure_attrition_rate'])})"
+        )
+        print(
+            "Agent execution failures: "
+            f"{reliability_summary['n_agent_execution_failures']}/"
+            f"{valid_agent_trials}"
+        )
     print(
         "Conditional agent success: "
         f"{successful_valid_trials}/{valid_agent_trials} "

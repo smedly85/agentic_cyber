@@ -55,6 +55,14 @@ SEVERITY = {PASS: 0, SKIP: 0, XFAIL: 0,
             FAIL: 1, TIMEOUT: 2, SANITIZER: 3, CRASH: 4}
 FAILING = {FAIL, TIMEOUT, SANITIZER, CRASH}
 
+
+def case_result_id(case: dict, executed_name: str) -> str:
+    """Stable identity for one frozen case variant and invocation mode."""
+    return (
+        f"{case.get('_suite', '?')}::"
+        f"{int(case['_case_ordinal']):06d}::{executed_name}"
+    )
+
 # Distinct from 1 (a case failed) and 2 (usage error). The lineage controller
 # classifies this exit as platform_incompatible rather than validation_failed,
 # so a host mismatch is never counted against the candidate.
@@ -319,8 +327,9 @@ def main():
     for fp in files:
         data = _open_suite(fp)
         entries = data.get("cases", data) if isinstance(data, dict) else data
-        for c in entries:
+        for case_ordinal, c in enumerate(entries):
             c["_suite"] = os.path.basename(fp)
+            c["_case_ordinal"] = case_ordinal
             cases.append(c)
 
     jobs = []
@@ -383,8 +392,16 @@ def main():
 
     if args.json_report:
         with open(args.json_report, "w") as f:
-            json.dump({"counts": counts, "per_suite": per_suite,
-                       "failures": [(n, v, d) for n, _, v, d in failures]},
+            case_results = sorted(
+                ({"case_id": case_result_id(case, name),
+                  "verdict": verdict}
+                 for name, case, verdict, _ in results),
+                key=lambda item: item["case_id"],
+            )
+            json.dump({"schema_version": 2,
+                       "counts": counts, "per_suite": per_suite,
+                       "failures": [(n, v, d) for n, _, v, d in failures],
+                       "results": case_results},
                       f, indent=1)
 
     bad = sum(counts.get(k, 0) for k in FAILING)

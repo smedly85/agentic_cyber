@@ -119,6 +119,10 @@ def init_record(args: argparse.Namespace) -> dict[str, Any]:
         "lineage_id": args.lineage_id,
         "utility": args.utility,
         "model": args.model,
+        "model_provenance": (
+            json.loads(args.model_provenance_json)
+            if args.model_provenance_json else None
+        ),
         "temperature": float(args.temperature),
         # Recorded as null when the flag was not passed: "the server default
         # applied" is a different condition from "pinned to 0", and a lineage
@@ -209,6 +213,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     start.add_argument("--lineage-id", required=True)
     start.add_argument("--utility", required=True)
     start.add_argument("--model", default="")
+    start.add_argument("--model-provenance-json", default="")
     start.add_argument("--temperature", default="0")
     start.add_argument("--top-p", default="")
     start.add_argument("--sampling-seed", default="")

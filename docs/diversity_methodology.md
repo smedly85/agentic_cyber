@@ -1,6 +1,6 @@
-# Canonical v4.1.2 diversity methodology
+# Canonical v5.0.0 diversity methodology
 
-This document defines schema-v5 analysis for repeated, baseline-backed software
+This document defines schema-v6 analysis for repeated, baseline-backed software
 generation experiments. `scripts/analyze_experiment.py` is the sole analysis
 entry point. It evaluates functional reliability first, then two deliberately
 separate forms of structural diversity among successful implementations. No
@@ -36,12 +36,10 @@ from being presented as confirmatory outcomes.
    final extra test succeeds. Infrastructure failures remain in end-to-end
    counts but are separated from valid generated-agent trials.
 2. **Architecture diversity.** Effective architecture-family count, dominant
-   architecture-family share, and fixed-budget architecture normalized
-   family-discovery AUC@K describe
+   architecture-family share, and mean pairwise architecture distance describe
    structural organization of the configured experiment source.
 3. **Implementation-strategy diversity.** Effective strategy-family count,
-   dominant strategy-family share, and fixed-budget strategy normalized
-   family-discovery AUC@K describe
+   dominant strategy-family share, and mean pairwise strategy distance describe
    changes inside behavioral functions while suppressing parser and usage
    organization by default.
 
@@ -54,7 +52,8 @@ they are not asserted to be classical algorithms.
 ### SUPPORTING
 
 - Raw architecture- and strategy-family counts.
-- Mean pairwise cosine distance in each structural representation.
+- Fixed-budget normalized family-discovery AUC@K when K is configured and
+  supported by the population.
 - The complete exact DF@K curve for every available `K`.
 - Exact source convergence: distinct SHA-256 count, exact-unique rate, modal
   exact-copy share, and membership of each hash group.
@@ -138,6 +137,11 @@ visible in reliability and per-attempt records. Repeated identical successful
 candidates remain separate observations. All-run, complete-run, and passing-run
 partitions are diagnostic only.
 
+For a lineage population view, "successful" in this section means explicit
+controller membership (`analysis_population_member`) selected by successful
+lineage stage/boundary promotion. Held-out outcomes are measurements on that
+population and do not re-filter it through inherited `overall_success`.
+
 ### Lineage experiments
 
 Nothing in this document changes for a lineage experiment. The definitions,
@@ -166,9 +170,10 @@ Two denominators result, and both are reported rather than reconciled:
   failure and validation failure stay distinguishable.
 - **Final diversity** is measured over the completed lineages only — the final
   candidate of each lineage that passed every checkpoint. That population is a
-  set of independent implementations and is treated exactly like any other
-  successful complete population. Its report states both the number of lineages
-  started and the number of successful final implementations, so the completion
+  set of independent implementations. Its population-view report contains
+  structural metrics and population size but marks reliability and Pass@k NA
+  with scope `parent_lineage_experiment`. The parent lineage paper row combines
+  all-started completion with final structural measurements, so the completion
   rate is never implied to be one.
 
 Diversity at an intermediate checkpoint, when requested, uses the successful
@@ -179,9 +184,11 @@ checkpoints are never pooled.
 Because the lineages in a run do not share a seed, a lineage population has no
 single prior source to diff against, and its baseline is the empty translation
 unit — the same situation a `--source-mode new` experiment is already in. Churn
-measures relative to that baseline are therefore whole-program measures for
-these populations, and the structural diversity measures, which are computed
-from the candidate itself, are unaffected.
+measures relative to that baseline are unsupported as maintenance change and
+are exported as NA for these populations. Actual maintenance change lives in
+`lineage_transitions.csv` (checkpoint N-1 to N) and
+`lineage_total_change.csv` (same-lineage trajectory). Structural diversity,
+which compares population members under one constant baseline, is unaffected.
 
 ## Functional reliability
 
@@ -203,20 +210,23 @@ The failure taxonomy is deliberately conservative:
 
 - **Infrastructure attrition:** experiment workspace/setup failed before a
   usable agent invocation was attempted.
-- **Agent-execution failure:** timeout, configured-policy permission rejection,
-  or another nonzero attempted OpenCode invocation. These are valid failed
-  generated-agent trials.
+- **Agent-invocation outcome:** completion, timeout, permission rejection, and
+  other OpenCode errors are recorded independently from artifact/workflow
+  outcomes. A timeout with no candidate is an agent-execution failure; a
+  timeout with a candidate may continue through validation and repair.
 - **Candidate/workflow failure:** build, public-test, or hidden/extra-evaluator
   failure after generation.
 
 The analyzer does not infer provider or network outages from arbitrary error
-text. Agent-execution failures remain in conditional-agent, initial/final
+text. Valid attempted invocations remain in conditional-agent, initial/final
 public-success, and Pass@k denominators. Exit 124 is classified as an agent
-timeout and contributes a failed generated sample to those reliability
-outcomes, but it is not repair eligible because no completed initial
-implementation was produced. Initial permission rejection and nonzero OpenCode
-execution failure are excluded from the repair-efficacy denominator for the
-same reason. Infrastructure attrition is excluded from generated-sample
+timeout and remains visible in invocation-level summaries and reliability
+outcomes. Exit 124 always records an incomplete/timed-out invocation. When it
+left a candidate, `candidate_available_after_timeout` remains true and the
+artifact may pass public validation and the workflow may succeed; those facts
+do not rewrite the timeout. Initial permission rejection and non-salvageable
+OpenCode execution failure are excluded from the repair-efficacy denominator.
+Infrastructure attrition is excluded from generated-sample
 denominators, while end-to-end success still uses every analyzed attempt.
 
 Following Chen et al. (2021), Pass@k uses `n = N_valid_agent_trials` and `c`
@@ -232,6 +242,11 @@ Infrastructure failures do not count as failed generated samples, while
 end-to-end reporting still exposes them. Values are emitted only
 for supported `k` among 1, 5, 10, 20, 50, and 100.
 
+Pass@k is a secondary retry statistic, not a replacement for lineage
+completion. In particular, when `n = 10`, Pass@10 saturates at `1` whenever at
+least one lineage succeeds and therefore cannot express the difference between
+one and ten completed lineages.
+
 Reliability proportions receive 95% Wilson score intervals (Wilson, 1927).
 This avoids the poor boundary behavior of a symmetric normal interval and
 leaves an interval undefined when its denominator is zero.
@@ -243,7 +258,7 @@ structural organization** of the complete primary C source file. It does not
 measure repository-wide, module, or system architecture. Other changed files
 remain visible through descriptive patch metrics but do not enter the
 structural vector.
-For each candidate, v4.1.2 constructs three non-duplicated feature blocks:
+For each candidate, v5.0.0 constructs three non-duplicated feature blocks:
 
 1. Clang AST count deltas for source-file and function contexts.
 2. Tree-sitter C node-kind and call-count deltas for source-file and function
@@ -287,13 +302,20 @@ as for architecture. GumTree actions are omitted because they are whole-patch
 rather than reliably function-scoped. This representation operationalizes
 implementation decisions without claiming that every discovered family is a
 named or classical algorithm. Lee et al. (2025) motivates measuring diversity
-beyond correctness; v4.1.2 uses a broader, explicitly structural strategy
+beyond correctness; v5.0.0 uses a broader, explicitly structural strategy
 construct suitable for maintenance patches.
 
 ## Fixed clustering thresholds
 
 The clustering thresholds are calibrated using pilot experiments and then
-frozen before the confirmatory cross-model analysis. They are reused across the
+frozen before the confirmatory cross-model analysis. Formal analysis uses a
+versioned JSON configuration passed with `--analysis-config FILE
+--formal-analysis`. It explicitly records architecture and strategy thresholds,
+the sensitivity grid/rule, bootstrap repetitions/seed, strategy exclusion and
+forced includes, whether `main` is included, Clang extra arguments, and fixed K
+(including explicit null). Formal mode refuses missing values rather than using
+scientific defaults. The resolved configuration, version, and domain-separated
+fingerprint are recorded and propagated to every lineage population. Settings are reused across the
 checkpoints, models, and temperatures in that comparison. For Git experiments,
 each setting resolves by explicit CLI value, then the value recorded in
 `experiment.json`, then analyzer default. Architecture finally defaults to
@@ -306,14 +328,13 @@ preregistration before all pilot inspection. There is no condition-specific
 optimization, silhouette maximization, or post-hoc replacement of the
 configured cut. `summary.json` records every resolved value and whether it came
 from CLI, experiment metadata, an analyzer default, or the architecture cut.
-CLI overrides remain valid for exploratory or sensitivity analysis. A Git
-paper row is confirmatory only when its thresholds, K, strategy scope, and
-Clang arguments match the configuration recorded with that experiment; an
-override that changes those settings cannot enter or anchor the repository
-confirmatory aggregate.
+CLI overrides remain valid for exploratory or sensitivity analysis. A paper
+row is confirmatory only when `--formal-analysis` resolved a complete frozen
+configuration and the row matches it; exploratory/default-backed rows cannot
+enter or anchor the repository confirmatory aggregate.
 
 Threshold sensitivity is robustness analysis only. Unless `--thresholds`
-provides an exact comma-separated positive grid, v4.1.2 evaluates positive members
+provides an exact comma-separated positive grid, v5.0.0 evaluates positive members
 of `t + {-0.10, -0.05, -0.025, 0, 0.025, 0.05, 0.10}` around each primary cut.
 For every cut it reports raw and effective family counts, dominant share,
 singleton rate, silhouette when `2 <= families < N`, and ARI against the
@@ -367,7 +388,7 @@ fixed `K` supported by every compared architecture and strategy population.
 Exact convergence is calculated over successful candidates. Complete SHA-256
 coverage is required; otherwise the rates are null and hash coverage plus the
 reason are reported rather than silently shrinking the population. For
-population size `N_s`, v4.1.2 reports:
+population size `N_s`, v5.0.0 reports:
 
 ```text
 exact unique rate = distinct SHA-256 hashes / N_s
@@ -391,7 +412,7 @@ assignments and are not alternative correctness measures.
 
 ### Vendi score
 
-For normalized structural feature matrix `X`, v4.1.2 augments only the Vendi
+For normalized structural feature matrix `X`, v5.0.0 augments only the Vendi
 representation. A nonzero row becomes `[x, 0]`, while a zero row becomes a new
 unit basis vector `[0, ..., 0, 1]`. Thus zero-zero similarity is one,
 zero-nonzero similarity is zero, every diagonal is one, nonzero similarities
@@ -509,15 +530,17 @@ values are blank.
 The standardized **primary CSV schema** is:
 
 ```text
-Issue, Checkpoint, Model, Temp, N Attempts, Valid Agent Trials,
+Issue, Checkpoint, Model, Temp, Reliability Scope, Population N,
+Lineages Started, Lineages Completed, Lineage Completion Rate,
+N Attempts, Valid Agent Trials,
 Infrastructure Failures, Infrastructure Attrition Rate, Successful Runs,
 End-to-End Success Rate, Conditional Agent Success Rate,
 Initial Public Success Rate, Final Public Success Rate,
 Repair Recovery Rate, Pass@1, Pass@5, Pass@10,
 Architecture Population N, Effective Architecture Families,
-Dominant Architecture Family Share, Architecture Family-Discovery AUC@K,
+Dominant Architecture Family Share, Mean Pairwise Architecture Distance,
 Strategy Population N, Effective Strategy Families,
-Dominant Strategy Family Share, Strategy Family-Discovery AUC@K,
+Dominant Strategy Family Share, Mean Pairwise Strategy Distance,
 Diversity K Max
 ```
 
@@ -528,16 +551,16 @@ The standardized **descriptive CSV schema** is:
 
 ```text
 Issue, Checkpoint, Model, Temp,
-Raw Architecture Families, Mean Pairwise Architecture Distance,
+Raw Architecture Families, Architecture Family-Discovery AUC@K,
 Architecture Vendi Score, Raw Strategy Families,
-Mean Pairwise Strategy Distance, Strategy Vendi Score,
+Strategy Family-Discovery AUC@K, Strategy Vendi Score,
 Exact Unique Rate, Exact Modal Share,
 Mean Repair Loops, Median Repair Loops, Max Repair Loops,
 Mean LLM Invocations, Mean Repair LLM Runtime (s),
 Mean Total Runtime (s), Median Total Runtime (s),
 Mean Lines Edited, Mean Files Edited, Mean Functions Edited,
 Mean Functions Created, Mean Functions Deleted,
-Mean Normalized GumTree Edit-Action Magnitude
+Mean Normalized GumTree Edit-Action Magnitude, Maintenance Change Scope
 ```
 
 `paper_metrics_row.json` records `_schema_version`, `_analyzer_version`, and a
@@ -545,13 +568,15 @@ readable `_analysis_signature`. The signature contains architecture and strategy
 thresholds, fixed K, the strategy exclusion regex, sorted forced includes,
 whether `main` is included, and Clang extra arguments in supplied order. Because
 argument order is preserved and treated as significant, differently ordered
-Clang arguments are different signatures. Repository-level aggregation includes
-only current schema-v5/analyzer-v4.1.2 complete rows that individually match
+Clang arguments are different signatures. The signature also records the
+versioned resolved-configuration fingerprint, sensitivity rule/grid, and
+bootstrap settings. Repository-level aggregation includes
+only current schema-v6/analyzer-v5.0.0 complete rows that individually match
 their owning Git experiment's recorded configuration and share the first such
 row's exact signature. Older/incompatible, exploratory/nonconfirmatory, and
 incompatible-confirmatory-configuration rows are counted separately.
 `runs/experiments/paper_metrics_metadata.json` records the accepted signature
-and all four row counts. Historical analyses must be rerun with analyzer v4.1.2
+and all four row counts. Historical analyses must be rerun with analyzer v5.0.0
 before inclusion; historical analysis directories are not rewritten
 automatically.
 
@@ -591,13 +616,13 @@ Legacy `--analysis-threshold` sets both thresholds unless a corresponding
 specific option overrides it; otherwise strategy defaults to architecture. An
 unset K stays unset.
 
-Manual reanalysis uses CLI > recorded experiment metadata > analyzer default
-for architecture threshold, strategy threshold, and K. Omitting those CLI
-arguments reproduces the stored Git experiment configuration. Exploratory CLI
-overrides are allowed, but rows that change the recorded primary settings are
-excluded from repository-level confirmatory aggregation. Among individually
-confirmatory rows, mixed thresholds, K, strategy scope, or Clang arguments are
-rejected rather than silently pooled.
+Manual exploratory reanalysis uses CLI > recorded experiment metadata >
+analyzer default for architecture threshold, strategy threshold, and K.
+Omitting those CLI arguments reproduces the stored Git experiment
+configuration, but does not make the result confirmatory. A confirmatory row
+must be produced with `--formal-analysis` from a complete versioned frozen
+configuration. Mixed thresholds, K, strategy scope, or Clang arguments among
+formal rows are rejected rather than silently pooled.
 
 Optional diagnostics and controlled overrides are:
 

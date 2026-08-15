@@ -75,6 +75,9 @@ these flags existed):
   --max-tokens N             Cap on generated tokens per session, N >= 1. Sent
                              as max_tokens, replacing the model's own output
                              limit.
+  --model-provenance-json J  Metadata-only JSON object for model-definition
+                             controls such as base_model/top_k/top_k_control.
+                             It is never added to an OpenCode request.
 
                              There is no --top-k. See the SAMPLING PARAMETERS
                              note in this script for the measurements behind
@@ -414,6 +417,7 @@ TEMP_LIST_SET=0
 TOP_P=""
 SAMPLING_SEED=""
 MAX_TOKENS=""
+MODEL_PROVENANCE_JSON=""
 RUNS=1
 MAX_LOOPS=3
 REPAIR_TEMPLATE=""
@@ -449,7 +453,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --model|--prompt|--source|--source-mode|--temperature|--temp-min| \
         --temp-max|--temp-points|--temp-list|--runs|--max-loops| \
-        --top-p|--sampling-seed|--max-tokens| \
+        --top-p|--sampling-seed|--max-tokens|--model-provenance-json| \
         --repair-prompt|--agent| \
         --test-dir|--seed-file|--keep-glob|--build-cmd|--base-test-cmd| \
         --feature-test-cmd|--test-cmd|--extra-test-cmd|--timeout|--output-dir| \
@@ -474,6 +478,7 @@ while [[ $# -gt 0 ]]; do
         --top-p) TOP_P="${2:-}"; shift 2 ;;
         --sampling-seed) SAMPLING_SEED="${2:-}"; shift 2 ;;
         --max-tokens) MAX_TOKENS="${2:-}"; shift 2 ;;
+        --model-provenance-json) MODEL_PROVENANCE_JSON="${2:-}"; shift 2 ;;
         --top-k)
             # Measured, not assumed: OpenCode does put an agent-level top_k on
             # the wire, but it arrives at an OpenAI-compatible /v1/chat/
@@ -522,6 +527,12 @@ while [[ $# -gt 0 ]]; do
         *) die "unknown argument: $1" ;;
     esac
 done
+
+if [[ -n "$MODEL_PROVENANCE_JSON" ]]; then
+    "$PYTHON_BIN" -c 'import json, sys; value=json.loads(sys.argv[1]); sys.exit(0 if isinstance(value, dict) else 1)' \
+        "$MODEL_PROVENANCE_JSON" 2>/dev/null ||
+        die "--model-provenance-json must be a valid JSON object"
+fi
 
 command -v "$PYTHON_BIN" >/dev/null 2>&1 || die "$PYTHON_BIN was not found"
 command -v git >/dev/null 2>&1 || die "git is required (to resolve repo-relative paths)"
@@ -915,6 +926,7 @@ write_metadata "$OUTPUT_DIR/sweep.json" \
     repository "$REPO" \
     repository_commit "$REPO_COMMIT" \
     model "$MODEL" \
+    model_provenance "__JSON__:${MODEL_PROVENANCE_JSON:-null}" \
     agent "$AGENT" \
     prompt "$PROMPT_ABS" \
     source_workdir_path "$SOURCE_PATH" \
@@ -977,7 +989,8 @@ for temperature in "${TEMPERATURES_ARR[@]}"; do
                 "$RESOLVED_STRATEGY_THRESHOLD" \
                 "${ANALYSIS_DIVERSITY_K_MAX:-__NONE__}" \
                 "${TOP_P:-__NONE__}" "${SAMPLING_SEED:-__NONE__}" \
-                "${MAX_TOKENS:-__NONE__}" <<'PY'
+                "${MAX_TOKENS:-__NONE__}" \
+                "${MODEL_PROVENANCE_JSON:-__NONE__}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -1002,9 +1015,14 @@ data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
     top_p,
     sampling_seed,
     max_tokens,
+    model_provenance_json,
 ) = sys.argv[2:]
 expected = {
     "model": model,
+    "model_provenance": (
+        None if model_provenance_json == "__NONE__"
+        else json.loads(model_provenance_json)
+    ),
     "temperature": float(temperature),
     # Sampling conditions are part of what an attempt directory means, so
     # resuming into one with a different knob is the same mistake as resuming
@@ -1055,6 +1073,7 @@ PY
         repository "$REPO" \
         repository_commit "$REPO_COMMIT" \
         model "$MODEL" \
+        model_provenance "__JSON__:${MODEL_PROVENANCE_JSON:-null}" \
         temperature "$temperature" \
         top_p "$(optional_number "$TOP_P")" \
         sampling_seed "$(optional_number "$SAMPLING_SEED")" \
@@ -1664,6 +1683,7 @@ PY
             run_id "$attempt_id" \
             attempt_number "$attempt_number" \
             model "$MODEL" \
+            model_provenance "__JSON__:${MODEL_PROVENANCE_JSON:-null}" \
             temperature "$temperature" \
             top_p "$(optional_number "$TOP_P")" \
             sampling_seed "$(optional_number "$SAMPLING_SEED")" \

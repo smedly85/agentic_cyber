@@ -63,7 +63,7 @@ import sys
 from pathlib import Path
 from typing import Any, Mapping
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
@@ -595,6 +595,22 @@ def build_stage_rows(lineages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "loop_limit_reached": stage.get("loop_limit_reached"),
                     "infrastructure_failure": stage.get("infrastructure_failure"),
                     "agent_execution_failure": stage.get("agent_execution_failure"),
+                    "agent_invocation_completed": stage.get(
+                        "agent_invocation_completed",
+                        stage.get("initial_session_completed"),
+                    ),
+                    "agent_invocation_timed_out": stage.get(
+                        "agent_invocation_timed_out",
+                        stage.get("initial_opencode_exit_code") == 124,
+                    ),
+                    "candidate_available_after_timeout": stage.get(
+                        "candidate_available_after_timeout"
+                    ),
+                    "artifact_public_validation_success": stage.get(
+                        "artifact_public_validation_success",
+                        stage.get("public_validation_success"),
+                    ),
+                    "workflow_stage_success": stage.get("success"),
                     "build_exit_code": stage.get("build_exit_code"),
                     "feature_test_exit_code": stage.get("feature_test_exit_code"),
                     # Provenance: which candidate seeded this stage, and what
@@ -990,6 +1006,13 @@ def materialize_view(
                 "lineage_checkpoint_id": stage.get("checkpoint_id"),
                 "lineage_stage_dir": stage.get("stage_dir"),
                 "source_path": source_basename,
+                "analysis_population_member": True,
+                "population_selection_basis": "lineage_stage_success",
+                "artifact_public_validation_success": stage.get(
+                    "public_validation_success",
+                    metadata.get("public_validation_success"),
+                ),
+                "workflow_stage_success": bool(stage.get("success")),
             }
         )
         write_json(attempt_target / "metadata.json", metadata)
@@ -1025,6 +1048,8 @@ def materialize_view(
             "schema_version": 2,
             "experiment_format": "lineage_population_view",
             "population": label,
+            "reliability_scope": "parent_lineage_experiment",
+            "population_selection_basis": "lineage_stage_success",
             # Points at the view, not the checkout: analyze_experiment.py
             # rebuilds a repository-level paper aggregate under
             # <repository>/runs/experiments, and a lineage analysis must not
@@ -1033,6 +1058,7 @@ def materialize_view(
             "repository_commit": run_metadata.get("repository_commit"),
             "utility": run_metadata.get("utility"),
             "model": run_metadata.get("model"),
+            "model_provenance": run_metadata.get("model_provenance"),
             "temperature": run_metadata.get("temperature"),
             "agent": run_metadata.get("agent"),
             "max_loops": run_metadata.get("max_loops"),
@@ -1048,7 +1074,12 @@ def materialize_view(
             "feature_test_command": feature_test_command,
             "build_command": build_command,
             "requested_runs": len(members),
+            "population_size": len(members),
             "config_fingerprint": run_metadata.get("config_fingerprint"),
+            "frozen_analysis_configuration": run_metadata.get(
+                "frozen_analysis_configuration"
+            ),
+            "formal_analysis": bool(run_metadata.get("formal_analysis")),
             "baseline_rationale": (
                 "Lineages share no seed, so this population has no common "
                 "prior source. The empty translation unit is used so that every "
@@ -1084,6 +1115,10 @@ def run_analyzer(
         command += ["--strategy-threshold", str(args.strategy_threshold)]
     if args.diversity_k_max is not None:
         command += ["--diversity-k-max", str(args.diversity_k_max)]
+    if args.analysis_config is not None:
+        command += ["--analysis-config", str(args.analysis_config)]
+    if args.formal_analysis:
+        command.append("--formal-analysis")
 
     print(f"\n=== diversity: {view_dir.name} ===")
     completed = subprocess.run(command, check=False)
@@ -1092,6 +1127,55 @@ def run_analyzer(
         "returncode": completed.returncode,
         "analysis_dir": str(view_dir / "analysis"),
     }
+
+
+def build_parent_lineage_paper_row(
+    reliability: Mapping[str, Any],
+    populations: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Combine parent reliability with the final survivor structure only."""
+    final = next(
+        (entry for entry in populations if entry.get("label") == "final"), None
+    )
+    if not final or final.get("returncode") != 0 or not final.get("analysis_dir"):
+        return None, []
+    population_row_path = Path(str(final["analysis_dir"])) / "paper_metrics_row.json"
+    if not population_row_path.is_file():
+        return None, []
+    row = read_json(population_row_path)
+    analyzer = experiment_analyzer()
+    started = int(reliability["lineages_started"])
+    completed = int(reliability["lineages_completed"])
+    row.update(
+        {
+            "Reliability Scope": "parent_lineage_experiment",
+            "Population N": final.get("members"),
+            "Lineages Started": started,
+            "Lineages Completed": completed,
+            "Lineage Completion Rate": reliability.get(
+                "end_to_end_completion_rate"
+            ),
+            "N Attempts": started,
+            "Valid Agent Trials": None,
+            "Infrastructure Failures": None,
+            "Infrastructure Attrition Rate": None,
+            "Successful Runs": completed,
+            "End-to-End Success Rate": reliability.get(
+                "end_to_end_completion_rate"
+            ),
+            "Conditional Agent Success Rate": None,
+            "Initial Public Success Rate": None,
+            "Final Public Success Rate": None,
+            "Repair Recovery Rate": None,
+        }
+    )
+    for k in (1, 5, 10):
+        row[f"Pass@{k}"] = (
+            analyzer.pass_at_k(started, completed, k)
+            if analyzer is not None and k <= started else None
+        )
+    columns = list(getattr(analyzer, "PAPER_METRICS_COLUMNS", row.keys()))
+    return row, columns
 
 
 # ---------------------------------------------------------------------------
@@ -1291,6 +1375,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cluster-threshold", type=float, default=None)
     parser.add_argument("--strategy-threshold", type=float, default=None)
     parser.add_argument("--diversity-k-max", type=int, default=None)
+    parser.add_argument("--analysis-config", type=Path, default=None,
+                        help="Versioned frozen analysis configuration JSON")
+    parser.add_argument("--formal-analysis", action="store_true",
+                        help="Refuse analysis without a complete frozen config")
     parser.add_argument("--analyzer", type=Path,
                         default=REPO_ROOT / "scripts" / "analyze_experiment.py")
     parser.add_argument("--python", default=sys.executable)
@@ -1307,6 +1395,19 @@ def main(argv: list[str] | None = None) -> int:
     root = args.lineage_root.resolve()
     output_dir = (args.output_dir or root / "analysis").resolve()
     run_metadata, lineages, never_started = load_run(root)
+    run_metadata = dict(run_metadata)
+    if args.analysis_config is not None:
+        run_metadata["frozen_analysis_configuration"] = read_json(
+            args.analysis_config.resolve()
+        )
+    if args.formal_analysis and not isinstance(
+        run_metadata.get("frozen_analysis_configuration"), Mapping
+    ):
+        raise LineageError(
+            "--formal-analysis requires --analysis-config or recorded "
+            "frozen_analysis_configuration metadata"
+        )
+    run_metadata["formal_analysis"] = args.formal_analysis
 
     # Run-level environment eligibility is answered before anything else, and
     # answers a different question from reliability. No lineage started, so
@@ -1391,11 +1492,27 @@ def main(argv: list[str] | None = None) -> int:
             entry["view_dir"] = str(view)
             populations.append(entry)
 
+    parent_paper_row, parent_paper_columns = build_parent_lineage_paper_row(
+        reliability, populations
+    )
+    resolved_analysis_configuration = None
+    for population in populations:
+        analysis_dir = population.get("analysis_dir")
+        if population.get("returncode") == 0 and analysis_dir:
+            summary_path = Path(str(analysis_dir)) / "summary.json"
+            if summary_path.is_file():
+                resolved_analysis_configuration = read_json(summary_path).get(
+                    "analysis_configuration"
+                )
+                if resolved_analysis_configuration is not None:
+                    break
+
     report = {
         "schema_version": SCHEMA_VERSION,
         "lineage_root": str(root),
         "utility": run_metadata.get("utility"),
         "model": run_metadata.get("model"),
+        "model_provenance": run_metadata.get("model_provenance"),
         "temperature": run_metadata.get("temperature"),
         "agent": run_metadata.get("agent"),
         "max_loops": run_metadata.get("max_loops"),
@@ -1436,9 +1553,28 @@ def main(argv: list[str] | None = None) -> int:
         },
         "seed_provenance_problems": provenance_problems,
         "populations": populations,
+        "paper_facing_result": (
+            "lineage_paper_metrics_row.json" if parent_paper_row else None
+        ),
+        "analysis_configuration": resolved_analysis_configuration,
+        "analysis_configuration_version": (
+            resolved_analysis_configuration.get("configuration_version")
+            if isinstance(resolved_analysis_configuration, Mapping) else None
+        ),
+        "analysis_configuration_fingerprint": (
+            resolved_analysis_configuration.get("configuration_fingerprint")
+            if isinstance(resolved_analysis_configuration, Mapping) else None
+        ),
     }
 
     write_json(output_dir / "lineage_report.json", report)
+    if parent_paper_row is not None:
+        write_json(output_dir / "lineage_paper_metrics_row.json", parent_paper_row)
+        write_csv(
+            output_dir / "lineage_paper_metrics.csv",
+            [parent_paper_row],
+            parent_paper_columns,
+        )
     write_csv(
         output_dir / "lineage_stages.csv",
         stage_rows,
@@ -1447,12 +1583,14 @@ def main(argv: list[str] | None = None) -> int:
             "source_mode", "implemented_flags", "success", "failure_reason",
             "initial_success", "repair_loops", "llm_invocations", "success_loop",
             "stop_reason", "loop_limit_reached", "infrastructure_failure",
-            "agent_execution_failure", "build_exit_code", "feature_test_exit_code",
+            "agent_execution_failure", "agent_invocation_completed",
+            "agent_invocation_timed_out", "candidate_available_after_timeout",
+            "artifact_public_validation_success", "workflow_stage_success",
+            "build_exit_code", "feature_test_exit_code",
             # A stage can now succeed, or be repaired, after a session that ran
             # out of time. These keep that visible per stage rather than only in
             # the attempt metadata underneath it.
-            "opencode_exit_code", "initial_session_completed",
-            "candidate_available_after_timeout", "repair_eligible",
+            "opencode_exit_code", "initial_session_completed", "repair_eligible",
             "repair_eligibility_reason",
             "seed", "seed_sha256", "candidate", "candidate_sha256",
             "total_opencode_runtime_ms",

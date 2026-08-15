@@ -50,14 +50,13 @@ The unit is the same one `docs/diversity_methodology.md` defines: one complete
 generation/repair trajectory is one independent attempt, and repeated identical
 candidates are retained as separate observations rather than deduplicated.
 
-The population is the **successful runs of one condition**, exactly as
-`analyze_experiment.py` determined them. The failure taxonomy is not
-reimplemented here. `analyze_experiment.py` must have been run on the target
-experiment first; this reads `<experiment>/analysis/per_run_metrics.csv` and
-filters to `overall_success == True`, and takes `architecture_cluster_id` and
-`strategy_cluster_id` from the same rows. If that file is absent the measurement
-refuses to run rather than deriving a second, possibly divergent, notion of
-success.
+For an ordinary repeated-attempt condition, the population is selected by
+`overall_success`. For a `lineage_population_view`, membership instead uses the
+controller-recorded `analysis_population_member == True`, with
+`population_selection_basis = lineage_stage_success`. Held-out failure remains
+recorded but cannot remove a candidate that passed public and checkpoint-
+boundary validation and was promoted. Selection and structural family labels
+are read from `analysis/per_run_metrics.csv`; neither is re-derived here.
 
 Within that population, a run is **measured** when its retained candidate source
 rebuilds and both judging passes produce a report. A run that cannot be measured
@@ -148,21 +147,31 @@ written back.
 
 ## Fingerprints
 
-`runner.py --json-report` emits `{"counts": {...}, "per_suite": {...},
-"failures": [[name, verdict, detail], ...]}` — verified identical across the
-mkdir, sort, grep and chmod suites. It enumerates **failures** individually;
-every case not listed passed.
+`runner.py --json-report` retains `counts`, `per_suite`, and diagnostic
+`failures`, and additionally emits a deterministic complete `results` array:
 
-A behavioral fingerprint is a canonical SHA-256 over the sorted
-`(case name, verdict)` pairs of a report:
+```json
+{"case_id": "curated.json.gz::000042::case-name.p", "verdict": "PASS"}
+```
+
+The stable case ID includes its corpus file, zero-based frozen-suite case
+ordinal, and any invocation-mode suffix. The ordinal distinguishes separate
+frozen variants that intentionally retain the same human-readable case name;
+the mode suffix distinguishes executions of one variant through file, pipe, or
+redirect invocation.
+Verdicts retain the suite's existing PASS, SKIP, XFAIL, FAIL, TIMEOUT,
+SANITIZER, and CRASH meanings.
+
+A behavioral fingerprint is a domain-separated canonical SHA-256 over the
+corpus identity and the complete sorted verdict trace:
 
 ```text
-fingerprint = SHA-256( JSON( sorted( [[name, verdict], ...] ) ) )
+fingerprint = SHA-256(domain || JSON({corpus_identity, results}))
 ```
 
 Three are produced per measured candidate: **visible**, **held-out**, and
-**combined**, where the combined material is the concatenation of both failure
-lists with case names namespaced `visible::<name>` and `heldout::<name>` so a
+**combined**, where the combined material is the concatenation of both complete
+traces with case names namespaced `visible::<name>` and `heldout::<name>` so a
 shared name in the two corpora cannot collide.
 
 Three properties are intended. Sorting makes the hash order-independent, since
@@ -172,18 +181,29 @@ out on a case did not behave as one that produced wrong output on it. `detail`
 is excluded, because it carries prose containing absolute paths, byte offsets
 and timings, none of which are behavior.
 
-Hashing failures alone identifies the full pass/fail vector only if every
-candidate was judged on the same case set. That holds by construction — the case
-set is a deterministic function of the suite files, the corpus and the
-cumulative flag list, all fixed within a condition — but it is verified rather
-than assumed. `case_count_stable` is true when the visible and held-out case
-totals (summed over every verdict, including skips) were identical across the
-measured population. A false value means the condition was not held constant and
-the convergence rates are comparing candidates judged on different cases.
+Each scope records corpus-file hashes, ordered case IDs, number of cases,
+visible/held-out scope, cumulative checkpoint flags, and a deterministic corpus
+identity. Equal counts are only diagnostic. Candidates are directly comparable
+only when corpus identity and ordered case IDs match; otherwise the pair is
+reported as incomparable and no disagreement value is fabricated.
 
 ## Metrics
 
-### Exact behavioral convergence
+### Mean pairwise behavioral disagreement (primary RQ2)
+
+For compatible traces over `T_S` cases:
+
+```text
+d_B(i,j) = sum_t 1[o_it != o_jt] / T_S
+mean_D_B = sum_(i<j) d_B(i,j) / choose(M, 2)
+```
+
+This is computed separately for visible, held-out, and combined scopes. Zero
+means identical observed verdicts on every case. Fewer than two measured
+candidates, or any incompatible corpus pair, produces null with a reason. The
+machine-readable pair table is `pairwise_behavioral_distances.csv`.
+
+### Exact behavioral convergence (supporting)
 
 Over the measured population of size `N`, and separately for the visible,
 held-out and combined fingerprints:
@@ -193,7 +213,9 @@ exact_behavioral_unique_rate = distinct fingerprint hashes / N
 exact_behavioral_modal_share = largest fingerprint-group size / N
 ```
 
-These are the exact-convergence statistics of
+These sample-size-dependent descriptive statistics retain exact profile count,
+modal share, coverage, and memberships. They are not the primary RQ2 statistic.
+They are the exact-convergence statistics of
 `docs/diversity_methodology.md` applied to a different hash, computed by the
 same function — `diversity_metrics.exact_repetition_summary` is generic over
 hash strings and nothing in it is specific to source bytes. Reusing it keeps one
@@ -234,15 +256,17 @@ The default output is `<experiment>/analysis/execution_consistency/`:
 analysis/
 └── execution_consistency/
     ├── summary.json
-    └── behavioral_fingerprints.csv
+    ├── behavioral_fingerprints.csv
+    ├── behavioral_verdict_traces.json
+    └── pairwise_behavioral_distances.csv
 ```
 
 `summary.json` records the schema version, the resolved utility, flag list and
 candidate binary, the corpora used, population counts with
 `measurement_coverage` and a per-run reason for every unmeasured run,
-`case_count_stable` with the distinct case counts observed, the three exact
-behavioral convergence summaries, and both agreement results. Missing values are
-`null`.
+corpus identities and ordered case IDs, the three primary pairwise disagreement
+summaries, supporting exact convergence, and both agreement results. Missing or
+incomparable values are `null` with a reason.
 
 `behavioral_fingerprints.csv` is one row per measured run:
 

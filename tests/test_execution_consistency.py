@@ -56,10 +56,16 @@ def measure():
 class BehavioralFingerprintTests(unittest.TestCase):
     def test_fingerprint_is_order_independent(self):
         forward = em.behavioral_fingerprint_hash(
-            [("case-a", "FAIL"), ("case-b", "CRASH"), ("case-c", "TIMEOUT")]
+            "corpus-a",
+            [{"case_id": "case-a", "verdict": "PASS"},
+             {"case_id": "case-b", "verdict": "CRASH"},
+             {"case_id": "case-c", "verdict": "TIMEOUT"}],
         )
         shuffled = em.behavioral_fingerprint_hash(
-            [("case-c", "TIMEOUT"), ("case-a", "FAIL"), ("case-b", "CRASH")]
+            "corpus-a",
+            [{"case_id": "case-c", "verdict": "TIMEOUT"},
+             {"case_id": "case-a", "verdict": "PASS"},
+             {"case_id": "case-b", "verdict": "CRASH"}],
         )
         self.assertEqual(forward, shuffled)
         # The runner reports failures from a thread pool, so order carries no
@@ -67,28 +73,55 @@ class BehavioralFingerprintTests(unittest.TestCase):
         self.assertEqual(len(forward), 64)
 
     def test_fingerprint_is_sensitive_to_verdict_and_membership(self):
-        baseline = em.behavioral_fingerprint_hash([("case-a", "FAIL")])
-        other_verdict = em.behavioral_fingerprint_hash([("case-a", "CRASH")])
-        other_case = em.behavioral_fingerprint_hash([("case-b", "FAIL")])
+        trace = lambda case, verdict: [{"case_id": case, "verdict": verdict}]
+        baseline = em.behavioral_fingerprint_hash("corpus", trace("case-a", "FAIL"))
+        other_verdict = em.behavioral_fingerprint_hash("corpus", trace("case-a", "CRASH"))
+        other_case = em.behavioral_fingerprint_hash("corpus", trace("case-b", "FAIL"))
         extra_case = em.behavioral_fingerprint_hash(
-            [("case-a", "FAIL"), ("case-b", "FAIL")]
+            "corpus",
+            [*trace("case-a", "FAIL"), *trace("case-b", "FAIL")],
         )
         self.assertNotEqual(baseline, other_verdict)
         self.assertNotEqual(baseline, other_case)
         self.assertNotEqual(baseline, extra_case)
         # An all-passing candidate has a well-defined fingerprint of its own.
-        self.assertNotEqual(baseline, em.behavioral_fingerprint_hash([]))
+        self.assertNotEqual(baseline, em.behavioral_fingerprint_hash("corpus", []))
         self.assertEqual(
-            em.behavioral_fingerprint_hash([]), em.behavioral_fingerprint_hash(())
+            em.behavioral_fingerprint_hash("corpus", []),
+            em.behavioral_fingerprint_hash("corpus", ()),
+        )
+        self.assertNotEqual(
+            baseline,
+            em.behavioral_fingerprint_hash("different-corpus", trace("case-a", "FAIL")),
         )
 
     def test_fingerprint_does_not_confuse_name_and_verdict_boundaries(self):
         # A flat concatenation would collide these; the pairs are hashed as
         # structured JSON precisely so they do not.
         self.assertNotEqual(
-            em.behavioral_fingerprint_hash([("a", "bc")]),
-            em.behavioral_fingerprint_hash([("ab", "c")]),
+            em.behavioral_fingerprint_hash(
+                "corpus", [{"case_id": "a", "verdict": "bc"}]
+            ),
+            em.behavioral_fingerprint_hash(
+                "corpus", [{"case_id": "ab", "verdict": "c"}]
+            ),
         )
+
+    def test_pairwise_disagreement_uses_every_verdict(self):
+        left = [
+            {"case_id": "a", "verdict": "PASS"},
+            {"case_id": "b", "verdict": "PASS"},
+            {"case_id": "c", "verdict": "FAIL"},
+        ]
+        right = [
+            {"case_id": "a", "verdict": "PASS"},
+            {"case_id": "b", "verdict": "TIMEOUT"},
+            {"case_id": "c", "verdict": "FAIL"},
+        ]
+        self.assertEqual(em.pairwise_verdict_disagreement(left, left), 0.0)
+        self.assertEqual(em.pairwise_verdict_disagreement(left, right), 1 / 3)
+        with self.assertRaises(ValueError):
+            em.pairwise_verdict_disagreement(left, right[:-1])
 
 
 class StructuralBehaviorAgreementTests(unittest.TestCase):
@@ -222,15 +255,61 @@ def test_report_extraction_matches_the_json_report_contract(measure):
             ["case-two", "CRASH", "SIGSEGV"],
             ["case-three", "FAIL", "exit 1 vs 0"],
         ],
+        "results": [
+            {"case_id": "suite::case-one", "verdict": "FAIL"},
+            {"case_id": "suite::case-pass", "verdict": "PASS"},
+        ],
     }
     assert measure.report_failures(payload) == [
         ("case-one", "FAIL"),
         ("case-two", "CRASH"),
         ("case-three", "FAIL"),
     ]
-    # SKIPs are cases too: they are part of the denominator that makes the
-    # failure-only fingerprint sufficient.
+    # SKIPs are cases too and remain in the complete verdict trace denominator.
     assert measure.report_case_count(payload) == 51
+
+
+def test_complete_report_trace_contains_pass_and_failure_verdicts(measure):
+    payload = {
+        "counts": {"PASS": 1, "FAIL": 1},
+        "failures": [["failed", "FAIL", "detail"]],
+        "results": [
+            {"case_id": "suite::passed", "verdict": "PASS"},
+            {"case_id": "suite::failed", "verdict": "FAIL"},
+        ],
+    }
+    assert measure.report_results(payload) == sorted(
+        payload["results"], key=lambda entry: entry["case_id"]
+    )
+    assert "failures" in payload
+
+
+def test_runner_case_ids_distinguish_variants_and_invocation_modes(monkeypatch):
+    monkeypatch.syspath_prepend(str(SORT_SUITE))
+    spec = importlib.util.spec_from_file_location(
+        "sort_runner_case_identity", SORT_SUITE / "runner.py"
+    )
+    assert spec is not None and spec.loader is not None
+    runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner)
+
+    first_variant = {"_suite": "frozen.json.gz", "_case_ordinal": 12}
+    second_variant = {"_suite": "frozen.json.gz", "_case_ordinal": 13}
+    identifiers = [
+        runner.case_result_id(first_variant, "logical-case"),
+        runner.case_result_id(first_variant, "logical-case.p"),
+        runner.case_result_id(first_variant, "logical-case.r"),
+        runner.case_result_id(second_variant, "logical-case"),
+    ]
+    assert len(identifiers) == len(set(identifiers))
+    assert identifiers == [
+        runner.case_result_id(first_variant, "logical-case"),
+        runner.case_result_id(first_variant, "logical-case.p"),
+        runner.case_result_id(first_variant, "logical-case.r"),
+        runner.case_result_id(second_variant, "logical-case"),
+    ]
+    assert identifiers[1].endswith(".p")
+    assert identifiers[2].endswith(".r")
 
 
 def test_report_extraction_handles_a_clean_pass(measure):
@@ -248,14 +327,15 @@ def test_report_extraction_rejects_a_malformed_failure_entry(measure):
 
 def test_combined_fingerprint_namespaces_the_two_corpora(measure):
     """A visible and a held-out case of the same name must not collide."""
-    assert measure.namespaced_failures("visible", [("x", "FAIL")]) == [
-        ("visible::x", "FAIL")
+    result = [{"case_id": "x", "verdict": "FAIL"}]
+    assert measure.namespaced_results("visible", result) == [
+        {"case_id": "visible::x", "verdict": "FAIL"}
     ]
     visible_only = em.behavioral_fingerprint_hash(
-        measure.namespaced_failures("visible", [("x", "FAIL")])
+        "combined", measure.namespaced_results("visible", result)
     )
     heldout_only = em.behavioral_fingerprint_hash(
-        measure.namespaced_failures("heldout", [("x", "FAIL")])
+        "combined", measure.namespaced_results("heldout", result)
     )
     assert visible_only != heldout_only
 
@@ -280,6 +360,54 @@ def test_case_count_stability_detects_an_uneven_condition(measure):
     assert uneven["distinct_visible_case_counts"] == [48, 51]
     # An empty population is vacuously stable rather than an error.
     assert measure.case_count_stability([])["case_count_stable"] is True
+
+
+def test_lineage_population_selection_uses_controller_membership(measure, tmp_path):
+    metrics = tmp_path / "per_run_metrics.csv"
+    with metrics.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=(
+                "run_id", "overall_success", "analysis_population_member",
+                "population_selection_basis",
+            ),
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "run_id": "heldout-failed-but-promoted",
+                "overall_success": "False",
+                "analysis_population_member": "True",
+                "population_selection_basis": "lineage_stage_success",
+            }
+        )
+    population = measure.successful_population(
+        metrics,
+        {
+            "experiment_format": "lineage_population_view",
+            "population_selection_basis": "lineage_stage_success",
+        },
+    )
+    assert [row["run_id"] for row in population] == [
+        "heldout-failed-but-promoted"
+    ]
+
+
+def test_lineage_population_selection_rejects_missing_explicit_membership(
+    measure, tmp_path
+):
+    metrics = tmp_path / "per_run_metrics.csv"
+    metrics.write_text(
+        "run_id,overall_success\nattempt-001,True\n", encoding="utf-8"
+    )
+    with pytest.raises(SystemExit, match="malformed lineage_population_view"):
+        measure.successful_population(
+            metrics,
+            {
+                "experiment_format": "lineage_population_view",
+                "population_selection_basis": "lineage_stage_success",
+            },
+        )
 
 
 def test_convergence_summary_reuses_the_diversity_statistic(measure):
@@ -574,6 +702,11 @@ def test_rebuild_and_judge_round_trip_through_the_real_suite(
 
     for label, result in results.items():
         assert result["status"] == "measured", f"{label}: {result.get('detail')}"
+        for scope in ("visible", "heldout", "combined"):
+            case_ids = [entry["case_id"] for entry in result[f"{scope}_results"]]
+            assert len(case_ids) == len(set(case_ids)), (
+                f"{label}: {scope} trace contains duplicate case IDs"
+            )
 
     first, second, reversed_variant = (
         results["correct-first"],
@@ -587,15 +720,23 @@ def test_rebuild_and_judge_round_trip_through_the_real_suite(
     )
     assert first["visible_fingerprint_sha256"] == second["visible_fingerprint_sha256"]
     assert first["heldout_fingerprint_sha256"] == second["heldout_fingerprint_sha256"]
+    assert first["combined_results"] == second["combined_results"]
+
+    assert em.pairwise_verdict_disagreement(
+        first["combined_results"], second["combined_results"]
+    ) == 0.0
 
     # (b) A behaviorally different candidate does not.
     assert (
         reversed_variant["combined_fingerprint_sha256"]
         != first["combined_fingerprint_sha256"]
     )
+    assert em.pairwise_verdict_disagreement(
+        first["combined_results"], reversed_variant["combined_results"]
+    ) > 0.0
 
-    # The case set is fixed by the condition, which is what makes a
-    # failure-only fingerprint sufficient.
+    # Counts remain a diagnostic; corpus identities and ordered case IDs are
+    # the authoritative compatibility check.
     stability = measure.case_count_stability(list(results.values()))
     assert stability["case_count_stable"] is True
     assert stability["distinct_visible_case_counts"][0] > 0
@@ -814,12 +955,36 @@ def stub_measure_run(**kwargs):
     if run_id not in FABRICATED_FINGERPRINTS:
         return {"status": "rebuild_failed", "detail": f"fabricated failure: {run_id}"}
     visible, heldout, combined = FABRICATED_FINGERPRINTS[run_id]
+    visible_results = [
+        {"case_id": f"visible::{index:03d}", "verdict": "PASS"}
+        for index in range(51)
+    ]
+    heldout_results = [
+        {"case_id": f"heldout::{index:03d}", "verdict": "PASS"}
+        for index in range(29)
+    ]
+    combined_results = sorted(
+        [{"case_id": f"visible::{entry['case_id']}", "verdict": entry["verdict"]}
+         for entry in visible_results]
+        + [{"case_id": f"heldout::{entry['case_id']}", "verdict": entry["verdict"]}
+           for entry in heldout_results],
+        key=lambda entry: entry["case_id"],
+    )
     return {
         "status": "measured",
         "visible_case_count": 51,
         "heldout_case_count": 29,
         "visible_failure_count": 2,
         "heldout_failure_count": 1,
+        "visible_results": visible_results,
+        "heldout_results": heldout_results,
+        "combined_results": combined_results,
+        "visible_corpus": {"corpus_identity_sha256": "visible-corpus"},
+        "heldout_corpus": {"corpus_identity_sha256": "heldout-corpus"},
+        "combined_corpus": {"corpus_identity_sha256": "combined-corpus"},
+        "visible_corpus_identity_sha256": "visible-corpus",
+        "heldout_corpus_identity_sha256": "heldout-corpus",
+        "combined_corpus_identity_sha256": "combined-corpus",
         "visible_fingerprint_sha256": visible,
         "heldout_fingerprint_sha256": heldout,
         "combined_fingerprint_sha256": combined,
@@ -888,7 +1053,7 @@ def test_main_wires_population_fingerprints_and_agreement(
     assert rows[0]["heldout_failure_count"] == "1"
 
     captured = capsys.readouterr()
-    assert "Combined behavioral unique rate" in captured.out
+    assert "Supporting combined behavioral unique rate" in captured.out
     assert "Architecture-behavior ARI: 1.000" in captured.out
 
 
@@ -913,6 +1078,8 @@ def test_main_reports_an_unstable_case_count(
         result = stub_measure_run(**kwargs)
         if result["status"] == "measured" and result["visible_fingerprint_sha256"] == "V2":
             result["visible_case_count"] = 48
+            result["visible_corpus_identity_sha256"] = "different-visible-corpus"
+            result["combined_corpus_identity_sha256"] = "different-combined-corpus"
         return result
 
     monkeypatch.setattr(measure, "measure_run", uneven)
@@ -925,7 +1092,18 @@ def test_main_reports_an_unstable_case_count(
     )
     assert summary["case_count_stable"] is False
     assert summary["distinct_visible_case_counts"] == [48, 51]
-    assert "not held constant" in capsys.readouterr().err
+    visible_corpus = summary["behavioral_corpus"]["visible"]
+    assert visible_corpus["compatible_population"] is False
+    assert visible_corpus["distinct_corpus_identities"] == [
+        "different-visible-corpus", "visible-corpus"
+    ]
+    visible_disagreement = summary["pairwise_behavioral_disagreement"]["visible"]
+    assert visible_disagreement["incomparable_pairs"] > 0
+    assert visible_disagreement["mean_pairwise_disagreement"] is None
+    assert "incompatible case corpora" in visible_disagreement["unavailable_reason"]
+    warning = capsys.readouterr().err
+    assert "corpus identities differed" in warning
+    assert "incomparable, not computed" in warning
 
 
 def test_the_measurement_never_writes_into_the_experiment_attempts(
@@ -951,6 +1129,8 @@ def test_the_measurement_never_writes_into_the_experiment_attempts(
     assert written == {
         Path("analysis") / "execution_consistency" / "summary.json",
         Path("analysis") / "execution_consistency" / "behavioral_fingerprints.csv",
+        Path("analysis") / "execution_consistency" / "behavioral_verdict_traces.json",
+        Path("analysis") / "execution_consistency" / "pairwise_behavioral_distances.csv",
     }
 
 

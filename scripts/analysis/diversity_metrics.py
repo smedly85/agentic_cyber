@@ -139,9 +139,11 @@ def exact_repetition_summary(
 
 
 def primary_population(
-    rows: Sequence[Mapping[str, Any]], complete_measurement_key: str
+    rows: Sequence[Mapping[str, Any]],
+    complete_measurement_key: str,
+    membership_key: str = "overall_success",
 ) -> dict[str, Any]:
-    successful = [row for row in rows if bool(row.get("overall_success"))]
+    successful = [row for row in rows if bool(row.get(membership_key))]
     included = [
         row for row in successful if bool(row.get(complete_measurement_key))
     ]

@@ -14,7 +14,7 @@ the resolved manifest, the *contents* of every checkpoint prompt, the contents
 of the judge script, each checkpoint's cumulative implemented flags, each
 checkpoint's visible test bundle, the model/agent/repair settings the stages run
 under, the whole sampling configuration (temperature, top_p, sampling_seed,
-max_tokens), and the shared automation notice that is expanded into every
+max_tokens), explicit model-definition provenance, and the shared automation notice that is expanded into every
 prompt. The number of lineages is deliberately excluded, so extending an
 existing run from 10 lineages to 15 is allowed while editing a prompt, changing
 a sampling knob or rewording the notice is not.
@@ -123,6 +123,18 @@ def optional_int(value: Any, label: str) -> int | None:
         raise ManifestError(f"{label} must be an integer, got {value!r}") from None
 
 
+def optional_json_object(value: Any, label: str) -> dict[str, Any] | None:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = json.loads(value) if isinstance(value, str) else value
+    except json.JSONDecodeError as error:
+        raise ManifestError(f"{label} must be valid JSON: {error}") from None
+    if not isinstance(parsed, dict):
+        raise ManifestError(f"{label} must be a JSON object")
+    return parsed
+
+
 def resolve_plan(
     repo: Path,
     utility: str,
@@ -134,6 +146,7 @@ def resolve_plan(
     top_p: Any = None,
     sampling_seed: Any = None,
     max_tokens: Any = None,
+    model_provenance_json: Any = None,
 ) -> dict[str, Any]:
     manifest_path, manifest = load_manifest(repo, utility)
 
@@ -349,6 +362,11 @@ def resolve_plan(
         "extra_test_command": extra_test_command,
         "checkpoints": resolved,
         "model": model,
+        # Explicit metadata only. In particular, top_k is never inferred from
+        # a derived Ollama model alias and is not sent as a request parameter.
+        "model_provenance": optional_json_object(
+            model_provenance_json, "model_provenance_json"
+        ),
         "temperature": float(temperature),
         # The rest of the sampling configuration, carried the same way
         # temperature is. Null means the flag was not passed, so the server's
@@ -384,7 +402,8 @@ def fingerprint(plan: dict[str, Any]) -> str:
     model, agent, repair budget and per-session timeout the stages run under;
     the full sampling configuration (temperature, top_p, sampling_seed,
     max_tokens -- a null among them is itself a condition, meaning the server
-    default applied); and the shared automation notice, via
+    default applied); explicit model-definition provenance such as an Ollama
+    Modelfile top_k value; and the shared automation notice, via
     automation_notice_sha256, since it is expanded into every prompt the model
     sees without appearing in any prompt file.
 
@@ -448,6 +467,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--top-p", default="")
     parser.add_argument("--sampling-seed", default="")
     parser.add_argument("--max-tokens", default="")
+    parser.add_argument("--model-provenance-json", default="")
     parser.add_argument(
         "--emit",
         choices=("plan", "stages", "utilities", "fingerprint"),
@@ -478,6 +498,7 @@ def main(argv: list[str] | None = None) -> int:
         top_p=args.top_p,
         sampling_seed=args.sampling_seed,
         max_tokens=args.max_tokens,
+        model_provenance_json=args.model_provenance_json,
     )
 
     if args.emit == "stages":

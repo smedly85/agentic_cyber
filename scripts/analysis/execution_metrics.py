@@ -17,34 +17,55 @@ import hashlib
 import json
 from typing import Any, Mapping, Sequence
 
-from sklearn.metrics import adjusted_rand_score
+BEHAVIORAL_PROFILE_DOMAIN = "agentic-cyber.behavioral-verdict-profile.v2"
 
 
-def behavioral_fingerprint_hash(failing_cases: Sequence[tuple[str, str]]) -> str:
-    """Canonical SHA-256 over the (case name, verdict) pairs a candidate failed.
-
-    Order-independent by construction: the pairs are sorted before hashing, so
-    two candidates that failed the same cases with the same verdicts collide
-    regardless of the order the runner's thread pool happened to report them in.
-
-    The pairs are the *failures only*, which is what `runner.py --json-report`
-    enumerates individually. That is sufficient to identify the full pass/fail
-    vector precisely because the case set is a deterministic function of the
-    condition being measured -- same suite files, same cumulative flag list,
-    same corpus -- so every candidate under comparison is judged on an identical
-    set of cases and any case absent from the failure list passed. The
-    orchestrator verifies that premise rather than assuming it, and records the
-    result as `case_count_stable`.
-
-    The verdict is part of the material, not just the case name: a candidate
-    that times out on a case has not behaved the same way as one that produced
-    wrong output on it, and collapsing the two would understate divergence.
-    """
+def behavioral_fingerprint_hash(
+    corpus_identity: str,
+    case_results: Sequence[Mapping[str, Any]],
+) -> str:
+    """Hash a complete verdict trace together with its behavioral corpus."""
     normalized = sorted(
-        [str(name), str(verdict)] for name, verdict in failing_cases
+        (
+            {"case_id": str(result["case_id"]),
+             "verdict": str(result["verdict"])}
+            for result in case_results
+        ),
+        key=lambda result: result["case_id"],
     )
-    payload = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+    payload = json.dumps(
+        {
+            "domain": BEHAVIORAL_PROFILE_DOMAIN,
+            "corpus_identity": str(corpus_identity),
+            "results": normalized,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def pairwise_verdict_disagreement(
+    left: Sequence[Mapping[str, Any]],
+    right: Sequence[Mapping[str, Any]],
+) -> float:
+    """Fraction of compatible executed cases whose verdicts differ."""
+    left_trace = [
+        (str(result["case_id"]), str(result["verdict"])) for result in left
+    ]
+    right_trace = [
+        (str(result["case_id"]), str(result["verdict"])) for result in right
+    ]
+    left_ids = [case_id for case_id, _ in left_trace]
+    right_ids = [case_id for case_id, _ in right_trace]
+    if left_ids != right_ids:
+        raise ValueError("behavioral traces use different ordered case IDs")
+    if not left_trace:
+        raise ValueError("behavioral disagreement is undefined for an empty corpus")
+    return sum(
+        left_verdict != right_verdict
+        for (_, left_verdict), (_, right_verdict) in zip(left_trace, right_trace)
+    ) / len(left_trace)
 
 
 def structural_behavior_agreement(
@@ -73,6 +94,8 @@ def structural_behavior_agreement(
     undefined for fewer than two runs and is reported as null there rather than
     as a number.
     """
+    from sklearn.metrics import adjusted_rand_score
+
     shared = [
         run_id
         for run_id in run_ids

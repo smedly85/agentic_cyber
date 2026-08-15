@@ -22,8 +22,10 @@ RUNNER_HELPERS = (
     REPO_ROOT / "scripts" / "capture_candidate.py",
     REPO_ROOT / "scripts" / "repair_prompt.py",
     REPO_ROOT / "scripts" / "opencode_stats.py",
+    REPO_ROOT / "scripts" / "prompt_render.py",
 )
 REPAIR_TEMPLATE = REPO_ROOT / "prompts" / "repair_continuation_template.md"
+AUTOMATION_NOTICE = REPO_ROOT / "prompts" / "_shared" / "automation_notice.md"
 ANALYZER = REPO_ROOT / "scripts" / "analyze_experiment.py"
 # `true` lives in /bin on Linux but /usr/bin on macOS; resolve it instead of
 # hardcoding either, so suite fixtures that need a stub binary work on both.
@@ -914,11 +916,16 @@ def initialize_experiment_repo(tmp_path: Path) -> tuple[Path, Path]:
     repository = tmp_path / "repository"
     (repository / "scripts").mkdir(parents=True)
     (repository / "prompts").mkdir(parents=True)
+    (repository / "prompts" / "_shared").mkdir()
     (repository / "src").mkdir()
     shutil.copy2(RUNNER, repository / "scripts" / RUNNER.name)
     for helper in RUNNER_HELPERS:
         shutil.copy2(helper, repository / "scripts" / helper.name)
     shutil.copy2(REPAIR_TEMPLATE, repository / "prompts" / REPAIR_TEMPLATE.name)
+    shutil.copy2(
+        AUTOMATION_NOTICE,
+        repository / "prompts" / "_shared" / AUTOMATION_NOTICE.name,
+    )
     (repository / "scripts" / "analyze_experiment.py").write_text(
         """\
 import argparse
@@ -1368,11 +1375,24 @@ def test_timeout_is_failed_valid_agent_trial(tmp_path: Path):
     metadata = json.loads(
         (output / "attempt-001" / "metadata.json").read_text(encoding="utf-8")
     )
-    assert invocations == 1
+    # The timed-out initial invocation left a candidate. The controller
+    # independently validates it, then permits one repair invocation before
+    # the unchanged candidate triggers the existing no-progress guard.
+    assert invocations == 2
     assert metadata["opencode_exit_code"] == 124
+    assert metadata["initial_opencode_exit_code"] == 124
+    assert metadata["initial_session_completed"] is False
+    assert metadata["candidate_available_after_timeout"] is True
+    assert metadata["validation_completed_after_timeout"] is True
     assert metadata["infrastructure_failure"] is False
-    assert metadata["agent_execution_failure"] is True
-    assert metadata["agent_execution_failure_stage"] == "timeout"
+    assert metadata["agent_execution_failure"] is False
+    assert metadata["agent_execution_failure_stage"] is None
+    assert metadata["repair_eligible"] is True
+    assert metadata["repair_eligibility_reason"] == (
+        "controller_validation_after_timeout"
+    )
+    assert metadata["repair_loops"] == 1
+    assert metadata["stop_reason"] == "no_progress"
     assert metadata["loop_limit_reached"] is False
     assert metadata["initial_success"] is False
     assert metadata["public_validation_success"] is False
@@ -2282,6 +2302,116 @@ def test_analysis_configuration_precedence(analyzer):
     )
 
 
+def test_formal_analysis_requires_complete_versioned_configuration(
+    analyzer, tmp_path: Path
+):
+    with pytest.raises(SystemExit, match="formal-analysis requires"):
+        analyzer.load_frozen_analysis_configuration(None, {}, formal=True)
+
+    incomplete = tmp_path / "incomplete.json"
+    incomplete.write_text(json.dumps({"schema_version": 1}), encoding="utf-8")
+    with pytest.raises(SystemExit, match="incomplete"):
+        analyzer.load_frozen_analysis_configuration(incomplete, {}, formal=True)
+
+    complete = {
+        "schema_version": 1,
+        "architecture_threshold": 0.30,
+        "strategy_threshold": 0.30,
+        "threshold_sensitivity": {"rule": "deterministic_local_grid"},
+        "bootstrap_repetitions": 1000,
+        "bootstrap_seed": 20260723,
+        "strategy_exclusion_regex": analyzer.DEFAULT_STRATEGY_EXCLUDE_REGEX,
+        "strategy_include_functions": [],
+        "include_main": True,
+        "clang_extra_arguments": [],
+        "fixed_diversity_k": None,
+    }
+    path = tmp_path / "formal.json"
+    path.write_text(json.dumps(complete), encoding="utf-8")
+    assert analyzer.load_frozen_analysis_configuration(
+        path, {}, formal=True
+    ) == complete
+    changed = {**complete, "bootstrap_seed": 17}
+    assert analyzer.analysis_configuration_fingerprint(complete) != (
+        analyzer.analysis_configuration_fingerprint(changed)
+    )
+
+
+def test_lineage_population_paper_row_is_not_a_seven_of_seven_reliability_row(
+    analyzer,
+):
+    population = {
+        "run_count": 7,
+        "effective_family_count": 3.0,
+        "dominant_family_share": 0.4,
+        "mean_pairwise_distance": 0.25,
+    }
+    configuration = {
+        "configuration_version": 1,
+        "configuration_fingerprint": "a" * 64,
+        "architecture_threshold": 0.30,
+        "strategy_threshold": 0.30,
+        "diversity_k_max": None,
+        "strategy_exclude_regex": analyzer.DEFAULT_STRATEGY_EXCLUDE_REGEX,
+        "strategy_include_functions": [],
+        "strategy_main_included": True,
+        "clang_extra_args": [],
+        "threshold_sensitivity": {"rule": "deterministic_local_grid"},
+        "bootstrap_repetitions": 1000,
+        "bootstrap_seed": 20260723,
+    }
+    summary = {
+        "experiment_format": "lineage_population_view",
+        "population_size": 7,
+        "successful_runs": None,
+        "analysis_configuration": configuration,
+        "clustering": {
+            "architecture": {"populations": {"passing_complete_runs": population}},
+            "strategy": {"populations": {"passing_complete_runs": population}},
+        },
+        "pass_at_k": {"pass@1": 1.0, "pass@5": 1.0, "pass@10": 1.0},
+        "repair": {
+            "initial_public_success_rate": 1.0,
+            "final_public_success_rate": 1.0,
+            "repair_recovery_rate": 1.0,
+        },
+        "reliability": {
+            "n_attempts": 7,
+            "end_to_end_success_rate": 1.0,
+            "conditional_agent_success_rate": 1.0,
+        },
+    }
+    rows = [
+        {
+            "analysis_population_member": True,
+            "lines_edited": 100,
+            "gumtree_normalized_edit_distance": 1.0,
+        }
+        for _ in range(7)
+    ]
+    paper = analyzer.build_paper_metrics_row({}, summary, rows)
+    assert paper["Population N"] == 7
+    assert paper["N Attempts"] is None
+    assert paper["Successful Runs"] is None
+    for field in (
+        "End-to-End Success Rate",
+        "Conditional Agent Success Rate",
+        "Initial Public Success Rate",
+        "Final Public Success Rate",
+        "Repair Recovery Rate",
+        "Pass@1",
+        "Pass@5",
+        "Pass@10",
+    ):
+        assert paper[field] is None
+    descriptive = analyzer.build_paper_descriptive_row({}, summary, rows)
+    assert descriptive["Mean Lines Edited"] is None
+    assert descriptive["Mean Normalized GumTree Edit-Action Magnitude"] is None
+    assert descriptive["Maintenance Change Scope"] == (
+        "unsupported_for_lineage_population_empty_baseline"
+    )
+
+
 def test_analysis_signature_changes_with_primary_configuration(analyzer):
     base = {
         "architecture_threshold": 0.30,
@@ -2366,7 +2496,7 @@ def test_confirmatory_configuration_matches_recorded_primary_settings(
     assert [mismatch["setting"] for mismatch in mismatches] == [setting]
 
 
-def test_schema_v5_aggregate_skips_v4_rows(analyzer, tmp_path: Path, capsys):
+def test_schema_v6_aggregate_skips_older_rows(analyzer, tmp_path: Path, capsys):
     root = tmp_path / "repository"
     exploratory_path = root / "runs" / "experiments" / "a-exploratory" / "analysis"
     base_path = root / "runs" / "experiments" / "b-base" / "analysis"
@@ -2416,8 +2546,8 @@ def test_schema_v5_aggregate_skips_v4_rows(analyzer, tmp_path: Path, capsys):
                 {
                     **valid_row,
                     "Checkpoint": checkpoint,
-                    "_schema_version": 5,
-                    "_analyzer_version": "4.1.2",
+                    "_schema_version": 6,
+                    "_analyzer_version": "5.0.0",
                     "_analysis_signature": row_signature,
                     "_confirmatory_configuration_match": confirmatory,
                     "_confirmatory_configuration_mismatches": (
@@ -2447,8 +2577,8 @@ def test_schema_v5_aggregate_skips_v4_rows(analyzer, tmp_path: Path, capsys):
             {
                 **valid_row,
                 "Checkpoint": "old-analyzer",
-                "_schema_version": 5,
-                "_analyzer_version": "4.1.1",
+                "_schema_version": 6,
+                "_analyzer_version": "4.9.9",
                 "_analysis_signature": signature,
                 "_confirmatory_configuration_match": True,
             }
@@ -2459,8 +2589,8 @@ def test_schema_v5_aggregate_skips_v4_rows(analyzer, tmp_path: Path, capsys):
         json.dumps(
             {
                 **common,
-                "_schema_version": 5,
-                "_analyzer_version": "4.1.2",
+                "_schema_version": 6,
+                "_analyzer_version": "5.0.0",
             }
         ),
         encoding="utf-8",
@@ -2490,9 +2620,9 @@ def test_schema_v5_aggregate_skips_v4_rows(analyzer, tmp_path: Path, capsys):
     assert "skipped 2 rows with incompatible confirmatory configuration" in output
 
 
-def test_schema_v5_paper_columns(analyzer):
-    assert analyzer.ANALYZER_VERSION == "4.1.2"
-    assert analyzer.PAPER_SCHEMA_VERSION == 5
+def test_schema_v6_paper_columns(analyzer):
+    assert analyzer.ANALYZER_VERSION == "5.0.0"
+    assert analyzer.PAPER_SCHEMA_VERSION == 6
     assert "Exact Unique Rate" not in analyzer.PAPER_METRICS_COLUMNS
     assert "Exact Modal Share" not in analyzer.PAPER_METRICS_COLUMNS
     assert "Exact Unique Rate" in analyzer.PAPER_DESCRIPTIVE_COLUMNS
@@ -2501,8 +2631,11 @@ def test_schema_v5_paper_columns(analyzer):
         "Mean Normalized GumTree Edit-Action Magnitude"
         in analyzer.PAPER_DESCRIPTIVE_COLUMNS
     )
-    assert "Architecture Family-Discovery AUC@K" in analyzer.PAPER_METRICS_COLUMNS
-    assert "Strategy Family-Discovery AUC@K" in analyzer.PAPER_METRICS_COLUMNS
+    assert "Architecture Family-Discovery AUC@K" not in analyzer.PAPER_METRICS_COLUMNS
+    assert "Strategy Family-Discovery AUC@K" not in analyzer.PAPER_METRICS_COLUMNS
+    assert "Mean Pairwise Architecture Distance" in analyzer.PAPER_METRICS_COLUMNS
+    assert "Mean Pairwise Strategy Distance" in analyzer.PAPER_METRICS_COLUMNS
+    assert "Architecture Family-Discovery AUC@K" in analyzer.PAPER_DESCRIPTIVE_COLUMNS
     public_text = (
         ANALYZER.read_text(encoding="utf-8")
         + (REPO_ROOT / "scripts" / "analysis" / "diversity_metrics.py").read_text(
@@ -2646,8 +2779,8 @@ def test_full_analyzer_accepts_mixed_old_and_repair_metadata(tmp_path: Path):
         (experiment / "analysis" / "summary.json").read_text(encoding="utf-8")
     )
     assert summary["runs_analyzed"] == 2
-    assert summary["schema_version"] == 5
-    assert summary["analyzer_version"] == "4.1.2"
+    assert summary["schema_version"] == 6
+    assert summary["analyzer_version"] == "5.0.0"
     assert summary["analysis_configuration"]["architecture_threshold"] == 0.25
     assert (
         summary["analysis_configuration"]["architecture_threshold_source"]
@@ -2697,11 +2830,13 @@ def test_full_analyzer_accepts_mixed_old_and_repair_metadata(tmp_path: Path):
     paper_row = json.loads(
         (experiment / "analysis" / "paper_metrics_row.json").read_text()
     )
-    assert paper_row["_schema_version"] == 5
-    assert paper_row["_analyzer_version"] == "4.1.2"
-    assert paper_row["_confirmatory_configuration_match"] is True
-    assert paper_row["_confirmatory_configuration_mismatches"] == []
-    assert paper_row["_analysis_signature"] == {
+    assert paper_row["_schema_version"] == 6
+    assert paper_row["_analyzer_version"] == "5.0.0"
+    assert paper_row["_confirmatory_configuration_match"] is False
+    assert paper_row["_confirmatory_configuration_mismatches"][0]["setting"] == (
+        "formal_analysis_configuration"
+    )
+    expected_signature_subset = {
         "architecture_threshold": 0.25,
         "strategy_threshold": 0.35,
         "diversity_k_max": 5,
@@ -2710,6 +2845,9 @@ def test_full_analyzer_accepts_mixed_old_and_repair_metadata(tmp_path: Path):
         "strategy_main_included": True,
         "clang_extra_args": [],
     }
+    for key, value in expected_signature_subset.items():
+        assert paper_row["_analysis_signature"][key] == value
+    assert len(paper_row["_analysis_signature"]["configuration_fingerprint"]) == 64
     assert not (experiment / "analysis" / "diagnostics" / "representation_ablation.csv").exists()
 
     diagnostic_result = subprocess.run(

@@ -726,6 +726,24 @@ class LineageAggregationTests(unittest.TestCase):
         self.assertEqual(reliability["successful_final_implementations"], 2)
         self.assertAlmostEqual(reliability["end_to_end_completion_rate"], 0.5)
 
+    def test_ten_started_seven_completed_reports_point_seven(self):
+        records = [
+            {
+                "lineage_id": f"lineage-{index:03d}",
+                "state": "completed" if index <= 7 else "stopped",
+                "end_to_end_success": index <= 7,
+                "failure_stage": None if index <= 7 else "002",
+                "failure_reason": None if index <= 7 else "validation_failed",
+            }
+            for index in range(1, 11)
+        ]
+        reliability = analyze_lineages.build_reliability(
+            records, ["000", "001", "002"]
+        )
+        self.assertEqual(reliability["lineages_started"], 10)
+        self.assertEqual(reliability["lineages_completed"], 7)
+        self.assertEqual(reliability["end_to_end_completion_rate"], 0.70)
+
     def test_failure_stage_counts_name_the_stopping_checkpoint(self):
         report = self.run_tool("--skip-diversity")
         self.assertEqual(
@@ -843,6 +861,14 @@ class PopulationViewTests(unittest.TestCase):
             row = json.loads((attempt / "metadata.json").read_text(encoding="utf-8"))
             self.assertIn("lineage_id", row)
             self.assertEqual(row["lineage_checkpoint_id"], "002")
+            self.assertTrue(row["analysis_population_member"])
+            self.assertEqual(
+                row["population_selection_basis"], "lineage_stage_success"
+            )
+            self.assertTrue(row["workflow_stage_success"])
+        self.assertEqual(
+            metadata["reliability_scope"], "parent_lineage_experiment"
+        )
 
     def test_view_members_are_traceable_to_their_lineage(self):
         view = analyze_lineages.materialize_view(
@@ -930,12 +956,31 @@ class ViewFeedsEveryDownstreamAnalysisTests(unittest.TestCase):
     def measured(self, **kwargs) -> dict[str, Any]:
         """Stand in for the rebuild-and-judge pass, with a fingerprint per run."""
         run_id = Path(kwargs["candidate_source"]).parent.parent.name
+        visible_results = [
+            {"case_id": "visible-case", "verdict": "PASS"},
+        ]
+        heldout_results = [
+            {"case_id": "heldout-case", "verdict": "FAIL"},
+        ]
+        combined_results = [
+            {"case_id": "heldout::heldout-case", "verdict": "FAIL"},
+            {"case_id": "visible::visible-case", "verdict": "PASS"},
+        ]
         return {
             "status": "measured",
-            "visible_case_count": 51,
-            "heldout_case_count": 29,
+            "visible_case_count": len(visible_results),
+            "heldout_case_count": len(heldout_results),
             "visible_failure_count": 0,
             "heldout_failure_count": 1,
+            "visible_results": visible_results,
+            "heldout_results": heldout_results,
+            "combined_results": combined_results,
+            "visible_corpus": {"corpus_identity_sha256": "visible-corpus"},
+            "heldout_corpus": {"corpus_identity_sha256": "heldout-corpus"},
+            "combined_corpus": {"corpus_identity_sha256": "combined-corpus"},
+            "visible_corpus_identity_sha256": "visible-corpus",
+            "heldout_corpus_identity_sha256": "heldout-corpus",
+            "combined_corpus_identity_sha256": "combined-corpus",
             "visible_fingerprint_sha256": "V1",
             "heldout_fingerprint_sha256": f"H-{run_id}",
             "combined_fingerprint_sha256": f"C-{run_id}",
@@ -955,9 +1000,11 @@ class ViewFeedsEveryDownstreamAnalysisTests(unittest.TestCase):
         # analyzer here would pull in the clustering stack this file avoids.
         (view / "analysis").mkdir(parents=True, exist_ok=True)
         (view / "analysis" / "per_run_metrics.csv").write_text(
-            "run_id,overall_success,architecture_cluster_id,strategy_cluster_id\n"
-            "attempt-001,True,0,0\n"
-            "attempt-002,True,0,1\n",
+            "run_id,overall_success,analysis_population_member,"
+            "population_selection_basis,architecture_cluster_id,"
+            "strategy_cluster_id\n"
+            "attempt-001,True,True,lineage_stage_success,0,0\n"
+            "attempt-002,True,True,lineage_stage_success,0,1\n",
             encoding="utf-8",
         )
 
@@ -1694,6 +1741,23 @@ class ResumeFingerprintTests(unittest.TestCase):
         ):
             with self.subTest(setting=label):
                 self.assertNotEqual(base, self.plan(**overrides)["config_fingerprint"])
+
+    def test_explicit_model_level_top_k_changes_the_fingerprint(self):
+        provenance = json.dumps(
+            {
+                "base_model": "qwen3-coder-next:latest",
+                "top_k": 50,
+                "top_k_control": "ollama_modelfile",
+            }
+        )
+        first = self.plan(model_provenance_json=provenance)
+        second = self.plan(
+            model_provenance_json=provenance.replace("50", "40")
+        )
+        self.assertEqual(first["model_provenance"]["top_k"], 50)
+        self.assertNotEqual(
+            first["config_fingerprint"], second["config_fingerprint"]
+        )
 
     def test_plan_records_every_required_component(self):
         plan = self.plan()
@@ -4750,8 +4814,27 @@ class TimeoutRepairAnalysisTests(unittest.TestCase):
     def test_a_candidate_producing_timeout_is_not_agent_attrition(self):
         normalized = self.analyzer.normalize_repair_metadata(self.row())
         self.assertFalse(normalized["agent_execution_failure"])
+        self.assertFalse(normalized["agent_invocation_completed"])
+        self.assertTrue(normalized["agent_invocation_timed_out"])
+        self.assertTrue(normalized["candidate_available_after_timeout"])
+        self.assertTrue(normalized["artifact_public_validation_success"] is False)
+        self.assertFalse(normalized["workflow_stage_success"])
         reliability = self.analyzer.build_reliability_summary([normalized])
         self.assertEqual(reliability["n_infrastructure_failures"], 0)
+
+    def test_timeout_candidate_can_validate_and_succeed_as_a_workflow(self):
+        normalized = self.analyzer.normalize_repair_metadata(
+            self.row(
+                public_validation_success=True,
+                workflow_stage_success=True,
+                success_loop=1,
+            )
+        )
+        self.assertFalse(normalized["agent_invocation_completed"])
+        self.assertTrue(normalized["agent_invocation_timed_out"])
+        self.assertTrue(normalized["candidate_available_after_timeout"])
+        self.assertTrue(normalized["artifact_public_validation_success"])
+        self.assertTrue(normalized["workflow_stage_success"])
 
     def test_the_status_name_keeps_the_timeout_visible(self):
         """It must not be folded into 'completed': the session did not finish."""

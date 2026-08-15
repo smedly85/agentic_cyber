@@ -239,6 +239,11 @@ Two spellings are refused outright rather than accepted and quietly ignored:
   field set there and drops the rest. Reaching its sampler would need the native
   `/api/chat` options object. A flag that is accepted, recorded, and then
   ignored by the server is worse than no flag.
+  Model-definition-level top-k remains valid: create a derived Ollama model and
+  record it explicitly with metadata-only `--model-provenance-json`, for example
+  `'{"base_model":"qwen3-coder-next:latest","top_k":50,"top_k_control":"ollama_modelfile"}'`.
+  This object is fingerprinted and never added to the request. Nothing parses
+  top-k from the model alias and no local `ollama show` is required.
 * **`--seed`** — ambiguous in this harness. `--sampling-seed` is the
   token-selection seed; `--seed-file` is the checkpoint source-inheritance file,
   and the two senses must never collide.
@@ -281,6 +286,7 @@ bash scripts/run_lineage_experiment.sh \
     --top-p 0.5 \
     --sampling-seed 42 \
     --max-tokens 32768 \
+    --model-provenance-json '{"base_model":"qwen3-coder-next:latest","top_k":1,"top_k_control":"ollama_modelfile"}' \
     --lineages 10 \
     --max-loops 3 \
     --output-dir runs/formal/grep-qwen3-topk40-t0-p05-seed42-maxtok32768-loops1-n10
@@ -413,6 +419,15 @@ failure — diversity over one implementation is undefined, not failed.
 `successful final implementations = n`; the completion rate is never computed
 over the survivors.
 
+Each population view records `analysis_population_member: true` and
+`population_selection_basis: lineage_stage_success`. Its paper row retains
+population size and structural coverage but sets reliability and Pass@k to NA
+with `reliability_scope: parent_lineage_experiment`; it also sets empty-baseline
+maintenance-change fields to NA. The parent
+`analysis/lineage_paper_metrics.csv` combines all-started lineage completion
+with the final population's structural metrics. Thus 7 finals from 10 started
+lineages report completion 0.70, never 7/7.
+
 Note that stages themselves are not analyzed individually: the controller passes
 `--no-analysis` to the stage runner, so `analyze_experiment.py` runs only on the
 materialized populations, never once per checkpoint attempt.
@@ -446,17 +461,25 @@ directory holding multiple conditions rather than pooling them. Use a common
 normalized family-discovery AUC@K, and omit it when only complete within-
 population DF@K curves are needed.
 
-The analyzer writes schema-v5 results under `<population>/analysis/`:
+The analyzer writes schema-v6 results under `<population>/analysis/`:
 `summary.json`, `per_run_metrics.csv`, `paper_metrics.csv`,
 `paper_descriptive_metrics.csv`, diversity family assignments and DF@K curves,
 robustness tables, and uncertainty intervals. A view's `experiment.json` points
 `repository` at the view itself rather than at the checkout, so the repository-
 level paper aggregate the analyzer maintains is never rewritten by a lineage
-analysis. Analysis-setting precedence is explicit CLI value, then recorded
-experiment metadata, then analyzer default; a row that changes the recorded
-thresholds, K, strategy scope, or default Clang arguments remains valid for
-exploratory work but cannot enter or anchor a confirmatory aggregate. See
+analysis. Exploratory analysis retains CLI/metadata/default precedence. Only a
+row produced with `--formal-analysis` from a complete frozen configuration can
+enter or anchor a confirmatory aggregate. See
 `docs/diversity_methodology.md` for the formulas and their interpretation.
+
+Formal analysis uses `--analysis-config FILE --formal-analysis`. The versioned
+JSON must explicitly provide architecture/strategy thresholds, the sensitivity
+grid or deterministic rule, bootstrap repetitions/seed, strategy exclusion and
+forced includes, `include_main`, Clang extra arguments, and fixed K (including
+explicit `null`). Formal mode refuses a missing/incomplete file instead of
+falling back to scientific defaults. The resolved object, schema version, and
+domain-separated fingerprint are written to every population summary and the
+parent lineage report.
 
 ### 3. Behavioral and execution consistency
 
@@ -466,16 +489,17 @@ python3 scripts/measure_execution_consistency.py \
     --clean-output
 ```
 
-This rebuilds each successful candidate and re-judges it twice — once against
+This rebuilds each selected population member and re-judges it twice — once against
 the checkpoint's visible corpus and once against the held-out corpus the agent
 never saw — and summarizes the resulting verdict vectors as behavioral
 fingerprints. It is strictly post-hoc and read-only: it never re-runs OpenCode,
 never enters the repair loop, and never turns a pass into a fail.
 
 **It requires the previous steps to have run.** It does not re-derive the
-population or the family labels: it reads `analysis/per_run_metrics.csv`, filters
-to `overall_success == True`, and takes `architecture_cluster_id` and
-`strategy_cluster_id` from the same rows. Without that file it refuses to run
+population or the family labels: ordinary experiments use `overall_success`,
+while lineage views use the controller's explicit `analysis_population_member`.
+It takes `architecture_cluster_id` and `strategy_cluster_id` from the same rows.
+Without that file it refuses to run
 rather than growing a second, possibly divergent, definition of "successful". It
 also reads `source_path`, `feature_test_command`, `build_command` and
 `source_workdir_path` out of the view's `experiment.json`, and takes the suite
@@ -496,8 +520,10 @@ statistics, never silently dropped, because a condition whose candidates mostly
 fail to rebuild means something very different from one whose candidates all
 behave identically.
 
-Output lands in `<population>/analysis/execution_consistency/` as `summary.json`
-and `behavioral_fingerprints.csv`.
+Output lands in `<population>/analysis/execution_consistency/` as `summary.json`,
+`behavioral_fingerprints.csv`, `behavioral_verdict_traces.json`, and
+`pairwise_behavioral_distances.csv`. Mean pairwise verdict disagreement is the
+primary RQ2 result; exact profile count/modal share remain supporting output.
 
 ## How the harness works
 
@@ -733,9 +759,12 @@ are never touched.
 
 ### Failure classification
 
-Each attempt distinguishes infrastructure attrition from agent-execution failure
-and candidate failure. Timeout, permission rejection, and a nonzero attempted
-OpenCode invocation are failed valid agent trials. Build, public-test, and
+Each attempt distinguishes infrastructure attrition, invocation completion,
+candidate availability, artifact validation, and workflow success. Permission
+rejection and non-salvageable OpenCode errors are agent-execution failures. A
+timeout that leaves a candidate remains an incomplete invocation, but the
+controller may validate and repair that artifact and the workflow may succeed.
+Build, public-test, and
 hidden/extra-evaluator failures are candidate/workflow failures after
 generation. A `feature_test_exit_code` of 3 is the suite's platform gate
 refusing to judge on this host, and is classified with the infrastructure
@@ -781,7 +810,7 @@ agentic_cyber/
 ├── README.md
 ├── findings.md
 ├── docs/
-│   ├── diversity_methodology.md            # Canonical v4.1.2/schema-v5 methodology
+│   ├── diversity_methodology.md            # Canonical v5.0.0/schema-v6 methodology
 │   └── execution_consistency_methodology.md # Behavioral/execution consistency
 ├── experiments/
 │   └── utilities/                          # One manifest per experimental utility

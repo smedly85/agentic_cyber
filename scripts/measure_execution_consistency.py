@@ -42,11 +42,10 @@ What it deliberately does not do
     semantics exactly. A second comparator could disagree with the recorded
     verdict and nobody would know which was right.
 
-  * It does not re-derive the population or the family labels. Success and
-    failure are `analyze_experiment.py`'s determination, read back out of
-    `analysis/per_run_metrics.csv`; so are the architecture and strategy
-    cluster ids. Reimplementing the failure taxonomy here would let two
-    definitions of "successful" drift apart silently.
+  * It does not re-derive the population or the family labels. Ordinary success
+    and explicit lineage population membership are read from
+    `analysis/per_run_metrics.csv`; so are architecture and strategy cluster
+    ids. Reimplementing selection here would let definitions drift silently.
 
   * It does not change any outcome. It is strictly post-hoc and read-only with
     respect to the experiment: it never re-runs OpenCode, never enters the
@@ -75,6 +74,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import itertools
 import json
 import re
 import shlex
@@ -93,7 +94,7 @@ from analysis import diversity_metrics  # noqa: E402
 from analysis import execution_metrics  # noqa: E402
 from reference_generators import heldout_contract  # noqa: E402
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # `runner.py` exits 1 whenever any case fails, which is an ordinary outcome
 # here rather than an error -- a candidate that fails cases still has a
@@ -134,6 +135,9 @@ FINGERPRINT_CSV_FIELDS = (
     "visible_failure_count",
     "heldout_case_count",
     "heldout_failure_count",
+    "visible_corpus_identity_sha256",
+    "heldout_corpus_identity_sha256",
+    "combined_corpus_identity_sha256",
     "visible_fingerprint_sha256",
     "heldout_fingerprint_sha256",
     "combined_fingerprint_sha256",
@@ -226,10 +230,73 @@ def report_case_count(payload: Mapping[str, Any]) -> int:
     return sum(int(value) for value in counts.values())
 
 
-def namespaced_failures(
-    namespace: str, failures: Sequence[tuple[str, str]]
-) -> list[tuple[str, str]]:
-    return [(f"{namespace}::{name}", verdict) for name, verdict in failures]
+def report_results(payload: Mapping[str, Any]) -> list[dict[str, str]]:
+    """Complete deterministic verdict trace from the schema-v2 runner report."""
+    raw_results = payload.get("results")
+    if not isinstance(raw_results, list):
+        raise ValueError(
+            "runner report lacks complete 'results'; failure-only reports are "
+            "diagnostically readable but cannot support behavioral comparison"
+        )
+    results: list[dict[str, str]] = []
+    for entry in raw_results:
+        if not isinstance(entry, Mapping) or not entry.get("case_id") or not entry.get("verdict"):
+            raise ValueError(f"malformed complete result entry: {entry!r}")
+        results.append(
+            {"case_id": str(entry["case_id"]), "verdict": str(entry["verdict"])}
+        )
+    results.sort(key=lambda entry: entry["case_id"])
+    case_ids = [entry["case_id"] for entry in results]
+    if len(case_ids) != len(set(case_ids)):
+        raise ValueError("runner report contains duplicate case IDs")
+    if len(results) != report_case_count(payload):
+        raise ValueError("runner report counts do not match complete result count")
+    return results
+
+
+def namespaced_results(
+    namespace: str, results: Sequence[Mapping[str, str]]
+) -> list[dict[str, str]]:
+    return [
+        {"case_id": f"{namespace}::{result['case_id']}",
+         "verdict": str(result["verdict"])}
+        for result in results
+    ]
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def corpus_descriptor(
+    *,
+    scope: str,
+    corpora: Sequence[Path],
+    case_results: Sequence[Mapping[str, str]],
+    implemented: Sequence[str],
+    scope_configuration: Mapping[str, Any],
+) -> dict[str, Any]:
+    descriptor = {
+        "schema_version": 1,
+        "scope": scope,
+        "corpus_files": [
+            {"name": path.name, "sha256": sha256_file(path)}
+            for path in sorted(corpora, key=lambda item: item.name)
+        ],
+        "ordered_case_ids": [str(result["case_id"]) for result in case_results],
+        "number_of_cases": len(case_results),
+        "implemented_checkpoint_flags": list(implemented),
+        "scope_configuration": dict(scope_configuration),
+    }
+    material = json.dumps(descriptor, sort_keys=True, separators=(",", ":"))
+    descriptor["corpus_identity_sha256"] = hashlib.sha256(
+        ("agentic-cyber.behavioral-corpus.v1\n" + material).encode("utf-8")
+    ).hexdigest()
+    return descriptor
 
 
 def output_tail(output: str | bytes | None, limit: int = 800) -> str:
@@ -274,12 +341,14 @@ def write_csv(
             writer.writerow(row)
 
 
-def successful_population(metrics_csv: Path) -> list[dict[str, str]]:
-    """The successful runs and their family labels, as `analyze_experiment.py` left them.
+def successful_population(
+    metrics_csv: Path, experiment: Mapping[str, Any] | None = None
+) -> list[dict[str, str]]:
+    """The analyzed population and family labels, as the analyzer left them.
 
-    Read rather than recomputed. `overall_success` arrives as the string
-    `"True"`/`"False"` through `csv.DictReader`, and the cluster columns are
-    blank for runs outside the corresponding primary population.
+    Ordinary attempts use `overall_success`; lineage views use explicit
+    controller membership so held-out outcomes cannot re-filter a promoted
+    member. Boolean values arrive as strings through `csv.DictReader`.
     """
     if not metrics_csv.is_file():
         raise SystemExit(
@@ -289,7 +358,42 @@ def successful_population(metrics_csv: Path) -> list[dict[str, str]]:
             "rather than re-deriving them."
         )
     with metrics_csv.open(newline="", encoding="utf-8") as handle:
-        rows = list(csv.DictReader(handle))
+        reader = csv.DictReader(handle)
+        rows = list(reader)
+    if (experiment or {}).get("experiment_format") == "lineage_population_view":
+        required_basis = "lineage_stage_success"
+        if (experiment or {}).get("population_selection_basis") != required_basis:
+            raise SystemExit(
+                "measure_execution_consistency: malformed lineage_population_view: "
+                "experiment.json must record "
+                "population_selection_basis=lineage_stage_success"
+            )
+        required_columns = {
+            "analysis_population_member", "population_selection_basis"
+        }
+        missing_columns = sorted(required_columns - set(reader.fieldnames or ()))
+        if missing_columns:
+            raise SystemExit(
+                "measure_execution_consistency: malformed lineage_population_view: "
+                "per_run_metrics.csv is missing explicit population metadata: "
+                + ", ".join(missing_columns)
+            )
+        invalid_rows = [
+            row.get("run_id", "<unknown>")
+            for row in rows
+            if row.get("analysis_population_member") not in {"True", "False"}
+            or row.get("population_selection_basis") != required_basis
+        ]
+        if invalid_rows:
+            raise SystemExit(
+                "measure_execution_consistency: malformed lineage_population_view: "
+                "invalid explicit population metadata for run(s): "
+                + ", ".join(invalid_rows)
+            )
+        return [
+            row for row in rows
+            if row.get("analysis_population_member") == "True"
+        ]
     return [row for row in rows if row.get("overall_success") == "True"]
 
 
@@ -572,25 +676,73 @@ def measure_run(
     except RuntimeError as error:
         return {"status": UNMEASURED_JUDGE_FAILED, "detail": str(error)}
 
+    try:
+        visible_results = report_results(visible)
+        heldout_results = report_results(heldout)
+    except ValueError as error:
+        return {"status": UNMEASURED_JUDGE_FAILED, "detail": str(error)}
     visible_failures = report_failures(visible)
     heldout_failures = report_failures(heldout)
-    combined = namespaced_failures(
-        VISIBLE_NAMESPACE, visible_failures
-    ) + namespaced_failures(HELDOUT_NAMESPACE, heldout_failures)
+    visible_scope = visible_scope_overrides(suite_root)
+    visible_corpus = corpus_descriptor(
+        scope=VISIBLE_NAMESPACE,
+        corpora=visible_corpora,
+        case_results=visible_results,
+        implemented=flags,
+        scope_configuration=visible_scope,
+    )
+    heldout_corpus_descriptor = corpus_descriptor(
+        scope=HELDOUT_NAMESPACE,
+        corpora=[heldout_corpus],
+        case_results=heldout_results,
+        implemented=flags,
+        scope_configuration={},
+    )
+    combined_results = sorted(
+        namespaced_results(VISIBLE_NAMESPACE, visible_results)
+        + namespaced_results(HELDOUT_NAMESPACE, heldout_results),
+        key=lambda entry: entry["case_id"],
+    )
+    combined_corpus_material = {
+        "schema_version": 1,
+        "scope": "combined",
+        "component_corpus_identities": [
+            visible_corpus["corpus_identity_sha256"],
+            heldout_corpus_descriptor["corpus_identity_sha256"],
+        ],
+        "ordered_case_ids": [entry["case_id"] for entry in combined_results],
+        "number_of_cases": len(combined_results),
+        "implemented_checkpoint_flags": list(flags),
+    }
+    combined_material = json.dumps(
+        combined_corpus_material, sort_keys=True, separators=(",", ":")
+    )
+    combined_corpus_material["corpus_identity_sha256"] = hashlib.sha256(
+        ("agentic-cyber.behavioral-corpus.v1\n" + combined_material).encode("utf-8")
+    ).hexdigest()
     return {
         "status": "measured",
-        "visible_case_count": report_case_count(visible),
-        "heldout_case_count": report_case_count(heldout),
+        "visible_case_count": len(visible_results),
+        "heldout_case_count": len(heldout_results),
         "visible_failure_count": len(visible_failures),
         "heldout_failure_count": len(heldout_failures),
+        "visible_results": visible_results,
+        "heldout_results": heldout_results,
+        "combined_results": combined_results,
+        "visible_corpus": visible_corpus,
+        "heldout_corpus": heldout_corpus_descriptor,
+        "combined_corpus": combined_corpus_material,
+        "visible_corpus_identity_sha256": visible_corpus["corpus_identity_sha256"],
+        "heldout_corpus_identity_sha256": heldout_corpus_descriptor["corpus_identity_sha256"],
+        "combined_corpus_identity_sha256": combined_corpus_material["corpus_identity_sha256"],
         "visible_fingerprint_sha256": execution_metrics.behavioral_fingerprint_hash(
-            visible_failures
+            visible_corpus["corpus_identity_sha256"], visible_results
         ),
         "heldout_fingerprint_sha256": execution_metrics.behavioral_fingerprint_hash(
-            heldout_failures
+            heldout_corpus_descriptor["corpus_identity_sha256"], heldout_results
         ),
         "combined_fingerprint_sha256": execution_metrics.behavioral_fingerprint_hash(
-            combined
+            combined_corpus_material["corpus_identity_sha256"], combined_results
         ),
     }
 
@@ -636,6 +788,69 @@ def case_count_stability(measured: Sequence[Mapping[str, Any]]) -> dict[str, Any
     }
 
 
+def pairwise_behavioral_distances(
+    measured: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """All candidate pairs, refusing comparisons across different corpora."""
+    rows: list[dict[str, Any]] = []
+    summary: dict[str, Any] = {}
+    for scope in ("visible", "heldout", "combined"):
+        comparable_values: list[float] = []
+        incompatible_pairs = 0
+        for left, right in itertools.combinations(measured, 2):
+            left_identity = str(left[f"{scope}_corpus_identity_sha256"])
+            right_identity = str(right[f"{scope}_corpus_identity_sha256"])
+            compatible = left_identity == right_identity
+            disagreement: float | None = None
+            reason: str | None = None
+            if compatible:
+                try:
+                    disagreement = execution_metrics.pairwise_verdict_disagreement(
+                        left[f"{scope}_results"], right[f"{scope}_results"]
+                    )
+                except ValueError as error:
+                    compatible = False
+                    reason = str(error)
+            else:
+                reason = "corpus identity differs"
+            if compatible and disagreement is not None:
+                comparable_values.append(disagreement)
+            else:
+                incompatible_pairs += 1
+            rows.append(
+                {
+                    "scope": scope,
+                    "left_candidate_id": left["run_id"],
+                    "right_candidate_id": right["run_id"],
+                    "left_corpus_identity_sha256": left_identity,
+                    "right_corpus_identity_sha256": right_identity,
+                    "comparable": compatible,
+                    "disagreement": disagreement,
+                    "incomparable_reason": reason,
+                }
+            )
+        total_pairs = len(measured) * (len(measured) - 1) // 2
+        summary[scope] = {
+            "population_n": len(measured),
+            "total_pairs": total_pairs,
+            "comparable_pairs": len(comparable_values),
+            "incomparable_pairs": incompatible_pairs,
+            "mean_pairwise_disagreement": (
+                sum(comparable_values) / len(comparable_values)
+                if total_pairs > 0 and incompatible_pairs == 0
+                else None
+            ),
+            "unavailable_reason": (
+                "fewer than two measured candidates"
+                if total_pairs == 0
+                else "one or more candidate pairs used incompatible case corpora"
+                if incompatible_pairs
+                else None
+            ),
+        }
+    return rows, summary
+
+
 def build_summary(
     *,
     experiment_dir: Path,
@@ -661,6 +876,25 @@ def build_summary(
         )
         for space in ("visible", "heldout", "combined")
     }
+    _, disagreement = pairwise_behavioral_distances(measured)
+    corpus_identity = {
+        scope: {
+            "compatible_population": len({
+                str(row[f"{scope}_corpus_identity_sha256"]) for row in measured
+            }) <= 1,
+            "distinct_corpus_identities": sorted({
+                str(row[f"{scope}_corpus_identity_sha256"]) for row in measured
+            }),
+            "ordered_case_ids": (
+                [entry["case_id"] for entry in measured[0][f"{scope}_results"]]
+                if measured else []
+            ),
+            "number_of_cases": (
+                len(measured[0][f"{scope}_results"]) if measured else 0
+            ),
+        }
+        for scope in ("visible", "heldout", "combined")
+    }
     return {
         "schema_version": SCHEMA_VERSION,
         "experiment": str(experiment_dir),
@@ -671,6 +905,9 @@ def build_summary(
         "heldout_corpus": str(heldout_corpus),
         "visible_suite_files": [path.name for path in visible_corpora],
         "population": {
+            "selection_basis": experiment.get(
+                "population_selection_basis", "overall_success"
+            ),
             "successful_runs": successful_runs,
             "measured_runs": len(measured),
             "measurement_coverage": (
@@ -679,7 +916,11 @@ def build_summary(
             "unmeasured_runs": list(unmeasured),
         },
         **case_count_stability(measured),
+        "behavioral_corpus": corpus_identity,
+        "pairwise_behavioral_disagreement": disagreement,
         "exact_behavioral_convergence": convergence,
+        "exact_behavioral_convergence_role": "supporting_descriptive",
+        "exact_behavioral_unique_rate_caveat": "sample-size-dependent",
         "structural_behavior_agreement": {
             "architecture": execution_metrics.structural_behavior_agreement(
                 run_ids, behavioral_group, architecture_labels
@@ -757,7 +998,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         experiment_dir / "analysis" / "execution_consistency"
     )
     population = successful_population(
-        experiment_dir / "analysis" / "per_run_metrics.csv"
+        experiment_dir / "analysis" / "per_run_metrics.csv", experiment
     )
     architecture_labels = {
         str(row["run_id"]): label
@@ -810,6 +1051,43 @@ def main(argv: Sequence[str] | None = None) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     write_csv(output_dir / "behavioral_fingerprints.csv", measured, FINGERPRINT_CSV_FIELDS)
+    write_json(
+        output_dir / "behavioral_verdict_traces.json",
+        {
+            "schema_version": SCHEMA_VERSION,
+            "population_selection_basis": experiment.get(
+                "population_selection_basis", "overall_success"
+            ),
+            "candidates": [
+                {
+                    "run_id": row["run_id"],
+                    "visible": {
+                        "corpus": row["visible_corpus"],
+                        "results": row["visible_results"],
+                    },
+                    "heldout": {
+                        "corpus": row["heldout_corpus"],
+                        "results": row["heldout_results"],
+                    },
+                    "combined": {
+                        "corpus": row["combined_corpus"],
+                        "results": row["combined_results"],
+                    },
+                }
+                for row in measured
+            ],
+        },
+    )
+    distance_rows, _ = pairwise_behavioral_distances(measured)
+    write_csv(
+        output_dir / "pairwise_behavioral_distances.csv",
+        distance_rows,
+        (
+            "scope", "left_candidate_id", "right_candidate_id",
+            "left_corpus_identity_sha256", "right_corpus_identity_sha256",
+            "comparable", "disagreement", "incomparable_reason",
+        ),
+    )
     summary = build_summary(
         experiment_dir=experiment_dir,
         experiment=experiment,
@@ -827,13 +1105,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     write_json(output_dir / "summary.json", summary)
 
     combined = summary["exact_behavioral_convergence"]["combined"]
+    combined_disagreement = summary["pairwise_behavioral_disagreement"]["combined"]
     print(
         f"\nMeasured {len(measured)}/{len(population)} successful run(s); "
         f"{len(unmeasured)} unmeasured."
     )
     if measured:
+        mean_disagreement = combined_disagreement["mean_pairwise_disagreement"]
         print(
-            f"Combined behavioral unique rate: "
+            "Combined mean pairwise verdict disagreement: "
+            + ("undefined" if mean_disagreement is None else f"{mean_disagreement:.3f}")
+        )
+        print(
+            f"Supporting combined behavioral unique rate: "
             f"{combined['exact_behavioral_unique_rate']:.3f}  "
             f"modal share: {combined['exact_behavioral_modal_share']:.3f}"
         )
@@ -843,11 +1127,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"{space.capitalize()}-behavior ARI: "
                 + ("undefined (fewer than 2 shared runs)" if ari is None else f"{ari:.3f}")
             )
-    if not summary["case_count_stable"]:
+    if any(
+        not summary["behavioral_corpus"][scope]["compatible_population"]
+        for scope in ("visible", "heldout", "combined")
+    ):
         print(
-            "WARNING: case counts differed across the measured population; the "
-            "condition was not held constant and the convergence rates above "
-            "compare candidates judged on different cases.",
+            "WARNING: corpus identities differed across the measured population; "
+            "pairwise disagreement is reported as incomparable, not computed.",
             file=sys.stderr,
         )
     print(f"Wrote {output_dir}")
