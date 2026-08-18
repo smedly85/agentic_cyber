@@ -58,7 +58,7 @@ from analysis.diversity_validation import (
     pairwise_spearman_correlations,
     validation_distances,
 )
-from analysis.security_diagnostics import flawfinder_crosscheck, security_profile
+from analysis import security_diagnostics
 
 
 # ---------------------------------------------------------------------------
@@ -119,8 +119,8 @@ def require_diagnostic_packages() -> tuple[Any, Any, Any, Any, Any]:
     return plt, levenshtein_ratio, linkage, dendrogram, squareform
 
 
-ANALYZER_VERSION = "5.0.0"
-PAPER_SCHEMA_VERSION = 6
+ANALYZER_VERSION = "5.2.0"
+PAPER_SCHEMA_VERSION = 7
 
 PAPER_METRICS_COLUMNS = [
     "Issue",
@@ -176,6 +176,11 @@ PAPER_DESCRIPTIVE_COLUMNS = [
     "Mean Repair LLM Runtime (s)",
     "Mean Total Runtime (s)",
     "Median Total Runtime (s)",
+    "Mean Source LOC",
+    "Median Source LOC",
+    "SD Source LOC",
+    "Source LOC CV",
+    "Mean Source Bytes",
     "Mean Lines Edited",
     "Mean Files Edited",
     "Mean Functions Edited",
@@ -355,9 +360,21 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--security-analysis",
         "--security-diagnostics",
+        dest="security_analysis",
         action="store_true",
-        help="Write optional static security profiles and Flawfinder cross-checks.",
+        help=(
+            "Write formal RQ3 Flawfinder findings, source descriptors, coverage, "
+            "and paper-facing security outputs. --security-diagnostics is a "
+            "backward-compatible alias."
+        ),
+    )
+    parser.add_argument(
+        "--security-config",
+        type=Path,
+        default=None,
+        help="Versioned frozen RQ3 security configuration JSON.",
     )
     parser.add_argument(
         "--paper-issue-label",
@@ -497,6 +514,84 @@ def safe_numeric_mean(values: Iterable[Any]) -> float | None:
         and math.isfinite(float(value))
     ]
     return statistics.fmean(numeric) if numeric else None
+
+
+def load_security_configuration(
+    path: Path | None,
+    experiment_metadata: Mapping[str, Any],
+    *,
+    requested: bool,
+    formal: bool,
+) -> dict[str, Any] | None:
+    value: Any = None
+    if path is not None:
+        if not path.is_file():
+            raise SystemExit(f"security configuration not found: {path}")
+        value = read_json(path)
+    elif isinstance(experiment_metadata.get("frozen_security_configuration"), Mapping):
+        value = experiment_metadata["frozen_security_configuration"]
+    if value is None:
+        if requested and formal:
+            raise SystemExit(
+                "formal RQ3 security analysis requires --security-config or "
+                "embedded frozen_security_configuration metadata"
+            )
+        return security_diagnostics.default_security_configuration() if requested else None
+    if not isinstance(value, Mapping):
+        raise SystemExit("security configuration must be a JSON object")
+    try:
+        return security_diagnostics.validate_security_configuration(value)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+
+
+def source_physical_line_count(path: Path) -> int:
+    """Physical lines in one source file, including blank and comment lines."""
+    return len(path.read_text(encoding="utf-8", errors="replace").splitlines())
+
+
+def build_source_size_summary(
+    rows: Sequence[Mapping[str, Any]], membership_key: str
+) -> dict[str, Any]:
+    """Baseline-independent source-size descriptors for retained members."""
+    members = [row for row in rows if bool(row.get(membership_key))]
+    line_counts = [
+        float(row["source_line_count"])
+        for row in members
+        if isinstance(row.get("source_line_count"), (int, float))
+        and not isinstance(row.get("source_line_count"), bool)
+        and math.isfinite(float(row["source_line_count"]))
+    ]
+    source_bytes = [
+        float(row["source_bytes"])
+        for row in members
+        if isinstance(row.get("source_bytes"), (int, float))
+        and not isinstance(row.get("source_bytes"), bool)
+        and math.isfinite(float(row["source_bytes"]))
+    ]
+    mean_loc = statistics.fmean(line_counts) if line_counts else None
+    sample_sd = statistics.stdev(line_counts) if len(line_counts) >= 2 else None
+    return {
+        "role": "descriptive_implementation_size",
+        "population": "successful_measured_population",
+        "population_n": len(line_counts),
+        "source_line_count_definition": (
+            "len(source_text.splitlines()); blank and comment lines included"
+        ),
+        "mean_source_line_count": mean_loc,
+        "median_source_line_count": (
+            statistics.median(line_counts) if line_counts else None
+        ),
+        "sample_sd_source_line_count": sample_sd,
+        "source_line_count_cv": (
+            sample_sd / mean_loc
+            if sample_sd is not None and mean_loc is not None and mean_loc != 0
+            else None
+        ),
+        "mean_source_bytes": (
+            statistics.fmean(source_bytes) if source_bytes else None
+        ),
+    }
 
 
 def load_frozen_analysis_configuration(
@@ -1447,6 +1542,7 @@ def build_paper_descriptive_row(
     repair = summary.get("repair", {})
     exact = summary.get("exact_generation_convergence", {})
     runtime = summary.get("runtime_seconds", {})
+    source_size = summary.get("source_size", {})
     is_lineage_view = summary.get("experiment_format") == "lineage_population_view"
     membership_key = (
         "analysis_population_member" if is_lineage_view else "overall_success"
@@ -1480,6 +1576,11 @@ def build_paper_descriptive_row(
         "Mean Repair LLM Runtime (s)": repair.get("mean_repair_llm_runtime_seconds"),
         "Mean Total Runtime (s)": runtime.get("mean"),
         "Median Total Runtime (s)": runtime.get("median"),
+        "Mean Source LOC": source_size.get("mean_source_line_count"),
+        "Median Source LOC": source_size.get("median_source_line_count"),
+        "SD Source LOC": source_size.get("sample_sd_source_line_count"),
+        "Source LOC CV": source_size.get("source_line_count_cv"),
+        "Mean Source Bytes": source_size.get("mean_source_bytes"),
         "Mean Lines Edited": None if is_lineage_view else safe_numeric_mean(row.get("lines_edited") for row in successful_rows),
         "Mean Files Edited": None if is_lineage_view else safe_numeric_mean(row.get("files_edited") for row in successful_rows),
         "Mean Functions Edited": None if is_lineage_view else safe_numeric_mean(row.get("functions_edited_count") for row in successful_rows),
@@ -1502,6 +1603,7 @@ def paper_metrics_schema() -> dict[str, Any]:
             "primary_population": "ordinary successful candidates, or explicit lineage-stage population members, with complete measurement for that representation; no fallback",
             "lineage_population_reliability": "not applicable in a survivor view; use the parent lineage paper row",
             "lineage_population_change": "empty-baseline maintenance-change fields are unsupported and null",
+            "source_size": "baseline-independent physical configured-source size; LOC uses Python str.splitlines() and includes blank and comment lines",
             "effective_families": "exp(Shannon entropy) of empirical family shares",
             "fixed_budget_family_discovery_auc": "supporting; null unless a resolved fixed K is configured and supported by the population",
             "excluded_from_clustering": "lexical, APTED, API-call, security, complexity, runtime, and patch-size information",
@@ -3009,6 +3111,14 @@ def main() -> int:
     )
     if frozen_analysis_configuration is not None:
         apply_frozen_analysis_configuration(args, frozen_analysis_configuration)
+    security_configuration = load_security_configuration(
+        args.security_config,
+        experiment_metadata,
+        requested=args.security_analysis or args.security_config is not None,
+        formal=args.formal_analysis,
+    )
+    if security_configuration is not None:
+        args.security_analysis = True
     if args.bootstrap_repetitions < 0:
         raise SystemExit("--bootstrap-repetitions must be non-negative")
     analysis_configuration = resolve_analysis_configuration(
@@ -3158,7 +3268,11 @@ def main() -> int:
     tool_paths = {
         "clang": shutil.which("clang"),
         "gumtree": shutil.which("gumtree"),
-        "flawfinder": shutil.which("flawfinder"),
+        "flawfinder": (
+            str(security_diagnostics.resolve_flawfinder_executable())
+            if security_diagnostics.resolve_flawfinder_executable() is not None
+            else None
+        ),
         "python": sys.executable,
     }
     if diagnostic_root is not None:
@@ -3433,6 +3547,11 @@ def main() -> int:
             "candidate_missing": candidate_missing,
             "candidate_sha256": file_sha256(measured_source) if not candidate_missing else None,
             "source_bytes": measured_source.stat().st_size if not candidate_missing else None,
+            "source_line_count": (
+                source_physical_line_count(measured_source)
+                if not candidate_missing
+                else None
+            ),
             "source_tree_sitter_leaf_tokens": (
                 candidate.tree_sitter_leaf_tokens
             ),
@@ -3863,43 +3982,30 @@ def main() -> int:
             ],
         )
     security_summary: dict[str, Any] = {"status": "not_requested"}
-    if args.security_diagnostics:
-        security_rows = []
-        flawfinder_rows = []
-        for run_id in passing_ids:
-            source = candidate_sources.get(run_id)
-            if source is None:
-                continue
-            security_rows.append({"run_id": run_id, **security_profile(source.read_bytes())})
-            flawfinder = flawfinder_crosscheck(source)
-            flawfinder_rows.append(
-                {
-                    "run_id": run_id,
-                    "status": flawfinder["status"],
-                    "reason": flawfinder["reason"],
-                    "hit_count": len(flawfinder["hits"]),
-                }
-            )
-        write_csv(
-            output_dir / "security" / "security_profiles.csv",
-            security_rows,
-            [
-                "run_id", "unsafe_call_count", "bounded_risky_call_count",
-                "heap_allocation_deallocation_call_count",
-                "fixed_size_stack_buffer_count", "indexing_operation_count",
-            ],
+    if args.security_analysis and security_configuration is not None:
+        security_candidates = [
+            {
+                "run_id": run_id,
+                "source": candidate_sources.get(run_id),
+                "source_identifier": f"{run_id}/{source_path.as_posix()}",
+            }
+            for run_id in passing_ids
+        ]
+        security_result = security_diagnostics.analyze_security_population(
+            candidates=security_candidates,
+            output_dir=output_dir / "security",
+            configuration=security_configuration,
+            metadata={
+                "issue": infer_paper_issue(experiment_metadata, args.paper_issue_label),
+                "checkpoint": infer_paper_checkpoint(
+                    experiment_metadata, args.paper_checkpoint_label
+                ),
+                "model": experiment_metadata.get("model"),
+                "temperature": experiment_metadata.get("temperature"),
+            },
+            formal=args.formal_analysis,
         )
-        write_csv(
-            output_dir / "security" / "flawfinder.csv",
-            flawfinder_rows,
-            ["run_id", "status", "reason", "hit_count"],
-        )
-        security_summary = {
-            "status": "completed",
-            "profiles": len(security_rows),
-            "flawfinder_available_runs": sum(row["status"] == "available" for row in flawfinder_rows),
-            "flawfinder_unavailable_runs": sum(row["status"] != "available" for row in flawfinder_rows),
-        }
+        security_summary = security_result["summary"]
 
     for row in rows:
         run_id = str(row["run_id"])
@@ -4100,6 +4206,7 @@ def main() -> int:
 
     n = len(rows)
     successful = sum(bool(row.get(population_membership_key)) for row in rows)
+    source_size_summary = build_source_size_summary(rows, population_membership_key)
     reliability_summary = build_reliability_summary(rows)
     valid_agent_trials = reliability_summary["n_valid_agent_trials"]
     successful_valid_trials = reliability_summary[
@@ -4187,6 +4294,7 @@ def main() -> int:
         "runs_analyzed": n,
         "population_size": n if is_lineage_population_view else successful,
         "successful_runs": None if is_lineage_population_view else successful,
+        "source_size": source_size_summary,
         "reliability_scope": (
             "parent_lineage_experiment"
             if is_lineage_population_view else "current_experiment"
@@ -4289,6 +4397,7 @@ def main() -> int:
             "clang": baseline.clang_error,
             "tree_sitter": baseline.tree_sitter_error,
         },
+        "security_analysis": security_summary,
         "security_diagnostics": security_summary,
         "tool_paths": tool_paths,
     }

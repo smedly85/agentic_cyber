@@ -132,6 +132,7 @@ class StructuralBehaviorAgreementTests(unittest.TestCase):
         result = em.structural_behavior_agreement(run_ids, behavioral, structural)
         self.assertEqual(result["population_n"], 4)
         self.assertEqual(result["adjusted_rand_index"], 1.0)
+        self.assertIsNone(result["unavailable_reason"])
 
     def test_crossed_partitions_disagree(self):
         run_ids = ["r1", "r2", "r3", "r4"]
@@ -139,15 +140,47 @@ class StructuralBehaviorAgreementTests(unittest.TestCase):
         structural = {"r1": "0", "r2": "1", "r3": "0", "r4": "1"}
         result = em.structural_behavior_agreement(run_ids, behavioral, structural)
         self.assertAlmostEqual(result["adjusted_rand_index"], -0.5)
+        self.assertIsNone(result["unavailable_reason"])
 
-    def test_only_shared_runs_contribute(self):
-        run_ids = ["r1", "r2", "r3"]
-        behavioral = {"r1": "A", "r2": "A", "r3": "B"}
+    def test_only_shared_runs_contribute_to_nontrivial_partitions(self):
+        run_ids = ["r1", "r2", "r3", "r4", "r5"]
+        behavioral = {"r1": "A", "r2": "A", "r3": "B", "r4": "B", "r5": "C"}
         # r3 sits outside the architecture population, so it has no family label.
-        structural = {"r1": "0", "r2": "0"}
+        structural = {"r1": "0", "r2": "0", "r4": "1", "r5": "1"}
         result = em.structural_behavior_agreement(run_ids, behavioral, structural)
-        self.assertEqual(result["population_n"], 2)
-        self.assertEqual(result["adjusted_rand_index"], 1.0)
+        self.assertEqual(result["population_n"], 4)
+        self.assertIsNotNone(result["adjusted_rand_index"])
+
+    def test_one_behavioral_group_is_not_reported(self):
+        result = em.structural_behavior_agreement(
+            ["r1", "r2", "r3"],
+            {"r1": "A", "r2": "A", "r3": "A"},
+            {"r1": "0", "r2": "1", "r3": "1"},
+        )
+        self.assertIsNone(result["adjusted_rand_index"])
+        self.assertEqual(
+            result["unavailable_reason"], "trivial_behavioral_partition"
+        )
+
+    def test_one_structural_group_is_not_reported(self):
+        result = em.structural_behavior_agreement(
+            ["r1", "r2", "r3"],
+            {"r1": "A", "r2": "B", "r3": "B"},
+            {"r1": "0", "r2": "0", "r3": "0"},
+        )
+        self.assertIsNone(result["adjusted_rand_index"])
+        self.assertEqual(
+            result["unavailable_reason"], "trivial_structural_partition"
+        )
+
+    def test_both_trivial_partitions_are_not_reported(self):
+        result = em.structural_behavior_agreement(
+            ["r1", "r2"],
+            {"r1": "A", "r2": "A"},
+            {"r1": "0", "r2": "0"},
+        )
+        self.assertIsNone(result["adjusted_rand_index"])
+        self.assertEqual(result["unavailable_reason"], "both_partitions_trivial")
 
     def test_ari_is_null_below_two_shared_runs(self):
         for behavioral, structural in (
@@ -159,9 +192,16 @@ class StructuralBehaviorAgreementTests(unittest.TestCase):
                 ["r1", "r2", "r3"], behavioral, structural
             )
             self.assertIsNone(result["adjusted_rand_index"])
+            self.assertEqual(
+                result["unavailable_reason"], "insufficient_shared_runs"
+            )
         self.assertEqual(
             em.structural_behavior_agreement([], {}, {}),
-            {"population_n": 0, "adjusted_rand_index": None},
+            {
+                "population_n": 0,
+                "adjusted_rand_index": None,
+                "unavailable_reason": "insufficient_shared_runs",
+            },
         )
 
     def test_agreement_is_order_deterministic(self):
@@ -1002,6 +1042,7 @@ def test_main_wires_population_fingerprints_and_agreement(
     output = experiment / "analysis" / "execution_consistency"
     summary = json.loads((output / "summary.json").read_text())
 
+    assert summary["schema_version"] == 3
     assert summary["utility"] == "sort"
     assert summary["implemented_flags"] == ["-n"]
     assert summary["candidate_binary"] == "build/new_sort"

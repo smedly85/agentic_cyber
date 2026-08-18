@@ -2337,6 +2337,25 @@ def test_formal_analysis_requires_complete_versioned_configuration(
     )
 
 
+def test_formal_security_configuration_is_separate_required_and_fingerprinted(
+    analyzer, tmp_path: Path
+):
+    with pytest.raises(SystemExit, match="formal RQ3 security analysis requires"):
+        analyzer.load_security_configuration(
+            None, {}, requested=True, formal=True
+        )
+    configuration = sd.default_security_configuration()
+    path = tmp_path / "security.json"
+    path.write_text(json.dumps(configuration), encoding="utf-8")
+    assert analyzer.load_security_configuration(
+        path, {}, requested=True, formal=True
+    ) == configuration
+    changed = {**configuration, "unsafe_calls": [*configuration["unsafe_calls"], "demo"]}
+    assert sd.security_configuration_fingerprint(configuration) != (
+        sd.security_configuration_fingerprint(changed)
+    )
+
+
 def test_lineage_population_paper_row_is_not_a_seven_of_seven_reliability_row(
     analyzer,
 ):
@@ -2363,6 +2382,13 @@ def test_lineage_population_paper_row_is_not_a_seven_of_seven_reliability_row(
     summary = {
         "experiment_format": "lineage_population_view",
         "population_size": 7,
+        "source_size": {
+            "mean_source_line_count": 42.0,
+            "median_source_line_count": 41.0,
+            "sample_sd_source_line_count": 3.0,
+            "source_line_count_cv": 3.0 / 42.0,
+            "mean_source_bytes": 900.0,
+        },
         "successful_runs": None,
         "analysis_configuration": configuration,
         "clustering": {
@@ -2405,6 +2431,11 @@ def test_lineage_population_paper_row_is_not_a_seven_of_seven_reliability_row(
     ):
         assert paper[field] is None
     descriptive = analyzer.build_paper_descriptive_row({}, summary, rows)
+    assert descriptive["Mean Source LOC"] == 42.0
+    assert descriptive["Median Source LOC"] == 41.0
+    assert descriptive["SD Source LOC"] == 3.0
+    assert descriptive["Source LOC CV"] == pytest.approx(3.0 / 42.0)
+    assert descriptive["Mean Source Bytes"] == 900.0
     assert descriptive["Mean Lines Edited"] is None
     assert descriptive["Mean Normalized GumTree Edit-Action Magnitude"] is None
     assert descriptive["Maintenance Change Scope"] == (
@@ -2496,7 +2527,7 @@ def test_confirmatory_configuration_matches_recorded_primary_settings(
     assert [mismatch["setting"] for mismatch in mismatches] == [setting]
 
 
-def test_schema_v6_aggregate_skips_older_rows(analyzer, tmp_path: Path, capsys):
+def test_schema_v7_aggregate_skips_older_rows(analyzer, tmp_path: Path, capsys):
     root = tmp_path / "repository"
     exploratory_path = root / "runs" / "experiments" / "a-exploratory" / "analysis"
     base_path = root / "runs" / "experiments" / "b-base" / "analysis"
@@ -2546,8 +2577,8 @@ def test_schema_v6_aggregate_skips_older_rows(analyzer, tmp_path: Path, capsys):
                 {
                     **valid_row,
                     "Checkpoint": checkpoint,
-                    "_schema_version": 6,
-                    "_analyzer_version": "5.0.0",
+                    "_schema_version": 7,
+                    "_analyzer_version": "5.2.0",
                     "_analysis_signature": row_signature,
                     "_confirmatory_configuration_match": confirmatory,
                     "_confirmatory_configuration_mismatches": (
@@ -2577,7 +2608,7 @@ def test_schema_v6_aggregate_skips_older_rows(analyzer, tmp_path: Path, capsys):
             {
                 **valid_row,
                 "Checkpoint": "old-analyzer",
-                "_schema_version": 6,
+                "_schema_version": 7,
                 "_analyzer_version": "4.9.9",
                 "_analysis_signature": signature,
                 "_confirmatory_configuration_match": True,
@@ -2589,8 +2620,8 @@ def test_schema_v6_aggregate_skips_older_rows(analyzer, tmp_path: Path, capsys):
         json.dumps(
             {
                 **common,
-                "_schema_version": 6,
-                "_analyzer_version": "5.0.0",
+                "_schema_version": 7,
+                "_analyzer_version": "5.2.0",
             }
         ),
         encoding="utf-8",
@@ -2620,9 +2651,9 @@ def test_schema_v6_aggregate_skips_older_rows(analyzer, tmp_path: Path, capsys):
     assert "skipped 2 rows with incompatible confirmatory configuration" in output
 
 
-def test_schema_v6_paper_columns(analyzer):
-    assert analyzer.ANALYZER_VERSION == "5.0.0"
-    assert analyzer.PAPER_SCHEMA_VERSION == 6
+def test_schema_v7_paper_columns(analyzer):
+    assert analyzer.ANALYZER_VERSION == "5.2.0"
+    assert analyzer.PAPER_SCHEMA_VERSION == 7
     assert "Exact Unique Rate" not in analyzer.PAPER_METRICS_COLUMNS
     assert "Exact Modal Share" not in analyzer.PAPER_METRICS_COLUMNS
     assert "Exact Unique Rate" in analyzer.PAPER_DESCRIPTIVE_COLUMNS
@@ -2636,6 +2667,14 @@ def test_schema_v6_paper_columns(analyzer):
     assert "Mean Pairwise Architecture Distance" in analyzer.PAPER_METRICS_COLUMNS
     assert "Mean Pairwise Strategy Distance" in analyzer.PAPER_METRICS_COLUMNS
     assert "Architecture Family-Discovery AUC@K" in analyzer.PAPER_DESCRIPTIVE_COLUMNS
+    for column in (
+        "Mean Source LOC",
+        "Median Source LOC",
+        "SD Source LOC",
+        "Source LOC CV",
+        "Mean Source Bytes",
+    ):
+        assert column in analyzer.PAPER_DESCRIPTIVE_COLUMNS
     public_text = (
         ANALYZER.read_text(encoding="utf-8")
         + (REPO_ROOT / "scripts" / "analysis" / "diversity_metrics.py").read_text(
@@ -2643,6 +2682,46 @@ def test_schema_v6_paper_columns(analyzer):
         )
     )
     assert "Diversity Awareness" not in public_text
+
+
+def test_source_line_count_and_descriptors_are_physical_and_baseline_independent(
+    analyzer, tmp_path: Path
+):
+    source = tmp_path / "candidate.c"
+    source.write_text("// comment\n\nint main(void) { return 0; }\n", encoding="utf-8")
+    assert analyzer.source_physical_line_count(source) == 3
+
+    summary = analyzer.build_source_size_summary(
+        [
+            {
+                "overall_success": True,
+                "source_line_count": 1,
+                "source_bytes": 10,
+                "lines_edited": 999,
+            },
+            {
+                "overall_success": True,
+                "source_line_count": 3,
+                "source_bytes": 30,
+                "lines_edited": 0,
+            },
+            {
+                "overall_success": False,
+                "source_line_count": 100,
+                "source_bytes": 1000,
+            },
+        ],
+        "overall_success",
+    )
+    assert summary["population_n"] == 2
+    assert summary["mean_source_line_count"] == 2.0
+    assert summary["median_source_line_count"] == 2.0
+    assert summary["sample_sd_source_line_count"] == pytest.approx(2 ** 0.5)
+    assert summary["source_line_count_cv"] == pytest.approx(2 ** 0.5 / 2)
+    assert summary["mean_source_bytes"] == 20.0
+    assert "blank and comment lines included" in summary[
+        "source_line_count_definition"
+    ]
 
 
 def test_analyzer_reads_final_appended_tests_and_sums_invocation_tokens(
@@ -2779,8 +2858,8 @@ def test_full_analyzer_accepts_mixed_old_and_repair_metadata(tmp_path: Path):
         (experiment / "analysis" / "summary.json").read_text(encoding="utf-8")
     )
     assert summary["runs_analyzed"] == 2
-    assert summary["schema_version"] == 6
-    assert summary["analyzer_version"] == "5.0.0"
+    assert summary["schema_version"] == 7
+    assert summary["analyzer_version"] == "5.2.0"
     assert summary["analysis_configuration"]["architecture_threshold"] == 0.25
     assert (
         summary["analysis_configuration"]["architecture_threshold_source"]
@@ -2802,6 +2881,14 @@ def test_full_analyzer_accepts_mixed_old_and_repair_metadata(tmp_path: Path):
     assert summary["repair"]["final_public_success_rate"] == 1.0
     assert summary["repair"]["mean_llm_invocations"] == 2.0
     assert summary["successful_runs"] == 1
+    assert summary["source_size"]["population_n"] == 1
+    assert summary["source_size"]["mean_source_line_count"] == 1.0
+    assert summary["source_size"]["median_source_line_count"] == 1.0
+    assert summary["source_size"]["sample_sd_source_line_count"] is None
+    assert summary["source_size"]["source_line_count_cv"] is None
+    assert summary["source_size"]["mean_source_bytes"] == len(
+        baseline_source.encode("utf-8")
+    )
     assert summary["exact_generation_convergence"]["exact_unique_rate"] == 1.0
     assert summary["clustering"]["primary_population"] == {
         "architecture": "passing_complete_runs",
@@ -2826,12 +2913,14 @@ def test_full_analyzer_accepts_mixed_old_and_repair_metadata(tmp_path: Path):
         experiment / "analysis" / "paper_descriptive_metrics.csv"
     ).read_text().splitlines()[0]
     assert "Exact Unique Rate" in descriptive_header
+    assert "Mean Source LOC" in descriptive_header
+    assert "Mean Source Bytes" in descriptive_header
     assert "Mean Normalized GumTree Edit-Action Magnitude" in descriptive_header
     paper_row = json.loads(
         (experiment / "analysis" / "paper_metrics_row.json").read_text()
     )
-    assert paper_row["_schema_version"] == 6
-    assert paper_row["_analyzer_version"] == "5.0.0"
+    assert paper_row["_schema_version"] == 7
+    assert paper_row["_analyzer_version"] == "5.2.0"
     assert paper_row["_confirmatory_configuration_match"] is False
     assert paper_row["_confirmatory_configuration_mismatches"][0]["setting"] == (
         "formal_analysis_configuration"

@@ -61,9 +61,9 @@ import statistics
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
@@ -135,10 +135,61 @@ BASELINE_DEPENDENT_METRICS = (
     "gumtree_normalized_edit_distance",
 )
 
+LINEAGE_CHANGE_SUMMARY_FIELDS = (
+    "checkpoint_id",
+    "checkpoint_name",
+    "successful_transitions",
+    "measured_transitions",
+    "mean_lines_added",
+    "mean_lines_deleted",
+    "mean_lines_edited",
+    "median_lines_edited",
+    "mean_functions_edited",
+    "mean_functions_created",
+    "mean_functions_deleted",
+)
+
+SECURITY_STAGE_SUMMARY_FIELDS = (
+    "checkpoint_id",
+    "checkpoint_name",
+    "population_n",
+    "security_measurement_coverage",
+    "static_finding_prevalence",
+    "mean_flawfinder_findings",
+    "median_flawfinder_findings",
+    "mean_findings_per_kloc",
+    "median_findings_per_kloc",
+    "unsafe_api_prevalence",
+    "mean_unsafe_call_count",
+    "distinct_cwe_count",
+)
+
+SECURITY_TRANSITION_FIELDS = (
+    "lineage_id",
+    "from_checkpoint",
+    "to_checkpoint",
+    "analysis_status",
+    "unavailable_reason",
+    "flawfinder_findings_before",
+    "flawfinder_findings_after",
+    "flawfinder_finding_delta",
+    "findings_per_kloc_before",
+    "findings_per_kloc_after",
+    "findings_per_kloc_delta",
+    "unsafe_calls_before",
+    "unsafe_calls_after",
+    "unsafe_call_delta",
+    "cwe_set_before",
+    "cwe_set_after",
+    "newly_observed_cwes",
+    "no_longer_observed_cwes",
+)
+
 # Reused, never reimplemented: the churn and function-change formulas live in
 # the canonical analyzer. Imported on first use because that module pulls in
 # NumPy and scikit-learn at import time.
 _ANALYZER: dict[str, Any] = {"module": None, "unavailable_reason": None}
+_SECURITY: dict[str, Any] = {"module": None, "unavailable_reason": None}
 
 
 def experiment_analyzer():
@@ -154,6 +205,18 @@ def experiment_analyzer():
         else:
             _ANALYZER["module"] = analyze_experiment
     return _ANALYZER["module"]
+
+
+def security_analyzer():
+    """`analysis.security_diagnostics`, imported only when RQ3 is requested."""
+    if _SECURITY["module"] is None and _SECURITY["unavailable_reason"] is None:
+        try:
+            from analysis import security_diagnostics
+        except ImportError as error:
+            _SECURITY["unavailable_reason"] = str(error)
+        else:
+            _SECURITY["module"] = security_diagnostics
+    return _SECURITY["module"]
 
 
 class LineageError(SystemExit):
@@ -735,6 +798,50 @@ def build_transitions(lineages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return rows
 
 
+def build_transition_summary(
+    transitions: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Aggregate real same-lineage transitions by destination checkpoint."""
+    grouped: dict[str, list[Mapping[str, Any]]] = {}
+    for transition in transitions:
+        checkpoint = str(transition.get("to_checkpoint"))
+        grouped.setdefault(checkpoint, []).append(transition)
+
+    def aggregate(
+        rows: Sequence[Mapping[str, Any]], field: str, statistic: str = "mean"
+    ) -> Any:
+        return summarize([row.get(field) for row in rows])[statistic]
+
+    output: list[dict[str, Any]] = []
+    for checkpoint, rows in grouped.items():
+        output.append(
+            {
+                "checkpoint_id": checkpoint,
+                "checkpoint_name": rows[0].get("to_checkpoint_name"),
+                "successful_transitions": len(rows),
+                "measured_transitions": sum(
+                    bool(row.get("change_available")) for row in rows
+                ),
+                "mean_lines_added": aggregate(rows, "change_lines_added"),
+                "mean_lines_deleted": aggregate(rows, "change_lines_deleted"),
+                "mean_lines_edited": aggregate(rows, "change_lines_edited"),
+                "median_lines_edited": aggregate(
+                    rows, "change_lines_edited", "median"
+                ),
+                "mean_functions_edited": aggregate(
+                    rows, "change_functions_edited_count"
+                ),
+                "mean_functions_created": aggregate(
+                    rows, "change_functions_created_count"
+                ),
+                "mean_functions_deleted": aggregate(
+                    rows, "change_functions_deleted_count"
+                ),
+            }
+        )
+    return output
+
+
 def build_total_change(lineages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """D: the final source against that lineage's OWN checkpoint 000 source.
 
@@ -770,6 +877,262 @@ def build_total_change(lineages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         row.update({f"change_{k}": v for k, v in change_between(first, last).items()})
         rows.append(row)
     return rows
+
+
+def successful_transition_identifiers(
+    lineages: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Adjacent successful stage identities, without computing source churn."""
+    rows: list[dict[str, Any]] = []
+    for record in lineages:
+        previous: Mapping[str, Any] | None = None
+        for stage in record.get("stages", []):
+            if not stage.get("success"):
+                break
+            if previous is not None:
+                rows.append(
+                    {
+                        "lineage_id": record.get("lineage_id"),
+                        "from_checkpoint": previous.get("checkpoint_id"),
+                        "to_checkpoint": stage.get("checkpoint_id"),
+                    }
+                )
+            previous = stage
+    return rows
+
+
+def build_security_transition_rows(
+    transitions: Sequence[Mapping[str, Any]],
+    profiles: Mapping[tuple[str, str], Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Compare only adjacent successful stages within the same lineage."""
+
+    def delta(before: Any, after: Any) -> float | None:
+        if (
+            isinstance(before, (int, float))
+            and not isinstance(before, bool)
+            and isinstance(after, (int, float))
+            and not isinstance(after, bool)
+        ):
+            return float(after) - float(before)
+        return None
+
+    rows: list[dict[str, Any]] = []
+    for transition in transitions:
+        lineage_id = str(transition.get("lineage_id"))
+        before = profiles.get((lineage_id, str(transition.get("from_checkpoint"))))
+        after = profiles.get((lineage_id, str(transition.get("to_checkpoint"))))
+        available = (
+            before is not None
+            and after is not None
+            and before.get("analysis_status") == "available"
+            and after.get("analysis_status") == "available"
+        )
+        before_cwes = (
+            set(json.loads(before.get("cwe_ids") or "[]"))
+            if before is not None and before.get("flawfinder_status") == "available"
+            else None
+        )
+        after_cwes = (
+            set(json.loads(after.get("cwe_ids") or "[]"))
+            if after is not None and after.get("flawfinder_status") == "available"
+            else None
+        )
+        findings_before = before.get("flawfinder_finding_count") if before else None
+        findings_after = after.get("flawfinder_finding_count") if after else None
+        density_before = before.get("flawfinder_findings_per_kloc") if before else None
+        density_after = after.get("flawfinder_findings_per_kloc") if after else None
+        unsafe_before = before.get("unsafe_call_count") if before else None
+        unsafe_after = after.get("unsafe_call_count") if after else None
+        reasons = [
+            str(profile.get("unavailable_reason"))
+            for profile in (before, after)
+            if profile is not None and profile.get("analysis_status") != "available"
+        ]
+        if before is None or after is None:
+            reasons.append("stage_security_profile_missing")
+        rows.append(
+            {
+                "lineage_id": lineage_id,
+                "from_checkpoint": transition.get("from_checkpoint"),
+                "to_checkpoint": transition.get("to_checkpoint"),
+                "analysis_status": "available" if available else "unavailable",
+                "unavailable_reason": "; ".join(reasons) if reasons else None,
+                "flawfinder_findings_before": findings_before,
+                "flawfinder_findings_after": findings_after,
+                "flawfinder_finding_delta": delta(findings_before, findings_after),
+                "findings_per_kloc_before": density_before,
+                "findings_per_kloc_after": density_after,
+                "findings_per_kloc_delta": delta(density_before, density_after),
+                "unsafe_calls_before": unsafe_before,
+                "unsafe_calls_after": unsafe_after,
+                "unsafe_call_delta": delta(unsafe_before, unsafe_after),
+                "cwe_set_before": (
+                    json.dumps(sorted(before_cwes), separators=(",", ":"))
+                    if before_cwes is not None
+                    else None
+                ),
+                "cwe_set_after": (
+                    json.dumps(sorted(after_cwes), separators=(",", ":"))
+                    if after_cwes is not None
+                    else None
+                ),
+                "newly_observed_cwes": (
+                    json.dumps(
+                        sorted(after_cwes - before_cwes), separators=(",", ":")
+                    )
+                    if before_cwes is not None and after_cwes is not None
+                    else None
+                ),
+                "no_longer_observed_cwes": (
+                    json.dumps(
+                        sorted(before_cwes - after_cwes), separators=(",", ":")
+                    )
+                    if before_cwes is not None and after_cwes is not None
+                    else None
+                ),
+            }
+        )
+    return rows
+
+
+def analyze_lineage_security(
+    *,
+    lineages: list[dict[str, Any]],
+    order: Sequence[str],
+    transitions: Sequence[Mapping[str, Any]],
+    output_dir: Path,
+    run_metadata: Mapping[str, Any],
+    configuration: Mapping[str, Any],
+    formal: bool,
+) -> dict[str, Any]:
+    module = security_analyzer()
+    if module is None:
+        raise LineageError(
+            "RQ3 security analysis is unavailable: "
+            + str(_SECURITY["unavailable_reason"])
+        )
+
+    def candidates_for(
+        members: Sequence[tuple[str, Path, dict[str, Any]]]
+    ) -> list[dict[str, Any]]:
+        candidates = []
+        for lineage_id, lineage_dir, stage in members:
+            checkpoint = str(stage.get("checkpoint_id"))
+            source = stage_source(lineage_dir, stage)
+            basename = Path(str(stage.get("candidate_source_basename") or "candidate.c")).name
+            candidates.append(
+                {
+                    "run_id": lineage_id,
+                    "source": source,
+                    "source_identifier": f"{lineage_id}/{checkpoint}/{basename}",
+                }
+            )
+        return candidates
+
+    security_root = output_dir / "security"
+    final_result = module.analyze_security_population(
+        candidates=candidates_for(population_members(lineages, None)),
+        output_dir=security_root,
+        configuration=configuration,
+        metadata={
+            "issue": run_metadata.get("utility"),
+            "checkpoint": "final",
+            "model": run_metadata.get("model"),
+            "temperature": run_metadata.get("temperature"),
+        },
+        formal=formal,
+    )
+
+    stage_rows: list[dict[str, Any]] = []
+    severity_rows: list[dict[str, Any]] = []
+    profiles: dict[tuple[str, str], Mapping[str, Any]] = {}
+    for checkpoint in order:
+        members = population_members(lineages, checkpoint)
+        checkpoint_name = members[0][2].get("checkpoint_name") if members else None
+        result = module.analyze_security_population(
+            candidates=candidates_for(members),
+            output_dir=security_root / "stages" / f"checkpoint-{checkpoint}",
+            configuration=configuration,
+            metadata={
+                "issue": run_metadata.get("utility"),
+                "checkpoint": checkpoint,
+                "model": run_metadata.get("model"),
+                "temperature": run_metadata.get("temperature"),
+            },
+            formal=formal,
+        )
+        summary = result["summary"]
+        findings = summary["flawfinder_findings"]
+        density = summary["findings_per_kloc"]
+        stage_rows.append(
+            {
+                "checkpoint_id": checkpoint,
+                "checkpoint_name": checkpoint_name,
+                "population_n": summary["population_n"],
+                "security_measurement_coverage": summary[
+                    "security_measurement_coverage"
+                ],
+                "static_finding_prevalence": summary[
+                    "static_finding_prevalence"
+                ],
+                "mean_flawfinder_findings": findings["mean"],
+                "median_flawfinder_findings": findings["median"],
+                "mean_findings_per_kloc": density["mean"],
+                "median_findings_per_kloc": density["median"],
+                "unsafe_api_prevalence": summary["unsafe_api_prevalence"],
+                "mean_unsafe_call_count": summary["mean_unsafe_call_count"],
+                "distinct_cwe_count": summary["distinct_cwe_count"],
+            }
+        )
+        for severity in summary["severity_distribution"]:
+            severity_rows.append(
+                {
+                    "checkpoint_id": checkpoint,
+                    **severity,
+                }
+            )
+        for profile in result["rows"]:
+            profiles[(str(profile["run_id"]), checkpoint)] = profile
+
+    security_transitions = build_security_transition_rows(transitions, profiles)
+    module.write_csv(
+        output_dir / "security_stage_summary.csv",
+        stage_rows,
+        SECURITY_STAGE_SUMMARY_FIELDS,
+    )
+    module.write_csv(
+        output_dir / "security_stage_severity.csv",
+        severity_rows,
+        (
+            "checkpoint_id",
+            "level",
+            "finding_count",
+            "implementations_with_finding",
+            "candidate_prevalence",
+        ),
+    )
+    module.write_csv(
+        output_dir / "security_transitions.csv",
+        security_transitions,
+        SECURITY_TRANSITION_FIELDS,
+    )
+    return {
+        "status": final_result["summary"]["status"],
+        "security_configuration_fingerprint": final_result["summary"][
+            "security_configuration_fingerprint"
+        ],
+        "flawfinder": final_result["summary"]["flawfinder"],
+        "final_population": final_result["summary"],
+        "stage_summary_rows": len(stage_rows),
+        "transition_rows": len(security_transitions),
+        "outputs": {
+            "paper_security_metrics": "security/paper_security_metrics.csv",
+            "stage_summary": "security_stage_summary.csv",
+            "stage_severity": "security_stage_severity.csv",
+            "transitions": "security_transitions.csv",
+        },
+    }
 
 
 def check_seed_provenance(lineages: list[dict[str, Any]]) -> list[str]:
@@ -1079,6 +1442,9 @@ def materialize_view(
             "frozen_analysis_configuration": run_metadata.get(
                 "frozen_analysis_configuration"
             ),
+            "frozen_security_configuration": run_metadata.get(
+                "frozen_security_configuration"
+            ),
             "formal_analysis": bool(run_metadata.get("formal_analysis")),
             "baseline_rationale": (
                 "Lineages share no seed, so this population has no common "
@@ -1119,6 +1485,10 @@ def run_analyzer(
         command += ["--analysis-config", str(args.analysis_config)]
     if args.formal_analysis:
         command.append("--formal-analysis")
+    if args.security_analysis:
+        command.append("--security-analysis")
+    if args.security_config is not None:
+        command += ["--security-config", str(args.security_config)]
 
     print(f"\n=== diversity: {view_dir.name} ===")
     completed = subprocess.run(command, check=False)
@@ -1379,6 +1749,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Versioned frozen analysis configuration JSON")
     parser.add_argument("--formal-analysis", action="store_true",
                         help="Refuse analysis without a complete frozen config")
+    parser.add_argument("--security-analysis", "--security-diagnostics",
+                        dest="security_analysis", action="store_true",
+                        help="Run paper-facing RQ3 security measurement")
+    parser.add_argument("--security-config", type=Path, default=None,
+                        help="Versioned frozen RQ3 security configuration JSON")
     parser.add_argument("--analyzer", type=Path,
                         default=REPO_ROOT / "scripts" / "analyze_experiment.py")
     parser.add_argument("--python", default=sys.executable)
@@ -1408,6 +1783,43 @@ def main(argv: list[str] | None = None) -> int:
             "frozen_analysis_configuration metadata"
         )
     run_metadata["formal_analysis"] = args.formal_analysis
+    security_configuration = None
+    if args.security_analysis or args.security_config is not None:
+        module = security_analyzer()
+        if module is None:
+            raise LineageError(
+                "RQ3 security analysis is unavailable: "
+                + str(_SECURITY["unavailable_reason"])
+            )
+        raw_security_configuration: Any = None
+        if args.security_config is not None:
+            args.security_config = args.security_config.resolve()
+            if not args.security_config.is_file():
+                raise LineageError(
+                    f"security configuration not found: {args.security_config}"
+                )
+            raw_security_configuration = read_json(args.security_config)
+        elif isinstance(
+            run_metadata.get("frozen_security_configuration"), Mapping
+        ):
+            raw_security_configuration = run_metadata[
+                "frozen_security_configuration"
+            ]
+        elif args.formal_analysis:
+            raise LineageError(
+                "formal RQ3 security analysis requires --security-config or "
+                "recorded frozen_security_configuration metadata"
+            )
+        else:
+            raw_security_configuration = module.default_security_configuration()
+        try:
+            security_configuration = module.validate_security_configuration(
+                raw_security_configuration
+            )
+        except ValueError as error:
+            raise LineageError(str(error)) from error
+        args.security_analysis = True
+        run_metadata["frozen_security_configuration"] = security_configuration
 
     # Run-level environment eligibility is answered before anything else, and
     # answers a different question from reliability. No lineage started, so
@@ -1456,7 +1868,19 @@ def main(argv: list[str] | None = None) -> int:
     stage_rows = build_stage_rows(lineages)
     provenance_problems = check_seed_provenance(lineages)
     transitions = [] if args.skip_change else build_transitions(lineages)
+    transition_summary = build_transition_summary(transitions)
     total_change = [] if args.skip_change else build_total_change(lineages)
+    security_report = None
+    if args.security_analysis and security_configuration is not None:
+        security_report = analyze_lineage_security(
+            lineages=lineages,
+            order=order,
+            transitions=successful_transition_identifiers(lineages),
+            output_dir=output_dir,
+            run_metadata=run_metadata,
+            configuration=security_configuration,
+            formal=args.formal_analysis,
+        )
 
     populations: list[dict[str, Any]] = []
     if not args.skip_diversity:
@@ -1531,6 +1955,8 @@ def main(argv: list[str] | None = None) -> int:
                         "N-1's candidate in the same lineage",
             "transitions": len(transitions),
             "rows": "lineage_transitions.csv",
+            "summary_rows": "lineage_change_summary.csv",
+            "summary_stages": len(transition_summary),
             "unavailable_reason": _ANALYZER["unavailable_reason"],
         },
         "total_lineage_change": {
@@ -1553,6 +1979,7 @@ def main(argv: list[str] | None = None) -> int:
         },
         "seed_provenance_problems": provenance_problems,
         "populations": populations,
+        "security_analysis": security_report,
         "paper_facing_result": (
             "lineage_paper_metrics_row.json" if parent_paper_row else None
         ),
@@ -1601,6 +2028,12 @@ def main(argv: list[str] | None = None) -> int:
             output_dir / "lineage_transitions.csv",
             transitions,
             sorted({key for row in transitions for key in row}),
+        )
+    if not args.skip_change:
+        write_csv(
+            output_dir / "lineage_change_summary.csv",
+            transition_summary,
+            LINEAGE_CHANGE_SUMMARY_FIELDS,
         )
     if total_change:
         write_csv(

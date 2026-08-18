@@ -16,6 +16,7 @@ which does need that stack.
 from __future__ import annotations
 
 import ast
+import csv
 import gzip
 import hashlib
 import importlib.util
@@ -1848,6 +1849,19 @@ class FinalPopulationBaselineTests(unittest.TestCase):
         )
         self.assertFalse((view / "attempt-001" / "diff-numstat.txt").exists())
 
+    def test_transition_summary_output_has_no_checkpoint_000_pseudotransition(self):
+        report = self.report("--skip-diversity")
+        path = self.output / "lineage_change_summary.csv"
+        self.assertTrue(path.is_file())
+        with path.open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        self.assertEqual([row["checkpoint_id"] for row in rows], ["001", "002"])
+        self.assertNotIn("000", [row["checkpoint_id"] for row in rows])
+        self.assertEqual(
+            report["per_stage_change"]["summary_rows"],
+            "lineage_change_summary.csv",
+        )
+
 
 class ChangeBaselineTests(unittest.TestCase):
     """Audit 5 C and D: each change measure uses its own correct baseline."""
@@ -1911,6 +1925,52 @@ class ChangeBaselineTests(unittest.TestCase):
         rows = analyze_lineages.build_transitions(self.lineages)
         self.assertTrue(all(row["added_flags"] for row in rows))
 
+    def test_transition_summary_aggregates_existing_change_rows(self):
+        rows = [
+            {
+                "to_checkpoint": "001",
+                "to_checkpoint_name": "first extension",
+                "change_available": True,
+                "change_lines_added": 2,
+                "change_lines_deleted": 1,
+                "change_lines_edited": 3,
+                "change_functions_edited_count": 1,
+                "change_functions_created_count": 1,
+                "change_functions_deleted_count": 0,
+            },
+            {
+                "to_checkpoint": "001",
+                "to_checkpoint_name": "first extension",
+                "change_available": True,
+                "change_lines_added": 6,
+                "change_lines_deleted": 3,
+                "change_lines_edited": 9,
+                "change_functions_edited_count": 3,
+                "change_functions_created_count": 1,
+                "change_functions_deleted_count": 2,
+            },
+            {
+                "to_checkpoint": "002",
+                "to_checkpoint_name": "second extension",
+                "change_available": False,
+            },
+        ]
+        summary = analyze_lineages.build_transition_summary(rows)
+        self.assertEqual([row["checkpoint_id"] for row in summary], ["001", "002"])
+        first = summary[0]
+        self.assertEqual(first["successful_transitions"], 2)
+        self.assertEqual(first["measured_transitions"], 2)
+        self.assertEqual(first["mean_lines_added"], 4.0)
+        self.assertEqual(first["mean_lines_deleted"], 2.0)
+        self.assertEqual(first["mean_lines_edited"], 6.0)
+        self.assertEqual(first["median_lines_edited"], 6.0)
+        self.assertEqual(first["mean_functions_edited"], 2.0)
+        self.assertEqual(first["mean_functions_created"], 1.0)
+        self.assertEqual(first["mean_functions_deleted"], 1.0)
+        self.assertEqual(summary[1]["successful_transitions"], 1)
+        self.assertEqual(summary[1]["measured_transitions"], 0)
+        self.assertIsNone(summary[1]["mean_lines_edited"])
+
     def test_total_change_uses_the_same_lineage_checkpoint_000(self):
         rows = analyze_lineages.build_total_change(self.lineages)
         # Only completed lineages have a final.
@@ -1929,6 +1989,150 @@ class ChangeBaselineTests(unittest.TestCase):
     def test_a_stopped_lineage_contributes_no_total_change(self):
         rows = analyze_lineages.build_total_change(self.lineages)
         self.assertNotIn("lineage-003", [row["lineage_id"] for row in rows])
+
+
+class SecurityLineageTests(unittest.TestCase):
+    """RQ3 populations and deltas preserve the lineage/stage boundaries."""
+
+    def setUp(self):
+        import tempfile
+
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = make_lineage_root(
+            Path(self.temp.name) / "lineages", [None, None, 2]
+        )
+        self.run_metadata, self.lineages, _ = analyze_lineages.load_run(self.root)
+
+    def test_security_transition_deltas_and_cwe_sets_are_same_lineage(self):
+        transitions = [
+            {
+                "lineage_id": "lineage-001",
+                "from_checkpoint": "000",
+                "to_checkpoint": "001",
+            }
+        ]
+        profiles = {
+            ("lineage-001", "000"): {
+                "analysis_status": "available",
+                "flawfinder_status": "available",
+                "flawfinder_finding_count": 1,
+                "flawfinder_findings_per_kloc": 10.0,
+                "unsafe_call_count": 2,
+                "cwe_ids": '["CWE-20","CWE-120"]',
+            },
+            ("lineage-001", "001"): {
+                "analysis_status": "available",
+                "flawfinder_status": "available",
+                "flawfinder_finding_count": 3,
+                "flawfinder_findings_per_kloc": 15.0,
+                "unsafe_call_count": 1,
+                "cwe_ids": '["CWE-120","CWE-787"]',
+            },
+        }
+        row = analyze_lineages.build_security_transition_rows(
+            transitions, profiles
+        )[0]
+        self.assertEqual(row["flawfinder_finding_delta"], 2.0)
+        self.assertEqual(row["findings_per_kloc_delta"], 5.0)
+        self.assertEqual(row["unsafe_call_delta"], -1.0)
+        self.assertEqual(json.loads(row["newly_observed_cwes"]), ["CWE-787"])
+        self.assertEqual(json.loads(row["no_longer_observed_cwes"]), ["CWE-20"])
+
+        profiles[("lineage-001", "000")]["flawfinder_status"] = "unavailable"
+        unavailable = analyze_lineages.build_security_transition_rows(
+            transitions, profiles
+        )[0]
+        self.assertIsNone(unavailable["cwe_set_before"])
+        self.assertIsNone(unavailable["newly_observed_cwes"])
+        self.assertIsNone(unavailable["no_longer_observed_cwes"])
+
+    def test_stage_security_uses_successful_stage_populations(self):
+        calls: list[tuple[str, list[str]]] = []
+
+        class FakeSecurity:
+            @staticmethod
+            def analyze_security_population(**kwargs):
+                candidates = kwargs["candidates"]
+                checkpoint = kwargs["metadata"]["checkpoint"]
+                calls.append((str(checkpoint), [row["run_id"] for row in candidates]))
+                profiles = []
+                for candidate in candidates:
+                    identifier = candidate["source_identifier"]
+                    cwes = ["CWE-120"] if "/001/" in identifier else []
+                    profiles.append(
+                        {
+                            "run_id": candidate["run_id"],
+                            "analysis_status": "available",
+                            "flawfinder_status": "available",
+                            "flawfinder_finding_count": len(cwes),
+                            "flawfinder_findings_per_kloc": float(len(cwes)),
+                            "unsafe_call_count": 0,
+                            "cwe_ids": json.dumps(cwes),
+                        }
+                    )
+                n = len(candidates)
+                return {
+                    "summary": {
+                        "status": "completed",
+                        "population_n": n,
+                        "security_measurement_coverage": 1.0 if n else None,
+                        "static_finding_prevalence": 1.0 if checkpoint == "001" else 0.0,
+                        "flawfinder_findings": {"mean": 1.0, "median": 1.0},
+                        "findings_per_kloc": {"mean": 1.0, "median": 1.0},
+                        "unsafe_api_prevalence": 0.0,
+                        "mean_unsafe_call_count": 0.0,
+                        "distinct_cwe_count": 1 if checkpoint == "001" else 0,
+                        "severity_distribution": [],
+                        "security_configuration_fingerprint": "f" * 64,
+                        "flawfinder": {"version": "2.0.20"},
+                    },
+                    "rows": profiles,
+                }
+
+            @staticmethod
+            def write_csv(path, rows, fields):
+                analyze_lineages.write_csv(path, rows, fields)
+
+        original_module = analyze_lineages._SECURITY["module"]
+        original_reason = analyze_lineages._SECURITY["unavailable_reason"]
+        analyze_lineages._SECURITY.update(
+            {"module": FakeSecurity, "unavailable_reason": None}
+        )
+        self.addCleanup(
+            analyze_lineages._SECURITY.update,
+            {"module": original_module, "unavailable_reason": original_reason},
+        )
+        output = Path(self.temp.name) / "analysis"
+        report = analyze_lineages.analyze_lineage_security(
+            lineages=self.lineages,
+            order=["000", "001", "002"],
+            transitions=analyze_lineages.successful_transition_identifiers(
+                self.lineages
+            ),
+            output_dir=output,
+            run_metadata=self.run_metadata,
+            configuration={"schema_version": 1},
+            formal=True,
+        )
+        populations = {checkpoint: members for checkpoint, members in calls}
+        self.assertEqual(populations["000"], ["lineage-001", "lineage-002", "lineage-003"])
+        self.assertEqual(populations["001"], ["lineage-001", "lineage-002", "lineage-003"])
+        self.assertEqual(populations["002"], ["lineage-001", "lineage-002"])
+        self.assertEqual(populations["final"], ["lineage-001", "lineage-002"])
+        self.assertEqual(report["stage_summary_rows"], 3)
+        self.assertEqual(report["transition_rows"], 5)
+        with (output / "security_stage_summary.csv").open(
+            newline="", encoding="utf-8"
+        ) as handle:
+            stage_rows = list(csv.DictReader(handle))
+        self.assertEqual([row["checkpoint_id"] for row in stage_rows], ["000", "001", "002"])
+        with (output / "security_transitions.csv").open(
+            newline="", encoding="utf-8"
+        ) as handle:
+            transition_rows = list(csv.DictReader(handle))
+        self.assertEqual(len(transition_rows), 5)
+        self.assertFalse(any(row["to_checkpoint"] == "000" for row in transition_rows))
 
 
 class StaleRecordedPathTests(unittest.TestCase):

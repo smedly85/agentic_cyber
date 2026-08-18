@@ -6,12 +6,13 @@ repository state, generated candidates, validation results, and metadata needed
 to reproduce and compare independent repository histories.
 
 The experiment generates C reimplementations of four standard utilities one
-feature at a time, and then measures the resulting population along three
-separate dimensions: how reliably the workflow completes, how structurally
-varied the implementations that survive it are, and whether those
-implementations actually *behave* the same when run. No composite score combines
-them. `docs/diversity_methodology.md` defines the structural measurement and
-`docs/execution_consistency_methodology.md` defines the behavioral one.
+feature at a time. The primary paper analysis separates RQ1 correctness and
+lineage completion, RQ2 implementation diversity and maintenance variation,
+and RQ3 security. No composite score combines them.
+`docs/diversity_methodology.md` defines the structural and maintenance
+measurement. The existing behavioral-consistency tool is retained as an
+optional post-hoc diagnostic and documented separately in
+`docs/execution_consistency_methodology.md`.
 
 ## The experimental unit is a lineage
 
@@ -134,7 +135,8 @@ export PYTHON_BIN="$PWD/ac_venv/bin/python"
 | `timeout` | generation | Bounds each agent session. macOS ships none; without it the runner warns, runs unbounded, and records `timeout_enforced: false` |
 | `clang` | architecture measurement | Ships with the Xcode command line tools |
 | `gumtree` | architecture measurement | Java program; without it `gumtree_available` is false and clustering is incomplete |
-| `flawfinder` | `--security-diagnostics` only | Optional; its absence is recorded, never treated as a candidate failure |
+| `flawfinder` 2.0.20 | formal RQ3 security analysis | Pinned in `scripts/analysis-requirements.txt`; formal RQ3 is unavailable rather than reporting zero when missing or mismatched |
+| Clang `scan-build` / `clang-check` | optional RQ3 construct validation | Inspected independently; never merged with Flawfinder or installed automatically |
 
 `timeout` matters for any unattended sweep: a stalled session otherwise blocks
 every attempt behind it. It comes from GNU coreutils (`brew install coreutils`
@@ -377,9 +379,9 @@ while editing a prompt is not.
 
 ## Analyzing a lineage run
 
-Analysis is three separate tools, run in order. The first is required; the second
-is optional and deepens the diversity result; the third adds the behavioral
-dimension and depends on the first having run.
+Analysis uses the lineage and experiment analyzers for the three paper-facing
+research questions. Optional representation diagnostics deepen RQ2, while the
+behavioral-consistency tool remains a separate post-hoc diagnostic.
 
 ### 1. Reliability, change, and the diversity populations
 
@@ -404,7 +406,9 @@ has, never against the population view's placeholder baseline:
 file it was seeded with, and `analysis/lineage_total_change.csv` pairs each
 completed lineage's final source with that same lineage's own checkpoint 000
 source, labelled as total trajectory change rather than a single maintenance
-step. `--skip-change` omits both.
+step. `analysis/lineage_change_summary.csv` aggregates the real same-lineage
+transition rows by destination checkpoint; checkpoint 000 has no transition
+row. `--skip-change` omits these change outputs.
 
 For diversity it materializes each population under
 `analysis/populations/<label>/` and runs `scripts/analyze_experiment.py` on it.
@@ -423,7 +427,9 @@ Each population view records `analysis_population_member: true` and
 `population_selection_basis: lineage_stage_success`. Its paper row retains
 population size and structural coverage but sets reliability and Pass@k to NA
 with `reliability_scope: parent_lineage_experiment`; it also sets empty-baseline
-maintenance-change fields to NA. The parent
+maintenance-change fields to NA. Baseline-independent physical source LOC and
+source-byte descriptors remain supported in final and checkpoint population
+views. The parent
 `analysis/lineage_paper_metrics.csv` combines all-started lineage completion
 with the final population's structural metrics. Thus 7 finals from 10 started
 lineages report completion 0.70, never 7/7.
@@ -434,12 +440,9 @@ materialized populations, never once per checkpoint attempt.
 
 ### 2. Deeper diagnostics, run directly against a population
 
-`analyze_lineages.py` forwards only `--cluster-threshold`,
-`--strategy-threshold` and `--diversity-k-max` to the analyzer. There is no
-pass-through for `--diagnostic-output`, `--security-diagnostics`,
-`--clang-extra-arg` or the bootstrap options, so representation ablation and
-construct-validation distances are obtained by invoking the analyzer directly
-against a materialized population directory:
+Representation ablation and construct-validation distances can be obtained by
+invoking the experiment analyzer directly against a materialized population
+directory:
 
 ```bash
 POPULATION=runs/lineages/sort/<model-slug>/temp-0p2/analysis/populations/final
@@ -450,7 +453,6 @@ python3 scripts/analyze_experiment.py \
     --strategy-threshold 0.30 \
     --diversity-k-max 25 \
     --diagnostic-output \
-    --security-diagnostics \
     --clean-output
 ```
 
@@ -461,7 +463,7 @@ directory holding multiple conditions rather than pooling them. Use a common
 normalized family-discovery AUC@K, and omit it when only complete within-
 population DF@K curves are needed.
 
-The analyzer writes schema-v6 results under `<population>/analysis/`:
+The analyzer writes schema-v7 results under `<population>/analysis/`:
 `summary.json`, `per_run_metrics.csv`, `paper_metrics.csv`,
 `paper_descriptive_metrics.csv`, diversity family assignments and DF@K curves,
 robustness tables, and uncertainty intervals. A view's `experiment.json` points
@@ -481,7 +483,44 @@ falling back to scientific defaults. The resolved object, schema version, and
 domain-separated fingerprint are written to every population summary and the
 parent lineage report.
 
-### 3. Behavioral and execution consistency
+### 3. RQ3 security
+
+```bash
+python3 scripts/analyze_experiment.py \
+    --experiment "$POPULATION" \
+    --security-analysis \
+    --security-config scripts/security-analysis-config-v1.json \
+    --clean-output
+```
+
+Formal runs additionally use `--formal-analysis --analysis-config <RQ2-CONFIG>`.
+RQ3 uses exactly the successful RQ2 population and never re-filters it.
+Flawfinder 2.0.20 findings are the primary external static-analysis layer;
+Tree-sitter counts unsafe/bounded-risk APIs, heap calls, fixed-size buffers, and
+indexing as supporting security-sensitive descriptors. Findings and descriptors
+are never combined into a score or called confirmed vulnerabilities.
+
+Population outputs are written beneath `<population>/analysis/security/`:
+`paper_security_metrics.csv`, `security_summary.json`,
+`security_per_run.csv`, `flawfinder_findings.csv`, severity/maximum-level/CWE
+tables, and the construct-profile table. Lineage analysis with
+`--security-analysis` additionally writes `analysis/security_stage_summary.csv`,
+`analysis/security_stage_severity.csv`, and
+`analysis/security_transitions.csv`. See
+`docs/security_methodology.md` for definitions and coverage rules.
+
+To measure every successful lineage stage and the final population in one
+invocation, use:
+
+```bash
+python3 scripts/analyze_lineages.py \
+    --lineage-root runs/lineages/sort/<model-slug>/temp-0p2 \
+    --checkpoint-diversity \
+    --security-analysis \
+    --security-config scripts/security-analysis-config-v1.json
+```
+
+### 4. Optional behavioral and execution consistency diagnostic
 
 ```bash
 python3 scripts/measure_execution_consistency.py \
@@ -522,8 +561,9 @@ behave identically.
 
 Output lands in `<population>/analysis/execution_consistency/` as `summary.json`,
 `behavioral_fingerprints.csv`, `behavioral_verdict_traces.json`, and
-`pairwise_behavioral_distances.csv`. Mean pairwise verdict disagreement is the
-primary RQ2 result; exact profile count/modal share remain supporting output.
+`pairwise_behavioral_distances.csv`. These behavioral results, including
+structure-versus-behavior ARI, are optional diagnostics and are not part of the
+primary paper-facing RQ metrics.
 
 ## How the harness works
 
@@ -810,7 +850,7 @@ agentic_cyber/
 ├── README.md
 ├── findings.md
 ├── docs/
-│   ├── diversity_methodology.md            # Canonical v5.0.0/schema-v6 methodology
+│   ├── diversity_methodology.md            # Canonical v5.2.0/schema-v7 methodology
 │   └── execution_consistency_methodology.md # Behavioral/execution consistency
 ├── experiments/
 │   └── utilities/                          # One manifest per experimental utility

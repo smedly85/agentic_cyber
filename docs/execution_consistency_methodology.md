@@ -1,20 +1,24 @@
 # Behavioral and execution consistency
 
-This document defines the evaluation's second measurement dimension.
+This document defines an optional diagnostic subsystem. Behavioral/execution
+consistency is not a primary paper research question or paper-facing metric.
 `scripts/measure_execution_consistency.py` is its sole entry point. It is a
 strictly post-hoc, read-only layer over the canonical analysis in
 `docs/diversity_methodology.md`: it never re-runs the agent, never enters the
 repair loop, and never changes a success/failure determination.
 
-The three dimensions are separate outcomes and no composite score combines
-them:
+The paper-facing research questions remain separate from this diagnostic:
 
 1. **Correctness and completion** — `scripts/analyze_experiment.py` (success
    rates, Pass@k) and `scripts/analyze_lineages.py` (lineage completion).
-2. **Behavioral and execution consistency** — this document.
-3. **Implementation diversity among functionally valid outputs** —
+2. **Implementation diversity and maintenance variation** —
    `scripts/analyze_experiment.py` with `scripts/analysis/diversity_metrics.py`,
    defined in `docs/diversity_methodology.md`.
+3. **Security** — separate RQ3 analysis; security measurements do not enter
+   behavioral fingerprints or structural clustering.
+
+This document's behavioral and execution consistency outputs remain available
+only as optional post-hoc diagnostics.
 
 ## What it measures, and why the diversity measurement does not
 
@@ -189,7 +193,7 @@ reported as incomparable and no disagreement value is fabricated.
 
 ## Metrics
 
-### Mean pairwise behavioral disagreement (primary RQ2)
+### Mean pairwise behavioral disagreement (optional diagnostic)
 
 For compatible traces over `T_S` cases:
 
@@ -214,7 +218,7 @@ exact_behavioral_modal_share = largest fingerprint-group size / N
 ```
 
 These sample-size-dependent descriptive statistics retain exact profile count,
-modal share, coverage, and memberships. They are not the primary RQ2 statistic.
+modal share, coverage, and memberships. They are not primary paper statistics.
 They are the exact-convergence statistics of
 `docs/diversity_methodology.md` applied to a different hash, computed by the
 same function — `diversity_metrics.exact_repetition_summary` is generic over
@@ -238,15 +242,23 @@ adjusted_rand_index = ARI( behavioral groups, structural family labels )
 
 Only runs present in both partitions contribute, so a run outside a primary
 structural population simply does not enter that comparison, and each
-comparison reports its own `population_n`. ARI is undefined below two shared
-runs and is reported as null rather than as a number.
+comparison reports its own `population_n`. For this study's supporting
+structure-versus-behavior interpretation, ARI is reported only when there are
+at least two shared implementations **and** both the behavioral and structural
+partitions contain at least two groups. Otherwise `adjusted_rand_index` is null
+and `unavailable_reason` records `insufficient_shared_runs`,
+`trivial_behavioral_partition`, `trivial_structural_partition`, or
+`both_partitions_trivial`. This is an intentional non-informative reporting
+rule for this diagnostic association interpretation; it is not a claim that
+scikit-learn cannot mathematically calculate ARI for a trivial partition.
 
-This is the number that tests the paper's own framing directly. Near 1,
-structural family membership predicts behavioral identity. Near 0, it does not —
+As an optional diagnostic, a value near 1 means structural family membership
+predicts behavioral identity. Near 0, it does not —
 structurally distinct candidates converged on the same observed behavior, or
 structurally similar ones diverged. Neither direction is a defect. The value is
 evidence about how much the structural diversity result implies about behavior,
-which is a claim the diversity measurement does not itself make.
+which is a claim the diversity measurement does not itself make. This value is
+not promoted into the paper-facing diversity outputs.
 
 ## Output layout
 
@@ -261,7 +273,7 @@ analysis/
     └── pairwise_behavioral_distances.csv
 ```
 
-`summary.json` records the schema version, the resolved utility, flag list and
+`summary.json` records schema version 3, the resolved utility, flag list and
 candidate binary, the corpora used, population counts with
 `measurement_coverage` and a per-run reason for every unmeasured run,
 corpus identities and ordered case IDs, the three primary pairwise disagreement

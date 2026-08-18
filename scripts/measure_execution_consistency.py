@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """Measure whether repeated candidates in one condition behave the same way.
 
-This is the evaluation's second measurement dimension. The first --
-correctness and completion -- is `scripts/analyze_experiment.py` and
-`scripts/analyze_lineages.py`. The third -- implementation diversity among
-functionally valid outputs -- is `scripts/analyze_experiment.py` plus
-`scripts/analysis/diversity_metrics.py`, documented in
-`docs/diversity_methodology.md`. Neither of those answers the question this
-one asks.
+This is an optional post-hoc diagnostic subsystem, not a primary paper-facing
+research question. Correctness and completion are measured by
+`scripts/analyze_experiment.py` and `scripts/analyze_lineages.py`;
+implementation diversity among functionally valid outputs is measured by
+`scripts/analyze_experiment.py` plus `scripts/analysis/diversity_metrics.py`,
+documented in `docs/diversity_methodology.md`.
 
 The gap
 -------
@@ -28,12 +27,10 @@ same function, since it is generic over hash strings. Held-out behavior is
 measured separately from visible behavior precisely because agreement on cases
 the agent could read is the weaker claim.
 
-The last number is the one that tests the paper's own framing. The adjusted
-Rand index between the behavioral partition and the architecture/strategy
-family partitions asks whether structural family membership predicts behavioral
-identity at all. If it does not, the diversity result and the consistency
-result are measuring genuinely different things, and neither substitutes for
-the other.
+The adjusted Rand index between the behavioral partition and the
+architecture/strategy family partitions is an optional diagnostic association
+measure. It asks whether structural family membership predicts behavioral
+identity, without entering the paper-facing diversity metrics.
 
 What it deliberately does not do
 --------------------------------
@@ -94,7 +91,7 @@ from analysis import diversity_metrics  # noqa: E402
 from analysis import execution_metrics  # noqa: E402
 from reference_generators import heldout_contract  # noqa: E402
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # `runner.py` exits 1 whenever any case fails, which is an ordinary outcome
 # here rather than an error -- a candidate that fails cases still has a
@@ -1122,10 +1119,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"modal share: {combined['exact_behavioral_modal_share']:.3f}"
         )
         for space in ("architecture", "strategy"):
-            ari = summary["structural_behavior_agreement"][space]["adjusted_rand_index"]
+            agreement = summary["structural_behavior_agreement"][space]
+            ari = agreement["adjusted_rand_index"]
             print(
                 f"{space.capitalize()}-behavior ARI: "
-                + ("undefined (fewer than 2 shared runs)" if ari is None else f"{ari:.3f}")
+                + (
+                    f"not reported ({agreement['unavailable_reason']})"
+                    if ari is None
+                    else f"{ari:.3f}"
+                )
             )
     if any(
         not summary["behavioral_corpus"][scope]["compatible_population"]

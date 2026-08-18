@@ -1,16 +1,16 @@
-# Canonical v5.0.0 diversity methodology
+# Canonical v5.2.0 diversity methodology
 
-This document defines schema-v6 analysis for repeated, baseline-backed software
+This document defines schema-v7 analysis for repeated, baseline-backed software
 generation experiments. `scripts/analyze_experiment.py` is the sole analysis
 entry point. It evaluates functional reliability first, then two deliberately
 separate forms of structural diversity among successful implementations. No
 single composite score combines correctness, diversity, cost, validation, or
 security diagnostics.
 
-Both forms of diversity defined here are **structural**. A third,
-non-structural dimension — behavioral and execution consistency, which compares
+Both forms of diversity defined here are **structural**. An optional,
+non-structural diagnostic — behavioral and execution consistency, which compares
 successful candidates by the verdicts they produce when rebuilt and re-judged
-rather than by their source structure — is measured separately by
+rather than by their source structure — remains available separately through
 `scripts/measure_execution_consistency.py` and defined in
 `docs/execution_consistency_methodology.md`.
 
@@ -57,13 +57,16 @@ they are not asserted to be classical algorithms.
 - The complete exact DF@K curve for every available `K`.
 - Exact source convergence: distinct SHA-256 count, exact-unique rate, modal
   exact-copy share, and membership of each hash group.
+- Baseline-independent configured-source size: physical source lines and bytes.
 - Patch and cost descriptors: lines and files edited; functions edited,
   created, and deleted; normalized GumTree edit-action magnitude; repair loops; LLM
   invocations; runtime; and available token usage.
 
 These measurements explain the primary outcomes but do not replace them. Raw
-family count is especially sensitive to sample size and small clusters. Patch
-churn is descriptive effort, not structural diversity. The use of churn as a
+family count is especially sensitive to sample size and small clusters. Source
+size is descriptive implementation size, not a primary RQ2 diversity metric.
+Patch churn is descriptive maintenance effort, not
+structural diversity. The use of churn as a
 software-change measure follows Nagappan and Ball (2005), while no defect claim
 is inferred from churn in this study.
 
@@ -93,16 +96,17 @@ summary. They are not used to select the primary threshold.
 These independent representations test convergent and discriminant behavior.
 They never determine family assignments.
 
-### SECURITY/FUTURE RQ
+### SECURITY/RQ3
 
-Optional static profiles count unsafe calls, bounded-risk calls, heap
+Independent RQ3 static profiles count unsafe calls, bounded-risk calls, heap
 allocation/deallocation calls, fixed-size stack buffers, and indexing
-operations. An optional Flawfinder cross-check reports tool availability and
-hit counts. These profiles support future security research questions and
-hypothesis formation only; they are neither a primary diversity representation
-nor evidence of vulnerability or exploit non-transferability. Future work
+operations. Flawfinder 2.0.20 is the primary external static-finding analyzer.
+Its full findings and coverage are kept separate for RQ3 security analysis; they
+are neither a primary diversity representation nor by themselves evidence of
+vulnerability or exploit non-transferability. Additional work
 should add dynamic testing, vulnerability-class labeling, and exploit-transfer
-experiments before making security-effect claims.
+experiments before making security-effect claims. The complete RQ3 method is
+defined in `docs/security_methodology.md`.
 
 ## Experimental unit and populations
 
@@ -187,8 +191,13 @@ unit — the same situation a `--source-mode new` experiment is already in. Chur
 measures relative to that baseline are unsupported as maintenance change and
 are exported as NA for these populations. Actual maintenance change lives in
 `lineage_transitions.csv` (checkpoint N-1 to N) and
-`lineage_total_change.csv` (same-lineage trajectory). Structural diversity,
-which compares population members under one constant baseline, is unaffected.
+`lineage_total_change.csv` (same-lineage trajectory).
+`lineage_change_summary.csv` groups the existing transition rows by destination
+checkpoint and reports the number of successful and measured transitions,
+means for lines added/deleted/edited and functions edited/created/deleted, and
+median lines edited. It contains no checkpoint-000 row because that checkpoint
+has no real predecessor. Structural diversity, which compares population
+members under one constant baseline, is unaffected.
 
 ## Functional reliability
 
@@ -258,7 +267,7 @@ structural organization** of the complete primary C source file. It does not
 measure repository-wide, module, or system architecture. Other changed files
 remain visible through descriptive patch metrics but do not enter the
 structural vector.
-For each candidate, v5.0.0 constructs three non-duplicated feature blocks:
+For each candidate, v5.2.0 constructs three non-duplicated feature blocks:
 
 1. Clang AST count deltas for source-file and function contexts.
 2. Tree-sitter C node-kind and call-count deltas for source-file and function
@@ -302,7 +311,7 @@ as for architecture. GumTree actions are omitted because they are whole-patch
 rather than reliably function-scoped. This representation operationalizes
 implementation decisions without claiming that every discovered family is a
 named or classical algorithm. Lee et al. (2025) motivates measuring diversity
-beyond correctness; v5.0.0 uses a broader, explicitly structural strategy
+beyond correctness; v5.2.0 uses a broader, explicitly structural strategy
 construct suitable for maintenance patches.
 
 ## Fixed clustering thresholds
@@ -334,7 +343,7 @@ configuration and the row matches it; exploratory/default-backed rows cannot
 enter or anchor the repository confirmatory aggregate.
 
 Threshold sensitivity is robustness analysis only. Unless `--thresholds`
-provides an exact comma-separated positive grid, v5.0.0 evaluates positive members
+provides an exact comma-separated positive grid, v5.2.0 evaluates positive members
 of `t + {-0.10, -0.05, -0.025, 0, 0.025, 0.05, 0.10}` around each primary cut.
 For every cut it reports raw and effective family counts, dominant share,
 singleton rate, silhouette when `2 <= families < N`, and ARI against the
@@ -388,7 +397,7 @@ fixed `K` supported by every compared architecture and strategy population.
 Exact convergence is calculated over successful candidates. Complete SHA-256
 coverage is required; otherwise the rates are null and hash coverage plus the
 reason are reported rather than silently shrinking the population. For
-population size `N_s`, v5.0.0 reports:
+population size `N_s`, v5.2.0 reports:
 
 ```text
 exact unique rate = distinct SHA-256 hashes / N_s
@@ -398,6 +407,15 @@ exact modal share = largest hash-group size / N_s
 Hash groups retain all run identifiers. Exact equality is not a family
 definition: non-identical implementations may share a structural family, while
 the exact metrics reveal literal model repetition.
+
+`source_line_count` is baseline-independent physical LOC for the configured
+candidate source: `len(source_text.splitlines())`. Blank and comment lines are
+included, and no external LOC-analysis dependency is used. `source_bytes`,
+`source_tree_sitter_leaf_tokens`, and `source_tree_sitter_node_count` remain the
+existing size descriptors; they are reused rather than measured again. Source
+size is reported for successful measured populations, including final and
+checkpoint lineage population views. It affects neither success or membership,
+behavioral fingerprints, architecture/strategy features, nor clustering.
 
 Lines added and deleted come from Git numstat plus textual untracked files;
 lines edited are their sum. Files changed, function edits/creations/deletions,
@@ -412,7 +430,7 @@ assignments and are not alternative correctness measures.
 
 ### Vendi score
 
-For normalized structural feature matrix `X`, v5.0.0 augments only the Vendi
+For normalized structural feature matrix `X`, v5.2.0 augments only the Vendi
 representation. A nonzero row becomes `[x, 0]`, while a zero row becomes a new
 unit basis vector `[0, ..., 0, 1]`. Thus zero-zero similarity is one,
 zero-nonzero similarity is zero, every diagonal is one, nonzero similarities
@@ -492,7 +510,7 @@ coding, and compare the adjudicated partition with machine families using ARI.
 This is required before treating machine families as human-validated semantic
 categories.
 
-## Output layout (schema v5)
+## Output layout (schema v7)
 
 The default output is `<experiment>/analysis/`:
 
@@ -522,10 +540,11 @@ analysis/
 artifacts, normalized feature matrices and schemas, assignments for diagnostic
 populations, medoid tables, dendrograms, `pairwise_validation.csv`, and
 `cross_representation_correlation.csv` beneath `diagnostics/`.
-`--security-diagnostics` writes `security/security_profiles.csv` and
-`security/flawfinder.csv`; absence of the optional executable is recorded, not
-treated as a candidate failure. Missing JSON values are `null` and missing CSV
-values are blank.
+`--security-analysis` writes the independent paper-facing RQ3 outputs beneath
+`security/`; `--security-diagnostics` remains an alias. Flawfinder absence is
+recorded as unavailable and never interpreted as zero findings or as a
+candidate failure. See `docs/security_methodology.md`. Missing JSON values are
+`null` and missing CSV values are blank.
 
 The standardized **primary CSV schema** is:
 
@@ -558,10 +577,21 @@ Exact Unique Rate, Exact Modal Share,
 Mean Repair Loops, Median Repair Loops, Max Repair Loops,
 Mean LLM Invocations, Mean Repair LLM Runtime (s),
 Mean Total Runtime (s), Median Total Runtime (s),
+Mean Source LOC, Median Source LOC, SD Source LOC, Source LOC CV,
+Mean Source Bytes,
 Mean Lines Edited, Mean Files Edited, Mean Functions Edited,
 Mean Functions Created, Mean Functions Deleted,
 Mean Normalized GumTree Edit-Action Magnitude, Maintenance Change Scope
 ```
+
+Source LOC SD is the sample standard deviation. Source LOC CV is that sample SD
+divided by mean LOC and is null when fewer than two source measurements are
+available or mean LOC is zero. These source-size columns are descriptive only.
+For lineage population views they remain supported, while maintenance-change
+columns remain null because the empty population baseline does not represent a
+maintenance transition. Lineage maintenance change uses only checkpoint N
+versus the same lineage's checkpoint N-1 candidate; checkpoint 000 has no
+invented predecessor.
 
 `paper_metrics_row.json` records `_schema_version`, `_analyzer_version`, and a
 readable `_analysis_signature`. The signature contains architecture and strategy
@@ -571,12 +601,12 @@ argument order is preserved and treated as significant, differently ordered
 Clang arguments are different signatures. The signature also records the
 versioned resolved-configuration fingerprint, sensitivity rule/grid, and
 bootstrap settings. Repository-level aggregation includes
-only current schema-v6/analyzer-v5.0.0 complete rows that individually match
+only current schema-v7/analyzer-v5.2.0 complete rows that individually match
 their owning Git experiment's recorded configuration and share the first such
 row's exact signature. Older/incompatible, exploratory/nonconfirmatory, and
 incompatible-confirmatory-configuration rows are counted separately.
 `runs/experiments/paper_metrics_metadata.json` records the accepted signature
-and all four row counts. Historical analyses must be rerun with analyzer v5.0.0
+and all four row counts. Historical analyses must be rerun with analyzer v5.2.0
 before inclusion; historical analysis directories are not rewritten
 automatically.
 
@@ -628,8 +658,8 @@ Optional diagnostics and controlled overrides are:
 
 - `--diagnostic-output`: detailed feature, clustering, plot, and construct-
   validation artifacts.
-- `--security-diagnostics`: exploratory security profiles and the optional
-  static-tool cross-check.
+- `--security-analysis`: separate RQ3 Flawfinder findings, source descriptors,
+  coverage, and paper output.
 - `--thresholds`: exact sensitivity cuts; never changes the primary cut.
 - `--strategy-exclude-regex` and repeatable `--strategy-include-function`:
   pre-specified strategy scope adjustments.
@@ -662,8 +692,8 @@ The no-Git sandbox runner is retained for exploratory/pilot and historical
 analysis. Results generated under materially different agent-feedback or
 controller protocols must not be pooled as one experimental condition. Sandbox
 analyses are not automatically included in the repository-level confirmatory
-paper aggregate. Security diagnostics remain exploratory/future-RQ outputs and
-never enter either clustering representation.
+paper aggregate. Security outputs remain separate from RQ2 and never enter
+either clustering representation.
 
 ## References
 

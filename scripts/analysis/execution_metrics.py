@@ -90,9 +90,11 @@ def structural_behavior_agreement(
 
     Only runs present in both mappings contribute, so a run outside the
     architecture or strategy population simply does not enter that comparison.
-    `run_ids` fixes the order, keeping the result deterministic. ARI is
-    undefined for fewer than two runs and is reported as null there rather than
-    as a number.
+    `run_ids` fixes the order, keeping the result deterministic. For this
+    diagnostic structure--behavior interpretation, ARI is reported only
+    for at least two shared runs when both partitions contain at least two
+    groups. Trivial partitions are intentionally treated as non-informative,
+    even though scikit-learn can mathematically calculate an ARI for them.
     """
     from sklearn.metrics import adjusted_rand_score
 
@@ -102,10 +104,29 @@ def structural_behavior_agreement(
         if run_id in behavioral_group_by_run and run_id in structural_label_by_run
     ]
     if len(shared) < 2:
-        return {"population_n": len(shared), "adjusted_rand_index": None}
+        return {
+            "population_n": len(shared),
+            "adjusted_rand_index": None,
+            "unavailable_reason": "insufficient_shared_runs",
+        }
     behavioral = [str(behavioral_group_by_run[run_id]) for run_id in shared]
     structural = [str(structural_label_by_run[run_id]) for run_id in shared]
+    behavioral_is_trivial = len(set(behavioral)) < 2
+    structural_is_trivial = len(set(structural)) < 2
+    if behavioral_is_trivial or structural_is_trivial:
+        if behavioral_is_trivial and structural_is_trivial:
+            reason = "both_partitions_trivial"
+        elif behavioral_is_trivial:
+            reason = "trivial_behavioral_partition"
+        else:
+            reason = "trivial_structural_partition"
+        return {
+            "population_n": len(shared),
+            "adjusted_rand_index": None,
+            "unavailable_reason": reason,
+        }
     return {
         "population_n": len(shared),
         "adjusted_rand_index": float(adjusted_rand_score(behavioral, structural)),
+        "unavailable_reason": None,
     }
