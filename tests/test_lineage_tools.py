@@ -47,6 +47,7 @@ from reference_generators import suite_diff  # noqa: E402
 import lineage_plan  # noqa: E402
 import prompt_render  # noqa: E402
 import stage_test_bundle  # noqa: E402
+import temperature_value  # noqa: E402
 
 # The feature surfaces the redesign fixed. BusyBox selects which flags are in
 # scope; this is that selection written down where a test can enforce it.
@@ -5209,6 +5210,331 @@ class Bash32HeredocQuotingTests(unittest.TestCase):
         )
         self.assertIn('AIDER_SETTINGS_TOOL="$REPO/scripts/aider_settings.py"', text)
         self.assertNotIn("ATTEMPT_OPENCODE_CONFIG_CONTENT", text)
+
+
+class CanonicalTemperatureLineageTests(unittest.TestCase):
+    """The lineage producer and consumer share one temperature path contract.
+
+    The fake stage runner writes the same COMPLETE/metadata/candidate contract
+    as run_experiment.sh, but never invokes Aider or a model.  Its three mkdir
+    checkpoints exercise promotion and source inheritance end to end.
+    """
+
+    CONTROLLER = REPO_ROOT / "scripts" / "run_lineage_experiment.sh"
+    HASH = "a" * 64
+
+    @classmethod
+    def setUpClass(cls):
+        # Windows may expose WSL's bash.exe ahead of Git Bash.  The repository
+        # paths and native Python interpreter in this test need the MSYS path
+        # bridge Git Bash provides; Unix hosts continue to use /bin/bash.
+        git_bash = Path(r"C:\Program Files\Git\bin\bash.exe")
+        cls.bash = str(git_bash) if git_bash.is_file() else shutil.which("bash")
+        if not cls.bash:
+            raise unittest.SkipTest("bash is required to run the controller")
+
+    def setUp(self):
+        import tempfile
+
+        self.temp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.repo = self.temp / "repo"
+        scripts = self.repo / "scripts"
+        scripts.mkdir(parents=True)
+        for name in ("run_lineage_experiment.sh", "lineage_state.py",
+                     "temperature_value.py"):
+            shutil.copy2(REPO_ROOT / "scripts" / name, scripts / name)
+        self._write_fake_plan(scripts / "lineage_plan.py")
+        self._write_fake_bundle(scripts / "stage_test_bundle.py")
+        (scripts / "checkpoint_boundary_gate.py").write_text(
+            "#!/usr/bin/env python3\nraise SystemExit(0)\n", encoding="utf-8"
+        )
+        self._write_fake_stage_runner(scripts / "run_experiment.sh")
+        # Native Windows Python writes CRLF to captured stdout.  Bash command
+        # substitution removes LF but retains CR, which would contaminate plan
+        # fields in this cross-platform harness.  Vessel runs POSIX Python; the
+        # shim makes this local test's stdout match that contract.
+        python_shim = scripts / "python-for-bash"
+        native_python = Path(sys.executable).as_posix()
+        python_shim.write_text(
+            "#!/usr/bin/env bash\nset -o pipefail\n"
+            f'"{native_python}" "$@" | tr -d \'\\r\'\n',
+            encoding="utf-8",
+        )
+        python_shim.chmod(0o755)
+        self.python_bin = self.posix(python_shim)
+        subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
+
+    @staticmethod
+    def posix(path: Path) -> str:
+        text = path.as_posix()
+        return "/" + text[0].lower() + text[2:] if text[1:2] == ":" else text
+
+    def _write_fake_plan(self, path: Path) -> None:
+        path.write_text(
+            """#!/usr/bin/env python3
+import argparse
+import hashlib
+import json
+import platform
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--emit", required=True)
+parser.add_argument("--utility", default="mkdir")
+parser.add_argument("--model", default="demo/m")
+parser.add_argument("--editor-model", default="editor/m")
+parser.add_argument("--aider-version", default="unknown")
+parser.add_argument("--temperature", default="0")
+parser.add_argument("--top-p", default="")
+parser.add_argument("--sampling-seed", default="")
+parser.add_argument("--max-tokens", default="")
+parser.add_argument("--max-loops", type=int, default=3)
+parser.add_argument("--timeout-seconds", type=int, default=1800)
+parser.add_argument("--remote-base-url", default="")
+parser.add_argument("--remote-api-key-env", default="")
+args, _ = parser.parse_known_args()
+temperature = float(args.temperature)
+fingerprint = hashlib.sha256(
+    json.dumps({"temperature": temperature}, sort_keys=True).encode()
+).hexdigest()
+checkpoints = [
+    {"id": "000", "name": "base", "prompt": "prompts/mkdir/000.md",
+     "source_mode": "new", "implemented_flags": [],
+     "feature_test_command": "true", "test_bundle_fingerprint": "a" * 64},
+    {"id": "001", "name": "parents", "prompt": "prompts/mkdir/001.md",
+     "source_mode": "existing", "implemented_flags": ["-p"],
+     "feature_test_command": "true", "test_bundle_fingerprint": "a" * 64},
+    {"id": "002", "name": "mode", "prompt": "prompts/mkdir/002.md",
+     "source_mode": "existing", "implemented_flags": ["-p", "-m"],
+     "feature_test_command": "true", "test_bundle_fingerprint": "a" * 64},
+]
+if args.emit == "stages":
+    separator = "\\x1f"
+    for checkpoint in checkpoints:
+        print(separator.join((
+            checkpoint["id"], checkpoint["name"], checkpoint["prompt"],
+            checkpoint["source_mode"], checkpoint["feature_test_command"],
+            ",".join(checkpoint["implemented_flags"]), "a" * 64,
+        )))
+else:
+    print(json.dumps({
+        "schema_version": 1, "utility": "mkdir", "program": "new_mkdir",
+        "source_path": "src/new_mkdir/new_mkdir.c",
+        "source_basename": "new_mkdir.c", "executable_path": "build/new_mkdir",
+        "build_command": "true", "test_dir": "tests/mkdir-test-suite",
+        "judge": "true", "base_test_command": "", "extra_test_command": "",
+        "required_platform": None, "host_platform": platform.system(),
+        "agent_backend": "aider", "aider_version": args.aider_version,
+        "architect_model": args.model, "editor_model": args.editor_model,
+        "architect_mode": True, "model": args.model, "model_provenance": None,
+        "temperature": temperature,
+        "top_p": None if not args.top_p else float(args.top_p),
+        "sampling_seed": None if not args.sampling_seed else int(args.sampling_seed),
+        "max_tokens": None if not args.max_tokens else int(args.max_tokens),
+        "editor_temperature": 0.0, "editor_sampling_seed": 0,
+        "editor_edit_format": "editor-diff", "aider_model_settings": [],
+        "remote_base_url": args.remote_base_url or None,
+        "remote_api_key_env": args.remote_api_key_env or None,
+        "remote_transport": "default", "max_loops": args.max_loops,
+        "timeout_seconds": args.timeout_seconds,
+        "automation_notice_sha256": "b" * 64,
+        "config_fingerprint": fingerprint, "checkpoints": checkpoints,
+    }))
+""",
+            encoding="utf-8",
+        )
+
+    def _write_fake_bundle(self, path: Path) -> None:
+        path.write_text(
+            f"""#!/usr/bin/env python3
+import argparse
+import json
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--repo")
+parser.add_argument("--utility")
+parser.add_argument("--checkpoint")
+parser.add_argument("--output")
+parser.add_argument("--emit")
+args = parser.parse_args()
+from pathlib import Path
+output = Path(args.output)
+output.mkdir(parents=True, exist_ok=True)
+(output / "BUNDLE.json").write_text(json.dumps({{"bundle_fingerprint": "{self.HASH}"}}))
+print("{self.HASH}")
+""",
+            encoding="utf-8",
+        )
+
+    def _write_fake_stage_runner(self, path: Path) -> None:
+        path.write_text(
+            r'''#!/usr/bin/env bash
+set -uo pipefail
+temperature=""
+output_dir=""
+source_path=""
+seed_spec=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --temperature) temperature="$2"; shift 2 ;;
+        --output-dir) output_dir="$2"; shift 2 ;;
+        --source) source_path="$2"; shift 2 ;;
+        --seed-file) seed_spec="$2"; shift 2 ;;
+        --model|--editor-model|--runs|--max-loops|--timeout|--prompt|--source-mode|--test-dir|--build-cmd|--base-test-cmd|--feature-test-cmd|--extra-test-cmd|--repair-prompt|--remote-base-url|--remote-api-key-env|--top-p|--sampling-seed|--max-tokens|--model-provenance-json)
+            shift 2 ;;
+        *) shift ;;
+    esac
+done
+repo="$(git rev-parse --show-toplevel)"
+slug="$($PYTHON_BIN "$repo/scripts/temperature_value.py" slug "$temperature")"
+[[ "${FAKE_STAGE_LAYOUT:-canonical}" == canonical ]] || slug="0"
+experiment="$output_dir/temp-$slug"
+attempt="$experiment/attempt-001"
+candidate="$attempt/candidate/$(basename "$source_path")"
+mkdir -p "$(dirname "$candidate")" "$experiment/baseline"
+if [[ -n "$seed_spec" ]]; then
+    seed="${seed_spec%%:*}"
+    cp "$seed" "$experiment/baseline/$(basename "$source_path")"
+    cp "$seed" "$candidate"
+else
+    : > "$candidate"
+fi
+stage="$(basename "$output_dir")"
+printf 'checkpoint %s\n' "$stage" >> "$candidate"
+if [[ "${FAKE_STAGE_METADATA:-aider}" != missing ]]; then
+    if [[ "${FAKE_STAGE_METADATA:-aider}" == legacy ]]; then
+        printf '%s\n' '{"public_validation_success":true,"opencode_exit_code":0}' > "$attempt/metadata.json"
+    else
+        printf '%s\n' '{"public_validation_success":true,"agent_backend":"aider","agent_exit_code":0}' > "$attempt/metadata.json"
+    fi
+fi
+: > "$attempt/COMPLETE"
+''',
+            encoding="utf-8",
+        )
+
+    def run_controller(self, temperature: str, output: Path, *,
+                       lineage_start: int = 1, metadata: str = "aider",
+                       layout: str = "canonical") -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [self.bash, str(self.repo / "scripts" / "run_lineage_experiment.sh"),
+             "--utility", "mkdir", "--model", "demo/m",
+             "--editor-model", "editor/m", "--temperature", temperature,
+             "--lineages", "1", "--lineage-start", str(lineage_start),
+             "--output-dir", self.posix(output)],
+            cwd=str(self.repo), capture_output=True, text=True,
+            env={**os.environ, "PYTHON_BIN": self.python_bin,
+                 "AIDER_BIN": "true", "FAKE_STAGE_METADATA": metadata,
+                 "FAKE_STAGE_LAYOUT": layout},
+        )
+
+    def record(self, output: Path, lineage: int = 1) -> dict[str, Any]:
+        path = output / f"lineage-{lineage:03d}" / "lineage.json"
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def test_equivalent_spellings_share_canonical_values_and_slugs(self):
+        expected = {
+            "0": ("0.0", "0p0"), "0.0": ("0.0", "0p0"),
+            "0.00": ("0.0", "0p0"), "0.125": ("0.125", "0p125"),
+            "1": ("1.0", "1p0"), "1.0": ("1.0", "1p0"),
+            "1.2": ("1.2", "1p2"),
+        }
+        for spelling, (canonical, slug) in expected.items():
+            with self.subTest(spelling=spelling):
+                self.assertEqual(temperature_value.canonicalize(spelling), canonical)
+                self.assertEqual(temperature_value.slug(spelling), slug)
+
+    def test_stubbed_mkdir_lineages_find_and_promote_every_temperature(self):
+        spellings = ("0", "0.0", "0.00", "0.125", "1", "1.0", "1.2")
+        for index, spelling in enumerate(spellings, 1):
+            output = self.temp / f"out-{index}"
+            result = self.run_controller(spelling, output)
+            with self.subTest(temperature=spelling):
+                self.assertEqual(result.returncode, 0, result.stderr)
+                record = self.record(output)
+                self.assertEqual(record["state"], "completed")
+                self.assertEqual([stage["checkpoint_id"] for stage in record["stages"]],
+                                 ["000", "001", "002"])
+                self.assertTrue(all(stage["success"] for stage in record["stages"]))
+                slug = temperature_value.slug(spelling)
+                for checkpoint in ("000", "001", "002"):
+                    attempt = (output / "lineage-001" / checkpoint /
+                               f"temp-{slug}" / "attempt-001")
+                    self.assertTrue((attempt / "COMPLETE").is_file())
+                final = output / "lineage-001" / "final" / "new_mkdir.c"
+                self.assertEqual(final.read_text(encoding="utf-8").splitlines(),
+                                 ["checkpoint 000", "checkpoint 001", "checkpoint 002"])
+
+    def test_checkpoint_001_receives_checkpoint_000_candidate(self):
+        output = self.temp / "seed-chain"
+        result = self.run_controller("0", output)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = self.record(output)
+        first, second = record["stages"][:2]
+        self.assertEqual(second["seed_sha256"], first["candidate_sha256"])
+        baseline = (output / "lineage-001" / "001" / "temp-0p0" /
+                    "baseline" / "new_mkdir.c")
+        self.assertEqual(baseline.read_text(encoding="utf-8"), "checkpoint 000\n")
+
+    def test_numeric_respelling_resumes_without_fingerprint_mismatch(self):
+        output = self.temp / "resume"
+        first = self.run_controller("0", output, lineage_start=1)
+        second = self.run_controller("0.0", output, lineage_start=2)
+        third = self.run_controller("0.00", output, lineage_start=3)
+        for result in (first, second, third):
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("different configuration", result.stderr)
+        records = [self.record(output, number) for number in (1, 2, 3)]
+        self.assertEqual(len({record["config_fingerprint"] for record in records}), 1)
+        self.assertEqual({record["temperature"] for record in records}, {0.0})
+
+    def test_observed_temp_0_vs_temp_0p0_disagreement_is_impossible(self):
+        controller = self.CONTROLLER.read_text(encoding="utf-8")
+        stage_runner = (REPO_ROOT / "scripts" / "run_experiment.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(temperature_value.slug("0"), "0p0")
+        self.assertEqual(temperature_value.slug("0.0"), "0p0")
+        self.assertNotEqual(temperature_value.slug("0"), "0")
+        for source in (controller, stage_runner):
+            self.assertIn('"$TEMPERATURE_TOOL" slug', source)
+            self.assertNotIn("slugify \"$TEMPERATURE\" | sed 's/\\./p/g'", source)
+
+    def test_missing_metadata_does_not_manufacture_opencode_provenance(self):
+        output = self.temp / "missing-metadata"
+        result = self.run_controller("0", output, metadata="missing")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stage = self.record(output)["stages"][0]
+        self.assertIsNone(stage["agent_backend"])
+        self.assertNotEqual(stage["agent_backend"], "opencode")
+
+    def test_legacy_opencode_evidence_and_current_aider_metadata_are_recognized(self):
+        for metadata, expected in (("legacy", "opencode"), ("aider", "aider")):
+            output = self.temp / metadata
+            result = self.run_controller("0", output, metadata=metadata)
+            with self.subTest(metadata=metadata):
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    {stage["agent_backend"] for stage in self.record(output)["stages"]},
+                    {expected},
+                )
+
+    def test_missing_expected_attempt_is_an_output_contract_failure(self):
+        output = self.temp / "wrong-layout"
+        result = self.run_controller("0", output, layout="legacy_raw")
+        record = self.record(output)
+        stage = record["stages"][0]
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertFalse(stage["success"])
+        self.assertEqual(stage["failure_reason"], "stage_output_contract_failure")
+        self.assertTrue(stage["output_contract_failure"])
+        self.assertNotEqual(stage["failure_reason"], "stage_run_incomplete")
+
+    def test_real_plan_fingerprint_ignores_numeric_spelling(self):
+        plans = [lineage_plan.resolve_plan(
+            REPO_ROOT, "mkdir", "demo/m", spelling, "build", 3, 1800
+        ) for spelling in ("0", "0.0", "0.00")]
+        self.assertEqual({plan["temperature"] for plan in plans}, {0.0})
+        self.assertEqual(len({plan["config_fingerprint"] for plan in plans}), 1)
 
 
 class LineageSyntaxPreflightTests(unittest.TestCase):

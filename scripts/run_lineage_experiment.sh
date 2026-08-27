@@ -291,6 +291,8 @@ PLAN_TOOL="$REPO/scripts/lineage_plan.py"
 [[ -f "$PLAN_TOOL" ]] || die "plan resolver not found: $PLAN_TOOL"
 STAGE_RUNNER="$REPO/scripts/run_experiment.sh"
 [[ -f "$STAGE_RUNNER" ]] || die "single-stage runner not found: $STAGE_RUNNER"
+TEMPERATURE_TOOL="$REPO/scripts/temperature_value.py"
+[[ -f "$TEMPERATURE_TOOL" ]] || die "temperature helper not found: $TEMPERATURE_TOOL"
 # A syntax error in the stage runner must never reach lineage initialization.
 # It happened: a here-document inside a $( ) command substitution contained an
 # apostrophe, which Bash 4+ parses correctly and Apple's Bash 3.2 does not. On
@@ -327,8 +329,9 @@ fi
     die "--lineage-start must be a positive integer"
 [[ "$MAX_LOOPS" =~ ^[0-9]+$ ]] || die "--max-loops must be a non-negative integer"
 [[ "$TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || die "--timeout must be a non-negative integer"
-"$PYTHON_BIN" -c 'import sys; float(sys.argv[1])' "$TEMPERATURE" ||
-    die "--temperature must be numeric"
+TEMPERATURE="$(
+    "$PYTHON_BIN" "$TEMPERATURE_TOOL" canonical "$TEMPERATURE"
+)" || die "--temperature must be numeric and finite"
 
 # Sampling knobs, validated with the same rules scripts/run_experiment.sh uses.
 # This happens BEFORE the plan is resolved and therefore long before any lineage
@@ -537,7 +540,8 @@ if [[ "$AIDER_AVAILABLE" -eq 0 && "$DRY_RUN" -eq 0 && "$PRINT_PLAN" -eq 0 &&
 fi
 
 MODEL_SLUG="$(slugify "$MODEL")"
-TEMP_SLUG="$(slugify "$TEMPERATURE" | sed 's/\./p/g')"
+TEMP_SLUG="$("$PYTHON_BIN" "$TEMPERATURE_TOOL" slug "$TEMPERATURE")" ||
+    die "cannot create the directory slug for temperature $TEMPERATURE"
 
 if [[ -z "$OUTPUT_DIR" ]]; then
     OUTPUT_DIR="$REPO/runs/lineages/$UTILITY/$MODEL_SLUG/temp-$TEMP_SLUG"
@@ -975,6 +979,7 @@ for (( offset = 0; offset < LINEAGES; offset++ )); do
         fi
 
         stage_reused=false
+        stage_runner_status=0
         if [[ -f "$stage_attempt/COMPLETE" && "$FORCE" -eq 0 ]]; then
             # A reusable stage must have been produced from the same seed. The
             # runner snapshots its seed as baseline/<basename>, so comparing that
@@ -1011,7 +1016,9 @@ PY
             printf '  [%s %s] already complete; reusing\n' "$stage_id" "$stage_name"
         else
             printf '  [%s %s] %s\n' "$stage_id" "$stage_name" "$stage_prompt"
-            if ! bash "$STAGE_RUNNER" "${runner_args[@]}"; then
+            bash "$STAGE_RUNNER" "${runner_args[@]}"
+            stage_runner_status=$?
+            if [[ "$stage_runner_status" -ne 0 ]]; then
                 warn "$lineage_id stage $stage_id: run_experiment.sh exited nonzero"
                 overall_status=1
             fi
@@ -1022,6 +1029,7 @@ PY
                 "$stage_name" "$stage_prompt" "$stage_mode" "$stage_cmd" \
                 "$stage_flags" "${seed_recorded:-}" "${seed_absolute:-}" "$stage_reused" \
                 "$SOURCE_BASENAME" "$stage_bundle" "$stage_bundle_fingerprint" \
+                "$stage_runner_status" \
                 <<'PY'
 import hashlib
 import json
@@ -1043,6 +1051,7 @@ from pathlib import Path
     source_basename,
     test_bundle_dir,
     test_bundle_fingerprint,
+    stage_runner_status,
 ) = sys.argv[1:]
 
 attempt = Path(attempt_dir)
@@ -1064,6 +1073,7 @@ if candidate.is_file():
     candidate_sha = digest.hexdigest()
 
 attempt_complete = (attempt / "COMPLETE").is_file()
+attempt_exists = attempt.is_dir()
 public_success = bool(metadata.get("public_validation_success"))
 # A stage "successfully completed" only if the build/base/checkpoint validation
 # run by the controller passed AND the source it produced was captured. The
@@ -1071,7 +1081,14 @@ public_success = bool(metadata.get("public_validation_success"))
 # when validation reported success.
 success = attempt_complete and public_success and candidate_sha is not None
 
-if not attempt_complete:
+if not attempt_exists and int(stage_runner_status) == 0:
+    # The stage command reported success but did not honor the output path the
+    # controller passed to it.  That is a producer/consumer contract failure,
+    # not evidence about model reliability.
+    reason = "stage_output_contract_failure"
+elif not attempt_exists:
+    reason = "stage_runner_failure"
+elif not attempt_complete:
     reason = "stage_run_incomplete"
 elif metadata.get("infrastructure_failure"):
     reason = "infrastructure_failure"
@@ -1089,6 +1106,13 @@ elif candidate_sha is None:
     reason = "candidate_missing"
 else:
     reason = None
+
+backend = metadata.get("agent_backend")
+if not backend and any(key.startswith("opencode_") for key in metadata):
+    # Historical OpenCode attempts predate agent_backend, but their
+    # backend-specific fields are affirmative provenance.  Absence alone is
+    # not: a missing/unreadable current metadata file stays unknown.
+    backend = "opencode"
 
 record = {
     "checkpoint_id": checkpoint_id,
@@ -1110,6 +1134,8 @@ record = {
     "test_bundle_fingerprint": test_bundle_fingerprint,
     "test_bundle": None,
     "reused_existing_stage_run": reused == "true",
+    "stage_runner_exit_code": int(stage_runner_status),
+    "output_contract_failure": reason == "stage_output_contract_failure",
     "success": success,
     "failure_reason": reason,
     # Reuse the metadata vocabulary of the single-stage runner rather than
@@ -1129,7 +1155,7 @@ record = {
     # Timeout provenance, carried into the lineage record so a stage that
     # succeeded or was repaired after a cut-short session is still
     # distinguishable from one whose session finished normally.
-    "agent_backend": metadata.get("agent_backend", "opencode"),
+    "agent_backend": backend,
     "agent_exit_code": metadata.get(
         "agent_exit_code", metadata.get("opencode_exit_code")
     ),
@@ -1247,6 +1273,9 @@ print(json.dumps(record, separators=(",", ":")))
             end_to_end_success=false
             failure_stage_json="\"$stage_id\""
             failure_reason_json="\"${stage_reason:-unknown}\""
+            if [[ "$stage_reason" == "stage_output_contract_failure" ]]; then
+                overall_status=1
+            fi
             printf '  [%s %s] STOP: %s\n' \
                 "$stage_id" "$stage_name" "${stage_reason:-unknown}"
             break

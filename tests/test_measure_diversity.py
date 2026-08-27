@@ -24,6 +24,7 @@ RUNNER_HELPERS = (
     REPO_ROOT / "scripts" / "aider_settings.py",
     REPO_ROOT / "scripts" / "opencode_stats.py",
     REPO_ROOT / "scripts" / "prompt_render.py",
+    REPO_ROOT / "scripts" / "temperature_value.py",
 )
 REPAIR_TEMPLATE = REPO_ROOT / "prompts" / "repair_continuation_template.md"
 AUTOMATION_NOTICE = REPO_ROOT / "prompts" / "_shared" / "automation_notice.md"

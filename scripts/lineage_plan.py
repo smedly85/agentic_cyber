@@ -40,6 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import prompt_render  # noqa: E402
 import aider_settings  # noqa: E402
 import stage_test_bundle  # noqa: E402
+import temperature_value  # noqa: E402
 
 SCHEMA_VERSION = 1
 
@@ -158,6 +159,7 @@ def resolve_plan(
     # shell CLIs; Aider always uses architect mode.
     del agent
     architect_model = model
+    temperature = temperature_value.canonicalize(temperature)
     if not remote_base_url:
         remote_transport = "default"
     elif architect_model.startswith("ollama_chat/") and editor_model.startswith(

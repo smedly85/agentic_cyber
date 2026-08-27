@@ -607,6 +607,8 @@ command -v git >/dev/null 2>&1 || die "git is required (to resolve repo-relative
 REPO="$(git rev-parse --show-toplevel 2>/dev/null)" ||
     die "run this script inside a Git repository (only used to resolve paths)"
 REPO="$(cd "$REPO" && pwd -P)"
+TEMPERATURE_TOOL="$REPO/scripts/temperature_value.py"
+[[ -f "$TEMPERATURE_TOOL" ]] || die "temperature helper not found: $TEMPERATURE_TOOL"
 
 resolve_repo_path() {
     local path="$1"
@@ -753,26 +755,8 @@ if [[ "$TEMP_LIST_SET" -eq 1 ]]; then
     # Normalized once here so the grid, the slugs and sweep.json all agree, and
     # so a malformed list fails before any model time is spent. Diagnostics come
     # back on stdout so the reason survives into the die message.
-    temp_list_parsed="$("$PYTHON_BIN" - "$TEMP_LIST" <<'PY' 2>&1
-import sys
-
-values = [part.strip() for part in sys.argv[1].split(",") if part.strip()]
-if not values:
-    print("--temp-list must name at least one temperature")
-    raise SystemExit(1)
-seen: list[float] = []
-for value in values:
-    try:
-        number = float(value)
-    except ValueError:
-        print(f"--temp-list entry is not numeric: {value}")
-        raise SystemExit(1)
-    if number in seen:
-        print(f"--temp-list repeats {value}; each point runs once")
-        raise SystemExit(1)
-    seen.append(number)
-print(",".join(repr(number) for number in seen))
-PY
+    temp_list_parsed="$(
+        "$PYTHON_BIN" "$TEMPERATURE_TOOL" list "$TEMP_LIST" 2>&1
     )" || die "$temp_list_parsed"
     TEMP_LIST="$temp_list_parsed"
     TEMP_POINTS="$(awk -F, '{print NF}' <<<"$TEMP_LIST")"
@@ -797,6 +781,14 @@ else
         TEMP_POINTS=1
     fi
     [[ "$TEMP_POINTS" =~ ^[1-9][0-9]*$ ]] || die "--temp-points must be a positive integer"
+
+    # Canonicalize the endpoints after validation so metadata and scalar runs
+    # cannot retain a spelling that differs from the materialized sweep value.
+    TEMP_MIN="$("$PYTHON_BIN" "$TEMPERATURE_TOOL" canonical "$TEMP_MIN")" ||
+        die "--temp-min must be numeric"
+    TEMP_MAX="$("$PYTHON_BIN" "$TEMPERATURE_TOOL" canonical "$TEMP_MAX")" ||
+        die "--temp-max must be numeric"
+    [[ -z "$TEMPERATURE" ]] || TEMPERATURE="$TEMP_MIN"
 fi
 
 if [[ -n "$REMOTE_BASE_URL" ]]; then
@@ -983,17 +975,9 @@ if [[ -n "$TEMP_LIST" ]]; then
     TEMPERATURES="$(tr ',' '\n' <<<"$TEMP_LIST")"
 else
     TEMPERATURES="$(
-        "$PYTHON_BIN" -c '
-import sys
-n, lo, hi = int(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3])
-if n == 1:
-    print(lo)
-else:
-    step = (hi - lo) / (n - 1)
-    for i in range(n):
-        print(lo + step * i)
-' "$TEMP_POINTS" "$TEMP_MIN" "$TEMP_MAX"
-    )"
+        "$PYTHON_BIN" "$TEMPERATURE_TOOL" range \
+            "$TEMP_POINTS" "$TEMP_MIN" "$TEMP_MAX"
+    )" || die "cannot materialize the temperature grid"
 fi
 
 TEMPERATURES_ARR=()
@@ -1066,7 +1050,8 @@ printf 'Output:      %s\n\n' "$OUTPUT_DIR"
 overall_status=0
 
 for temperature in "${TEMPERATURES_ARR[@]}"; do
-    temp_slug="$(slugify "$temperature" | sed 's/\./p/g')"
+    temp_slug="$("$PYTHON_BIN" "$TEMPERATURE_TOOL" slug "$temperature")" ||
+        die "cannot create the directory slug for temperature $temperature"
     experiment_dir="$OUTPUT_DIR/temp-$temp_slug"
     mkdir -p "$experiment_dir"
 
