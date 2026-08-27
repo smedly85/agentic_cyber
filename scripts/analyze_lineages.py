@@ -95,7 +95,7 @@ def wilson(successes: int, total: int) -> dict[str, Any] | None:
 
 # Copied into a population view alongside metadata.json and candidate/. These
 # are the small per-attempt artifacts analyze_experiment.py knows how to read;
-# opencode.log is deliberately not copied, because a view exists to compare
+# Backend logs are deliberately not copied, because a view exists to compare
 # sources and the session transcript stays with the stage run that produced it.
 #
 # diff-numstat / untracked-files / changed-files are deliberately NOT copied:
@@ -383,6 +383,24 @@ def is_successful(record: Mapping[str, Any]) -> bool:
     return bool(record.get("end_to_end_success")) and classify(record) == "completed"
 
 
+def normalize_stage_backend_fields(stage: Mapping[str, Any]) -> dict[str, Any]:
+    """Add backend-neutral fields while retaining legacy OpenCode keys."""
+    normalized = dict(stage)
+    backend = str(
+        normalized.get("agent_backend")
+        or ("opencode" if "opencode_exit_code" in normalized else "unknown")
+    )
+    normalized.setdefault("agent_backend", backend)
+    normalized.setdefault("agent_exit_code", normalized.get("opencode_exit_code"))
+    normalized.setdefault(
+        "initial_agent_exit_code", normalized.get("initial_opencode_exit_code")
+    )
+    normalized.setdefault(
+        "total_agent_runtime_ms", normalized.get("total_opencode_runtime_ms")
+    )
+    return normalized
+
+
 def load_run(root: Path) -> tuple[dict[str, Any], list[dict[str, Any]], list[str]]:
     if not root.is_dir():
         raise LineageError(f"lineage root not found: {root}")
@@ -414,6 +432,13 @@ def load_run(root: Path) -> tuple[dict[str, Any], list[dict[str, Any]], list[str
                 record["record_error"] = "lineage.json is not a JSON object"
         record["_dir"] = directory
         record.setdefault("lineage_id", directory.name)
+        stages = record.get("stages")
+        if isinstance(stages, list):
+            record["stages"] = [
+                normalize_stage_backend_fields(stage)
+                if isinstance(stage, Mapping) else stage
+                for stage in stages
+            ]
         lineages.append(record)
 
     # Planned is not started. lineages.json is written ONCE, before any lineage
@@ -664,7 +689,7 @@ def build_stage_rows(lineages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     ),
                     "agent_invocation_timed_out": stage.get(
                         "agent_invocation_timed_out",
-                        stage.get("initial_opencode_exit_code") == 124,
+                        stage.get("initial_agent_exit_code") == 124,
                     ),
                     "candidate_available_after_timeout": stage.get(
                         "candidate_available_after_timeout"
@@ -682,7 +707,10 @@ def build_stage_rows(lineages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "seed_sha256": stage.get("seed_sha256"),
                     "candidate": stage.get("candidate"),
                     "candidate_sha256": stage.get("candidate_sha256"),
-                    "total_opencode_runtime_ms": stage.get("total_opencode_runtime_ms"),
+                    "agent_backend": stage.get("agent_backend"),
+                    "agent_exit_code": stage.get("agent_exit_code"),
+                    "initial_agent_exit_code": stage.get("initial_agent_exit_code"),
+                    "total_agent_runtime_ms": stage.get("total_agent_runtime_ms"),
                 }
             )
     return rows
@@ -784,7 +812,7 @@ def build_transitions(lineages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "repair_loops": stage.get("repair_loops"),
                     "llm_invocations": stage.get("llm_invocations"),
                     "initial_success": stage.get("initial_success"),
-                    "total_opencode_runtime_ms": stage.get("total_opencode_runtime_ms"),
+                    "total_agent_runtime_ms": stage.get("total_agent_runtime_ms"),
                     "total_runtime_ms": stage.get("total_runtime_ms"),
                 }
                 row.update(
@@ -2017,10 +2045,11 @@ def main(argv: list[str] | None = None) -> int:
             # A stage can now succeed, or be repaired, after a session that ran
             # out of time. These keep that visible per stage rather than only in
             # the attempt metadata underneath it.
-            "opencode_exit_code", "initial_session_completed", "repair_eligible",
+            "agent_backend", "agent_exit_code", "initial_agent_exit_code",
+            "initial_session_completed", "repair_eligible",
             "repair_eligibility_reason",
             "seed", "seed_sha256", "candidate", "candidate_sha256",
-            "total_opencode_runtime_ms",
+            "total_agent_runtime_ms",
         ],
     )
     if transitions:

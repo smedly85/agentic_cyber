@@ -329,7 +329,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
-    # A repair session is a fresh OpenCode session, so it needs the same
+    # A repair invocation is a fresh Aider process, so it needs the same
     # operating instructions the initial session got. Expanded through the one
     # renderer rather than restated here: the continuation template carries
     # [AUTOMATION_NOTICE], and --original-prompt is deliberately the UNrendered

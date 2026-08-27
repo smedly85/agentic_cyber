@@ -1736,8 +1736,9 @@ class ResumeFingerprintTests(unittest.TestCase):
         base = self.plan()["config_fingerprint"]
         for label, overrides in (
             ("model", {"model": "other/model"}),
+            ("editor_model", {"editor_model": "other/editor"}),
+            ("aider_version", {"aider_version": "aider 9.9"}),
             ("temperature", {"temperature": "0.7"}),
-            ("agent", {"agent": "plan"}),
             ("max_loops", {"max_loops": 5}),
         ):
             with self.subTest(setting=label):
@@ -1765,13 +1766,32 @@ class ResumeFingerprintTests(unittest.TestCase):
         # Manifest-level components.
         for key in ("utility", "program", "source_path", "executable_path",
                     "build_command", "test_dir", "judge", "judge_sha256",
-                    "model", "temperature", "agent", "max_loops"):
+                    "agent_backend", "aider_version", "architect_model",
+                    "editor_model", "architect_mode", "aider_model_settings",
+                    "remote_transport", "model", "temperature", "max_loops"):
             self.assertIn(key, plan)
         # Per-checkpoint components.
         for checkpoint in plan["checkpoints"]:
             for key in ("id", "prompt", "prompt_sha256", "implemented_flags",
                         "feature_test_command", "test_bundle_fingerprint"):
                 self.assertIn(key, checkpoint)
+
+    def test_remote_transport_form_is_explicit_and_fingerprinted(self):
+        native = self.plan(
+            model="ollama_chat/qwen3.8:27b",
+            editor_model="ollama_chat/qwen3-coder-next:latest",
+            remote_base_url="http://ollama.example:11434",
+        )
+        compatible = self.plan(
+            model="openai/qwen3.8:27b",
+            editor_model="openai/qwen3-coder-next:latest",
+            remote_base_url="https://gateway.example/v1",
+        )
+        self.assertEqual(native["remote_transport"], "ollama_native")
+        self.assertEqual(compatible["remote_transport"], "openai_compatible")
+        self.assertNotEqual(
+            native["config_fingerprint"], compatible["config_fingerprint"]
+        )
 
     def test_the_visible_bundle_is_part_of_the_fingerprint(self):
         plan = self.plan()
@@ -2694,17 +2714,50 @@ class LineageControllerInvocationTests(unittest.TestCase):
         if not cls.bash:
             raise unittest.SkipTest("bash is required to run the controller")
 
-    def dry_run(self, utility: str, output_dir: Path) -> list[str]:
+    def dry_run(self, utility: str, output_dir: Path,
+                editor_model: str = "ollama_chat/qwen3-coder-next:latest") -> list[str]:
         result = subprocess.run(
             [self.bash, str(REPO_ROOT / "scripts" / "run_lineage_experiment.sh"),
              "--utility", utility, "--model", "demo/m", "--temperature", "0.2",
-             "--lineages", "2", "--output-dir", str(output_dir), "--dry-run"],
+             "--editor-model", editor_model, "--lineages", "2",
+             "--output-dir", str(output_dir), "--dry-run"],
             capture_output=True, text=True, cwd=str(REPO_ROOT),
             env={**os.environ, "PYTHON_BIN": sys.executable},
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         return [line for line in result.stdout.splitlines()
                 if "run_experiment.sh" in line]
+
+    def test_model_pair_is_forwarded_unchanged_to_every_stage(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as temp:
+            lines = self.dry_run("grep", Path(temp) / "pair", "fixed/editor:model")
+        self.assertTrue(lines)
+        for line in lines:
+            self.assertIn("--model demo/m", line)
+            self.assertIn("--editor-model fixed/editor:model", line)
+
+    def test_dry_run_prints_the_aider_architect_invocation(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as temp:
+            result = subprocess.run(
+                [self.bash,
+                 str(REPO_ROOT / "scripts" / "run_lineage_experiment.sh"),
+                 "--utility", "grep", "--model", "architect/model",
+                 "--editor-model", "editor/model", "--temperature", "0",
+                 "--lineages", "1", "--output-dir", str(Path(temp) / "dry"),
+                 "--dry-run"],
+                capture_output=True, text=True, cwd=str(REPO_ROOT),
+                env={**os.environ, "PYTHON_BIN": sys.executable},
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Aider invocation template:", result.stdout)
+        self.assertIn("--architect", result.stdout)
+        self.assertIn("--model architect/model", result.stdout)
+        self.assertIn("--editor-model editor/model", result.stdout)
+        self.assertNotIn("opencode run", result.stdout.lower())
 
     def test_every_stage_runs_exactly_one_attempt(self):
         import tempfile
@@ -2782,22 +2835,29 @@ def maintained_shell_scripts() -> list[Path]:
 class SamplingParameterSurfaceTests(unittest.TestCase):
     """The sampling knobs must be real, recorded, and refused when they are not.
 
-    Measured against OpenCode 1.18.9 by pointing its provider at a recording
-    HTTP endpoint: temperature, top_p, seed and max_tokens all reach the
-    request body from the agent block, and temperature reaches it ONLY when the
-    model declares the capability -- which a config-defined model does not do by
-    default. These assertions pin the wiring that measurement justified.
+    Aider model settings pass temperature, top_p, seed and max_tokens through
+    LiteLLM to the architect model. These assertions pin that wiring.
     """
 
     RUNNER = REPO_ROOT / "scripts" / "run_experiment.sh"
 
     def setUp(self):
         self.text = self.RUNNER.read_text(encoding="utf-8")
+        self.settings_text = (
+            REPO_ROOT / "scripts" / "aider_settings.py"
+        ).read_text(encoding="utf-8")
 
     def test_each_confirmed_knob_has_a_flag(self):
         for flag in ("--top-p", "--sampling-seed", "--max-tokens"):
             with self.subTest(flag=flag):
                 self.assertIn(f"{flag})", self.text)
+
+    def test_new_runs_depend_on_aider_not_opencode(self):
+        self.assertIn('AIDER_BIN="${AIDER_BIN:-aider}"', self.text)
+        self.assertNotIn('OPENCODE_BIN=', self.text)
+        self.assertIn('--editor-model)', self.text)
+        self.assertIn('--message-file', self.text)
+        self.assertIn('--no-git', self.text)
 
     def test_the_sampling_seed_flag_is_not_called_seed(self):
         """--seed-file is the source-inheritance file; the senses must not mix."""
@@ -2813,13 +2873,11 @@ class SamplingParameterSurfaceTests(unittest.TestCase):
         the server drops it. A recorded condition the server ignored would be
         worse than no flag."""
         self.assertIn("--top-k is not supported", self.text)
-        self.assertNotIn('"top_k"', self.text)
+        self.assertNotIn('"top_k"', self.settings_text)
 
-    def test_the_temperature_capability_is_declared(self):
-        """Without this, OpenCode discards the agent's temperature for any
-        config-defined model -- which is every model this harness uses."""
-        self.assertIn('model_entry = {"temperature": True}', self.text)
-        self.assertIn('config["provider"] = {provider_id: {"models"', self.text)
+    def test_temperature_is_in_the_architect_extra_params(self):
+        self.assertIn('"temperature": float(temperature)', self.settings_text)
+        self.assertIn('"extra_params": architect_params', self.settings_text)
 
     def test_every_knob_is_recorded_where_temperature_is(self):
         """Three record sites, the same three temperature already reaches:
@@ -2831,9 +2889,8 @@ class SamplingParameterSurfaceTests(unittest.TestCase):
                     self.text.count(f'{key} "$(optional_number "$'), 3,
                     f"{key} must be written to all three records",
                 )
-        # experiment.json also states that the capability was declared, so a
-        # record written before the fix is distinguishable from one after it.
-        self.assertIn("temperature_capability_declared true", self.text)
+        self.assertIn('architect_sampling "__JSON__:', self.text)
+        self.assertIn('aider_model_settings_sha256', self.text)
 
     def test_unset_knobs_are_recorded_as_null_not_omitted(self):
         self.assertIn("__JSON__:null", self.text)
@@ -4012,7 +4069,7 @@ class PlatformPreflightTests(unittest.TestCase):
         output = self.temp / "mk-noexec"
         result = self.run_controller("mkdir", output, lineages=10)
         combined = result.stdout + result.stderr
-        for marker in ("run_experiment.sh", "opencode", "attempt-001",
+        for marker in ("run_experiment.sh", "aider", "attempt-001",
                        "test-bundle", "=== lineage-"):
             with self.subTest(marker=marker):
                 self.assertNotIn(marker, combined)
@@ -4741,7 +4798,7 @@ class TimeoutRepairEligibilityTests(unittest.TestCase):
     neither was used. The attempt was scored as though no implementation had
     ever existed.
 
-    These drive the real controller with a stub OpenCode that exits 124 after
+    These drive the real controller with a stub Aider that exits 124 after
     writing a chosen source, and assert the four outcomes plus the two cases
     that must NOT change.
     """
@@ -4776,8 +4833,8 @@ class TimeoutRepairEligibilityTests(unittest.TestCase):
         "passing": "int main(void){return 0;}\n",       # compiles, tests pass
     }
 
-    def stub_opencode(self, behavior: str, *, repair_fixes: bool = False) -> Path:
-        """An OpenCode that writes a source and then times out (exit 124)."""
+    def stub_aider(self, behavior: str, *, repair_fixes: bool = False) -> Path:
+        """A fake Aider that writes a source and then times out (exit 124)."""
         source = self.SOURCES[behavior]
         write = ""
         if source is not None:
@@ -4795,13 +4852,11 @@ class TimeoutRepairEligibilityTests(unittest.TestCase):
                 'fi\n'
                 'touch "$workdir/.repaired"\n'
             )
-        path = self.temp / f"opencode-{behavior}"
+        path = self.temp / f"aider-{behavior}"
         path.write_text(
             '#!/bin/bash\n'
-            'workdir=""\n'
-            'while [ $# -gt 0 ]; do\n'
-            '  case "$1" in --dir) workdir="$2"; shift 2 ;; *) shift ;; esac\n'
-            'done\n'
+            'if [ "${1:-}" = --version ]; then echo "aider 0.test"; exit 0; fi\n'
+            'workdir="$PWD"\n'
             'src="$workdir/src/x.c"\n'
             + repair_branch + write +
             'exit 124\n',
@@ -4824,7 +4879,7 @@ class TimeoutRepairEligibilityTests(unittest.TestCase):
              "--output-dir", self.posix(output), "--no-analysis"],
             cwd=str(REPO_ROOT), capture_output=True, text=True,
             env={**os.environ, "PYTHON_BIN": sys.executable,
-                 "OPENCODE_BIN": str(self.stub_opencode(
+                 "AIDER_BIN": str(self.stub_aider(
                      behavior, repair_fixes=repair_fixes))},
         )
         found = sorted(output.glob("temp-*/attempt-001/metadata.json"))
@@ -4834,8 +4889,8 @@ class TimeoutRepairEligibilityTests(unittest.TestCase):
     # --- the timeout must never be erased ----------------------------------
 
     def assert_timeout_recorded(self, meta: dict) -> None:
-        self.assertEqual(meta["opencode_exit_code"], 124)
-        self.assertEqual(meta["initial_opencode_exit_code"], 124)
+        self.assertEqual(meta["agent_exit_code"], 124)
+        self.assertEqual(meta["initial_agent_exit_code"], 124)
         self.assertTrue(meta["timeout_enforced"])
         self.assertFalse(meta["initial_session_completed"])
 
@@ -4894,7 +4949,7 @@ class TimeoutRepairEligibilityTests(unittest.TestCase):
                          "the initial generation still failed")
         self.assertGreaterEqual(meta["repair_loops"], 1)
         # The success does not hide where the candidate came from.
-        self.assertEqual(meta["initial_opencode_exit_code"], 124)
+        self.assertEqual(meta["initial_agent_exit_code"], 124)
         self.assertFalse(meta["initial_session_completed"])
         self.assertTrue(meta["candidate_available_after_timeout"])
 
@@ -5057,7 +5112,7 @@ class Bash32HeredocQuotingTests(unittest.TestCase):
     This is the defect itself, written down. Bash 3.2 does not skip a
     here-document body while scanning for the closing paren of a command
     substitution -- it keeps lexing the body as shell text. Three apostrophes in
-    Python comments (`model's`, `agent's`, `provider's`) inside the OpenCode
+    Python comments (`model's`, `agent's`, `provider's`) inside the former
     config builder therefore opened a single-quoted string that never closed,
     and the parse ran to end of file:
 
@@ -5065,7 +5120,7 @@ class Bash32HeredocQuotingTests(unittest.TestCase):
 
     reported against line 1182, the line that opened the substitution. Bash 4+
     parses the same file cleanly, so `bash -n` on Linux said nothing. On Vessel
-    every stage aborted before OpenCode started and checkpoint 000 was recorded
+    every stage aborted before the backend started and checkpoint 000 was recorded
     as stage_run_incomplete -- an environment fault booked as a model result.
 
     Verified against a Bash 3.2.0 built from source: with an odd apostrophe
@@ -5148,15 +5203,12 @@ class Bash32HeredocQuotingTests(unittest.TestCase):
         offenders = [line for line in body.splitlines() if "'" in line]
         self.assertEqual(len(offenders), 1)
 
-    def test_the_config_builder_documents_the_constraint(self):
-        """A future editor has to be told, at the site, not to add one."""
+    def test_the_aider_settings_builder_is_outside_shell_substitutions(self):
         text = (REPO_ROOT / "scripts" / "run_experiment.sh").read_text(
             encoding="utf-8"
         )
-        marker = text.index("ATTEMPT_OPENCODE_CONFIG_CONTENT=\"$(")
-        preamble = text[max(0, marker - 1200):marker]
-        self.assertIn("APOSTROPHES", preamble.upper())
-        self.assertIn("3.2", preamble)
+        self.assertIn('AIDER_SETTINGS_TOOL="$REPO/scripts/aider_settings.py"', text)
+        self.assertNotIn("ATTEMPT_OPENCODE_CONFIG_CONTENT", text)
 
 
 class LineageSyntaxPreflightTests(unittest.TestCase):
@@ -5264,10 +5316,10 @@ class LineageSamplingParameterTests(unittest.TestCase):
         return "/" + text[0].lower() + text[2:] if text[1:2] == ":" else text
 
     def run_controller(self, *arguments: str,
-                       opencode: str = "") -> subprocess.CompletedProcess:
+                       aider: str = "") -> subprocess.CompletedProcess:
         environment = {**os.environ, "PYTHON_BIN": sys.executable}
-        if opencode:
-            environment["OPENCODE_BIN"] = opencode
+        if aider:
+            environment["AIDER_BIN"] = aider
         return subprocess.run(
             [self.bash, str(self.CONTROLLER),
              "--utility", "grep", "--model", "demo/m", "--temperature", "0.2",
@@ -5377,7 +5429,7 @@ class LineageSamplingParameterTests(unittest.TestCase):
         result = self.run_controller("--lineages", "1", "--top-k", "20")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--top-k is not supported", result.stderr)
-        self.assertIn("OpenAI-compatible", result.stderr)
+        self.assertIn("separate experimental change", result.stderr)
 
     def test_seed_is_refused_as_ambiguous(self):
         result = self.run_controller("--lineages", "1", "--seed", "7")
@@ -5416,15 +5468,23 @@ class LineageSamplingParameterTests(unittest.TestCase):
     def start_run(self, output: Path, *arguments: str):
         """Begin a real run far enough to write lineages.json.
 
-        OPENCODE_BIN points at nothing, so the first stage fails immediately --
+        AIDER_BIN points at a stub that fails generation, so the first stage fails --
         but the run record and the lineage record are both written before any
         stage starts, which is exactly the state a resume has to be checked
         against.
         """
+        failing_aider = self.temp / "failing-aider"
+        failing_aider.write_text(
+            "#!/bin/sh\n"
+            "if [ \"${1:-}\" = --version ]; then echo 'aider 0.test'; exit 0; fi\n"
+            "exit 42\n",
+            encoding="utf-8",
+        )
+        failing_aider.chmod(0o755)
         return self.run_controller(
             "--lineages", "1", "--max-loops", "0",
             "--output-dir", self.posix(output), *arguments,
-            opencode=str(self.temp / "no-such-opencode"),
+            aider=str(failing_aider),
         )
 
     def test_durable_records_carry_the_sampling_configuration(self):
@@ -5606,14 +5666,15 @@ class SharedAutomationNoticeRenderTests(unittest.TestCase):
                 )
 
     def test_run_experiment_uses_the_rendered_prompt_everywhere(self):
-        """Durable copy, sandbox copy and the text sent to OpenCode all come
+        """Durable copy, sandbox copy and the text sent to Aider all come
         from the one rendered file, so they cannot disagree."""
         text = (REPO_ROOT / "scripts" / "run_experiment.sh").read_text(
             encoding="utf-8"
         )
         self.assertIn('cp "$RENDERED_PROMPT" "$experiment_dir/prompt.md"', text)
         self.assertIn('cp "$RENDERED_PROMPT" "$workdir/', text)
-        self.assertIn('prompt_text="$(cat "$RENDERED_PROMPT")"', text)
+        self.assertIn('current_prompt="$RENDERED_PROMPT"', text)
+        self.assertIn('--message-file "$prompt"', text)
         # And the unrendered file is what the repair renderer quotes, so the
         # notice is not stated twice in a continuation prompt.
         self.assertIn('--original-prompt "$PROMPT_ABS"', text)
@@ -6133,7 +6194,8 @@ class LineageStateTests(unittest.TestCase):
         path = self.root / lineage_id / "lineage.json"
         result = self.state_tool(
             path, "init", "--lineage-id", lineage_id, "--utility", "grep",
-            "--model", "m", "--temperature", "0", "--agent", "build",
+            "--model", "m", "--editor-model", "editor/m",
+            "--aider-version", "aider 0.test", "--temperature", "0",
             "--max-loops", "3", "--fingerprint", "fp",
             "--checkpoint-count", "3", "--checkpoint-ids", "000,001,002",
         )

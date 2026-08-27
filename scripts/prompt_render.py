@@ -3,7 +3,7 @@
 
 **The single expansion point.** `prompts/_shared/automation_notice.md` is the
 one canonical copy of the notice; nothing else in the repository may restate it.
-Every prompt OpenCode is shown -- checkpoint 000, every feature checkpoint, and
+Every prompt Aider is shown -- checkpoint 000, every feature checkpoint, and
 every repair continuation -- is passed through `render()` first, so the notice
 reaches the model without any prompt file carrying its own copy to drift from.
 
@@ -20,7 +20,7 @@ Why rendering, rather than pasting the notice into the twenty manifest prompts:
 
 The rendered text is what is written to the durable experiment copy
 (`experiment.json` -> `prompt_copy`), what is copied into the sandbox, and what
-is handed to `opencode run`. Those are the same bytes by construction: they all
+is handed to `aider --message-file`. Those are the same bytes by construction: they all
 come from this one rendered file.
 
 Placement rule, applied in this order:

@@ -113,8 +113,8 @@ defined in `docs/security_methodology.md`.
 One complete generation/repair trajectory is one independent attempt and the
 implementation is the sampling and inference unit. Only high-confidence
 pre-invocation workspace/setup failure is infrastructure attrition. Once an
-OpenCode invocation is attempted, the attempt is a valid agent trial even if it
-times out, encounters a permission rejection, or exits nonzero. One valid trial
+backend invocation is attempted, the attempt is a valid agent trial even if it
+times out, is rejected by an isolation guard, or exits nonzero. One valid trial
 contributes its final candidate after the configured process. Repeated source
 or feature-identical candidates are retained as separate observations because
 their frequency is part of the model's output distribution. Deduplicating first
@@ -219,8 +219,8 @@ The failure taxonomy is deliberately conservative:
 
 - **Infrastructure attrition:** experiment workspace/setup failed before a
   usable agent invocation was attempted.
-- **Agent-invocation outcome:** completion, timeout, permission rejection, and
-  other OpenCode errors are recorded independently from artifact/workflow
+- **Agent-invocation outcome:** completion, timeout, isolation rejection, and
+  other backend errors are recorded independently from artifact/workflow
   outcomes. A timeout with no candidate is an agent-execution failure; a
   timeout with a candidate may continue through validation and repair.
 - **Candidate/workflow failure:** build, public-test, or hidden/extra-evaluator
@@ -233,8 +233,8 @@ timeout and remains visible in invocation-level summaries and reliability
 outcomes. Exit 124 always records an incomplete/timed-out invocation. When it
 left a candidate, `candidate_available_after_timeout` remains true and the
 artifact may pass public validation and the workflow may succeed; those facts
-do not rewrite the timeout. Initial permission rejection and non-salvageable
-OpenCode execution failure are excluded from the repair-efficacy denominator.
+do not rewrite the timeout. Initial isolation rejection and non-salvageable
+backend execution failure are excluded from the repair-efficacy denominator.
 Infrastructure attrition is excluded from generated-sample
 denominators, while end-to-end success still uses every analyzed attempt.
 

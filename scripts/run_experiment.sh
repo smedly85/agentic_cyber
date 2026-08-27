@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
-# Run repeated OpenCode code-generation experiments in isolated plain
+# Run repeated Aider code-generation experiments in isolated plain
 # directories, with a controller-driven generate/validate/continue loop.
 #
 # Each attempt gets a fresh working directory containing only the prompt, any
-# --test-dir directories, and any --seed-file files. OpenCode runs with --dir
-# pointed at it and a configuration that denies every other path, so nothing
-# else in the repository is ever visible. No Git worktrees are involved.
+# --test-dir directories, and any --seed-file files. Aider runs from inside the
+# directory with Git and its repository map disabled. Only the source is
+# editable; the other text files in this directory are explicit read-only
+# context. No Git worktrees or scratch repositories are involved.
 #
-# After each OpenCode session the controller independently runs --build-cmd,
+# After each Aider process the controller independently runs --build-cmd,
 # --base-test-cmd, and --feature-test-cmd. If any of them fails, it renders a
 # continuation prompt (prompts/repair_continuation_template.md) containing the
-# original task and the specific failures, and starts a NEW OpenCode session
+# original task and the specific failures, and starts a NEW Aider process
 # against the SAME working directory, so the model picks up where it left off.
 # This repeats up to --max-loops times.
 #
@@ -19,7 +20,8 @@
 #
 # Example (from scratch, with repair):
 #   scripts/run_experiment.sh \
-#     --model school-ollama/qwen3-coder-next:latest \
+#     --model ollama_chat/qwen3.8:27b \
+#     --editor-model ollama_chat/qwen3-coder-next:latest \
 #     --temperature 0.2 --runs 25 --max-loops 3 \
 #     --prompt prompts/mkdir/000_base_new_mkdir.md \
 #     --source src/new_mkdir/new_mkdir.c --source-mode new \
@@ -29,7 +31,8 @@
 #
 # Example (temperature sweep):
 #   scripts/run_experiment.sh \
-#     --model school-ollama/qwen3-coder-next:latest \
+#     --model ollama_chat/qwen3.8:27b \
+#     --editor-model ollama_chat/qwen3-coder-next:latest \
 #     --temp-min 0 --temp-max 2 --temp-points 10 --runs 3 \
 #     --prompt prompts/new_sort/000_base_new_sort.md \
 #     --source src/new_sort/new_sort.c --source-mode new \
@@ -44,8 +47,10 @@ Usage:
   run_experiment.sh --model MODEL --prompt FILE --source PATH [options]
 
 Required:
-  --model MODEL              OpenCode model name, e.g.
-                             school-ollama/qwen3-coder-next:latest
+  --model MODEL              Aider architect/reasoning model, e.g.
+                             ollama_chat/qwen3.8:27b
+  --editor-model MODEL       Aider editor model (default:
+                             ollama_chat/qwen3-coder-next:latest)
   --prompt FILE              Prompt file, repo-relative or absolute
   --source PATH              Path, relative to the working directory, that the
                              agent is expected to write, e.g.
@@ -77,7 +82,7 @@ these flags existed):
                              limit.
   --model-provenance-json J  Metadata-only JSON object for model-definition
                              controls such as base_model/top_k/top_k_control.
-                             It is never added to an OpenCode request.
+                             It is never added to an Aider request.
 
                              There is no --top-k. See the SAMPLING PARAMETERS
                              note in this script for the measurements behind
@@ -90,8 +95,7 @@ Generation and repair:
                              prompts/repair_continuation_template.md)
   --allow-no-progress        Keep looping even when a session leaves the
                              source byte-identical. Default is to stop early.
-  --agent NAME               OpenCode agent (default: build)
-  --timeout SECONDS          OpenCode timeout per session; 0 disables
+  --timeout SECONDS          Aider timeout per invocation; 0 disables
                              (default: 1800). Requires timeout or gtimeout;
                              without either, sessions run unwrapped and
                              metadata records timeout_enforced false.
@@ -137,8 +141,15 @@ Analysis:
   -h, --help                 Show this help
 
 Environment:
-  OPENCODE_BIN               OpenCode executable (default: opencode)
+  AIDER_BIN                  Aider executable (default: aider)
   PYTHON_BIN                 Python executable (default: python3)
+
+Remote endpoints:
+  --remote-base-url URL      Native Ollama root for ollama_chat/* models, or
+                             an OpenAI-compatible URL for openai/* models
+  --remote-api-key-env NAME  Optional environment variable containing the
+                             endpoint key. An unauthenticated openai/* gateway
+                             receives the conventional dummy value "ollama".
 
 Directory layout:
   <output-dir>/
@@ -148,7 +159,7 @@ Directory layout:
       prompt.md
       baseline/<source-basename>
       attempt-001/
-        metadata.json  opencode.log  build.log
+        metadata.json  aider.log  aider-model-settings.yml  build.log
         base-tests.log  feature-tests.log  extra-tests.log
         repair-prompt-1.md ...
         candidate/          flattened source files the agent produced
@@ -305,58 +316,115 @@ run_final_command() {
     printf '%s %s\n' "$status" "$(( (end_ns - start_ns) / 1000000 ))"
 }
 
-run_opencode() {
-    # Usage: run_opencode LOGFILE WORKDIR PROMPT INVOCATION KIND
-    # Each call is a new OpenCode session against the same working directory.
+run_aider() {
+    # Usage: run_aider LOGFILE WORKDIR PROMPT_FILE INVOCATION KIND
+    # Each call is a new Aider process against the same working directory.
     local logfile="$1"
     local workdir="$2"
     local prompt="$3"
     local invocation="$4"
     local kind="$5"
-    local current_log start_ns end_ns status runtime_ms permission_rejected
+    local current_log start_ns end_ns status runtime_ms isolation_rejected
+    local env_args
 
-    current_log="$attempt_dir/.opencode-current.log"
+    current_log="$attempt_dir/.aider-current.log"
     printf '\n===== LLM INVOCATION %s: %s =====\n\n' \
         "$invocation" "$kind" >>"$logfile"
     start_ns="$(date +%s%N)"
-    # `--thinking` makes OpenCode emit the model's reasoning blocks alongside
-    # every tool call and result. Pipe through tee so the log grows live: a
-    # large reasoning model can run for many minutes, and buffering until the
-    # invocation returns would leave the log empty for all of it. `tee` writes
-    # the per-invocation copy used for the permission check below, and passes
-    # the same stream through to the cumulative log.
+    # Preserve only the process essentials and the explicitly selected Ollama
+    # endpoint. In particular, no inherited AIDER_* variables can turn testing,
+    # Git, shell suggestions or a user's global config back on. Git's ceiling
+    # prevents Aider's startup discovery (which happens before --no-git is
+    # parsed) from walking into the parent agentic_cyber repository.
+    env_args=(
+        "HOME=$AIDER_HOME"
+        "PATH=$PATH"
+        "TMPDIR=$AIDER_HOME/tmp"
+        "GIT_CEILING_DIRECTORIES=$(dirname "$workdir")"
+    )
+    if [[ "$REMOTE_TRANSPORT" == "ollama_native" ]]; then
+        env_args+=("OLLAMA_API_BASE=$REMOTE_BASE_URL")
+        if [[ -n "$REMOTE_API_KEY_ENV" ]]; then
+            env_args+=("OLLAMA_API_KEY=${!REMOTE_API_KEY_ENV}")
+        fi
+    elif [[ "$REMOTE_TRANSPORT" == "openai_compatible" ]]; then
+        env_args+=("OPENAI_API_BASE=$REMOTE_BASE_URL")
+        if [[ -n "$REMOTE_API_KEY_ENV" ]]; then
+            env_args+=("OPENAI_API_KEY=${!REMOTE_API_KEY_ENV}")
+        else
+            # OpenAI clients require a non-empty key even when a local Ollama
+            # compatibility endpoint ignores authentication.
+            env_args+=("OPENAI_API_KEY=ollama")
+        fi
+    fi
+
+    # --message-file makes this one-shot. The only editable path is SOURCE_PATH;
+    # every other visible text file is added with --read. No --yes-always is
+    # needed, and stdin is closed so an unexpected prompt fails instead of
+    # hanging an unattended experiment.
+    aider_command=(
+        "$AIDER_BIN"
+        --architect
+        --auto-accept-architect
+        --model "$MODEL"
+        --editor-model "$EDITOR_MODEL"
+        --weak-model "$EDITOR_MODEL"
+        --editor-edit-format "$EDITOR_EDIT_FORMAT"
+        --model-settings-file "$AIDER_MODEL_SETTINGS_FILE"
+        --message-file "$prompt"
+        --file "$SOURCE_PATH"
+        --no-git
+        --no-gitignore
+        --map-tokens 0
+        --no-auto-commits
+        --no-dirty-commits
+        --no-auto-lint
+        --no-auto-test
+        --no-suggest-shell-commands
+        --no-analytics
+        --no-check-update
+        --no-show-release-notes
+        --no-show-model-warnings
+        --no-check-model-accepts-settings
+        --no-restore-chat-history
+        --no-pretty
+        --no-fancy-input
+        --no-notifications
+        --no-detect-urls
+        --disable-playwright
+        --config "$AIDER_CONFIG_FILE"
+        --env-file "$AIDER_ENV_FILE"
+        --input-history-file /dev/null
+        --chat-history-file /dev/null
+    )
+    aider_command+=("${AIDER_READ_ARGS[@]+"${AIDER_READ_ARGS[@]}"}")
+
     if [[ "$TIMEOUT_ENFORCED" == true ]]; then
-        OPENCODE_CONFIG_CONTENT="$ATTEMPT_OPENCODE_CONFIG_CONTENT" \
-            "$TIMEOUT_BIN" --signal=TERM --kill-after=30 \
-            "$TIMEOUT_SECONDS" \
-            "$OPENCODE_BIN" run \
-                --dir "$workdir" \
-                --model "$MODEL" \
-                --agent "$AGENT" \
-                --thinking \
-                "$prompt" </dev/null
+        (
+            cd "$workdir" || exit 125
+            env -i "${env_args[@]}" \
+                "$TIMEOUT_BIN" --signal=TERM --kill-after=30 \
+                "$TIMEOUT_SECONDS" \
+                "${aider_command[@]}" </dev/null
+        )
     else
-        OPENCODE_CONFIG_CONTENT="$ATTEMPT_OPENCODE_CONFIG_CONTENT" \
-            "$OPENCODE_BIN" run \
-                --dir "$workdir" \
-                --model "$MODEL" \
-                --agent "$AGENT" \
-                --thinking \
-                "$prompt" </dev/null
+        (
+            cd "$workdir" || exit 125
+            env -i "${env_args[@]}" "${aider_command[@]}" </dev/null
+        )
     fi 2>&1 | tee "$current_log" >>"$logfile"
-    # The exit status of OpenCode itself, not of tee.
+    # The exit status of Aider itself, not of tee.
     status="${PIPESTATUS[0]}"
     end_ns="$(date +%s%N)"
     runtime_ms=$(( (end_ns - start_ns) / 1000000 ))
 
-    permission_rejected=false
-    if grep -Eiq \
-            'permission requested:[[:space:]]*external_directory|auto-rejecting|user rejected permission' \
-            "$current_log"; then
-        permission_rejected=true
-    fi
+    # Aider has no OpenCode-style external-directory permission event. Its
+    # boundary is structural: no Git discovery/repo map, one explicit editable
+    # source and explicit read-only context. Test tampering remains independently
+    # detected by capture_candidate.py.
+    isolation_rejected=false
     rm -f "$current_log"
-    printf '%s %s %s\n' "$status" "$runtime_ms" "$permission_rejected"
+    printf '%s %s %s\n' "$status" "$runtime_ms" "$isolation_rejected"
 }
 
 make_loop_record() {
@@ -367,12 +435,12 @@ import sys
 (
     loop,
     kind,
-    opencode_exit,
-    permission_rejected,
+    agent_exit,
+    isolation_rejected,
     build_exit,
     base_test_exit,
     feature_test_exit,
-    opencode_ms,
+    agent_ms,
     build_ms,
     base_test_ms,
     feature_test_ms,
@@ -382,12 +450,12 @@ import sys
 print(json.dumps({
     "loop": int(loop),
     "kind": kind,
-    "opencode_exit_code": int(opencode_exit),
-    "opencode_permission_rejected": permission_rejected == "true",
+    "agent_exit_code": int(agent_exit),
+    "agent_isolation_rejected": isolation_rejected == "true",
     "build_exit_code": int(build_exit),
     "base_test_exit_code": int(base_test_exit),
     "feature_test_exit_code": int(feature_test_exit),
-    "opencode_runtime_ms": int(opencode_ms),
+    "agent_runtime_ms": int(agent_ms),
     "build_runtime_ms": int(build_ms),
     "base_test_runtime_ms": int(base_test_ms),
     "feature_test_runtime_ms": int(feature_test_ms),
@@ -398,6 +466,8 @@ PY
 }
 
 MODEL=""
+EDITOR_MODEL="ollama_chat/qwen3-coder-next:latest"
+EDITOR_EDIT_FORMAT="editor-diff"
 PROMPT=""
 SOURCE_PATH=""
 SOURCE_MODE="existing"
@@ -410,7 +480,7 @@ TEMP_LIST=""
 # rather than silently falling through to the --temp-min/--temp-max path.
 TEMP_LIST_SET=0
 # Optional sampling parameters. Empty means "not requested": the key is left
-# out of the OpenCode agent block entirely, so the server default applies and
+# out of the architect model settings entirely, so the server default applies and
 # behavior matches a run from before these flags existed. See the SAMPLING
 # PARAMETERS note above the per-attempt config builder for what each one is
 # measured to do.
@@ -422,7 +492,6 @@ RUNS=1
 MAX_LOOPS=3
 REPAIR_TEMPLATE=""
 ALLOW_NO_PROGRESS=0
-AGENT="build"
 OUTPUT_DIR=""
 BUILD_CMD=""
 BASE_TEST_CMD=""
@@ -434,7 +503,8 @@ KEEP_WORKDIR=0
 PRUNE_ONLY=""
 NO_ANALYSIS=0
 REMOTE_BASE_URL=""
-REMOTE_API_KEY_ENV="OPENCODE_REMOTE_API_KEY"
+REMOTE_API_KEY_ENV=""
+REMOTE_TRANSPORT="default"
 ANALYSIS_THRESHOLD=""
 ANALYSIS_ARCHITECTURE_THRESHOLD=""
 ANALYSIS_STRATEGY_THRESHOLD=""
@@ -443,7 +513,7 @@ TEST_DIRS=()
 SEED_FILES=()
 KEEP_GLOBS=()
 
-OPENCODE_BIN="${OPENCODE_BIN:-opencode}"
+AIDER_BIN="${AIDER_BIN:-aider}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 while [[ $# -gt 0 ]]; do
@@ -451,10 +521,10 @@ while [[ $# -gt 0 ]]; do
     # guard a trailing `--flag` leaves `shift 2` unable to shift, so the loop
     # re-reads the same argument forever.
     case "$1" in
-        --model|--prompt|--source|--source-mode|--temperature|--temp-min| \
+        --model|--editor-model|--prompt|--source|--source-mode|--temperature|--temp-min| \
         --temp-max|--temp-points|--temp-list|--runs|--max-loops| \
         --top-p|--sampling-seed|--max-tokens|--model-provenance-json| \
-        --repair-prompt|--agent| \
+        --repair-prompt| \
         --test-dir|--seed-file|--keep-glob|--build-cmd|--base-test-cmd| \
         --feature-test-cmd|--test-cmd|--extra-test-cmd|--timeout|--output-dir| \
         --prune-only|--remote-base-url|--remote-api-key-env| \
@@ -466,6 +536,7 @@ while [[ $# -gt 0 ]]; do
 
     case "$1" in
         --model) MODEL="${2:-}"; shift 2 ;;
+        --editor-model) EDITOR_MODEL="${2:-}"; shift 2 ;;
         --prompt) PROMPT="${2:-}"; shift 2 ;;
         --source) SOURCE_PATH="${2:-}"; shift 2 ;;
         --source-mode) SOURCE_MODE="${2:-}"; shift 2 ;;
@@ -480,15 +551,10 @@ while [[ $# -gt 0 ]]; do
         --max-tokens) MAX_TOKENS="${2:-}"; shift 2 ;;
         --model-provenance-json) MODEL_PROVENANCE_JSON="${2:-}"; shift 2 ;;
         --top-k)
-            # Measured, not assumed: OpenCode does put an agent-level top_k on
-            # the wire, but it arrives at an OpenAI-compatible /v1/chat/
-            # completions endpoint, whose schema has no top_k -- Ollama parses
-            # a fixed field set there and ignores the rest. Reaching Ollama's
-            # sampler would require its native /api/chat "options" object,
-            # which OpenCode's @ai-sdk/openai-compatible provider never speaks.
-            # A flag that is accepted, recorded and silently ignored by the
-            # server is worse than no flag, so this one refuses instead.
-            die "--top-k is not supported: top_k is not part of the OpenAI-compatible chat API that OpenCode speaks to Ollama, so it would be accepted here and ignored by the server (see the SAMPLING PARAMETERS note in this script)" ;;
+            # Native ollama_chat can carry top_k, but changing that experimental
+            # control is intentionally outside this backend migration. It needs
+            # its own transport-level validation and study design.
+            die "--top-k is not supported by this migration; validate and add it as a separate experimental change" ;;
         --seed)
             # --seed-file is the checkpoint source-inheritance file. The two
             # senses of "seed" must never collide in this harness.
@@ -496,7 +562,8 @@ while [[ $# -gt 0 ]]; do
         --max-loops) MAX_LOOPS="${2:-}"; shift 2 ;;
         --repair-prompt) REPAIR_TEMPLATE="${2:-}"; shift 2 ;;
         --allow-no-progress) ALLOW_NO_PROGRESS=1; shift ;;
-        --agent) AGENT="${2:-}"; shift 2 ;;
+        --agent)
+            die "--agent was removed with the OpenCode backend; Aider always runs in architect mode" ;;
         --test-dir) TEST_DIRS+=("${2:-}"); shift 2 ;;
         --seed-file) SEED_FILES+=("${2:-}"); shift 2 ;;
         --keep-glob) KEEP_GLOBS+=("${2:-}"); shift 2 ;;
@@ -553,8 +620,8 @@ resolve_repo_path() {
 CAPTURE_TOOL="$REPO/scripts/capture_candidate.py"
 [[ -f "$CAPTURE_TOOL" ]] || die "capture helper not found: $CAPTURE_TOOL"
 
-STATS_TOOL="$REPO/scripts/opencode_stats.py"
-[[ -f "$STATS_TOOL" ]] || die "stats helper not found: $STATS_TOOL"
+AIDER_SETTINGS_TOOL="$REPO/scripts/aider_settings.py"
+[[ -f "$AIDER_SETTINGS_TOOL" ]] || die "Aider settings helper not found: $AIDER_SETTINGS_TOOL"
 
 # ---------------------------------------------------------------------------
 # Standalone cleanup of existing runs
@@ -608,6 +675,8 @@ fi
 # ---------------------------------------------------------------------------
 
 [[ -n "$MODEL" ]] || die "--model is required"
+[[ "$MODEL" != "$EDITOR_MODEL" ]] ||
+    die "--model and --editor-model must differ so their sampling settings remain role-specific"
 [[ -n "$PROMPT" ]] || die "--prompt is required"
 [[ -n "$SOURCE_PATH" ]] || die "--source is required"
 [[ "$RUNS" =~ ^[1-9][0-9]*$ ]] || die "--runs must be a positive integer"
@@ -731,10 +800,19 @@ else
 fi
 
 if [[ -n "$REMOTE_BASE_URL" ]]; then
-    [[ "$MODEL" == */* ]] ||
-        die "--model must be PROVIDER/MODEL when --remote-base-url is set (got: $MODEL)"
+    if [[ "$MODEL" == ollama_chat/* && "$EDITOR_MODEL" == ollama_chat/* ]]; then
+        REMOTE_TRANSPORT="ollama_native"
+        [[ "$REMOTE_BASE_URL" != */v1 && "$REMOTE_BASE_URL" != */v1/ ]] ||
+            die "ollama_chat/* needs the native Ollama root (for example http://host:11434), not a /v1 URL"
+    elif [[ "$MODEL" == openai/* && "$EDITOR_MODEL" == openai/* ]]; then
+        REMOTE_TRANSPORT="openai_compatible"
+    else
+        die "with --remote-base-url, both models must use either ollama_chat/* (native Ollama) or openai/* (OpenAI-compatible gateway)"
+    fi
+fi
+if [[ -n "$REMOTE_API_KEY_ENV" ]]; then
     [[ -n "${!REMOTE_API_KEY_ENV:-}" ]] ||
-        die "$REMOTE_API_KEY_ENV is not set (export it, or pass --remote-api-key-env)"
+        die "$REMOTE_API_KEY_ENV is not set (export it, or omit --remote-api-key-env for an unauthenticated Ollama endpoint)"
 fi
 
 PROMPT_ABS="$(resolve_repo_path "$PROMPT")"
@@ -744,7 +822,7 @@ PROMPT_ABS="$(resolve_repo_path "$PROMPT")"
 # expanded into it (scripts/prompt_render.py, the single expansion point). It is
 # rendered ONCE here and then used for every downstream purpose -- the durable
 # experiment copy, the copy placed in the sandbox, and the text handed to
-# `opencode run` -- so those cannot disagree: they are the same file.
+# `aider --message-file` -- so those cannot disagree: they are the same file.
 RENDER_TOOL="$REPO/scripts/prompt_render.py"
 [[ -f "$RENDER_TOOL" ]] || die "prompt renderer not found: $RENDER_TOOL"
 RENDERED_PROMPT="$(mktemp)" || die "cannot create the rendered prompt file"
@@ -861,7 +939,9 @@ if [[ "$NO_ANALYSIS" -eq 0 ]]; then
 fi
 
 # Checked after argument validation so a bad flag reports the bad flag.
-command -v "$OPENCODE_BIN" >/dev/null 2>&1 || die "$OPENCODE_BIN was not found"
+command -v "$AIDER_BIN" >/dev/null 2>&1 || die "$AIDER_BIN was not found"
+AIDER_VERSION="$({ "$AIDER_BIN" --version 2>/dev/null || true; } | head -1)"
+[[ -n "$AIDER_VERSION" ]] || AIDER_VERSION="unknown"
 
 TIMEOUT_BIN=""
 if command -v timeout >/dev/null 2>&1; then
@@ -925,9 +1005,19 @@ write_metadata "$OUTPUT_DIR/sweep.json" \
     schema_version 1 \
     repository "$REPO" \
     repository_commit "$REPO_COMMIT" \
+    agent_backend aider \
+    aider_version "__STR__:$AIDER_VERSION" \
+    architect_model "$MODEL" \
+    editor_model "$EDITOR_MODEL" \
+    architect_mode true \
     model "$MODEL" \
     model_provenance "__JSON__:${MODEL_PROVENANCE_JSON:-null}" \
-    agent "$AGENT" \
+    editor_temperature 0 \
+    editor_sampling_seed 0 \
+    editor_edit_format editor-diff \
+    remote_base_url "$REMOTE_BASE_URL" \
+    remote_api_key_env "$REMOTE_API_KEY_ENV" \
+    remote_transport "$REMOTE_TRANSPORT" \
     prompt "$PROMPT_ABS" \
     source_workdir_path "$SOURCE_PATH" \
     source_path "$SOURCE_FLAT" \
@@ -952,7 +1042,9 @@ write_metadata "$OUTPUT_DIR/sweep.json" \
     created_at "$(timestamp)"
 
 printf 'Repository:  %s\n' "$REPO"
-printf 'Model:       %s\n' "$MODEL"
+printf 'Architect:   %s\n' "$MODEL"
+printf 'Editor:      %s\n' "$EDITOR_MODEL"
+printf 'Aider:       %s\n' "$AIDER_VERSION"
 printf 'Prompt:      %s\n' "$PROMPT_ABS"
 printf 'Source:      %s (captured as %s)\n' "$SOURCE_PATH" "$SOURCE_FLAT"
 if [[ -n "$TEMP_LIST" ]]; then
@@ -981,7 +1073,7 @@ for temperature in "${TEMPERATURES_ARR[@]}"; do
     if [[ -f "$experiment_dir/experiment.json" ]]; then
         mismatches="$(
             "$PYTHON_BIN" - "$experiment_dir/experiment.json" \
-                "$MODEL" "$temperature" "$AGENT" "$PROMPT_ABS" \
+                "$MODEL" "$EDITOR_MODEL" "$AIDER_VERSION" "$temperature" "$PROMPT_ABS" \
                 "$SOURCE_FLAT" "$SOURCE_PATH" "$SOURCE_MODE" "$MAX_LOOPS" \
                 "$BUILD_CMD" "$BASE_TEST_CMD" "$FEATURE_TEST_CMD" \
                 "$EXTRA_TEST_CMD" \
@@ -990,7 +1082,10 @@ for temperature in "${TEMPERATURES_ARR[@]}"; do
                 "${ANALYSIS_DIVERSITY_K_MAX:-__NONE__}" \
                 "${TOP_P:-__NONE__}" "${SAMPLING_SEED:-__NONE__}" \
                 "${MAX_TOKENS:-__NONE__}" \
-                "${MODEL_PROVENANCE_JSON:-__NONE__}" <<'PY'
+                "${MODEL_PROVENANCE_JSON:-__NONE__}" \
+                "${REMOTE_BASE_URL:-__NONE__}" \
+                "${REMOTE_API_KEY_ENV:-__NONE__}" \
+                "$REMOTE_TRANSPORT" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -998,8 +1093,9 @@ from pathlib import Path
 data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 (
     model,
+    editor_model,
+    aider_version,
     temperature,
-    agent,
     prompt,
     source_path,
     source_workdir_path,
@@ -1016,8 +1112,16 @@ data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
     sampling_seed,
     max_tokens,
     model_provenance_json,
+    remote_base_url,
+    remote_api_key_env,
+    remote_transport,
 ) = sys.argv[2:]
 expected = {
+    "agent_backend": "aider",
+    "aider_version": aider_version,
+    "architect_model": model,
+    "editor_model": editor_model,
+    "architect_mode": True,
     "model": model,
     "model_provenance": (
         None if model_provenance_json == "__NONE__"
@@ -1030,7 +1134,14 @@ expected = {
     "top_p": None if top_p == "__NONE__" else float(top_p),
     "sampling_seed": None if sampling_seed == "__NONE__" else int(sampling_seed),
     "max_tokens": None if max_tokens == "__NONE__" else int(max_tokens),
-    "agent": agent,
+    "editor_temperature": 0,
+    "editor_sampling_seed": 0,
+    "editor_edit_format": "editor-diff",
+    "remote_base_url": None if remote_base_url == "__NONE__" else remote_base_url,
+    "remote_api_key_env": (
+        None if remote_api_key_env == "__NONE__" else remote_api_key_env
+    ),
+    "remote_transport": remote_transport,
     "prompt": prompt,
     "source_path": source_path,
     "source_workdir_path": source_workdir_path,
@@ -1072,14 +1183,23 @@ PY
         schema_version 2 \
         repository "$REPO" \
         repository_commit "$REPO_COMMIT" \
+        agent_backend aider \
+        aider_version "__STR__:$AIDER_VERSION" \
+        architect_model "$MODEL" \
+        editor_model "$EDITOR_MODEL" \
+        architect_mode true \
         model "$MODEL" \
         model_provenance "__JSON__:${MODEL_PROVENANCE_JSON:-null}" \
         temperature "$temperature" \
         top_p "$(optional_number "$TOP_P")" \
         sampling_seed "$(optional_number "$SAMPLING_SEED")" \
         max_tokens "$(optional_number "$MAX_TOKENS")" \
-        temperature_capability_declared true \
-        agent "$AGENT" \
+        editor_temperature 0 \
+        editor_sampling_seed 0 \
+        editor_edit_format editor-diff \
+        remote_base_url "$([[ -n "$REMOTE_BASE_URL" ]] && printf '__STR__:%s' "$REMOTE_BASE_URL" || printf '__JSON__:null')" \
+        remote_api_key_env "$([[ -n "$REMOTE_API_KEY_ENV" ]] && printf '__STR__:%s' "$REMOTE_API_KEY_ENV" || printf '__JSON__:null')" \
+        remote_transport "$REMOTE_TRANSPORT" \
         prompt "$PROMPT_ABS" \
         prompt_copy "$experiment_dir/prompt.md" \
         automation_notice_sha256 "$AUTOMATION_NOTICE_SHA256" \
@@ -1117,19 +1237,14 @@ PY
 
         printf '[%s/%s] starting %s\n' "$attempt_number" "$RUNS" "$attempt_id"
 
-        # OpenCode keys its sessions by working directory, and this path is
-        # reused whenever an attempt is re-run with --force or restarted after
-        # an interruption. Without a floor, the stats for this attempt would
-        # also collect the abandoned run's sessions.
-        attempt_started_ms="$(( $(date +%s) * 1000 ))"
-
         rm -rf "$attempt_dir"
         mkdir -p "$workdir"
 
         # Seed the working directory. This is everything the agent can see.
         # Rendered, under the task file's own name: the copy the agent can read
         # must match the text it was sent.
-        cp "$RENDERED_PROMPT" "$workdir/$(basename "$PROMPT_ABS")"
+        WORKDIR_PROMPT_PATH="$(basename "$PROMPT_ABS")"
+        cp "$RENDERED_PROMPT" "$workdir/$WORKDIR_PROMPT_PATH"
         for (( test_dir_index = 0;
                test_dir_index < ${#TEST_DIR_SOURCES[@]};
                test_dir_index++ )); do
@@ -1149,168 +1264,72 @@ PY
             cp -p "$(resolve_repo_path "$seed_src")" "$workdir/$seed_dest"
         done
 
-        # OpenCode resolves a session's project root by walking up for a .git
-        # directory, and only consults its external_directory rules for paths
-        # outside that root. Without a .git of its own the workdir inherits
-        # this repository as its root, every repository path counts as
-        # internal, and the agent can read and write anywhere in the checkout
-        # -- observed: a session wrote src/new_mkdir/new_mkdir.c into the real
-        # repository. An empty repository here moves the boundary onto the
-        # workdir. It is scratch metadata only, never committed to, and it
-        # goes away with the workdir during the prune.
-        git init -q "$workdir" ||
-            die "failed to initialize sandbox marker repository in $workdir"
-        sandbox_root="$(git -C "$workdir" rev-parse --show-toplevel 2>/dev/null || printf '')"
-        # Fail closed: without this boundary the agent is loose in the repo,
-        # which silently corrupts both the checkout and every later attempt.
-        [[ "$sandbox_root" == "$(cd "$workdir" && pwd -P)" ]] ||
-            die "sandbox boundary not established for $workdir (root=$sandbox_root)"
+        # Aider must receive an editable file even for a new-source checkpoint.
+        # The empty file is still the same empty analysis baseline, and a
+        # successful invocation must replace it with a non-empty implementation.
+        mkdir -p "$(dirname "$workdir/$SOURCE_PATH")"
+        [[ -e "$workdir/$SOURCE_PATH" ]] || : >"$workdir/$SOURCE_PATH"
 
-        # ---- SAMPLING PARAMETERS -----------------------------------------
-        #
-        # Measured against OpenCode 1.18.9 with @ai-sdk/openai-compatible, by
-        # pointing the provider at a recording HTTP endpoint and reading the
-        # request body it actually sent. Every claim below is an observation,
-        # not a reading of the AI SDK's option list.
-        #
-        #   temperature   agent.<name>.temperature  ->  body.temperature
-        #                 ONLY when the model declares the capability (below).
-        #   top_p         agent.<name>.top_p        ->  body.top_p
-        #   seed          agent.<name>.seed         ->  body.seed
-        #   max_tokens    agent.<name>.max_tokens   ->  body.max_tokens
-        #                 (otherwise the model's own output limit is sent)
-        #
-        # top_k is deliberately absent. It does reach the body from the same
-        # agent object, but the body is an OpenAI-compatible
-        # /v1/chat/completions request, and that API has no top_k: Ollama
-        # parses a fixed field set there and drops the rest. Its sampler is
-        # only reachable through the native /api/chat "options" object, which
-        # this provider never speaks. So --top-k is refused rather than
-        # recorded as a condition the server ignored.
-        #
-        # THE CAPABILITY DECLARATION IS NOT COSMETIC. OpenCode gates
-        # temperature on model.capabilities.temperature, which defaults to
-        # FALSE for any model defined in config rather than resolved from its
-        # own catalog -- which is every model this harness uses. Without the
-        # declaration below, the agent block's temperature is dropped before
-        # the request is built and the server applies its own default. It was
-        # measured absent from the request body in exactly the configuration
-        # this harness shipped. Declaring the capability is what makes
-        # --temperature real; runs recorded before this change carry a
-        # temperature they did not actually sample at.
-        # APOSTROPHES AND UNBALANCED PARENTHESES ARE FORBIDDEN IN THE HERE-DOC
-        # BELOW. It sits inside a $( ) command substitution, and Bash 3.2 --
-        # Apple's /bin/bash, which Darwin runs -- does not skip a here-document
-        # body while scanning for the closing paren. It keeps lexing the body as
-        # shell text, so an apostrophe opens a single-quoted string that never
-        # closes and the parse runs to end of file:
-        #
-        #   run_experiment.sh: line <EOF>: syntax error: unexpected end of file
-        #
-        # reported against the line that opened the substitution, with no other
-        # clue. Bash 4+ parses it correctly, so this is invisible on Linux and
-        # fatal on macOS: it aborted a real run before any OpenCode session
-        # started, and the lineage recorded checkpoint 000 as
-        # stage_run_incomplete. Write "the model of the agent", never
-        # "the agent's model".
-        # tests/test_lineage_tools.py::Bash32HeredocQuotingTests enforces this.
-        ATTEMPT_OPENCODE_CONFIG_CONTENT="$(
-            "$PYTHON_BIN" - "$AGENT" "$temperature" "$workdir" \
-                "$REMOTE_BASE_URL" "$REMOTE_API_KEY_ENV" "$MODEL" \
-                "$TOP_P" "$SAMPLING_SEED" "$MAX_TOKENS" <<'PY'
-import json
-import sys
-from pathlib import Path
+        # Reject config-shaped files at the workspace root. Aider searches CWD
+        # during early startup, before all command-line options are applied.
+        # Formal inputs must not be able to inject configuration through that
+        # search path.
+        for reserved in .env .aider.conf.yml .aider.model.settings.yml \
+                        .aider.model.metadata.json; do
+            [[ ! -e "$workdir/$reserved" ]] ||
+                die "attempt workspace contains reserved Aider config path: $reserved"
+        done
 
-agent = sys.argv[1]
-temperature = float(sys.argv[2])
-workdir = str(Path(sys.argv[3]).resolve())
-remote_base_url = sys.argv[4]
-remote_api_key_env = sys.argv[5]
-model = sys.argv[6]
-top_p = sys.argv[7]
-sampling_seed = sys.argv[8]
-max_tokens = sys.argv[9]
+        AIDER_HOME="$attempt_dir/aider-home"
+        mkdir -p "$AIDER_HOME/tmp"
+        AIDER_CONFIG_FILE="$attempt_dir/aider.conf.yml"
+        AIDER_ENV_FILE="$attempt_dir/aider.env"
+        AIDER_MODEL_SETTINGS_FILE="$attempt_dir/aider-model-settings.yml"
+        printf '{}\n' >"$AIDER_CONFIG_FILE"
+        : >"$AIDER_ENV_FILE"
+        "$PYTHON_BIN" "$AIDER_SETTINGS_TOOL" \
+            --architect-model "$MODEL" \
+            --editor-model "$EDITOR_MODEL" \
+            --temperature "$temperature" \
+            --top-p "$TOP_P" \
+            --sampling-seed "$SAMPLING_SEED" \
+            --max-tokens "$MAX_TOKENS" \
+            --output "$AIDER_MODEL_SETTINGS_FILE" \
+            --emit sha256 >"$attempt_dir/aider-model-settings.sha256" ||
+            die "failed to build per-attempt Aider model settings"
+        AIDER_MODEL_SETTINGS_SHA256="$(tr -d '\r\n' <"$attempt_dir/aider-model-settings.sha256")"
+        AIDER_MODEL_SETTINGS_JSON="$(cat "$AIDER_MODEL_SETTINGS_FILE")"
 
-escaped_workdir = workdir.replace(" ", r"\ ")
-external_directory = {
-    "*": "deny",
-    workdir: "allow",
-    f"{workdir}/**": "allow",
-}
-if escaped_workdir != workdir:
-    # OpenCode 1.17.20 preserves backslash-escaped spaces in bash path checks.
-    external_directory[escaped_workdir] = "allow"
-    external_directory[f"{escaped_workdir}/**"] = "allow"
+        # Explicit read-only context, limited to text files already copied into
+        # this attempt. Binary/compressed corpora remain present for controller
+        # validation but are not injected wholesale into either model context.
+        AIDER_READ_ARGS=()
+        while IFS= read -r visible_file; do
+            [[ "$visible_file" == "$SOURCE_PATH" ]] && continue
+            # --message-file already supplies the rendered task. Keeping its
+            # durable workspace copy out of --read avoids duplicating the full
+            # task in both models' contexts.
+            [[ "$visible_file" == "$WORKDIR_PROMPT_PATH" ]] && continue
+            case "$visible_file" in
+                *.c|*.h|*.py|*.sh|*.json|*.md|*.txt|*.toml|*.yaml|*.yml)
+                    AIDER_READ_ARGS+=(--read "$visible_file") ;;
+            esac
+        done < <(cd "$workdir" && find . -type f -print | sed 's#^./##' | LC_ALL=C sort)
 
-agent_block = {
-    "temperature": temperature,
-    "permission": {
-        "external_directory": external_directory,
-    },
-}
-# Absent unless requested, so an unset knob leaves the request exactly as it
-# was before the flag existed rather than pinning a value that looks chosen.
-if top_p:
-    agent_block["top_p"] = float(top_p)
-if sampling_seed:
-    agent_block["seed"] = int(sampling_seed)
-if max_tokens:
-    agent_block["max_tokens"] = int(max_tokens)
-
-config = {
-    "$schema": "https://opencode.ai/config.json",
-    # Snapshots exist so an interactive user can undo a change. Nothing here
-    # reverts, and with a per-attempt project root OpenCode would otherwise
-    # keep one snapshot repository per attempt under its shared data
-    # directory, copying the whole seeded tree on every step.
-    "snapshot": False,
-    "agent": {agent: agent_block},
-}
-
-# Turn temperature on for this model. See the SAMPLING PARAMETERS note above:
-# the temperature capability of a config-defined model defaults to false, and a
-# false capability silently discards the temperature set in the agent block.
-# Written as a partial provider entry naming only the model, which merges into
-# whatever provider definition the environment already supplies -- the harness
-# does not know the baseURL of that provider unless --remote-base-url was
-# given, and must not overwrite it.
-provider_id, _, model_id = model.partition("/")
-model_entry = {"temperature": True}
-
-if remote_base_url:
-    config["provider"] = {
-        provider_id: {
-            "npm": "@ai-sdk/openai-compatible",
-            "options": {
-                "baseURL": remote_base_url,
-                "apiKey": f"{{env:{remote_api_key_env}}}",
-            },
-            "models": {model_id: model_entry},
-        }
-    }
-elif provider_id and model_id:
-    config["provider"] = {provider_id: {"models": {model_id: model_entry}}}
-
-print(json.dumps(config))
-PY
-        )" || die "failed to build per-attempt OpenCode configuration"
-
-        prompt_text="$(cat "$RENDERED_PROMPT")"
-        : >"$attempt_dir/opencode.log"
+        : >"$attempt_dir/aider.log"
         : >"$attempt_dir/build.log"
         : >"$attempt_dir/base-tests.log"
         : >"$attempt_dir/feature-tests.log"
 
-        current_prompt="$prompt_text"
+        current_prompt="$RENDERED_PROMPT"
         repair_loops=0
-        total_opencode_ms=0
-        initial_opencode_ms=0
-        repair_opencode_ms=0
+        total_agent_ms=0
+        initial_agent_ms=0
+        repair_agent_ms=0
         total_build_ms=0
         total_base_test_ms=0
         total_feature_test_ms=0
-        opencode_permission_rejected=false
+        agent_isolation_rejected=false
         initial_success=false
         public_validation_success=false
         success_loop_json=null
@@ -1324,14 +1343,14 @@ PY
         # source itself -- so the attempt can have real public-test feedback
         # even though the agent never finished. These record which of those two
         # timeouts happened, and are never used to erase the timeout itself:
-        # opencode_exit_code stays 124 and timeout_enforced stays true either
+        # agent_exit_code stays 124 and timeout_enforced stays true either
         # way.
         initial_session_completed=false
-        # opencode_exit_code records the LAST session, so after a successful
+        # agent_exit_code records the LAST process, so after a successful
         # repair it reads 0 and the initial timeout would survive only inside
         # loops[0]. Kept at the top level too, so "this candidate came out of a
         # session that ran out of time" is never lost to a later success.
-        initial_opencode_exit=""
+        initial_agent_exit=""
         candidate_available_after_initial_session=false
         candidate_available_after_timeout=false
         validation_completed_after_timeout=false
@@ -1351,22 +1370,22 @@ PY
                 repair_loops=$((repair_loops + 1))
             fi
 
-            read -r opencode_exit opencode_ms invocation_permission_rejected < <(
-                run_opencode \
-                    "$attempt_dir/opencode.log" \
+            read -r agent_exit agent_ms invocation_isolation_rejected < <(
+                run_aider \
+                    "$attempt_dir/aider.log" \
                     "$workdir" \
                     "$current_prompt" \
                     "$validation_loop" \
                     "$invocation_kind"
             )
-            total_opencode_ms=$((total_opencode_ms + opencode_ms))
+            total_agent_ms=$((total_agent_ms + agent_ms))
             if [[ "$validation_loop" -eq 0 ]]; then
-                initial_opencode_ms="$opencode_ms"
+                initial_agent_ms="$agent_ms"
             else
-                repair_opencode_ms=$((repair_opencode_ms + opencode_ms))
+                repair_agent_ms=$((repair_agent_ms + agent_ms))
             fi
-            if [[ "$invocation_permission_rejected" == true ]]; then
-                opencode_permission_rejected=true
+            if [[ "$invocation_isolation_rejected" == true ]]; then
+                agent_isolation_rejected=true
             fi
 
             # Did this session leave a source behind? A timeout is only fatal
@@ -1381,14 +1400,14 @@ PY
                 invocation_candidate_present=true
             fi
             invocation_timed_out=false
-            if [[ "$opencode_exit" -eq 124 ]]; then
+            if [[ "$agent_exit" -eq 124 ]]; then
                 invocation_timed_out=true
             fi
             if [[ "$validation_loop" -eq 0 ]]; then
-                initial_opencode_exit="$opencode_exit"
+                initial_agent_exit="$agent_exit"
                 candidate_available_after_initial_session="$invocation_candidate_present"
-                if [[ "$opencode_exit" -eq 0 &&
-                      "$invocation_permission_rejected" == false ]]; then
+                if [[ "$agent_exit" -eq 0 &&
+                      "$invocation_isolation_rejected" == false ]]; then
                     initial_session_completed=true
                 fi
                 if [[ "$invocation_timed_out" == true &&
@@ -1398,7 +1417,7 @@ PY
             fi
 
             invocation_agent_execution_failed=false
-            if [[ "$invocation_permission_rejected" == true ]]; then
+            if [[ "$invocation_isolation_rejected" == true ]]; then
                 # A rejected permission means the sandbox boundary held, not
                 # that the model produced work. Unchanged.
                 invocation_agent_execution_failed=true
@@ -1413,7 +1432,7 @@ PY
                 # short, so reliability analysis can tell this apart from a
                 # session that finished on its own.
                 :
-            elif [[ "$opencode_exit" -ne 0 ]]; then
+            elif [[ "$agent_exit" -ne 0 ]]; then
                 invocation_agent_execution_failed=true
                 agent_execution_failed=true
                 if [[ "$invocation_timed_out" == true ]]; then
@@ -1421,7 +1440,7 @@ PY
                     # exists, so there is nothing to repair.
                     agent_execution_failure_stage_json='"timeout"'
                 else
-                    agent_execution_failure_stage_json='"opencode"'
+                    agent_execution_failure_stage_json='"aider"'
                 fi
             fi
 
@@ -1473,9 +1492,9 @@ PY
 
             loop_records+=("$(make_loop_record \
                 "$validation_loop" "$loop_kind" \
-                "$opencode_exit" "$invocation_permission_rejected" \
+                "$agent_exit" "$invocation_isolation_rejected" \
                 "$build_exit" "$base_test_exit" "$feature_test_exit" \
-                "$opencode_ms" "$build_ms" "$base_test_ms" \
+                "$agent_ms" "$build_ms" "$base_test_ms" \
                 "$feature_test_ms" "$validation_success" "$source_sha")")
 
             printf '    loop %s: build=%s base=%s checkpoint=%s\n' \
@@ -1551,7 +1570,7 @@ PY
                 stop_reason="repair_prompt_failed"
                 break
             fi
-            current_prompt="$(cat "$repair_prompt_file")"
+            current_prompt="$repair_prompt_file"
         done
         # ---- end loop -----------------------------------------------------
 
@@ -1613,7 +1632,7 @@ PY
             run_final_command "$attempt_dir/extra-tests.log" "$EXTRA_TEST_CMD"
         )
 
-        total_ms=$((total_opencode_ms + total_build_ms + total_base_test_ms + total_feature_test_ms + extra_test_ms))
+        total_ms=$((total_agent_ms + total_build_ms + total_base_test_ms + total_feature_test_ms + extra_test_ms))
 
         # A failing candidate is an experimental result, not a runner error, so
         # it is recorded in metadata without affecting the exit status. Only
@@ -1624,19 +1643,6 @@ PY
               "$extra_test_exit" -ne 0 ]]; then
             overall_success=false
         fi
-
-        # Pull token counts, per-step latency, tool usage and reasoning volume
-        # out of OpenCode's own database. `opencode run` prints none of it, and
-        # the sessions are keyed by working directory, so this has to happen
-        # before the prune renames nothing but while the path is still known.
-        "$PYTHON_BIN" "$STATS_TOOL" \
-            --workdir "$workdir" \
-            --output-dir "$attempt_dir" \
-            --model "$MODEL" \
-            --temperature "$temperature" \
-            --attempt "$attempt_id" \
-            --since-ms "$attempt_started_ms" ||
-            warn "opencode stats extraction failed for $attempt_id"
 
         # Flatten the sources, record any test tampering, drop the workdir.
         capture_args=(
@@ -1682,31 +1688,43 @@ PY
             schema_version 2 \
             run_id "$attempt_id" \
             attempt_number "$attempt_number" \
+            agent_backend aider \
+            aider_version "__STR__:$AIDER_VERSION" \
+            architect_model "$MODEL" \
+            editor_model "$EDITOR_MODEL" \
+            architect_mode true \
             model "$MODEL" \
             model_provenance "__JSON__:${MODEL_PROVENANCE_JSON:-null}" \
             temperature "$temperature" \
             top_p "$(optional_number "$TOP_P")" \
             sampling_seed "$(optional_number "$SAMPLING_SEED")" \
             max_tokens "$(optional_number "$MAX_TOKENS")" \
-            agent "$AGENT" \
+            architect_sampling "__JSON__:$("$PYTHON_BIN" -c 'import json,sys; s=json.loads(sys.argv[1]); print(json.dumps(s[0]["extra_params"],separators=(",",":")))' "$AIDER_MODEL_SETTINGS_JSON")" \
+            editor_sampling "__JSON__:$("$PYTHON_BIN" -c 'import json,sys; s=json.loads(sys.argv[1]); print(json.dumps(s[1]["extra_params"],separators=(",",":")))' "$AIDER_MODEL_SETTINGS_JSON")" \
+            editor_edit_format "$EDITOR_EDIT_FORMAT" \
+            aider_model_settings "__JSON__:$AIDER_MODEL_SETTINGS_JSON" \
+            aider_model_settings_sha256 "$AIDER_MODEL_SETTINGS_SHA256" \
+            remote_base_url "$([[ -n "$REMOTE_BASE_URL" ]] && printf '__STR__:%s' "$REMOTE_BASE_URL" || printf '__JSON__:null')" \
+            remote_api_key_env "$([[ -n "$REMOTE_API_KEY_ENV" ]] && printf '__STR__:%s' "$REMOTE_API_KEY_ENV" || printf '__JSON__:null')" \
+            remote_transport "$REMOTE_TRANSPORT" \
             source_path "$SOURCE_FLAT" \
             source_workdir_path "$SOURCE_PATH" \
             source_mode "$SOURCE_MODE" \
             max_loops "$MAX_LOOPS" \
-            opencode_exit_code "$opencode_exit" \
-            opencode_permission_rejected "$opencode_permission_rejected" \
+            agent_exit_code "$agent_exit" \
+            agent_isolation_rejected "$agent_isolation_rejected" \
             build_exit_code "$build_exit" \
             base_test_exit_code "$base_test_exit" \
             feature_test_exit_code "$feature_test_exit" \
             extra_test_exit_code "$extra_test_exit" \
-            opencode_runtime_ms "$total_opencode_ms" \
+            agent_runtime_ms "$total_agent_ms" \
             build_runtime_ms "$total_build_ms" \
             base_test_runtime_ms "$total_base_test_ms" \
             feature_test_runtime_ms "$total_feature_test_ms" \
             extra_test_runtime_ms "$extra_test_ms" \
-            initial_opencode_runtime_ms "$initial_opencode_ms" \
-            repair_opencode_runtime_ms "$repair_opencode_ms" \
-            total_opencode_runtime_ms "$total_opencode_ms" \
+            initial_agent_runtime_ms "$initial_agent_ms" \
+            repair_agent_runtime_ms "$repair_agent_ms" \
+            total_agent_runtime_ms "$total_agent_ms" \
             total_runtime_ms "$total_ms" \
             initial_success "$initial_success" \
             repair_loops "$repair_loops" \
@@ -1721,7 +1739,7 @@ PY
             agent_execution_failure "$agent_execution_failed" \
             agent_execution_failure_stage "__JSON__:$agent_execution_failure_stage_json" \
             initial_session_completed "$initial_session_completed" \
-            initial_opencode_exit_code "$(optional_number "$initial_opencode_exit")" \
+            initial_agent_exit_code "$(optional_number "$initial_agent_exit")" \
             candidate_available_after_initial_session "$candidate_available_after_initial_session" \
             candidate_available_after_timeout "$candidate_available_after_timeout" \
             validation_completed_after_timeout "$validation_completed_after_timeout" \

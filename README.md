@@ -128,10 +128,19 @@ export PYTHON_BIN="$PWD/ac_venv/bin/python"
 
 ### External tools
 
+Install Aider with its official installer (do this separately on every host
+that will execute generation, including the vessel):
+
+```bash
+python3 -m pip install aider-install
+aider-install
+aider --version
+```
+
 | Tool | Required for | Notes |
 |---|---|---|
-| `opencode` | generation | Must resolve by **name** on `PATH`; the runner checks `command -v` |
-| `git` | generation | Also used per attempt to fence the agent into its working directory |
+| `aider` | generation | Installed with `aider-install`; override the executable with `AIDER_BIN` |
+| `git` | generation | Used only to resolve controller inputs; Aider runs with Git disabled |
 | `timeout` | generation | Bounds each agent session. macOS ships none; without it the runner warns, runs unbounded, and records `timeout_enforced: false` |
 | `clang` | architecture measurement | Ships with the Xcode command line tools |
 | `gumtree` | architecture measurement | Java program; without it `gumtree_available` is false and clustering is incomplete |
@@ -174,28 +183,34 @@ chmod +x ~/.local/bin/gumtree
 Confirm everything resolves before a run:
 
 ```bash
-for t in opencode git timeout clang gumtree flawfinder; do printf '%-12s %s\n' "$t" "$(command -v $t || echo MISSING)"; done
+for t in aider git timeout clang gumtree flawfinder; do printf '%-12s %s\n' "$t" "$(command -v $t || echo MISSING)"; done
 ```
 
 ### Model backend
 
-Point the runner at any OpenAI-compatible endpoint with `--remote-base-url`;
-the provider is injected for that run only, leaving `~/.config/opencode` alone.
-For a local Ollama server:
+The formal configuration is self-contained. Each attempt gets an isolated home,
+empty explicit Aider config and env files, and a generated model-settings file;
+the runner does not inherit `~/.aider.conf.yml`, `~/.env`, or
+`~/.aider.model.settings.yml`.
+
+For a native Ollama endpoint, use Aider's recommended `ollama_chat/` provider
+and pass the Ollama **root** URL (not `/v1`):
 
 ```bash
-export OPENCODE_REMOTE_API_KEY=ollama   # required to be non-empty; Ollama ignores it
-
 bash scripts/run_lineage_experiment.sh \
     --utility grep \
-    --model ollama/qwen3-coder-next:latest \
-    --remote-base-url http://localhost:11434/v1 \
+    --model ollama_chat/qwen3.8:27b \
+    --editor-model ollama_chat/qwen3-coder-next:latest \
+    --remote-base-url http://localhost:11434 \
     ...
 ```
 
-`--remote-api-key-env` names the variable holding that endpoint's key and
-defaults to `OPENCODE_REMOTE_API_KEY`, so the export above is enough; the runner
-refuses to start if the named variable is unset.
+If the vessel exposes only its existing OpenAI-compatible gateway, use matching
+`openai/` model names and its `/v1` URL instead. `--remote-api-key-env` may name
+an exported credential; when omitted for an unauthenticated compatibility
+gateway, the runner supplies the conventional dummy key `ollama`. The old
+`school-ollama/` prefix was an OpenCode provider alias and is not an Aider model
+provider name.
 
 ## Running a lineage
 
@@ -204,7 +219,8 @@ refuses to start if the named variable is unset.
 ```bash
 bash scripts/run_lineage_experiment.sh \
     --utility sort \
-    --model school-ollama/qwen3-coder-next:latest \
+    --model ollama_chat/qwen3.8:27b \
+    --editor-model ollama_chat/qwen3-coder-next:latest \
     --temperature 0.2 \
     --lineages 10 \
     --max-loops 3
@@ -220,7 +236,7 @@ lineages already on disk, `--output-dir DIR` relocates the results, `--force`
 reruns stages that are already complete, `--print-plan` shows the resolved stage
 plan, `--dry-run` prints every `run_experiment.sh` command without running one
 or touching the filesystem, and `--list-utilities` lists the manifests. Sandbox
-and backend options (`--agent`, `--timeout`, `--keep-workdir`,
+and backend options (`--editor-model`, `--timeout`, `--keep-workdir`,
 `--allow-no-progress`, `--repair-prompt`, `--remote-base-url`,
 `--remote-api-key-env`) pass straight through to the stage runner.
 
@@ -236,11 +252,10 @@ than mixing conditions.
 
 Two spellings are refused outright rather than accepted and quietly ignored:
 
-* **`--top-k`** — the OpenCode provider speaks OpenAI-compatible
-  `/v1/chat/completions`, whose schema has no `top_k`; Ollama parses a fixed
-  field set there and drops the rest. Reaching its sampler would need the native
-  `/api/chat` options object. A flag that is accepted, recorded, and then
-  ignored by the server is worse than no flag.
+* **`--top-k`** — native `ollama_chat` can carry it, but transport support alone
+  is not enough to add a new experimental control. It remains rejected until a
+  separate transport-level verification establishes what the selected vessel
+  endpoint forwards to Ollama.
   Model-definition-level top-k remains valid: create a derived Ollama model and
   record it explicitly with metadata-only `--model-provenance-json`, for example
   `'{"base_model":"qwen3-coder-next:latest","top_k":50,"top_k_control":"ollama_modelfile"}'`.
@@ -531,7 +546,7 @@ python3 scripts/measure_execution_consistency.py \
 This rebuilds each selected population member and re-judges it twice — once against
 the checkpoint's visible corpus and once against the held-out corpus the agent
 never saw — and summarizes the resulting verdict vectors as behavioral
-fingerprints. It is strictly post-hoc and read-only: it never re-runs OpenCode,
+fingerprints. It is strictly post-hoc and read-only: it never re-runs Aider,
 never enters the repair loop, and never turns a pass into a fail.
 
 **It requires the previous steps to have run.** It does not re-derive the
@@ -575,7 +590,7 @@ reimplements.
 `scripts/run_experiment.sh` runs a **single stage** — one prompt, one source
 mode, one validation command, with the generate/validate/repair loop. The
 lineage controller calls it once per checkpoint and adds nothing to it, so the
-isolated working directory, the OpenCode permissions, the source modes, the seed
+isolated working directory, the Aider file boundary, the source modes, the seed
 files, the repair loop, the build and test validation, the candidate capture and
 the infrastructure-failure metadata all live here.
 
@@ -601,12 +616,30 @@ tampering is detected and recorded in `metadata.json`.
 
 ### Generation, validation, and continuation
 
-After each OpenCode session the controller independently runs `--build-cmd`,
+The generation path is:
+
+```text
+Qwen3.8-27B
+    ↓
+Aider architect/reasoning stage
+    ↓
+qwen3-coder-next
+    ↓
+Aider editor stage
+    ↓
+candidate source
+    ↓
+controller-owned build/tests
+```
+
+The editor model is Aider's editing phase, not a separate autonomous subagent.
+After each one-shot Aider process the controller independently runs `--build-cmd`,
 `--base-test-cmd`, and `--feature-test-cmd` inside the working directory. If any
 of them fails, it renders a continuation prompt from
-`prompts/repair_continuation_template.md` and starts a **new** OpenCode session
+`prompts/repair_continuation_template.md` and starts a **new** Aider process
 against the **same** working directory, so the model picks up where the previous
-session left off. This repeats up to `--max-loops` times.
+process left off. This repeats up to `--max-loops` times. Neither Aider model
+runs validation or decides whether repair occurs.
 
 The continuation prompt quotes the original task, states where the source and
 the visible tests live, and reports what failed as a compact list of failing
@@ -630,26 +663,20 @@ inside the sandbox — exactly where held-out material must never be.
 
 ### Agent sandboxing
 
-Each attempt runs in its own working directory containing only the prompt, the
-`--test-dir` directories and the `--seed-file` inputs, and the agent must not be
-able to reach anything else — not the repository it is nested inside, and not
-another attempt. No Git worktrees are involved.
+Each attempt runs in its own plain working directory containing only the prompt,
+the checkpoint-specific `--test-dir` bundle and the `--seed-file` inputs. Aider
+starts **inside** that directory with `--no-git`, `--no-gitignore`, a zero-token
+repository map and a Git discovery ceiling at the directory's parent. It never
+initializes a repository and cannot scan the parent checkout for a repo map.
 
-OpenCode enforces this through its `external_directory` permission, which the
-runner sets to deny everything except the working directory. That rule alone is
-not enough: OpenCode decides whether a path *is* external by comparing it
-against the session's project root, which it finds by walking up from `--dir`
-looking for a `.git` directory. A working directory nested inside this
-repository therefore inherits the repository as its root, every repository path
-counts as internal, and the deny rule is never consulted. Observed directly: a
-session asked to create `src/new_mkdir/new_mkdir.c` wrote it into the real
-checkout.
-
-The runner closes this by running `git init` in each working directory before
-the first invocation, which moves the project root onto the working directory
-itself, and then verifying the boundary took effect before spending any model
-time. The repository is a marker only — nothing is ever committed to it, and it
-is removed during cleanup along with the rest of the working directory.
+The source path is the sole `--file` editable path. Visible text files already
+copied into the attempt are explicit `--read` context; binary/compressed corpus
+files remain available only to controller validation. Later checkpoint tests,
+hidden tests, generators, specification models and every file outside the
+attempt are absent from model context. Shell-command suggestions, automatic
+linting and automatic testing are disabled, and stdin is closed. The harness
+does not use blanket `--yes-always`; `--auto-accept-architect` only transfers
+Aider's architect proposal into its configured editor phase.
 
 ### Visible tests are built per checkpoint, not copied
 
@@ -748,28 +775,23 @@ They never enumerate a later checkpoint's flags.
 
 ### Session statistics
 
-`opencode run` reports no usage figures, so after each attempt the runner reads
-them out of OpenCode's own database
-(`~/.local/share/opencode/opencode.db`) and writes them into the attempt
-directory before the working directory is pruned:
+Aider output is retained in `attempt-*/aider.log`. Controller metadata records
+the backend exit code and wall time for every initial/repair invocation, plus
+the exact architect/editor model pair and generated model settings. Aider does
+not expose a stable local database equivalent to the previous backend's session
+store, so new runs do not manufacture token-usage fields that cannot be
+reliably recovered.
+
+Legacy OpenCode attempts remain unchanged and analyzable. Their historical
+session files retain their original names:
 
 ```text
 attempt-001/opencode-stats.json   one record per session
 attempt-001/opencode-stats.txt    the same, formatted for reading
 ```
 
-Sessions are matched by working directory and floored at the attempt's start
-time, so a re-run under `--force` does not inherit the abandoned run's numbers.
-Each validation loop is a separate session, reported in order as loop 0 (the
-initial generation) onward, with input/output/reasoning/cache token counts, cost,
-wall and model time, per-step latency, finish reasons, tool-call and tool-error
-counts by tool, and reasoning-block volume. `scripts/opencode_stats.py` can also
-be run by hand against any working directory that still has sessions on record.
-
-Note that token *counts* depend on the backend: Ollama's OpenAI-compatible
-endpoint does not report reasoning tokens separately, so `reasoning tokens`
-reads 0 there even for a reasoning model. Reasoning blocks and characters are
-counted from the transcript and remain accurate.
+`scripts/opencode_stats.py` is retained only as a legacy reader; the active
+runner never calls it.
 
 ### Working directory cleanup
 
@@ -800,8 +822,8 @@ are never touched.
 ### Failure classification
 
 Each attempt distinguishes infrastructure attrition, invocation completion,
-candidate availability, artifact validation, and workflow success. Permission
-rejection and non-salvageable OpenCode errors are agent-execution failures. A
+candidate availability, artifact validation, and workflow success. A
+non-salvageable Aider error is an agent-execution failure. A
 timeout that leaves a candidate remains an incomplete invocation, but the
 controller may validate and repair that artifact and the workflow may succeed.
 Build, public-test, and
@@ -868,6 +890,7 @@ agentic_cyber/
 ├── scripts/
 │   ├── analysis/                           # Canonical metric and validation modules
 │   ├── analysis-requirements.txt
+│   ├── aider_settings.py                   # Per-attempt architect/editor settings
 │   ├── analyze_experiment.py               # Sole per-population analysis entry point
 │   ├── analyze_lineages.py                 # Lineage aggregation; delegates diversity
 │   ├── capture_candidate.py                # Flat capture, integrity check, cleanup
@@ -877,7 +900,7 @@ agentic_cyber/
 │   ├── lineage_plan.py                     # Manifest -> stage plan + config fingerprint
 │   ├── lineage_state.py                    # Atomic lineage.json state transitions
 │   ├── measure_execution_consistency.py    # Behavioral fingerprints and convergence
-│   ├── opencode_stats.py                   # Per-session token, timing and tool stats
+│   ├── opencode_stats.py                   # Legacy OpenCode session-stat reader
 │   ├── prompt_render.py                    # Single expansion point for that notice
 │   ├── repair_prompt.py                    # Continuation prompt renderer
 │   ├── run_experiment.sh                   # Single-stage experiment runner

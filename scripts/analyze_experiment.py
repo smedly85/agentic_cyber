@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Analyze repeated OpenCode maintenance runs.
+"""Analyze repeated coding-backend maintenance runs.
 
 This is the unified analyzer used by ``run_experiment.sh``.  It keeps the
 original command-line contract (especially ``--cluster-threshold``), while
@@ -784,9 +784,26 @@ def normalize_repair_metadata(
     repair_loops = normalized.get("repair_loops", 0)
     if not isinstance(repair_loops, int) or isinstance(repair_loops, bool):
         repair_loops = 0
+    backend = str(
+        normalized.get("agent_backend")
+        or ("opencode" if any(key.startswith("opencode_") for key in normalized) else "unknown")
+    )
+    agent_exit = normalized.get(
+        "agent_exit_code", normalized.get("opencode_exit_code")
+    )
+    initial_agent_exit = normalized.get(
+        "initial_agent_exit_code",
+        normalized.get("initial_opencode_exit_code", agent_exit),
+    )
+    isolation_rejected = bool(
+        normalized.get(
+            "agent_isolation_rejected",
+            normalized.get("opencode_permission_rejected", False),
+        )
+    )
     setup_failed_before_invocation = (
         normalized.get("setup_exit_code") not in (None, 0)
-        and normalized.get("opencode_exit_code") is None
+        and agent_exit is None
     )
     default_invocations = 0 if setup_failed_before_invocation else repair_loops + 1
     llm_invocations = normalized.get("llm_invocations", default_invocations)
@@ -800,34 +817,40 @@ def normalize_repair_metadata(
     if not isinstance(success_loop, int) or isinstance(success_loop, bool):
         success_loop = 0 if initial_success else None
 
-    old_opencode_runtime = normalized.get("opencode_runtime_ms", 0)
-    if not isinstance(old_opencode_runtime, (int, float)) or isinstance(
-        old_opencode_runtime, bool
-    ):
-        old_opencode_runtime = 0
-    initial_runtime = normalized.get(
-        "initial_opencode_runtime_ms",
-        old_opencode_runtime if repair_loops == 0 else 0,
+    old_agent_runtime = normalized.get(
+        "agent_runtime_ms", normalized.get("opencode_runtime_ms", 0)
     )
-    repair_runtime = normalized.get("repair_opencode_runtime_ms", 0)
+    if not isinstance(old_agent_runtime, (int, float)) or isinstance(
+        old_agent_runtime, bool
+    ):
+        old_agent_runtime = 0
+    initial_runtime = normalized.get(
+        "initial_agent_runtime_ms",
+        normalized.get(
+            "initial_opencode_runtime_ms",
+            old_agent_runtime if repair_loops == 0 else 0,
+        ),
+    )
+    repair_runtime = normalized.get(
+        "repair_agent_runtime_ms",
+        normalized.get("repair_opencode_runtime_ms", 0),
+    )
     total_runtime = normalized.get(
-        "total_opencode_runtime_ms",
-        old_opencode_runtime,
+        "total_agent_runtime_ms",
+        normalized.get("total_opencode_runtime_ms", old_agent_runtime),
     )
 
     explicit_infrastructure = normalized.get("infrastructure_failure")
     explicit_infrastructure_stage = normalized.get("infrastructure_failure_stage")
     explicit_agent_failure = normalized.get("agent_execution_failure")
     explicit_agent_stage = normalized.get("agent_execution_failure_stage")
-    permission_rejected = bool(normalized.get("opencode_permission_rejected"))
-    opencode_exit = normalized.get("opencode_exit_code")
 
     # Only a high-confidence failure before invocation is infrastructure.
     infrastructure_failure = setup_failed_before_invocation or (
         explicit_infrastructure is True
         and explicit_infrastructure_stage == "setup"
         and llm_invocations == 0
-        and opencode_exit is None
+        and agent_exit is None
     )
     infrastructure_stage = "setup" if infrastructure_failure else None
 
@@ -839,27 +862,27 @@ def normalize_repair_metadata(
     # stays false, and initial_agent_invocation_status still reports
     # "timeout_with_candidate", so a candidate-producing timeout is never
     # counted as a clean run.
-    candidate_producing_timeout = opencode_exit == 124 and bool(
+    candidate_producing_timeout = agent_exit == 124 and bool(
         normalized.get("candidate_available_after_timeout")
     )
     agent_execution_failure = (
         not infrastructure_failure
         and not candidate_producing_timeout
         and (
-            permission_rejected
-            or opencode_exit not in (None, 0)
+            isolation_rejected
+            or agent_exit not in (None, 0)
             or explicit_agent_failure is True
         )
     )
     if agent_execution_failure:
-        if permission_rejected:
+        if isolation_rejected:
             agent_execution_stage = "permission"
-        elif opencode_exit == 124:
+        elif agent_exit == 124:
             agent_execution_stage = "timeout"
-        elif explicit_agent_stage in {"timeout", "opencode", "permission"}:
+        elif explicit_agent_stage in {"timeout", "opencode", "aider", "permission"}:
             agent_execution_stage = str(explicit_agent_stage)
         else:
-            agent_execution_stage = "opencode"
+            agent_execution_stage = backend if backend != "unknown" else "agent"
     else:
         agent_execution_stage = None
 
@@ -895,9 +918,13 @@ def normalize_repair_metadata(
                 )
             ),
             "public_validation_success": public_success,
-            "initial_opencode_runtime_ms": initial_runtime,
-            "repair_opencode_runtime_ms": repair_runtime,
-            "total_opencode_runtime_ms": total_runtime,
+            "agent_backend": backend,
+            "agent_exit_code": agent_exit,
+            "initial_agent_exit_code": initial_agent_exit,
+            "agent_isolation_rejected": isolation_rejected,
+            "initial_agent_runtime_ms": initial_runtime,
+            "repair_agent_runtime_ms": repair_runtime,
+            "total_agent_runtime_ms": total_runtime,
             "loops": normalized.get("loops", []),
             "infrastructure_failure": infrastructure_failure,
             "infrastructure_failure_stage": infrastructure_stage,
@@ -912,10 +939,10 @@ def normalize_repair_metadata(
             "agent_invocation_completed": (
                 bool(normalized.get("initial_session_completed"))
                 if isinstance(normalized.get("initial_session_completed"), bool)
-                else normalized.get("initial_opencode_exit_code", opencode_exit) == 0
+                else initial_agent_exit == 0
             ),
             "agent_invocation_timed_out": (
-                normalized.get("initial_opencode_exit_code", opencode_exit) == 124
+                initial_agent_exit == 124
             ),
             "candidate_available_after_timeout": bool(
                 normalized.get("candidate_available_after_timeout")
@@ -929,6 +956,16 @@ def normalize_repair_metadata(
             ),
         }
     )
+    # Preserve the established normalized columns only for legacy records.
+    # New metadata stays backend-neutral on disk and in new analysis rows.
+    if backend == "opencode":
+        normalized.update(
+            {
+                "initial_opencode_runtime_ms": initial_runtime,
+                "repair_opencode_runtime_ms": repair_runtime,
+                "total_opencode_runtime_ms": total_runtime,
+            }
+        )
     return normalized
 
 
@@ -941,6 +978,8 @@ REPAIR_ELIGIBLE_INITIAL_STATUSES = frozenset({"completed", "timeout_with_candida
 
 def initial_agent_invocation_status(row: Mapping[str, Any]) -> str:
     """Classify whether the initial agent invocation completed confidently."""
+    backend = str(row.get("agent_backend") or "opencode")
+    backend_error = f"{backend}_error"
     if bool(row.get("infrastructure_failure")):
         return "infrastructure_failure"
 
@@ -950,16 +989,21 @@ def initial_agent_invocation_status(row: Mapping[str, Any]) -> str:
     if isinstance(loops, Sequence) and not isinstance(loops, (str, bytes)) and loops:
         initial = loops[0]
         if isinstance(initial, Mapping):
-            if bool(initial.get("opencode_permission_rejected")):
+            if bool(initial.get(
+                "agent_isolation_rejected",
+                initial.get("opencode_permission_rejected", False),
+            )):
                 return "permission_rejection"
-            exit_code = initial.get("opencode_exit_code")
+            exit_code = initial.get(
+                "agent_exit_code", initial.get("opencode_exit_code")
+            )
             if isinstance(exit_code, (int, float)) and not isinstance(exit_code, bool):
                 if exit_code == 0:
                     return "completed"
                 if exit_code == 124:
                     return ("timeout_with_candidate" if candidate_after_timeout
                             else "timeout")
-                return "opencode_error"
+                return backend_error
         # Reaching a later invocation proves that the initial invocation
         # completed and produced validation feedback.
         if len(loops) > 1:
@@ -971,14 +1015,16 @@ def initial_agent_invocation_status(row: Mapping[str, Any]) -> str:
     # LAST session's, so after a successful repair it reads 0 -- this is what
     # keeps a repaired candidate-producing timeout from being scored as a clean
     # first run.
-    initial_exit = row.get("initial_opencode_exit_code")
+    initial_exit = row.get(
+        "initial_agent_exit_code", row.get("initial_opencode_exit_code")
+    )
     if isinstance(initial_exit, (int, float)) and not isinstance(initial_exit, bool):
         if initial_exit == 0:
             return "completed"
         if initial_exit == 124:
             return ("timeout_with_candidate" if candidate_after_timeout
                     else "timeout")
-        return "opencode_error"
+        return backend_error
 
     repair_loops = row.get("repair_loops")
     if (
@@ -988,23 +1034,25 @@ def initial_agent_invocation_status(row: Mapping[str, Any]) -> str:
     ):
         return "completed"
 
-    if bool(row.get("opencode_permission_rejected")):
+    if bool(row.get(
+        "agent_isolation_rejected", row.get("opencode_permission_rejected", False)
+    )):
         return "permission_rejection"
-    exit_code = row.get("opencode_exit_code")
+    exit_code = row.get("agent_exit_code", row.get("opencode_exit_code"))
     if isinstance(exit_code, (int, float)) and not isinstance(exit_code, bool):
         if exit_code == 0:
             return "completed"
         if exit_code == 124:
             return ("timeout_with_candidate" if candidate_after_timeout
                     else "timeout")
-        return "opencode_error"
+        return backend_error
     if bool(row.get("agent_execution_failure")):
         stage = row.get("agent_execution_failure_stage")
         if stage == "permission":
             return "permission_rejection"
         if stage == "timeout":
             return "timeout"
-        return "opencode_error"
+        return backend_error
     return "unknown_initial_invocation"
 
 
@@ -1063,7 +1111,12 @@ def build_repair_summary(
         if status not in REPAIR_ELIGIBLE_INITIAL_STATUSES
     )
     repair_runtimes = [
-        float(row.get("repair_opencode_runtime_ms", 0)) / 1000.0
+        float(
+            row.get(
+                "repair_agent_runtime_ms",
+                row.get("repair_opencode_runtime_ms", 0),
+            )
+        ) / 1000.0
         for row in valid_rows
     ]
 
@@ -3518,7 +3571,10 @@ def main() -> int:
             base_test = parse_test_log(Path("/nonexistent"))
             feature_test = parse_test_log(attempt / "test.log")
             extra_test = parse_test_log(Path("/nonexistent"))
-        llm_tokens = parse_llm_tokens(attempt / "opencode.log")
+        agent_log = attempt / (
+            "aider.log" if (attempt / "aider.log").is_file() else "opencode.log"
+        )
+        llm_tokens = parse_llm_tokens(agent_log)
 
         complete_architecture_measurement = all(
             [
@@ -3582,8 +3638,9 @@ def main() -> int:
             "llm_reasoning_tokens": llm_tokens["reasoning_tokens"],
             "llm_cache_read_tokens": llm_tokens["cache_read_tokens"],
             "llm_total_tokens": llm_tokens["total_tokens"],
-            "opencode_permission_rejected": metadata.get(
-                "opencode_permission_rejected", False
+            "agent_isolation_rejected": metadata.get(
+                "agent_isolation_rejected",
+                metadata.get("opencode_permission_rejected", False),
             ),
             "clang_available": candidate.clang_error is None,
             "tree_sitter_available": candidate.tree_sitter_error is None,
@@ -4259,7 +4316,7 @@ def main() -> int:
     ]
     stage_success_ratios: dict[str, float | None] = {}
     for key in (
-        "opencode_exit_code",
+        "agent_exit_code",
         "build_exit_code",
         "base_test_exit_code",
         "feature_test_exit_code",
@@ -4275,6 +4332,8 @@ def main() -> int:
             if available
             else None
         )
+    if experiment_metadata.get("agent_backend") in (None, "opencode"):
+        stage_success_ratios["opencode"] = stage_success_ratios.get("agent")
     if is_lineage_population_view:
         stage_success_ratios = {
             key: None for key in stage_success_ratios
@@ -4289,6 +4348,13 @@ def main() -> int:
         "experiment": str(experiment),
         "output_directory": str(output_dir),
         "model": experiment_metadata.get("model"),
+        "agent_backend": experiment_metadata.get("agent_backend", "opencode"),
+        "aider_version": experiment_metadata.get("aider_version"),
+        "architect_model": experiment_metadata.get(
+            "architect_model", experiment_metadata.get("model")
+        ),
+        "editor_model": experiment_metadata.get("editor_model"),
+        "architect_mode": experiment_metadata.get("architect_mode", False),
         "model_provenance": experiment_metadata.get("model_provenance"),
         "temperature": experiment_metadata.get("temperature"),
         "runs_analyzed": n,

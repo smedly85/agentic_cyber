@@ -12,7 +12,7 @@ not silently mix stage configurations, and comparing one hash is both cheaper
 and harder to get wrong than comparing a dozen fields: the fingerprint covers
 the resolved manifest, the *contents* of every checkpoint prompt, the contents
 of the judge script, each checkpoint's cumulative implemented flags, each
-checkpoint's visible test bundle, the model/agent/repair settings the stages run
+checkpoint's visible test bundle, the Aider/model-pair/repair settings the stages run
 under, the whole sampling configuration (temperature, top_p, sampling_seed,
 max_tokens), explicit model-definition provenance, and the shared automation notice that is expanded into every
 prompt. The number of lineages is deliberately excluded, so extending an
@@ -38,6 +38,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import prompt_render  # noqa: E402
+import aider_settings  # noqa: E402
 import stage_test_bundle  # noqa: E402
 
 SCHEMA_VERSION = 1
@@ -140,14 +141,35 @@ def resolve_plan(
     utility: str,
     model: str,
     temperature: str,
-    agent: str,
+    agent: str | None,
     max_loops: int,
     timeout_seconds: int,
     top_p: Any = None,
     sampling_seed: Any = None,
     max_tokens: Any = None,
     model_provenance_json: Any = None,
+    editor_model: str = "ollama_chat/qwen3-coder-next:latest",
+    aider_version: str = "unknown",
+    remote_base_url: str = "",
+    remote_api_key_env: str = "",
 ) -> dict[str, Any]:
+    # `agent` remains only as a Python-call compatibility slot for older test
+    # and analysis helpers. It is not emitted, fingerprinted or exposed by the
+    # shell CLIs; Aider always uses architect mode.
+    del agent
+    architect_model = model
+    if not remote_base_url:
+        remote_transport = "default"
+    elif architect_model.startswith("ollama_chat/") and editor_model.startswith(
+        "ollama_chat/"
+    ):
+        remote_transport = "ollama_native"
+    elif architect_model.startswith("openai/") and editor_model.startswith("openai/"):
+        remote_transport = "openai_compatible"
+    else:
+        raise ManifestError(
+            "remote model pair must use matching ollama_chat/* or openai/* prefixes"
+        )
     manifest_path, manifest = load_manifest(repo, utility)
 
     schema_version = manifest.get("schema_version")
@@ -361,7 +383,13 @@ def resolve_plan(
         "base_test_command": base_test_command,
         "extra_test_command": extra_test_command,
         "checkpoints": resolved,
-        "model": model,
+        "agent_backend": "aider",
+        "aider_version": aider_version,
+        "architect_model": architect_model,
+        "editor_model": editor_model,
+        "architect_mode": True,
+        # Kept as an architect alias for generic/legacy analysis readers.
+        "model": architect_model,
         # Explicit metadata only. In particular, top_k is never inferred from
         # a derived Ollama model alias and is not sent as a request parameter.
         "model_provenance": optional_json_object(
@@ -376,7 +404,27 @@ def resolve_plan(
         "top_p": optional_float(top_p, "top_p"),
         "sampling_seed": optional_int(sampling_seed, "sampling_seed"),
         "max_tokens": optional_int(max_tokens, "max_tokens"),
-        "agent": agent,
+        "editor_temperature": aider_settings.EDITOR_TEMPERATURE,
+        "editor_sampling_seed": aider_settings.EDITOR_SEED,
+        "editor_edit_format": aider_settings.EDITOR_EDIT_FORMAT,
+        # Bundle-only callers resolve checkpoints with an empty model because
+        # they need no inference configuration. Formal shell entry points
+        # require --model before resolving a runnable plan.
+        "aider_model_settings": (
+            aider_settings.build_model_settings(
+                architect_model,
+                editor_model,
+                temperature,
+                top_p=top_p,
+                sampling_seed=sampling_seed,
+                max_tokens=max_tokens,
+            )
+            if architect_model
+            else []
+        ),
+        "remote_base_url": remote_base_url or None,
+        "remote_api_key_env": remote_api_key_env or None,
+        "remote_transport": remote_transport,
         "max_loops": max_loops,
         "timeout_seconds": timeout_seconds,
         # The shared automation notice is expanded into every prompt the model
@@ -399,7 +447,8 @@ def fingerprint(plan: dict[str, Any]) -> str:
     every checkpoint prompt and of the judge script, via their SHA-256; each
     checkpoint's cumulative implemented flags and its resolved judge command;
     each checkpoint's visible test bundle, via its bundle fingerprint; the
-    model, agent, repair budget and per-session timeout the stages run under;
+    Aider version, architect/editor model pair, architect mode, fixed editor
+    sampling, repair budget and per-invocation timeout the stages run under;
     the full sampling configuration (temperature, top_p, sampling_seed,
     max_tokens -- a null among them is itself a condition, meaning the server
     default applied); explicit model-definition provenance such as an Ollama
@@ -458,8 +507,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--repo", type=Path, default=Path("."))
     parser.add_argument("--utility")
     parser.add_argument("--model", default="")
+    parser.add_argument("--editor-model", default="")
+    parser.add_argument("--aider-version", default="unknown")
     parser.add_argument("--temperature", default="0")
-    parser.add_argument("--agent", default="build")
     parser.add_argument("--max-loops", type=int, default=3)
     parser.add_argument("--timeout-seconds", type=int, default=1800)
     # Passed through as strings so "unset" survives the shell as an empty
@@ -468,6 +518,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sampling-seed", default="")
     parser.add_argument("--max-tokens", default="")
     parser.add_argument("--model-provenance-json", default="")
+    parser.add_argument("--remote-base-url", default="")
+    parser.add_argument("--remote-api-key-env", default="")
     parser.add_argument(
         "--emit",
         choices=("plan", "stages", "utilities", "fingerprint"),
@@ -492,13 +544,17 @@ def main(argv: list[str] | None = None) -> int:
         args.utility,
         args.model,
         args.temperature,
-        args.agent,
+        None,
         args.max_loops,
         args.timeout_seconds,
         top_p=args.top_p,
         sampling_seed=args.sampling_seed,
         max_tokens=args.max_tokens,
         model_provenance_json=args.model_provenance_json,
+        editor_model=args.editor_model,
+        aider_version=args.aider_version,
+        remote_base_url=args.remote_base_url,
+        remote_api_key_env=args.remote_api_key_env,
     )
 
     if args.emit == "stages":

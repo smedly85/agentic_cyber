@@ -45,7 +45,7 @@ What it deliberately does not do
     ids. Reimplementing selection here would let definitions drift silently.
 
   * It does not change any outcome. It is strictly post-hoc and read-only with
-    respect to the experiment: it never re-runs OpenCode, never enters the
+    respect to the experiment: it never re-runs the coding backend, never enters the
     repair loop, never rewrites an attempt, and never turns a pass into a fail.
     Its rebuilds happen in a temporary directory that is discarded.
 

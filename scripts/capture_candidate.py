@@ -99,10 +99,9 @@ def capture(
 ) -> dict:
     excluded = [workdir / split_test_dir(spec)[1] for spec in test_dirs]
     excluded.append(workdir / "build")
-    # The runner runs `git init` in the workdir so OpenCode treats it as the
-    # project root and its external_directory deny rules take effect. Nothing
-    # under .git is agent-authored source, and OpenCode's own snapshots live
-    # there, so it never belongs in candidate/.
+    # Legacy OpenCode attempts contain a scratch .git boundary. It is never
+    # agent-authored source; new Aider attempts use --no-git and do not create
+    # it, but retaining the exclusion keeps legacy capture/pruning safe.
     excluded.append(workdir / ".git")
 
     candidate_dir = attempt_dir / "candidate"
@@ -341,11 +340,8 @@ def main() -> int:
         shutil.rmtree(args.workdir)
         pruned = True
     else:
-        # The runner creates an empty repository in the workdir purely to move
-        # OpenCode's project boundary onto it. Dropping the workdir normally
-        # takes it along; when the workdir is kept for inspection the marker is
-        # still scratch, and leaving it makes the kept tree look like a real
-        # checkout.
+        # Remove the scratch boundary from a retained legacy OpenCode workdir.
+        # New Aider workdirs contain no repository marker.
         git_marker = args.workdir / ".git"
         if git_marker.is_dir():
             shutil.rmtree(git_marker)

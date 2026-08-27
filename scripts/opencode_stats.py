@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Extract per-session OpenCode statistics for one attempt.
+"""Extract per-session statistics from a legacy OpenCode attempt.
 
 OpenCode records every session in a SQLite database under its data directory:
 token counts, cost, per-assistant-message timing, reasoning blocks and tool
-calls. `opencode run` prints none of that, so scripts/run_experiment.sh calls
-this after each attempt to pull the numbers into the attempt directory before
-the working directory is pruned.
+calls. Historical OpenCode-era runs called this helper after each attempt. The
+active Aider runner does not call it; this reader remains so unchanged legacy
+artifacts can still be inspected and analyzed.
 
 Sessions are matched by working directory. Each attempt gets a fresh workdir
 and each validation loop is a new session against it, so the sessions for a

@@ -2,7 +2,7 @@
 """A portable subset of GNU coreutils `timeout`.
 
 macOS ships no `timeout`, and Homebrew is not writable on this machine, so
-scripts/run_experiment.sh otherwise runs every OpenCode session unbounded and
+scripts/run_experiment.sh otherwise runs every Aider invocation unbounded and
 records timeout_enforced: false. This implements exactly the invocation that
 script uses:
 
@@ -89,7 +89,7 @@ def main(argv: list[str]) -> int:
 
     try:
         # A new session means the whole process tree can be signalled at once.
-        # OpenCode spawns helpers, and signalling only the direct child would
+        # Aider may spawn helpers, and signalling only the direct child would
         # leave those running and holding the pipe open.
         child = subprocess.Popen(args, start_new_session=True)
     except FileNotFoundError:

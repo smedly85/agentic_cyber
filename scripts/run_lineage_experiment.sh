@@ -10,12 +10,12 @@
 #
 # Lineages never share source. Stage 000 runs --source-mode new; every later
 # stage runs --source-mode existing, seeded from the immediately preceding
-# successful candidate of the SAME lineage. Each stage is a fresh OpenCode
-# session; the only implementation state carried across a stage boundary is that
+# successful candidate of the SAME lineage. Each stage is a fresh Aider
+# process; the only implementation state carried across a stage boundary is that
 # one seed file.
 #
 # This script owns lineage bookkeeping only. All single-stage mechanism --
-# isolated work directories, OpenCode permissions, source modes, seed files,
+# isolated work directories, explicit Aider file scope, source modes, seed files,
 # controller-driven repair loops, build and test validation, candidate capture,
 # infrastructure-failure metadata -- belongs to scripts/run_experiment.sh, which
 # this script calls once per stage. Nothing is reimplemented here.
@@ -29,7 +29,8 @@
 # Example (10 sort lineages at one temperature):
 #   scripts/run_lineage_experiment.sh \
 #     --utility sort \
-#     --model school-ollama/qwen3-coder-next:latest \
+#     --model ollama_chat/qwen3.8:27b \
+#     --editor-model ollama_chat/qwen3-coder-next:latest \
 #     --temperature 0.2 \
 #     --lineages 10 \
 #     --max-loops 3
@@ -46,8 +47,10 @@ Usage:
 
 Required:
   --utility NAME             Manifest under experiments/utilities/<NAME>.json
-  --model MODEL              OpenCode model name, e.g.
-                             school-ollama/qwen3-coder-next:latest
+  --model MODEL              Aider architect/reasoning model, e.g.
+                             ollama_chat/qwen3.8:27b
+  --editor-model MODEL       Aider editor model (default:
+                             ollama_chat/qwen3-coder-next:latest)
 
 Experiment size:
   --temperature T            Single temperature for every stage (default: 0)
@@ -73,13 +76,10 @@ default applies):
                              controls, e.g. base_model/top_k/top_k_control.
                              It is fingerprinted and never sent in requests.
 
-                             There is no --top-k. The OpenCode provider in use
-                             speaks OpenAI-compatible /v1/chat/completions,
-                             whose schema has no top_k, and Ollama drops it
-                             there; reaching its sampler would need the native
-                             /api/chat options object, which this provider does
-                             not speak. --top-k is refused rather than recorded
-                             as a condition the server ignored.
+                             There is no --top-k in this migration. Native
+                             ollama_chat can transport it, but adding a new
+                             experimental control requires a separate verified
+                             change rather than being folded into this one.
 
                              Every sampling value is part of the lineage
                              configuration fingerprint, so changing one refuses
@@ -87,14 +87,14 @@ default applies):
                              mixing conditions.
 
 Passed through to scripts/run_experiment.sh:
-  --agent NAME               OpenCode agent (default: build)
-  --timeout SECONDS          Per-session timeout; 0 disables (default: 1800)
+  --timeout SECONDS          Per-invocation timeout; 0 disables (default: 1800)
   --allow-no-progress        Keep repairing a stage even when a session leaves
                              the source byte-identical
   --repair-prompt FILE       Continuation template
   --keep-workdir             Retain each stage's working directory
-  --remote-base-url URL      OpenAI-compatible endpoint for --model
-  --remote-api-key-env NAME  Env var holding that endpoint's key
+  --remote-base-url URL      Native Ollama root for ollama_chat/* models, or
+                             an OpenAI-compatible URL for openai/* models
+  --remote-api-key-env NAME  Optional env var holding that endpoint's key
 
 Output:
   --output-dir DIR           Lineage root. Default:
@@ -107,7 +107,7 @@ Output:
   -h, --help                 Show this help
 
 Environment:
-  OPENCODE_BIN               OpenCode executable (default: opencode)
+  AIDER_BIN                  Aider executable (default: aider)
   PYTHON_BIN                 Python executable (default: python3)
 
 Directory layout:
@@ -178,7 +178,7 @@ record_path() {
 #
 # The build is repeated here rather than reused because run_experiment.sh
 # discards its working directory; the candidate source is the only durable
-# artifact, and rebuilding it is cheap next to an OpenCode session.
+# artifact, and rebuilding it is cheap next to an Aider invocation.
 #
 # 0 = candidate stayed inside its checkpoint, 1 = it implemented a later flag,
 # 2 = the gate could not run.
@@ -205,6 +205,7 @@ boundary_gate() {
 
 UTILITY=""
 MODEL=""
+EDITOR_MODEL="ollama_chat/qwen3-coder-next:latest"
 TEMPERATURE="0"
 # Optional sampling knobs. Empty means "not requested": the value is recorded as
 # a JSON null and no flag is forwarded, so the stage runs exactly as it did
@@ -216,7 +217,6 @@ MODEL_PROVENANCE_JSON=""
 LINEAGES=1
 LINEAGE_START=1
 MAX_LOOPS=3
-AGENT="build"
 TIMEOUT_SECONDS=1800
 ALLOW_NO_PROGRESS=0
 REPAIR_TEMPLATE=""
@@ -230,12 +230,13 @@ LIST_UTILITIES=0
 DRY_RUN=0
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+AIDER_BIN="${AIDER_BIN:-aider}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --utility|--model|--temperature|--lineages|--lineage-start|--max-loops| \
+        --utility|--model|--editor-model|--temperature|--lineages|--lineage-start|--max-loops| \
         --top-p|--sampling-seed|--max-tokens|--model-provenance-json| \
-        --agent|--timeout|--repair-prompt|--remote-base-url| \
+        --timeout|--repair-prompt|--remote-base-url| \
         --remote-api-key-env|--output-dir)
             [[ $# -ge 2 ]] || die "$1 requires a value"
             ;;
@@ -244,21 +245,14 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --utility) UTILITY="${2:-}"; shift 2 ;;
         --model) MODEL="${2:-}"; shift 2 ;;
+        --editor-model) EDITOR_MODEL="${2:-}"; shift 2 ;;
         --temperature) TEMPERATURE="${2:-}"; shift 2 ;;
         --top-p) TOP_P="${2:-}"; shift 2 ;;
         --sampling-seed) SAMPLING_SEED="${2:-}"; shift 2 ;;
         --max-tokens) MAX_TOKENS="${2:-}"; shift 2 ;;
         --model-provenance-json) MODEL_PROVENANCE_JSON="${2:-}"; shift 2 ;;
         --top-k)
-            # Fail closed, matching scripts/run_experiment.sh. top_k does reach
-            # the request body, but the body is an OpenAI-compatible
-            # /v1/chat/completions request whose schema has no top_k, and
-            # Ollama parses a fixed field set there and drops the rest. Its
-            # sampler is only reachable through the native /api/chat "options"
-            # object, which this provider never speaks. A flag that is
-            # accepted, recorded and then ignored by the server is worse than
-            # no flag.
-            die "--top-k is not supported: top_k is not part of the OpenAI-compatible chat API that OpenCode speaks to Ollama, so it would be recorded here and ignored by the server" ;;
+            die "--top-k is not supported by this migration; validate and add it as a separate experimental change" ;;
         --seed)
             # --seed-file is the checkpoint source-inheritance file. The two
             # senses of "seed" must never collide in this harness.
@@ -266,7 +260,8 @@ while [[ $# -gt 0 ]]; do
         --lineages) LINEAGES="${2:-}"; shift 2 ;;
         --lineage-start) LINEAGE_START="${2:-}"; shift 2 ;;
         --max-loops) MAX_LOOPS="${2:-}"; shift 2 ;;
-        --agent) AGENT="${2:-}"; shift 2 ;;
+        --agent)
+            die "--agent was removed with the OpenCode backend; Aider always runs in architect mode" ;;
         --timeout) TIMEOUT_SECONDS="${2:-}"; shift 2 ;;
         --allow-no-progress) ALLOW_NO_PROGRESS=1; shift ;;
         --repair-prompt) REPAIR_TEMPLATE="${2:-}"; shift 2 ;;
@@ -299,7 +294,7 @@ STAGE_RUNNER="$REPO/scripts/run_experiment.sh"
 # A syntax error in the stage runner must never reach lineage initialization.
 # It happened: a here-document inside a $( ) command substitution contained an
 # apostrophe, which Bash 4+ parses correctly and Apple's Bash 3.2 does not. On
-# Darwin every stage died with "unexpected end of file" before OpenCode was
+# Darwin every stage died with "unexpected end of file" before the backend was
 # invoked, and because the failure looked like a stage that simply produced
 # nothing, the lineage recorded checkpoint 000 as stage_run_incomplete -- a
 # model result, for what was a parse error in the controller.
@@ -325,6 +320,8 @@ fi
 
 [[ -n "$UTILITY" ]] || die "--utility is required"
 [[ -n "$MODEL" ]] || die "--model is required"
+[[ "$MODEL" != "$EDITOR_MODEL" ]] ||
+    die "--model and --editor-model must differ so their sampling settings remain role-specific"
 [[ "$LINEAGES" =~ ^[1-9][0-9]*$ ]] || die "--lineages must be a positive integer"
 [[ "$LINEAGE_START" =~ ^[1-9][0-9]*$ ]] ||
     die "--lineage-start must be a positive integer"
@@ -356,6 +353,31 @@ if [[ -n "$MAX_TOKENS" ]]; then
     [[ "$MAX_TOKENS" =~ ^[1-9][0-9]*$ ]] ||
         die "--max-tokens must be a positive integer"
 fi
+if [[ -n "$REMOTE_BASE_URL" ]]; then
+    if [[ "$MODEL" == ollama_chat/* && "$EDITOR_MODEL" == ollama_chat/* ]]; then
+        [[ "$REMOTE_BASE_URL" != */v1 && "$REMOTE_BASE_URL" != */v1/ ]] ||
+            die "ollama_chat/* needs the native Ollama root, not a /v1 URL"
+    elif [[ "$MODEL" == openai/* && "$EDITOR_MODEL" == openai/* ]]; then
+        : # Existing OpenAI-compatible gateways remain supported.
+    else
+        die "with --remote-base-url, both models must use either ollama_chat/* (native Ollama) or openai/* (OpenAI-compatible gateway)"
+    fi
+fi
+if [[ -n "$REMOTE_API_KEY_ENV" ]]; then
+    [[ -n "${!REMOTE_API_KEY_ENV:-}" ]] ||
+        die "$REMOTE_API_KEY_ENV is not set"
+fi
+
+if command -v "$AIDER_BIN" >/dev/null 2>&1; then
+    AIDER_AVAILABLE=1
+    AIDER_VERSION="$({ "$AIDER_BIN" --version 2>/dev/null || true; } | head -1)"
+    [[ -n "$AIDER_VERSION" ]] || AIDER_VERSION="unknown"
+else
+    AIDER_AVAILABLE=0
+    # Dry-run/plan and platform-incompatible preflight paths invoke no backend.
+    # A compatible real run is rejected below before any lineage starts.
+    AIDER_VERSION="not-installed"
+fi
 
 # ---------------------------------------------------------------------------
 # Resolve the stage plan
@@ -366,14 +388,17 @@ PLAN_JSON="$(
         --repo "$REPO" \
         --utility "$UTILITY" \
         --model "$MODEL" \
+        --editor-model "$EDITOR_MODEL" \
+        --aider-version "$AIDER_VERSION" \
         --temperature "$TEMPERATURE" \
         --top-p "$TOP_P" \
         --sampling-seed "$SAMPLING_SEED" \
         --max-tokens "$MAX_TOKENS" \
         --model-provenance-json "$MODEL_PROVENANCE_JSON" \
-        --agent "$AGENT" \
         --max-loops "$MAX_LOOPS" \
         --timeout-seconds "$TIMEOUT_SECONDS" \
+        --remote-base-url "$REMOTE_BASE_URL" \
+        --remote-api-key-env "$REMOTE_API_KEY_ENV" \
         --emit plan
 )" || exit 2
 
@@ -402,14 +427,17 @@ STAGE_TABLE="$(
         --repo "$REPO" \
         --utility "$UTILITY" \
         --model "$MODEL" \
+        --editor-model "$EDITOR_MODEL" \
+        --aider-version "$AIDER_VERSION" \
         --temperature "$TEMPERATURE" \
         --top-p "$TOP_P" \
         --sampling-seed "$SAMPLING_SEED" \
         --max-tokens "$MAX_TOKENS" \
         --model-provenance-json "$MODEL_PROVENANCE_JSON" \
-        --agent "$AGENT" \
         --max-loops "$MAX_LOOPS" \
         --timeout-seconds "$TIMEOUT_SECONDS" \
+        --remote-base-url "$REMOTE_BASE_URL" \
+        --remote-api-key-env "$REMOTE_API_KEY_ENV" \
         --emit stages
 )" || exit 2
 
@@ -502,6 +530,12 @@ for (( check_index = 0; check_index < STAGE_COUNT; check_index++ )); do
         "stage plan is malformed: checkpoint $checkpoint has a test-bundle fingerprint that is not a SHA-256 hex digest: '$fingerprint'"
 done
 
+if [[ "$AIDER_AVAILABLE" -eq 0 && "$DRY_RUN" -eq 0 && "$PRINT_PLAN" -eq 0 &&
+      ! ( -n "$REQUIRED_PLATFORM" && "$REQUIRED_PLATFORM" != "None" &&
+          "$REQUIRED_PLATFORM" != "$HOST_PLATFORM" ) ]]; then
+    die "$AIDER_BIN was not found"
+fi
+
 MODEL_SLUG="$(slugify "$MODEL")"
 TEMP_SLUG="$(slugify "$TEMPERATURE" | sed 's/\./p/g')"
 
@@ -575,14 +609,15 @@ if [[ -n "$REQUIRED_PLATFORM" && "$REQUIRED_PLATFORM" != "None" &&
             # recording them would let analysis later resurrect them as
             # missing_directory or planned_not_started entries, which is exactly the
             # denominator pollution this preflight exists to prevent.
-            "$PYTHON_BIN" - "$RUN_METADATA_PATH" "$UTILITY" "$MODEL" \
+            "$PYTHON_BIN" - "$RUN_METADATA_PATH" "$PLAN_JSON" \
                 "$REQUIRED_PLATFORM" "$HOST_PLATFORM" "$CONFIG_FINGERPRINT" \
                 "$(timestamp)" <<'PYPRE'
 import json
 import sys
 from pathlib import Path
 
-path, utility, model, required, host, fingerprint, created = sys.argv[1:]
+path, plan_json, required, host, fingerprint, created = sys.argv[1:]
+plan = json.loads(plan_json)
 target = Path(path)
 target.parent.mkdir(parents=True, exist_ok=True)
 target.write_text(
@@ -590,8 +625,17 @@ target.write_text(
         {
             "schema_version": 1,
             "experiment_unit": "lineage",
-            "utility": utility,
-            "model": model,
+            "utility": plan["utility"],
+            "agent_backend": plan["agent_backend"],
+            "aider_version": plan["aider_version"],
+            "architect_model": plan["architect_model"],
+            "editor_model": plan["editor_model"],
+            "architect_mode": plan["architect_mode"],
+            "model": plan["model"],
+            "aider_model_settings": plan["aider_model_settings"],
+            "remote_base_url": plan["remote_base_url"],
+            "remote_api_key_env": plan["remote_api_key_env"],
+            "remote_transport": plan["remote_transport"],
             "config_fingerprint": fingerprint,
             "run_status": "platform_incompatible",
             "required_platform": required,
@@ -627,14 +671,14 @@ RUN_METADATA="$OUTPUT_DIR/lineages.json"
 if [[ -f "$RUN_METADATA" && "$DRY_RUN" -eq 0 ]]; then
     mismatch="$(
         "$PYTHON_BIN" - "$RUN_METADATA" "$CONFIG_FINGERPRINT" "$UTILITY" \
-            "$MODEL" "$TEMPERATURE" "$AGENT" "$MAX_LOOPS" \
+            "$MODEL" "$EDITOR_MODEL" "$AIDER_VERSION" "$TEMPERATURE" "$MAX_LOOPS" \
             "${TOP_P:-__NONE__}" "${SAMPLING_SEED:-__NONE__}" \
             "${MAX_TOKENS:-__NONE__}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-(path, fingerprint, utility, model, temperature, agent, max_loops,
+(path, fingerprint, utility, model, editor_model, aider_version, temperature, max_loops,
  top_p, sampling_seed, max_tokens) = sys.argv[1:]
 try:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -645,6 +689,11 @@ except (OSError, UnicodeError, json.JSONDecodeError) as error:
 expected = {
     "config_fingerprint": fingerprint,
     "utility": utility,
+    "agent_backend": "aider",
+    "architect_model": model,
+    "editor_model": editor_model,
+    "aider_version": aider_version,
+    "architect_mode": True,
     "model": model,
     "temperature": float(temperature),
     # Named individually as well as covered by the fingerprint: a changed
@@ -655,7 +704,6 @@ expected = {
     "top_p": None if top_p == "__NONE__" else float(top_p),
     "sampling_seed": None if sampling_seed == "__NONE__" else int(sampling_seed),
     "max_tokens": None if max_tokens == "__NONE__" else int(max_tokens),
-    "agent": agent,
     "max_loops": int(max_loops),
 }
 differences = [key for key, value in expected.items() if data.get(key) != value]
@@ -675,7 +723,9 @@ done
 printf 'Repository:   %s\n' "$REPO"
 printf 'Utility:      %s (%s checkpoints)\n' "$UTILITY" "$STAGE_COUNT"
 printf 'Checkpoints:  %s\n' "$CHECKPOINT_LADDER"
-printf 'Model:        %s\n' "$MODEL"
+printf 'Architect:    %s\n' "$MODEL"
+printf 'Editor:       %s\n' "$EDITOR_MODEL"
+printf 'Aider:        %s\n' "$AIDER_VERSION"
 printf 'Temperature:  %s\n' "$TEMPERATURE"
 # Printed as "(server default)" rather than omitted, so the console record of a
 # run states every sampling condition instead of leaving three of them implied.
@@ -687,6 +737,19 @@ printf 'Lineages:     %s (numbered %s..%s)\n' \
 printf 'Max loops:    %s per stage\n' "$MAX_LOOPS"
 printf 'Fingerprint:  %s\n' "$CONFIG_FINGERPRINT"
 printf 'Output:       %s\n\n' "$OUTPUT_DIR"
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+    printf 'Aider invocation template:'
+    printf ' %q' "$AIDER_BIN" --architect --auto-accept-architect \
+        --model "$MODEL" --editor-model "$EDITOR_MODEL" \
+        --weak-model "$EDITOR_MODEL" --editor-edit-format editor-diff \
+        --model-settings-file '<attempt>/aider-model-settings.yml' \
+        --message-file '<prompt-file>' --file '<source>' --no-git \
+        --map-tokens 0 --no-auto-commits --no-dirty-commits \
+        --no-auto-lint --no-auto-test --no-suggest-shell-commands \
+        --no-analytics --no-check-update --no-show-release-notes
+    printf '\n\n'
+fi
 
 if [[ "$DRY_RUN" -eq 0 ]]; then
     "$PYTHON_BIN" - "$RUN_METADATA" "$PLAN_JSON" "$REPO" "$REPO_COMMIT" \
@@ -725,6 +788,11 @@ record.update(
         "repository_commit": commit,
         "utility": plan["utility"],
         "program": plan["program"],
+        "agent_backend": plan["agent_backend"],
+        "aider_version": plan["aider_version"],
+        "architect_model": plan["architect_model"],
+        "editor_model": plan["editor_model"],
+        "architect_mode": plan["architect_mode"],
         "model": plan["model"],
         "model_provenance": plan.get("model_provenance"),
         "temperature": plan["temperature"],
@@ -735,7 +803,13 @@ record.update(
         "sampling_seed": plan["sampling_seed"],
         "max_tokens": plan["max_tokens"],
         "automation_notice_sha256": plan["automation_notice_sha256"],
-        "agent": plan["agent"],
+        "editor_temperature": plan["editor_temperature"],
+        "editor_sampling_seed": plan["editor_sampling_seed"],
+        "editor_edit_format": plan["editor_edit_format"],
+        "aider_model_settings": plan["aider_model_settings"],
+        "remote_base_url": plan["remote_base_url"],
+        "remote_api_key_env": plan["remote_api_key_env"],
+        "remote_transport": plan["remote_transport"],
         "max_loops": plan["max_loops"],
         "timeout_seconds": plan["timeout_seconds"],
         "source_path": plan["source_path"],
@@ -792,12 +866,13 @@ for (( offset = 0; offset < LINEAGES; offset++ )); do
             --lineage-id "$lineage_id" \
             --utility "$UTILITY" \
             --model "$MODEL" \
+            --editor-model "$EDITOR_MODEL" \
+            --aider-version "$AIDER_VERSION" \
             --model-provenance-json "$MODEL_PROVENANCE_JSON" \
             --temperature "$TEMPERATURE" \
             --top-p "$TOP_P" \
             --sampling-seed "$SAMPLING_SEED" \
             --max-tokens "$MAX_TOKENS" \
-            --agent "$AGENT" \
             --max-loops "$MAX_LOOPS" \
             --fingerprint "$CONFIG_FINGERPRINT" \
             --checkpoint-count "$STAGE_COUNT" \
@@ -843,10 +918,10 @@ for (( offset = 0; offset < LINEAGES; offset++ )); do
 
         runner_args=(
             --model "$MODEL"
+            --editor-model "$EDITOR_MODEL"
             --temperature "$TEMPERATURE"
             --runs 1
             --max-loops "$MAX_LOOPS"
-            --agent "$AGENT"
             --timeout "$TIMEOUT_SECONDS"
             --prompt "$stage_prompt"
             --source "$SOURCE_PATH"
@@ -1054,7 +1129,10 @@ record = {
     # Timeout provenance, carried into the lineage record so a stage that
     # succeeded or was repaired after a cut-short session is still
     # distinguishable from one whose session finished normally.
-    "opencode_exit_code": metadata.get("opencode_exit_code"),
+    "agent_backend": metadata.get("agent_backend", "opencode"),
+    "agent_exit_code": metadata.get(
+        "agent_exit_code", metadata.get("opencode_exit_code")
+    ),
     "initial_session_completed": metadata.get("initial_session_completed"),
     "candidate_available_after_timeout": metadata.get(
         "candidate_available_after_timeout"
@@ -1069,7 +1147,9 @@ record = {
     "feature_test_exit_code": metadata.get("feature_test_exit_code"),
     "extra_test_exit_code": metadata.get("extra_test_exit_code"),
     "test_dir_integrity": metadata.get("test_dir_integrity"),
-    "total_opencode_runtime_ms": metadata.get("total_opencode_runtime_ms"),
+    "total_agent_runtime_ms": metadata.get(
+        "total_agent_runtime_ms", metadata.get("total_opencode_runtime_ms")
+    ),
     "total_runtime_ms": metadata.get("total_runtime_ms"),
 }
 

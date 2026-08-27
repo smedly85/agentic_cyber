@@ -21,6 +21,7 @@ RUNNER = REPO_ROOT / "scripts" / "run_experiment.sh"
 RUNNER_HELPERS = (
     REPO_ROOT / "scripts" / "capture_candidate.py",
     REPO_ROOT / "scripts" / "repair_prompt.py",
+    REPO_ROOT / "scripts" / "aider_settings.py",
     REPO_ROOT / "scripts" / "opencode_stats.py",
     REPO_ROOT / "scripts" / "prompt_render.py",
 )
@@ -967,8 +968,8 @@ args, _ = parser.parse_known_args()
         check=True,
     )
 
-    fake_opencode = tmp_path / "fake-opencode"
-    fake_opencode.write_text(
+    fake_aider = tmp_path / "fake-aider"
+    fake_aider.write_text(
         """\
 #!/usr/bin/env python3
 import json
@@ -977,27 +978,33 @@ import subprocess
 import sys
 from pathlib import Path
 
-counter = Path(os.environ["FAKE_COUNTER"])
+if "--version" in sys.argv:
+    print("aider 0.test")
+    raise SystemExit(0)
+
+fixture_root = Path(__file__).parent
+counter = fixture_root / "counter.txt"
 invocation = int(counter.read_text()) if counter.exists() else 0
 counter.write_text(str(invocation + 1))
-prompt = sys.argv[-1]
-with Path(os.environ["FAKE_PROMPTS"]).open("a", encoding="utf-8") as handle:
+with (fixture_root / "aider-args.jsonl").open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps(sys.argv[1:]) + "\\n")
+prompt_file = Path(sys.argv[sys.argv.index("--message-file") + 1])
+prompt = prompt_file.read_text(encoding="utf-8")
+with (fixture_root / "prompts.txt").open("a", encoding="utf-8") as handle:
     handle.write(f"\\n===== PROMPT {invocation} =====\\n{prompt}\\n")
-worktree = Path(sys.argv[sys.argv.index("--dir") + 1])
-# OpenCode only applies its external_directory rules outside the session's
-# project root, which it finds by walking up for .git. Record what that walk
-# would land on so a test can prove the boundary is the workdir itself and
-# not the surrounding repository.
-Path(os.environ["FAKE_GIT_ROOT"]).write_text(
+worktree = Path.cwd()
+# Aider is run with --no-git and GIT_CEILING_DIRECTORIES at the workdir.
+# Record that ordinary Git discovery cannot reach the surrounding repository.
+(fixture_root / "sandbox-root.txt").write_text(
     subprocess.run(
         ["git", "-C", str(worktree), "rev-parse", "--show-toplevel"],
         capture_output=True,
         text=True,
     ).stdout.strip()
 )
-scenario = os.environ["FAKE_SCENARIO"]
-source = worktree / os.environ.get("FAKE_SOURCE", "src/tool.c")
-Path(os.environ["FAKE_PREEXISTED"]).write_text(str(source.exists()).lower())
+scenario = (fixture_root / "scenario.txt").read_text(encoding="utf-8")
+source = worktree / sys.argv[sys.argv.index("--file") + 1]
+(fixture_root / "source-preexisted.txt").write_text(str(source.exists()).lower())
 if (scenario == "repair-success" and invocation > 0) or scenario in {"valid", "permission"}:
     value = "repaired"
 else:
@@ -1014,8 +1021,8 @@ if scenario == "permission":
 """,
         encoding="utf-8",
     )
-    fake_opencode.chmod(0o755)
-    return repository, fake_opencode
+    fake_aider.chmod(0o755)
+    return repository, fake_aider
 
 
 def run_experiment(
@@ -1032,7 +1039,7 @@ def run_experiment(
     temperature: str | None = "0",
     runs: int = 1,
 ) -> tuple[Path, subprocess.CompletedProcess[str], int, str]:
-    repository, fake_opencode = initialize_experiment_repo(tmp_path)
+    repository, fake_aider = initialize_experiment_repo(tmp_path)
     counter = tmp_path / "counter.txt"
     prompts = tmp_path / "prompts.txt"
     extra_count = tmp_path / "extra-count.txt"
@@ -1076,16 +1083,11 @@ def run_experiment(
         command.extend(extra_args)
 
     environment = os.environ.copy()
+    (tmp_path / "scenario.txt").write_text(scenario, encoding="utf-8")
     environment.update(
         {
-            "OPENCODE_BIN": str(fake_opencode),
+            "AIDER_BIN": str(fake_aider),
             "PYTHON_BIN": sys.executable,
-            "FAKE_COUNTER": str(counter),
-            "FAKE_PROMPTS": str(prompts),
-            "FAKE_SCENARIO": scenario,
-            "FAKE_SOURCE": source_path,
-            "FAKE_PREEXISTED": str(tmp_path / "source-preexisted.txt"),
-            "FAKE_GIT_ROOT": str(tmp_path / "sandbox-root.txt"),
             "EXTRA_COUNT": str(extra_count),
         }
     )
@@ -1102,7 +1104,8 @@ def run_experiment(
     invocations = int(counter.read_text()) if counter.exists() else 0
     # --output-dir is the sweep root; each temperature is its own experiment.
     output = sweep / "temp-0p0"
-    return output, result, invocations, prompts.read_text(encoding="utf-8")
+    prompt_text = prompts.read_text(encoding="utf-8") if prompts.is_file() else ""
+    return output, result, invocations, prompt_text
 
 
 def test_temp_list_runs_an_unequally_spaced_grid(tmp_path: Path):
@@ -1143,16 +1146,8 @@ def test_temp_list_runs_an_unequally_spaced_grid(tmp_path: Path):
         assert experiment["temperature"] == point
 
 
-def test_workdir_is_its_own_project_root(tmp_path: Path):
-    """The agent's project boundary is the workdir, not the repository.
-
-    OpenCode resolves a session's project root by walking up for a .git
-    directory and only consults its external_directory deny rules for paths
-    outside that root. A workdir nested in the repository without one inherits
-    the repository as its root, so every repository path counts as internal and
-    the agent can write anywhere in the checkout -- which is exactly what
-    happened before the runner started seeding a marker repository.
-    """
+def test_aider_cannot_discover_the_parent_repository(tmp_path: Path):
+    """Git discovery is cut off before the surrounding checkout."""
     output, result, _, _ = run_experiment(
         tmp_path,
         scenario="valid",
@@ -1161,12 +1156,8 @@ def test_workdir_is_its_own_project_root(tmp_path: Path):
 
     assert result.returncode == 0, result.stderr
     observed = (tmp_path / "sandbox-root.txt").read_text().strip()
+    assert observed == "", f"Aider could discover parent repository {observed}"
     workdir = output / "attempt-001" / "workdir"
-    assert observed, "the agent saw no project root at all"
-    assert Path(observed).resolve() == workdir.resolve(), (
-        f"agent's project root was {observed}, not its own workdir"
-    )
-    # The marker is scratch: it must not survive into the stored artifacts.
     assert not workdir.exists()
     assert not (output / "attempt-001" / "candidate" / ".git").exists()
 
@@ -1186,8 +1177,8 @@ def test_kept_workdir_drops_the_sandbox_marker(tmp_path: Path):
     assert not (workdir / ".git").exists()
 
 
-def test_attempt_records_opencode_session_statistics(tmp_path: Path):
-    """Token and timing stats land in the attempt directory before the prune."""
+def test_attempt_records_aider_model_settings(tmp_path: Path):
+    """Both role-specific inference configurations are durable and hashed."""
     output, result, _, _ = run_experiment(
         tmp_path,
         scenario="valid",
@@ -1196,17 +1187,47 @@ def test_attempt_records_opencode_session_statistics(tmp_path: Path):
 
     assert result.returncode == 0, result.stderr
     attempt = output / "attempt-001"
-    stats = json.loads((attempt / "opencode-stats.json").read_text())
-    # The fake agent never talks to OpenCode, so there are no sessions to find;
-    # what matters here is that the runner always emits the files and records
-    # which workdir it looked for, rather than failing the attempt.
-    assert stats["context"]["attempt"] == "attempt-001"
-    assert stats["context"]["model"] == "fake/model"
-    assert stats["context"]["workdir"].endswith("attempt-001/workdir")
-    assert stats["totals"]["sessions"] == 0
-    assert (attempt / "opencode-stats.txt").read_text().startswith(
-        "OpenCode session statistics"
+    settings = json.loads((attempt / "aider-model-settings.yml").read_text())
+    metadata = json.loads((attempt / "metadata.json").read_text())
+    assert settings[0]["name"] == "fake/model"
+    assert settings[0]["extra_params"]["temperature"] == 0
+    assert settings[1]["name"] == "ollama_chat/qwen3-coder-next:latest"
+    assert settings[1]["extra_params"] == {"temperature": 0.0, "seed": 0}
+    assert metadata["aider_model_settings"] == settings
+    assert metadata["aider_model_settings_sha256"] == (
+        attempt / "aider-model-settings.sha256"
+    ).read_text().strip()
+    assert metadata["agent_backend"] == "aider"
+    assert metadata["aider_version"] == "aider 0.test"
+    assert metadata["architect_model"] == "fake/model"
+    assert metadata["editor_model"] == "ollama_chat/qwen3-coder-next:latest"
+    assert metadata["architect_mode"] is True
+    assert (attempt / "aider.log").is_file()
+    assert not (attempt / "opencode.log").exists()
+
+
+def test_aider_invocation_is_one_shot_scoped_and_noninteractive(tmp_path: Path):
+    _, result, invocations, _ = run_experiment(
+        tmp_path,
+        scenario="valid",
+        max_loops=0,
+        extra_args=["--editor-model", "fixed/editor"],
     )
+
+    assert result.returncode == 0, result.stderr
+    assert invocations == 1
+    args = json.loads((tmp_path / "aider-args.jsonl").read_text().splitlines()[0])
+    for flag in (
+        "--architect", "--auto-accept-architect", "--message-file", "--file",
+        "--no-git", "--no-auto-commits", "--no-dirty-commits",
+        "--no-auto-lint", "--no-auto-test", "--no-suggest-shell-commands",
+        "--no-analytics", "--no-check-update", "--no-show-release-notes",
+    ):
+        assert flag in args
+    assert args[args.index("--model") + 1] == "fake/model"
+    assert args[args.index("--editor-model") + 1] == "fixed/editor"
+    assert "--yes-always" not in args
+    assert "--test" not in args
 
 
 def test_default_max_loops_allows_repair(tmp_path: Path):
@@ -1276,8 +1297,8 @@ def test_successful_repair_stops_and_captures_final_candidate(tmp_path: Path):
     # Sources are captured flattened to their basename.
     assert (attempt / "candidate" / "tool.c").read_text() == "repaired\n"
     assert "tool.c" in (attempt / "changed-files.txt").read_text()
-    assert "LLM INVOCATION 0: INITIAL" in (attempt / "opencode.log").read_text()
-    assert "LLM INVOCATION 1: REPAIR LOOP 1" in (attempt / "opencode.log").read_text()
+    assert "LLM INVOCATION 0: INITIAL" in (attempt / "aider.log").read_text()
+    assert "LLM INVOCATION 1: REPAIR LOOP 1" in (attempt / "aider.log").read_text()
     assert "VALIDATION LOOP 0" in (attempt / "build.log").read_text()
     assert "VALIDATION LOOP 1" in (attempt / "build.log").read_text()
     assert "Continue the current implementation" in prompts
@@ -1343,7 +1364,7 @@ def test_repair_budget_exhaustion_is_recorded(tmp_path: Path):
     assert len(metadata["loops"]) == 3
 
 
-def test_opencode_error_is_failed_valid_agent_trial(tmp_path: Path):
+def test_aider_error_is_failed_valid_agent_trial(tmp_path: Path):
     output, result, invocations, _ = run_experiment(
         tmp_path,
         scenario="agent-error",
@@ -1355,14 +1376,14 @@ def test_opencode_error_is_failed_valid_agent_trial(tmp_path: Path):
         (output / "attempt-001" / "metadata.json").read_text(encoding="utf-8")
     )
     assert invocations == 1
-    assert metadata["opencode_exit_code"] == 42
+    assert metadata["agent_exit_code"] == 42
     assert metadata["repair_loops"] == 0
     assert metadata["loop_limit_reached"] is False
     assert metadata["overall_success"] is False
     assert metadata["infrastructure_failure"] is False
     assert metadata["infrastructure_failure_stage"] is None
     assert metadata["agent_execution_failure"] is True
-    assert metadata["agent_execution_failure_stage"] == "opencode"
+    assert metadata["agent_execution_failure_stage"] == "aider"
 
 
 def test_timeout_is_failed_valid_agent_trial(tmp_path: Path):
@@ -1379,8 +1400,8 @@ def test_timeout_is_failed_valid_agent_trial(tmp_path: Path):
     # independently validates it, then permits one repair invocation before
     # the unchanged candidate triggers the existing no-progress guard.
     assert invocations == 2
-    assert metadata["opencode_exit_code"] == 124
-    assert metadata["initial_opencode_exit_code"] == 124
+    assert metadata["agent_exit_code"] == 124
+    assert metadata["initial_agent_exit_code"] == 124
     assert metadata["initial_session_completed"] is False
     assert metadata["candidate_available_after_timeout"] is True
     assert metadata["validation_completed_after_timeout"] is True
@@ -1399,7 +1420,7 @@ def test_timeout_is_failed_valid_agent_trial(tmp_path: Path):
     assert metadata["overall_success"] is False
 
 
-def test_permission_rejection_is_agent_execution_failure(tmp_path: Path):
+def test_aider_log_text_cannot_create_an_opencode_permission_failure(tmp_path: Path):
     output, result, invocations, _ = run_experiment(
         tmp_path,
         scenario="permission",
@@ -1412,12 +1433,12 @@ def test_permission_rejection_is_agent_execution_failure(tmp_path: Path):
     assert invocations == 1
     assert metadata["infrastructure_failure"] is False
     assert metadata["infrastructure_failure_stage"] is None
-    assert metadata["agent_execution_failure"] is True
-    assert metadata["agent_execution_failure_stage"] == "permission"
+    assert metadata["agent_execution_failure"] is False
+    assert metadata["agent_execution_failure_stage"] is None
     assert metadata["loop_limit_reached"] is False
-    assert metadata["initial_success"] is False
-    assert metadata["public_validation_success"] is False
-    assert metadata["overall_success"] is False
+    assert metadata["initial_success"] is True
+    assert metadata["public_validation_success"] is True
+    assert metadata["overall_success"] is True
 
 
 def test_candidate_validation_failures_are_not_infrastructure(tmp_path: Path):
@@ -1470,13 +1491,13 @@ def test_visible_test_tampering_is_recorded_and_preserved(tmp_path: Path):
     record and the preserved files are the only remaining evidence that the
     instruction was violated.
     """
-    repository, fake_opencode = initialize_experiment_repo(tmp_path)
+    repository, fake_aider = initialize_experiment_repo(tmp_path)
     suite = repository / "tests" / "suite"
     suite.mkdir(parents=True)
     (suite / "check.py").write_text("assert True\n", encoding="utf-8")
     (suite / "helper.py").write_text("VALUE = 1\n", encoding="utf-8")
 
-    tampering_agent = tmp_path / "tampering-opencode"
+    tampering_agent = tmp_path / "tampering-aider"
     tampering_agent.write_text(
         """\
 #!/usr/bin/env python3
@@ -1484,8 +1505,11 @@ import os
 import sys
 from pathlib import Path
 
-workdir = Path(sys.argv[sys.argv.index("--dir") + 1])
-source = workdir / os.environ["FAKE_SOURCE"]
+if "--version" in sys.argv:
+    print("aider 0.test")
+    raise SystemExit(0)
+workdir = Path.cwd()
+source = workdir / sys.argv[sys.argv.index("--file") + 1]
 source.parent.mkdir(parents=True, exist_ok=True)
 source.write_text("repaired\\n")
 # Weaken one visible test and smuggle in another file.
@@ -1516,9 +1540,8 @@ source.write_text("repaired\\n")
         cwd=repository,
         env={
             **os.environ,
-            "OPENCODE_BIN": str(tampering_agent),
+            "AIDER_BIN": str(tampering_agent),
             "PYTHON_BIN": sys.executable,
-            "FAKE_SOURCE": "src/tool.c",
         },
         text=True,
         stdout=subprocess.PIPE,
@@ -1574,7 +1597,9 @@ def test_runner_existing_and_new_source_modes(tmp_path: Path):
     assert experiment["source_mode"] == "new"
     assert experiment["baseline_source_kind"] == "empty_new_source"
     assert (new_output / "baseline" / "new_tool.c").read_bytes() == b""
-    assert (tmp_path / "new" / "source-preexisted.txt").read_text() == "false"
+    # Aider needs the sole editable path to exist, so new mode supplies an
+    # empty file while retaining the same empty analysis baseline.
+    assert (tmp_path / "new" / "source-preexisted.txt").read_text() == "true"
     assert (attempt / "candidate" / "new_tool.c").read_text() == "repaired\n"
     # An empty baseline exists for new-source mode, so churn is a tracked edit.
     assert "new_tool.c" in (attempt / "diff-numstat.txt").read_text()
@@ -1603,7 +1628,7 @@ def test_runner_source_mode_rejects_seed_mismatch(
     seed_files: list[str],
     expected: str,
 ):
-    repository, fake_opencode = initialize_experiment_repo(tmp_path)
+    repository, fake_aider = initialize_experiment_repo(tmp_path)
     seed_arguments: list[str] = []
     for seed in seed_files:
         seed_arguments.extend(["--seed-file", seed])
@@ -1628,7 +1653,7 @@ def test_runner_source_mode_rejects_seed_mismatch(
         cwd=repository,
         env={
             **os.environ,
-            "OPENCODE_BIN": str(fake_opencode),
+            "AIDER_BIN": str(fake_aider),
             "PYTHON_BIN": sys.executable,
         },
         text=True,
@@ -1757,7 +1782,7 @@ def test_runner_rejects_unsafe_source_paths(source: str):
             "new",
         ],
         cwd=REPO_ROOT,
-        env={**os.environ, "OPENCODE_BIN": "true", "PYTHON_BIN": sys.executable},
+        env={**os.environ, "AIDER_BIN": "true", "PYTHON_BIN": sys.executable},
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -1787,7 +1812,7 @@ def test_max_loops_rejects_arithmetic_overflow():
             "999999999999999999999999999999999999999",
         ],
         cwd=REPO_ROOT,
-        env={**os.environ, "OPENCODE_BIN": "true", "PYTHON_BIN": sys.executable},
+        env={**os.environ, "AIDER_BIN": "true", "PYTHON_BIN": sys.executable},
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -1827,6 +1852,24 @@ def test_analyzer_normalizes_old_and_new_metadata(analyzer):
     assert new["repair_loops"] == 2
     assert new["llm_invocations"] == 3
     assert new["success_loop"] == 2
+
+    aider = analyzer.normalize_repair_metadata(
+        {
+            "agent_backend": "aider",
+            "agent_exit_code": 0,
+            "agent_runtime_ms": 150,
+            "initial_agent_runtime_ms": 100,
+            "repair_agent_runtime_ms": 50,
+            "total_agent_runtime_ms": 150,
+            "agent_isolation_rejected": False,
+            "public_validation_success": True,
+            "overall_success": True,
+        }
+    )
+    assert aider["agent_backend"] == "aider"
+    assert aider["agent_exit_code"] == 0
+    assert aider["total_agent_runtime_ms"] == 150
+    assert aider["agent_execution_failure"] is False
 
     old_setup_failure = analyzer.normalize_repair_metadata(
         {

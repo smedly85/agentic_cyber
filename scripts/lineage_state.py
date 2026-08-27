@@ -118,6 +118,11 @@ def init_record(args: argparse.Namespace) -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "lineage_id": args.lineage_id,
         "utility": args.utility,
+        "agent_backend": "aider",
+        "aider_version": args.aider_version,
+        "architect_model": args.model,
+        "editor_model": args.editor_model,
+        "architect_mode": True,
         "model": args.model,
         "model_provenance": (
             json.loads(args.model_provenance_json)
@@ -130,7 +135,9 @@ def init_record(args: argparse.Namespace) -> dict[str, Any]:
         "top_p": optional_float(args.top_p),
         "sampling_seed": optional_int(args.sampling_seed),
         "max_tokens": optional_int(args.max_tokens),
-        "agent": args.agent,
+        "editor_temperature": 0.0,
+        "editor_sampling_seed": 0,
+        "editor_edit_format": "editor-diff",
         "max_loops": int(args.max_loops),
         "config_fingerprint": args.fingerprint,
         "checkpoint_count": int(args.checkpoint_count),
@@ -213,12 +220,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     start.add_argument("--lineage-id", required=True)
     start.add_argument("--utility", required=True)
     start.add_argument("--model", default="")
+    start.add_argument("--editor-model", default="")
+    start.add_argument("--aider-version", default="unknown")
     start.add_argument("--model-provenance-json", default="")
     start.add_argument("--temperature", default="0")
     start.add_argument("--top-p", default="")
     start.add_argument("--sampling-seed", default="")
     start.add_argument("--max-tokens", default="")
-    start.add_argument("--agent", default="build")
     start.add_argument("--max-loops", default="0")
     start.add_argument("--fingerprint", default="")
     start.add_argument("--checkpoint-count", default="0")
