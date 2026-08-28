@@ -18,6 +18,7 @@ from typing import Any
 EDITOR_TEMPERATURE = 0.0
 EDITOR_SEED = 0
 EDITOR_EDIT_FORMAT = "editor-diff"
+ARCHITECT_THINK_VALUES = ("low", "medium", "high")
 
 
 def optional_float(value: Any) -> float | None:
@@ -40,6 +41,7 @@ def build_model_settings(
     top_p: Any = None,
     sampling_seed: Any = None,
     max_tokens: Any = None,
+    architect_think: Any = None,
 ) -> list[dict[str, Any]]:
     """Return the role-specific settings passed to Aider/LiteLLM.
 
@@ -57,9 +59,20 @@ def build_model_settings(
             "settings cannot collide"
         )
 
-    architect_params: dict[str, int | float] = {
+    architect_params: dict[str, int | float | str] = {
         "temperature": float(temperature),
     }
+    if architect_think not in (None, ""):
+        if architect_think not in ARCHITECT_THINK_VALUES:
+            raise ValueError(
+                "architect think must be one of "
+                + ", ".join(ARCHITECT_THINK_VALUES)
+            )
+        # LiteLLM preserves the native string-valued `think` parameter and its
+        # Ollama adapter promotes it to the top-level request. Do not substitute
+        # reasoning_effort: for this model that collapses low/medium/high to the
+        # same boolean `think=true` condition.
+        architect_params["think"] = architect_think
     parsed_top_p = optional_float(top_p)
     parsed_seed = optional_int(sampling_seed)
     parsed_max_tokens = optional_int(max_tokens)
@@ -106,6 +119,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--top-p", default="")
     parser.add_argument("--sampling-seed", default="")
     parser.add_argument("--max-tokens", default="")
+    parser.add_argument("--architect-think", default="")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--emit", choices=("settings", "sha256"), default="settings")
     return parser.parse_args(argv)
@@ -121,6 +135,7 @@ def main(argv: list[str] | None = None) -> int:
             top_p=args.top_p,
             sampling_seed=args.sampling_seed,
             max_tokens=args.max_tokens,
+            architect_think=args.architect_think,
         )
     except (TypeError, ValueError) as error:
         raise SystemExit(f"aider_settings: {error}") from error

@@ -1013,6 +1013,8 @@ else:
 source.parent.mkdir(parents=True, exist_ok=True)
 source.write_text(value + "\\n")
 print(json.dumps({"total_tokens": invocation + 10}))
+if scenario == "token-limit":
+    print("Model ollama_chat/qwen3.8:27b has hit a token limit!")
 if scenario in {"agent-error", "infrastructure-failure"}:
     raise SystemExit(42)
 if scenario == "timeout":
@@ -1184,6 +1186,7 @@ def test_attempt_records_aider_model_settings(tmp_path: Path):
         tmp_path,
         scenario="valid",
         max_loops=0,
+        extra_args=["--architect-think", "medium"],
     )
 
     assert result.returncode == 0, result.stderr
@@ -1191,7 +1194,10 @@ def test_attempt_records_aider_model_settings(tmp_path: Path):
     settings = json.loads((attempt / "aider-model-settings.yml").read_text())
     metadata = json.loads((attempt / "metadata.json").read_text())
     assert settings[0]["name"] == "fake/model"
-    assert settings[0]["extra_params"]["temperature"] == 0
+    assert settings[0]["extra_params"] == {
+        "temperature": 0.0,
+        "think": "medium",
+    }
     assert settings[1]["name"] == "ollama_chat/qwen3-coder-next:latest"
     assert settings[1]["extra_params"] == {"temperature": 0.0, "seed": 0}
     assert metadata["aider_model_settings"] == settings
@@ -1203,6 +1209,7 @@ def test_attempt_records_aider_model_settings(tmp_path: Path):
     assert metadata["architect_model"] == "fake/model"
     assert metadata["editor_model"] == "ollama_chat/qwen3-coder-next:latest"
     assert metadata["architect_mode"] is True
+    assert metadata["architect_think"] == "medium"
     assert (attempt / "aider.log").is_file()
     assert not (attempt / "opencode.log").exists()
 
@@ -1223,6 +1230,7 @@ def test_aider_invocation_is_one_shot_scoped_and_noninteractive(tmp_path: Path):
         "--no-git", "--no-auto-commits", "--no-dirty-commits",
         "--no-auto-lint", "--no-auto-test", "--no-suggest-shell-commands",
         "--no-analytics", "--no-check-update", "--no-show-release-notes",
+        "--no-browser",
     ):
         assert flag in args
     assert args[args.index("--model") + 1] == "fake/model"
@@ -1385,6 +1393,26 @@ def test_aider_error_is_failed_valid_agent_trial(tmp_path: Path):
     assert metadata["infrastructure_failure_stage"] is None
     assert metadata["agent_execution_failure"] is True
     assert metadata["agent_execution_failure_stage"] == "aider"
+
+
+def test_aider_token_limit_is_not_no_progress(tmp_path: Path):
+    output, result, invocations, _ = run_experiment(
+        tmp_path,
+        scenario="token-limit",
+        max_loops=3,
+    )
+    assert result.returncode == 0, result.stderr
+    metadata = json.loads(
+        (output / "attempt-001" / "metadata.json").read_text(encoding="utf-8")
+    )
+    assert invocations == 1
+    assert metadata["agent_execution_failure"] is True
+    assert metadata["agent_execution_failure_stage"] == "token_limit"
+    assert metadata["agent_failure_reason"] == "output_token_limit"
+    assert metadata["stop_reason"] == "agent_execution_failure"
+    assert metadata["stop_reason"] != "no_progress"
+    assert metadata["repair_loops"] == 0
+    assert metadata["loops"][0]["agent_token_limit"] is True
 
 
 def test_timeout_is_failed_valid_agent_trial(tmp_path: Path):
@@ -1871,6 +1899,22 @@ def test_analyzer_normalizes_old_and_new_metadata(analyzer):
     assert aider["agent_exit_code"] == 0
     assert aider["total_agent_runtime_ms"] == 150
     assert aider["agent_execution_failure"] is False
+    assert aider.get("architect_think") is None
+
+    token_limit = analyzer.normalize_repair_metadata(
+        {
+            "agent_backend": "aider",
+            "agent_exit_code": 0,
+            "agent_execution_failure": True,
+            "agent_execution_failure_stage": "token_limit",
+            "agent_failure_reason": "output_token_limit",
+            "public_validation_success": False,
+            "overall_success": False,
+        }
+    )
+    assert token_limit["agent_execution_failure"] is True
+    assert token_limit["agent_execution_failure_stage"] == "token_limit"
+    assert token_limit["agent_failure_reason"] == "output_token_limit"
 
     old_setup_failure = analyzer.normalize_repair_metadata(
         {
@@ -1915,6 +1959,7 @@ def test_analyzer_normalizes_old_and_new_metadata(analyzer):
     assert old_opencode_failure["infrastructure_failure_stage"] is None
     assert old_opencode_failure["agent_execution_failure"] is True
     assert old_opencode_failure["agent_execution_failure_stage"] == "opencode"
+    assert old_opencode_failure.get("architect_think") is None
     assert old_opencode_failure["agent_execution_failure_classification_inferred"] is True
     old_timeout = analyzer.normalize_repair_metadata(
         {"opencode_exit_code": 124, "overall_success": False}

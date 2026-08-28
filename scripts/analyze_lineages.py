@@ -1068,6 +1068,7 @@ def analyze_lineage_security(
             "checkpoint": "final",
             "model": run_metadata.get("model"),
             "temperature": run_metadata.get("temperature"),
+            "architect_think": run_metadata.get("architect_think"),
         },
         formal=formal,
     )
@@ -1087,6 +1088,7 @@ def analyze_lineage_security(
                 "checkpoint": checkpoint,
                 "model": run_metadata.get("model"),
                 "temperature": run_metadata.get("temperature"),
+                "architect_think": run_metadata.get("architect_think"),
             },
             formal=formal,
         )
@@ -1451,6 +1453,7 @@ def materialize_view(
             "model": run_metadata.get("model"),
             "model_provenance": run_metadata.get("model_provenance"),
             "temperature": run_metadata.get("temperature"),
+            "architect_think": run_metadata.get("architect_think"),
             "agent": run_metadata.get("agent"),
             "max_loops": run_metadata.get("max_loops"),
             "source_path": source_basename,
@@ -1588,6 +1591,7 @@ def render_summary(report: dict[str, Any]) -> str:
         "",
         f"* Root: `{report['lineage_root']}`",
         f"* Model: `{report['model']}`  Temperature: {report['temperature']}",
+        f"* Architect think: {report.get('architect_think') or '(server default)'}",
         f"* Checkpoints: {' -> '.join(report['checkpoints'])}",
         f"* Configuration fingerprint: `{report['config_fingerprint']}`",
         "",
@@ -1966,6 +1970,7 @@ def main(argv: list[str] | None = None) -> int:
         "model": run_metadata.get("model"),
         "model_provenance": run_metadata.get("model_provenance"),
         "temperature": run_metadata.get("temperature"),
+        "architect_think": run_metadata.get("architect_think"),
         "agent": run_metadata.get("agent"),
         "max_loops": run_metadata.get("max_loops"),
         "config_fingerprint": (

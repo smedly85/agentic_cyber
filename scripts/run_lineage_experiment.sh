@@ -66,6 +66,8 @@ Experiment size:
 Sampling (optional; each is forwarded unchanged to every stage and every repair
 session, and unset means the flag is absent from the request so the server's own
 default applies):
+  --architect-think LEVEL   Native architect thinking level: low, medium, or
+                             high. Forwarded as `think`, not reasoning_effort.
   --top-p P                  Nucleus sampling mass, 0 <= P <= 1
   --sampling-seed N          Token-selection seed, N >= 0. Named this way on
                              purpose: --seed-file is the checkpoint
@@ -213,6 +215,7 @@ TEMPERATURE="0"
 TOP_P=""
 SAMPLING_SEED=""
 MAX_TOKENS=""
+ARCHITECT_THINK=""
 MODEL_PROVENANCE_JSON=""
 LINEAGES=1
 LINEAGE_START=1
@@ -235,7 +238,7 @@ AIDER_BIN="${AIDER_BIN:-aider}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --utility|--model|--editor-model|--temperature|--lineages|--lineage-start|--max-loops| \
-        --top-p|--sampling-seed|--max-tokens|--model-provenance-json| \
+        --top-p|--sampling-seed|--max-tokens|--architect-think|--model-provenance-json| \
         --timeout|--repair-prompt|--remote-base-url| \
         --remote-api-key-env|--output-dir)
             [[ $# -ge 2 ]] || die "$1 requires a value"
@@ -250,6 +253,7 @@ while [[ $# -gt 0 ]]; do
         --top-p) TOP_P="${2:-}"; shift 2 ;;
         --sampling-seed) SAMPLING_SEED="${2:-}"; shift 2 ;;
         --max-tokens) MAX_TOKENS="${2:-}"; shift 2 ;;
+        --architect-think) ARCHITECT_THINK="${2:-}"; shift 2 ;;
         --model-provenance-json) MODEL_PROVENANCE_JSON="${2:-}"; shift 2 ;;
         --top-k)
             die "--top-k is not supported by this migration; validate and add it as a separate experimental change" ;;
@@ -356,6 +360,12 @@ if [[ -n "$MAX_TOKENS" ]]; then
     [[ "$MAX_TOKENS" =~ ^[1-9][0-9]*$ ]] ||
         die "--max-tokens must be a positive integer"
 fi
+if [[ -n "$ARCHITECT_THINK" &&
+      "$ARCHITECT_THINK" != low &&
+      "$ARCHITECT_THINK" != medium &&
+      "$ARCHITECT_THINK" != high ]]; then
+    die "--architect-think must be low, medium, or high"
+fi
 if [[ -n "$REMOTE_BASE_URL" ]]; then
     if [[ "$MODEL" == ollama_chat/* && "$EDITOR_MODEL" == ollama_chat/* ]]; then
         [[ "$REMOTE_BASE_URL" != */v1 && "$REMOTE_BASE_URL" != */v1/ ]] ||
@@ -397,6 +407,7 @@ PLAN_JSON="$(
         --top-p "$TOP_P" \
         --sampling-seed "$SAMPLING_SEED" \
         --max-tokens "$MAX_TOKENS" \
+        --architect-think "$ARCHITECT_THINK" \
         --model-provenance-json "$MODEL_PROVENANCE_JSON" \
         --max-loops "$MAX_LOOPS" \
         --timeout-seconds "$TIMEOUT_SECONDS" \
@@ -436,6 +447,7 @@ STAGE_TABLE="$(
         --top-p "$TOP_P" \
         --sampling-seed "$SAMPLING_SEED" \
         --max-tokens "$MAX_TOKENS" \
+        --architect-think "$ARCHITECT_THINK" \
         --model-provenance-json "$MODEL_PROVENANCE_JSON" \
         --max-loops "$MAX_LOOPS" \
         --timeout-seconds "$TIMEOUT_SECONDS" \
@@ -550,7 +562,8 @@ elif [[ "$OUTPUT_DIR" != /* ]]; then
 fi
 
 if [[ "$PRINT_PLAN" -eq 1 ]]; then
-    # The plan JSON already carries top_p, sampling_seed, max_tokens and the
+    # The plan JSON already carries architect_think, top_p, sampling_seed,
+    # max_tokens and the
     # automation-notice hash, all of which are inside config_fingerprint; these
     # lines restate the sampling settings in the same human-readable form the
     # run banner uses.
@@ -558,8 +571,9 @@ if [[ "$PRINT_PLAN" -eq 1 ]]; then
     printf '\nOutput dir: %s\n' "$OUTPUT_DIR"
     printf 'Lineages:   %s..%s\n' \
         "$LINEAGE_START" "$((LINEAGE_START + LINEAGES - 1))"
-    printf 'Sampling:   temperature=%s top-p=%s sampling-seed=%s max-tokens=%s\n' \
-        "$TEMPERATURE" "${TOP_P:-null}" "${SAMPLING_SEED:-null}" \
+    printf 'Sampling:   temperature=%s architect-think=%s top-p=%s sampling-seed=%s max-tokens=%s\n' \
+        "$TEMPERATURE" "${ARCHITECT_THINK:-null}" \
+        "${TOP_P:-null}" "${SAMPLING_SEED:-null}" \
         "${MAX_TOKENS:-null}"
     exit 0
 fi
@@ -635,6 +649,7 @@ target.write_text(
             "architect_model": plan["architect_model"],
             "editor_model": plan["editor_model"],
             "architect_mode": plan["architect_mode"],
+            "architect_think": plan["architect_think"],
             "model": plan["model"],
             "aider_model_settings": plan["aider_model_settings"],
             "remote_base_url": plan["remote_base_url"],
@@ -675,15 +690,15 @@ RUN_METADATA="$OUTPUT_DIR/lineages.json"
 if [[ -f "$RUN_METADATA" && "$DRY_RUN" -eq 0 ]]; then
     mismatch="$(
         "$PYTHON_BIN" - "$RUN_METADATA" "$CONFIG_FINGERPRINT" "$UTILITY" \
-            "$MODEL" "$EDITOR_MODEL" "$AIDER_VERSION" "$TEMPERATURE" "$MAX_LOOPS" \
+        "$MODEL" "$EDITOR_MODEL" "$AIDER_VERSION" "$TEMPERATURE" "$MAX_LOOPS" \
             "${TOP_P:-__NONE__}" "${SAMPLING_SEED:-__NONE__}" \
-            "${MAX_TOKENS:-__NONE__}" <<'PY'
+            "${MAX_TOKENS:-__NONE__}" "${ARCHITECT_THINK:-__NONE__}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 (path, fingerprint, utility, model, editor_model, aider_version, temperature, max_loops,
- top_p, sampling_seed, max_tokens) = sys.argv[1:]
+ top_p, sampling_seed, max_tokens, architect_think) = sys.argv[1:]
 try:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
 except (OSError, UnicodeError, json.JSONDecodeError) as error:
@@ -708,6 +723,9 @@ expected = {
     "top_p": None if top_p == "__NONE__" else float(top_p),
     "sampling_seed": None if sampling_seed == "__NONE__" else int(sampling_seed),
     "max_tokens": None if max_tokens == "__NONE__" else int(max_tokens),
+    "architect_think": (
+        None if architect_think == "__NONE__" else architect_think
+    ),
     "max_loops": int(max_loops),
 }
 differences = [key for key, value in expected.items() if data.get(key) != value]
@@ -736,6 +754,7 @@ printf 'Temperature:  %s\n' "$TEMPERATURE"
 printf 'Top-p:        %s\n' "${TOP_P:-(server default)}"
 printf 'Sampling seed: %s\n' "${SAMPLING_SEED:-(server default)}"
 printf 'Max tokens:   %s\n' "${MAX_TOKENS:-(server default)}"
+printf 'Architect think: %s\n' "${ARCHITECT_THINK:-(server default)}"
 printf 'Lineages:     %s (numbered %s..%s)\n' \
     "$LINEAGES" "$LINEAGE_START" "$((LINEAGE_START + LINEAGES - 1))"
 printf 'Max loops:    %s per stage\n' "$MAX_LOOPS"
@@ -751,7 +770,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
         --message-file '<prompt-file>' --file '<source>' --no-git \
         --map-tokens 0 --no-auto-commits --no-dirty-commits \
         --no-auto-lint --no-auto-test --no-suggest-shell-commands \
-        --no-analytics --no-check-update --no-show-release-notes
+        --no-analytics --no-check-update --no-show-release-notes --no-browser
     printf '\n\n'
 fi
 
@@ -800,6 +819,7 @@ record.update(
         "model": plan["model"],
         "model_provenance": plan.get("model_provenance"),
         "temperature": plan["temperature"],
+        "architect_think": plan["architect_think"],
         # Taken from the plan rather than re-read from the shell, so the run
         # record and the fingerprint cannot describe different conditions.
         # Null means the flag was not passed and the server default applied.
@@ -877,6 +897,7 @@ for (( offset = 0; offset < LINEAGES; offset++ )); do
             --top-p "$TOP_P" \
             --sampling-seed "$SAMPLING_SEED" \
             --max-tokens "$MAX_TOKENS" \
+            --architect-think "$ARCHITECT_THINK" \
             --max-loops "$MAX_LOOPS" \
             --fingerprint "$CONFIG_FINGERPRINT" \
             --checkpoint-count "$STAGE_COUNT" \
@@ -947,6 +968,8 @@ for (( offset = 0; offset < LINEAGES; offset++ )); do
         [[ -n "$TOP_P" ]] && runner_args+=(--top-p "$TOP_P")
         [[ -n "$SAMPLING_SEED" ]] && runner_args+=(--sampling-seed "$SAMPLING_SEED")
         [[ -n "$MAX_TOKENS" ]] && runner_args+=(--max-tokens "$MAX_TOKENS")
+        [[ -n "$ARCHITECT_THINK" ]] &&
+            runner_args+=(--architect-think "$ARCHITECT_THINK")
         [[ -n "$BASE_TEST_CMD" ]] && runner_args+=(--base-test-cmd "$BASE_TEST_CMD")
         [[ -n "$EXTRA_TEST_CMD" ]] && runner_args+=(--extra-test-cmd "$EXTRA_TEST_CMD")
         [[ "$ALLOW_NO_PROGRESS" -eq 1 ]] && runner_args+=(--allow-no-progress)
@@ -1152,6 +1175,8 @@ record = {
     "infrastructure_failure_stage": metadata.get("infrastructure_failure_stage"),
     "agent_execution_failure": bool(metadata.get("agent_execution_failure")),
     "agent_execution_failure_stage": metadata.get("agent_execution_failure_stage"),
+    "agent_failure_reason": metadata.get("agent_failure_reason"),
+    "architect_think": metadata.get("architect_think"),
     # Timeout provenance, carried into the lineage record so a stage that
     # succeeded or was repaired after a cut-short session is still
     # distinguishable from one whose session finished normally.

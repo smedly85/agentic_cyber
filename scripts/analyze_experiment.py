@@ -127,6 +127,7 @@ PAPER_METRICS_COLUMNS = [
     "Checkpoint",
     "Model",
     "Temp",
+    "Architect Think",
     "Reliability Scope",
     "Population N",
     "Lineages Started",
@@ -161,6 +162,7 @@ PAPER_DESCRIPTIVE_COLUMNS = [
     "Checkpoint",
     "Model",
     "Temp",
+    "Architect Think",
     "Raw Architecture Families",
     "Architecture Family-Discovery AUC@K",
     "Architecture Vendi Score",
@@ -879,7 +881,9 @@ def normalize_repair_metadata(
             agent_execution_stage = "permission"
         elif agent_exit == 124:
             agent_execution_stage = "timeout"
-        elif explicit_agent_stage in {"timeout", "opencode", "aider", "permission"}:
+        elif explicit_agent_stage in {
+            "timeout", "opencode", "aider", "permission", "token_limit"
+        }:
             agent_execution_stage = str(explicit_agent_stage)
         else:
             agent_execution_stage = backend if backend != "unknown" else "agent"
@@ -1539,6 +1543,9 @@ def build_paper_metrics_row(
         "Checkpoint": infer_paper_checkpoint(experiment_metadata, checkpoint_label),
         "Model": experiment_metadata.get("model", summary.get("model")),
         "Temp": experiment_metadata.get("temperature", summary.get("temperature")),
+        "Architect Think": experiment_metadata.get(
+            "architect_think", summary.get("architect_think")
+        ),
         "Reliability Scope": (
             "parent_lineage_experiment" if is_lineage_view else "current_experiment"
         ),
@@ -1610,6 +1617,9 @@ def build_paper_descriptive_row(
         "Checkpoint": infer_paper_checkpoint(experiment_metadata, checkpoint_label),
         "Model": experiment_metadata.get("model", summary.get("model")),
         "Temp": experiment_metadata.get("temperature", summary.get("temperature")),
+        "Architect Think": experiment_metadata.get(
+            "architect_think", summary.get("architect_think")
+        ),
         "Raw Architecture Families": architecture_primary.get("raw_family_count"),
         "Architecture Family-Discovery AUC@K": architecture_primary.get(
             "family_discovery_auc_at_kmax"
@@ -4059,6 +4069,7 @@ def main() -> int:
                 ),
                 "model": experiment_metadata.get("model"),
                 "temperature": experiment_metadata.get("temperature"),
+                "architect_think": experiment_metadata.get("architect_think"),
             },
             formal=args.formal_analysis,
         )
@@ -4355,6 +4366,7 @@ def main() -> int:
         ),
         "editor_model": experiment_metadata.get("editor_model"),
         "architect_mode": experiment_metadata.get("architect_mode", False),
+        "architect_think": experiment_metadata.get("architect_think"),
         "model_provenance": experiment_metadata.get("model_provenance"),
         "temperature": experiment_metadata.get("temperature"),
         "runs_analyzed": n,

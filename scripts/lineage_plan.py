@@ -13,8 +13,8 @@ and harder to get wrong than comparing a dozen fields: the fingerprint covers
 the resolved manifest, the *contents* of every checkpoint prompt, the contents
 of the judge script, each checkpoint's cumulative implemented flags, each
 checkpoint's visible test bundle, the Aider/model-pair/repair settings the stages run
-under, the whole sampling configuration (temperature, top_p, sampling_seed,
-max_tokens), explicit model-definition provenance, and the shared automation notice that is expanded into every
+under, the whole sampling configuration (temperature, architect_think, top_p,
+sampling_seed, max_tokens), explicit model-definition provenance, and the shared automation notice that is expanded into every
 prompt. The number of lineages is deliberately excluded, so extending an
 existing run from 10 lineages to 15 is allowed while editing a prompt, changing
 a sampling knob or rewording the notice is not.
@@ -153,6 +153,7 @@ def resolve_plan(
     aider_version: str = "unknown",
     remote_base_url: str = "",
     remote_api_key_env: str = "",
+    architect_think: Any = None,
 ) -> dict[str, Any]:
     # `agent` remains only as a Python-call compatibility slot for older test
     # and analysis helpers. It is not emitted, fingerprinted or exposed by the
@@ -160,6 +161,13 @@ def resolve_plan(
     del agent
     architect_model = model
     temperature = temperature_value.canonicalize(temperature)
+    if architect_think in (None, ""):
+        architect_think = None
+    elif architect_think not in aider_settings.ARCHITECT_THINK_VALUES:
+        raise ManifestError(
+            "architect_think must be one of "
+            + ", ".join(aider_settings.ARCHITECT_THINK_VALUES)
+        )
     if not remote_base_url:
         remote_transport = "default"
     elif architect_model.startswith("ollama_chat/") and editor_model.startswith(
@@ -406,6 +414,9 @@ def resolve_plan(
         "top_p": optional_float(top_p, "top_p"),
         "sampling_seed": optional_int(sampling_seed, "sampling_seed"),
         "max_tokens": optional_int(max_tokens, "max_tokens"),
+        # Native Ollama/Qwen architect thinking control. This is deliberately a
+        # string, not reasoning_effort and not a boolean.
+        "architect_think": architect_think,
         "editor_temperature": aider_settings.EDITOR_TEMPERATURE,
         "editor_sampling_seed": aider_settings.EDITOR_SEED,
         "editor_edit_format": aider_settings.EDITOR_EDIT_FORMAT,
@@ -420,6 +431,7 @@ def resolve_plan(
                 top_p=top_p,
                 sampling_seed=sampling_seed,
                 max_tokens=max_tokens,
+                architect_think=architect_think,
             )
             if architect_model
             else []
@@ -451,8 +463,8 @@ def fingerprint(plan: dict[str, Any]) -> str:
     each checkpoint's visible test bundle, via its bundle fingerprint; the
     Aider version, architect/editor model pair, architect mode, fixed editor
     sampling, repair budget and per-invocation timeout the stages run under;
-    the full sampling configuration (temperature, top_p, sampling_seed,
-    max_tokens -- a null among them is itself a condition, meaning the server
+    the full sampling configuration (temperature, architect_think, top_p,
+    sampling_seed, max_tokens -- a null among them is itself a condition, meaning the server
     default applied); explicit model-definition provenance such as an Ollama
     Modelfile top_k value; and the shared automation notice, via
     automation_notice_sha256, since it is expanded into every prompt the model
@@ -463,6 +475,12 @@ def fingerprint(plan: dict[str, Any]) -> str:
     change).
     """
     material = {key: value for key, value in plan.items() if key != "config_fingerprint"}
+    # Historical plans predate this optional key. Omitting the new control is
+    # the same request condition as those plans, so preserve their fingerprint;
+    # explicit low/medium/high values remain covered both here and in the
+    # generated Aider settings.
+    if material.get("architect_think") is None:
+        material.pop("architect_think", None)
     canonical = json.dumps(material, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -519,6 +537,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--top-p", default="")
     parser.add_argument("--sampling-seed", default="")
     parser.add_argument("--max-tokens", default="")
+    parser.add_argument("--architect-think", default="")
     parser.add_argument("--model-provenance-json", default="")
     parser.add_argument("--remote-base-url", default="")
     parser.add_argument("--remote-api-key-env", default="")
@@ -552,6 +571,7 @@ def main(argv: list[str] | None = None) -> int:
         top_p=args.top_p,
         sampling_seed=args.sampling_seed,
         max_tokens=args.max_tokens,
+        architect_think=args.architect_think,
         model_provenance_json=args.model_provenance_json,
         editor_model=args.editor_model,
         aider_version=args.aider_version,

@@ -71,6 +71,9 @@ Temperature:
 Other sampling parameters (each optional; unset means the flag is absent from
 the request and the server's own default applies, which is the behavior before
 these flags existed):
+  --architect-think LEVEL   Native architect thinking level: low, medium, or
+                             high. Sent directly as the string-valued `think`
+                             parameter; never translated to reasoning_effort.
   --top-p P                  Nucleus sampling mass, 0 <= P <= 1. Sent as
                              top_p.
   --sampling-seed N          Pseudorandom seed for token selection, N >= 0.
@@ -206,6 +209,14 @@ optional_number() {
     fi
 }
 
+optional_string() {
+    if [[ -n "$1" ]]; then
+        printf '__STR__:%s' "$1"
+    else
+        printf '__JSON__:null'
+    fi
+}
+
 write_metadata() {
     local file="$1"
     shift
@@ -325,6 +336,7 @@ run_aider() {
     local invocation="$4"
     local kind="$5"
     local current_log start_ns end_ns status runtime_ms isolation_rejected
+    local token_limit
     local env_args
 
     current_log="$attempt_dir/.aider-current.log"
@@ -390,6 +402,7 @@ run_aider() {
         --no-pretty
         --no-fancy-input
         --no-notifications
+        --no-browser
         --no-detect-urls
         --disable-playwright
         --config "$AIDER_CONFIG_FILE"
@@ -423,8 +436,13 @@ run_aider() {
     # source and explicit read-only context. Test tampering remains independently
     # detected by capture_candidate.py.
     isolation_rejected=false
+    token_limit=false
+    if grep -Fq 'has hit a token limit!' "$current_log"; then
+        token_limit=true
+    fi
     rm -f "$current_log"
-    printf '%s %s %s\n' "$status" "$runtime_ms" "$isolation_rejected"
+    printf '%s %s %s %s\n' \
+        "$status" "$runtime_ms" "$isolation_rejected" "$token_limit"
 }
 
 make_loop_record() {
@@ -446,6 +464,8 @@ import sys
     feature_test_ms,
     validation_success,
     source_sha256,
+    token_limit,
+    agent_failure_reason,
 ) = sys.argv[1:]
 print(json.dumps({
     "loop": int(loop),
@@ -461,6 +481,8 @@ print(json.dumps({
     "feature_test_runtime_ms": int(feature_test_ms),
     "validation_success": validation_success == "true",
     "source_sha256": source_sha256,
+    "agent_token_limit": token_limit == "true",
+    "agent_failure_reason": agent_failure_reason or None,
 }, separators=(",", ":")))
 PY
 }
@@ -487,6 +509,7 @@ TEMP_LIST_SET=0
 TOP_P=""
 SAMPLING_SEED=""
 MAX_TOKENS=""
+ARCHITECT_THINK=""
 MODEL_PROVENANCE_JSON=""
 RUNS=1
 MAX_LOOPS=3
@@ -523,7 +546,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --model|--editor-model|--prompt|--source|--source-mode|--temperature|--temp-min| \
         --temp-max|--temp-points|--temp-list|--runs|--max-loops| \
-        --top-p|--sampling-seed|--max-tokens|--model-provenance-json| \
+        --top-p|--sampling-seed|--max-tokens|--architect-think|--model-provenance-json| \
         --repair-prompt| \
         --test-dir|--seed-file|--keep-glob|--build-cmd|--base-test-cmd| \
         --feature-test-cmd|--test-cmd|--extra-test-cmd|--timeout|--output-dir| \
@@ -549,6 +572,7 @@ while [[ $# -gt 0 ]]; do
         --top-p) TOP_P="${2:-}"; shift 2 ;;
         --sampling-seed) SAMPLING_SEED="${2:-}"; shift 2 ;;
         --max-tokens) MAX_TOKENS="${2:-}"; shift 2 ;;
+        --architect-think) ARCHITECT_THINK="${2:-}"; shift 2 ;;
         --model-provenance-json) MODEL_PROVENANCE_JSON="${2:-}"; shift 2 ;;
         --top-k)
             # Native ollama_chat can carry top_k, but changing that experimental
@@ -718,6 +742,12 @@ fi
 if [[ -n "$MAX_TOKENS" ]]; then
     [[ "$MAX_TOKENS" =~ ^[1-9][0-9]*$ ]] ||
         die "--max-tokens must be a positive integer"
+fi
+if [[ -n "$ARCHITECT_THINK" &&
+      "$ARCHITECT_THINK" != low &&
+      "$ARCHITECT_THINK" != medium &&
+      "$ARCHITECT_THINK" != high ]]; then
+    die "--architect-think must be low, medium, or high"
 fi
 
 "$PYTHON_BIN" - "$SOURCE_PATH" <<'PY' ||
@@ -1013,6 +1043,7 @@ write_metadata "$OUTPUT_DIR/sweep.json" \
     top_p "$(optional_number "$TOP_P")" \
     sampling_seed "$(optional_number "$SAMPLING_SEED")" \
     max_tokens "$(optional_number "$MAX_TOKENS")" \
+    architect_think "$(optional_string "$ARCHITECT_THINK")" \
     runs_per_temperature "$RUNS" \
     max_loops "$MAX_LOOPS" \
     test_dirs "$TEST_DIRS_JOINED" \
@@ -1067,6 +1098,7 @@ for temperature in "${TEMPERATURES_ARR[@]}"; do
                 "${ANALYSIS_DIVERSITY_K_MAX:-__NONE__}" \
                 "${TOP_P:-__NONE__}" "${SAMPLING_SEED:-__NONE__}" \
                 "${MAX_TOKENS:-__NONE__}" \
+                "${ARCHITECT_THINK:-__NONE__}" \
                 "${MODEL_PROVENANCE_JSON:-__NONE__}" \
                 "${REMOTE_BASE_URL:-__NONE__}" \
                 "${REMOTE_API_KEY_ENV:-__NONE__}" \
@@ -1096,6 +1128,7 @@ data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
     top_p,
     sampling_seed,
     max_tokens,
+    architect_think,
     model_provenance_json,
     remote_base_url,
     remote_api_key_env,
@@ -1119,6 +1152,9 @@ expected = {
     "top_p": None if top_p == "__NONE__" else float(top_p),
     "sampling_seed": None if sampling_seed == "__NONE__" else int(sampling_seed),
     "max_tokens": None if max_tokens == "__NONE__" else int(max_tokens),
+    "architect_think": (
+        None if architect_think == "__NONE__" else architect_think
+    ),
     "editor_temperature": 0,
     "editor_sampling_seed": 0,
     "editor_edit_format": "editor-diff",
@@ -1179,6 +1215,7 @@ PY
         top_p "$(optional_number "$TOP_P")" \
         sampling_seed "$(optional_number "$SAMPLING_SEED")" \
         max_tokens "$(optional_number "$MAX_TOKENS")" \
+        architect_think "$(optional_string "$ARCHITECT_THINK")" \
         editor_temperature 0 \
         editor_sampling_seed 0 \
         editor_edit_format editor-diff \
@@ -1279,6 +1316,7 @@ PY
             --top-p "$TOP_P" \
             --sampling-seed "$SAMPLING_SEED" \
             --max-tokens "$MAX_TOKENS" \
+            --architect-think "$ARCHITECT_THINK" \
             --output "$AIDER_MODEL_SETTINGS_FILE" \
             --emit sha256 >"$attempt_dir/aider-model-settings.sha256" ||
             die "failed to build per-attempt Aider model settings"
@@ -1320,6 +1358,7 @@ PY
         success_loop_json=null
         agent_execution_failed=false
         agent_execution_failure_stage_json=null
+        agent_failure_reason_json=null
         stop_reason=""
         previous_source_sha=""
         loop_records=()
@@ -1355,7 +1394,8 @@ PY
                 repair_loops=$((repair_loops + 1))
             fi
 
-            read -r agent_exit agent_ms invocation_isolation_rejected < <(
+            read -r agent_exit agent_ms invocation_isolation_rejected \
+                invocation_token_limit < <(
                 run_aider \
                     "$attempt_dir/aider.log" \
                     "$workdir" \
@@ -1392,7 +1432,8 @@ PY
                 initial_agent_exit="$agent_exit"
                 candidate_available_after_initial_session="$invocation_candidate_present"
                 if [[ "$agent_exit" -eq 0 &&
-                      "$invocation_isolation_rejected" == false ]]; then
+                      "$invocation_isolation_rejected" == false &&
+                      "$invocation_token_limit" == false ]]; then
                     initial_session_completed=true
                 fi
                 if [[ "$invocation_timed_out" == true &&
@@ -1402,7 +1443,18 @@ PY
             fi
 
             invocation_agent_execution_failed=false
-            if [[ "$invocation_isolation_rejected" == true ]]; then
+            invocation_agent_failure_reason=""
+            if [[ "$invocation_token_limit" == true ]]; then
+                # Aider may exit zero after reporting this explicit generation
+                # failure. It is terminal regardless of source contents or
+                # controller validation: a truncated architect response is not
+                # a completed repair attempt and must never become no_progress.
+                invocation_agent_execution_failed=true
+                agent_execution_failed=true
+                agent_execution_failure_stage_json='"token_limit"'
+                agent_failure_reason_json='"output_token_limit"'
+                invocation_agent_failure_reason="output_token_limit"
+            elif [[ "$invocation_isolation_rejected" == true ]]; then
                 # A rejected permission means the sandbox boundary held, not
                 # that the model produced work. Unchanged.
                 invocation_agent_execution_failed=true
@@ -1480,7 +1532,9 @@ PY
                 "$agent_exit" "$invocation_isolation_rejected" \
                 "$build_exit" "$base_test_exit" "$feature_test_exit" \
                 "$agent_ms" "$build_ms" "$base_test_ms" \
-                "$feature_test_ms" "$validation_success" "$source_sha")")
+                "$feature_test_ms" "$validation_success" "$source_sha" \
+                "$invocation_token_limit" \
+                "$invocation_agent_failure_reason")")
 
             printf '    loop %s: build=%s base=%s checkpoint=%s\n' \
                 "$validation_loop" "$build_exit" "$base_test_exit" \
@@ -1684,6 +1738,7 @@ PY
             top_p "$(optional_number "$TOP_P")" \
             sampling_seed "$(optional_number "$SAMPLING_SEED")" \
             max_tokens "$(optional_number "$MAX_TOKENS")" \
+            architect_think "$(optional_string "$ARCHITECT_THINK")" \
             architect_sampling "__JSON__:$("$PYTHON_BIN" -c 'import json,sys; s=json.loads(sys.argv[1]); print(json.dumps(s[0]["extra_params"],separators=(",",":")))' "$AIDER_MODEL_SETTINGS_JSON")" \
             editor_sampling "__JSON__:$("$PYTHON_BIN" -c 'import json,sys; s=json.loads(sys.argv[1]); print(json.dumps(s[1]["extra_params"],separators=(",",":")))' "$AIDER_MODEL_SETTINGS_JSON")" \
             editor_edit_format "$EDITOR_EDIT_FORMAT" \
@@ -1723,6 +1778,7 @@ PY
             infrastructure_failure_classification_inferred false \
             agent_execution_failure "$agent_execution_failed" \
             agent_execution_failure_stage "__JSON__:$agent_execution_failure_stage_json" \
+            agent_failure_reason "__JSON__:$agent_failure_reason_json" \
             initial_session_completed "$initial_session_completed" \
             initial_agent_exit_code "$(optional_number "$initial_agent_exit")" \
             candidate_available_after_initial_session "$candidate_available_after_initial_session" \

@@ -37,6 +37,7 @@ MANIFEST_DIR = REPO_ROOT / "experiments" / "utilities"
 
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 import analyze_lineages  # noqa: E402
+import aider_settings  # noqa: E402
 import capture_candidate  # noqa: E402
 import checkpoint_boundary_gate  # noqa: E402
 
@@ -1745,6 +1746,30 @@ class ResumeFingerprintTests(unittest.TestCase):
             with self.subTest(setting=label):
                 self.assertNotEqual(base, self.plan(**overrides)["config_fingerprint"])
 
+    def test_architect_think_values_are_distinct_and_fingerprinted(self):
+        plans = {
+            value: self.plan(architect_think=value)
+            for value in (None, "low", "medium", "high")
+        }
+        fingerprints = {
+            value: plan["config_fingerprint"] for value, plan in plans.items()
+        }
+        self.assertEqual(len(set(fingerprints.values())), 4)
+        self.assertEqual(
+            fingerprints["medium"],
+            self.plan(architect_think="medium")["config_fingerprint"],
+        )
+        self.assertIsNone(plans[None]["architect_think"])
+
+    def test_omitted_think_preserves_the_historical_fingerprint_shape(self):
+        plan = self.plan()
+        historical = dict(plan)
+        historical.pop("architect_think")
+        historical.pop("config_fingerprint")
+        self.assertEqual(
+            plan["config_fingerprint"], lineage_plan.fingerprint(historical)
+        )
+
     def test_explicit_model_level_top_k_changes_the_fingerprint(self):
         provenance = json.dumps(
             {
@@ -2849,7 +2874,9 @@ class SamplingParameterSurfaceTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
     def test_each_confirmed_knob_has_a_flag(self):
-        for flag in ("--top-p", "--sampling-seed", "--max-tokens"):
+        for flag in (
+            "--architect-think", "--top-p", "--sampling-seed", "--max-tokens"
+        ):
             with self.subTest(flag=flag):
                 self.assertIn(f"{flag})", self.text)
 
@@ -2859,6 +2886,51 @@ class SamplingParameterSurfaceTests(unittest.TestCase):
         self.assertIn('--editor-model)', self.text)
         self.assertIn('--message-file', self.text)
         self.assertIn('--no-git', self.text)
+        self.assertIn('--no-browser', self.text)
+
+    def test_architect_think_cli_reaches_native_model_settings(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(REPO_ROOT / "scripts" / "aider_settings.py"),
+                "--architect-model", "ollama_chat/qwen3.8:27b",
+                "--editor-model", "ollama_chat/qwen3-coder-next:latest",
+                "--temperature", "0",
+                "--architect-think", "medium",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        settings = json.loads(result.stdout)
+        self.assertEqual(
+            settings[0],
+            {
+                "name": "ollama_chat/qwen3.8:27b",
+                "use_repo_map": False,
+                "extra_params": {"temperature": 0.0, "think": "medium"},
+            },
+        )
+        self.assertEqual(
+            settings[1]["extra_params"], {"temperature": 0.0, "seed": 0}
+        )
+        self.assertEqual(settings[1]["editor_edit_format"], "editor-diff")
+
+    def test_architect_think_levels_remain_strings(self):
+        observed = []
+        for value in ("low", "medium", "high"):
+            settings = aider_settings.build_model_settings(
+                "ollama_chat/qwen3.8:27b",
+                "ollama_chat/qwen3-coder-next:latest",
+                0,
+                architect_think=value,
+            )
+            think = settings[0]["extra_params"]["think"]
+            self.assertIsInstance(think, str)
+            self.assertNotIn("reasoning_effort", settings[0]["extra_params"])
+            observed.append(think)
+        self.assertEqual(observed, ["low", "medium", "high"])
 
     def test_the_sampling_seed_flag_is_not_called_seed(self):
         """--seed-file is the source-inheritance file; the senses must not mix."""
@@ -4832,6 +4904,8 @@ class TimeoutRepairEligibilityTests(unittest.TestCase):
         "broken": "int main(void) { return\n",          # does not compile
         "failing": "int main(void){return 1;}\n",       # compiles, tests fail
         "passing": "int main(void){return 0;}\n",       # compiles, tests pass
+        "token_limit": None,
+        "unchanged": "int main(void){return 1;}\n",
     }
 
     def stub_aider(self, behavior: str, *, repair_fixes: bool = False) -> Path:
@@ -4853,14 +4927,21 @@ class TimeoutRepairEligibilityTests(unittest.TestCase):
                 'fi\n'
                 'touch "$workdir/.repaired"\n'
             )
+        terminal = "exit 124\n"
+        if behavior == "token_limit":
+            terminal = (
+                'echo "Model ollama_chat/qwen3.8:27b has hit a token limit!"\n'
+                "exit 0\n"
+            )
+        elif behavior == "unchanged":
+            terminal = "exit 0\n"
         path = self.temp / f"aider-{behavior}"
         path.write_text(
             '#!/bin/bash\n'
             'if [ "${1:-}" = --version ]; then echo "aider 0.test"; exit 0; fi\n'
             'workdir="$PWD"\n'
             'src="$workdir/src/x.c"\n'
-            + repair_branch + write +
-            'exit 124\n',
+            + repair_branch + write + terminal,
             encoding="utf-8", newline="\n",
         )
         path.chmod(0o755)
@@ -4910,6 +4991,24 @@ class TimeoutRepairEligibilityTests(unittest.TestCase):
                          "agent_execution_failure")
         self.assertEqual(meta["repair_loops"], 0)
         self.assertEqual(meta["stop_reason"], "agent_execution_failure")
+
+    def test_aider_token_limit_is_terminal_agent_execution_failure(self):
+        meta = self.run_attempt("token_limit")
+        self.assertTrue(meta["agent_execution_failure"])
+        self.assertEqual(meta["agent_execution_failure_stage"], "token_limit")
+        self.assertEqual(meta["agent_failure_reason"], "output_token_limit")
+        self.assertEqual(meta["stop_reason"], "agent_execution_failure")
+        self.assertNotEqual(meta["stop_reason"], "no_progress")
+        self.assertEqual(meta["repair_loops"], 0)
+        self.assertTrue(meta["loops"][0]["agent_token_limit"])
+
+    def test_completed_unchanged_invocation_still_stops_for_no_progress(self):
+        meta = self.run_attempt("unchanged")
+        self.assertFalse(meta["agent_execution_failure"])
+        self.assertIsNone(meta["agent_execution_failure_stage"])
+        self.assertIsNone(meta["agent_failure_reason"])
+        self.assertEqual(meta["stop_reason"], "no_progress")
+        self.assertEqual(meta["repair_loops"], 1)
 
     # --- 2. timeout with a source that fails to build ----------------------
 
@@ -5287,6 +5386,7 @@ parser.add_argument("--temperature", default="0")
 parser.add_argument("--top-p", default="")
 parser.add_argument("--sampling-seed", default="")
 parser.add_argument("--max-tokens", default="")
+parser.add_argument("--architect-think", default="")
 parser.add_argument("--max-loops", type=int, default=3)
 parser.add_argument("--timeout-seconds", type=int, default=1800)
 parser.add_argument("--remote-base-url", default="")
@@ -5294,7 +5394,10 @@ parser.add_argument("--remote-api-key-env", default="")
 args, _ = parser.parse_known_args()
 temperature = float(args.temperature)
 fingerprint = hashlib.sha256(
-    json.dumps({"temperature": temperature}, sort_keys=True).encode()
+    json.dumps(
+        {"temperature": temperature, "architect_think": args.architect_think or None},
+        sort_keys=True,
+    ).encode()
 ).hexdigest()
 checkpoints = [
     {"id": "000", "name": "base", "prompt": "prompts/mkdir/000.md",
@@ -5330,6 +5433,7 @@ else:
         "top_p": None if not args.top_p else float(args.top_p),
         "sampling_seed": None if not args.sampling_seed else int(args.sampling_seed),
         "max_tokens": None if not args.max_tokens else int(args.max_tokens),
+        "architect_think": args.architect_think or None,
         "editor_temperature": 0.0, "editor_sampling_seed": 0,
         "editor_edit_format": "editor-diff", "aider_model_settings": [],
         "remote_base_url": args.remote_base_url or None,
@@ -5379,7 +5483,7 @@ while [[ $# -gt 0 ]]; do
         --output-dir) output_dir="$2"; shift 2 ;;
         --source) source_path="$2"; shift 2 ;;
         --seed-file) seed_spec="$2"; shift 2 ;;
-        --model|--editor-model|--runs|--max-loops|--timeout|--prompt|--source-mode|--test-dir|--build-cmd|--base-test-cmd|--feature-test-cmd|--extra-test-cmd|--repair-prompt|--remote-base-url|--remote-api-key-env|--top-p|--sampling-seed|--max-tokens|--model-provenance-json)
+        --model|--editor-model|--runs|--max-loops|--timeout|--prompt|--source-mode|--test-dir|--build-cmd|--base-test-cmd|--feature-test-cmd|--extra-test-cmd|--repair-prompt|--remote-base-url|--remote-api-key-env|--top-p|--sampling-seed|--max-tokens|--architect-think|--model-provenance-json)
             shift 2 ;;
         *) shift ;;
     esac
@@ -5663,10 +5767,13 @@ class LineageSamplingParameterTests(unittest.TestCase):
     # --- forwarding --------------------------------------------------------
 
     def test_every_stage_receives_every_requested_knob(self):
-        stages = self.dry_run_stages("--top-p", "0.9", "--sampling-seed", "42",
-                                     "--max-tokens", "512")
+        stages = self.dry_run_stages(
+            "--architect-think", "medium", "--top-p", "0.9",
+            "--sampling-seed", "42", "--max-tokens", "512"
+        )
         self.assertTrue(stages)
-        for flag, value in (("--top-p", "0.9"), ("--sampling-seed", "42"),
+        for flag, value in (("--architect-think", "medium"),
+                            ("--top-p", "0.9"), ("--sampling-seed", "42"),
                             ("--max-tokens", "512")):
             with self.subTest(flag=flag):
                 carrying = [line for line in stages
@@ -5689,7 +5796,9 @@ class LineageSamplingParameterTests(unittest.TestCase):
     def test_omitted_knobs_are_not_forwarded_at_all(self):
         stages = self.dry_run_stages()
         self.assertTrue(stages)
-        for flag in ("--top-p", "--sampling-seed", "--max-tokens"):
+        for flag in (
+            "--architect-think", "--top-p", "--sampling-seed", "--max-tokens"
+        ):
             with self.subTest(flag=flag):
                 self.assertEqual([line for line in stages if flag in line], [])
 
@@ -5699,7 +5808,7 @@ class LineageSamplingParameterTests(unittest.TestCase):
         plan = lineage_plan.resolve_plan(
             REPO_ROOT, "grep", "demo/m", "0.2", "build", 3, 1800
         )
-        for key in ("top_p", "sampling_seed", "max_tokens"):
+        for key in ("architect_think", "top_p", "sampling_seed", "max_tokens"):
             with self.subTest(key=key):
                 self.assertIn(key, plan)
                 self.assertIsNone(plan[key])
@@ -5772,6 +5881,7 @@ class LineageSamplingParameterTests(unittest.TestCase):
             (("--sampling-seed", "1.5"), "--sampling-seed must be"),
             (("--max-tokens", "0"), "--max-tokens must be"),
             (("--max-tokens", "abc"), "--max-tokens must be"),
+            (("--architect-think", "true"), "--architect-think must be"),
         ):
             output = self.temp / f"bad-{abs(hash(arguments))}"
             with self.subTest(arguments=arguments):
@@ -5815,14 +5925,17 @@ class LineageSamplingParameterTests(unittest.TestCase):
 
     def test_durable_records_carry_the_sampling_configuration(self):
         output = self.temp / "durable"
-        self.start_run(output, "--top-p", "0.9", "--sampling-seed", "42",
-                       "--max-tokens", "512")
+        self.start_run(
+            output, "--architect-think", "medium", "--top-p", "0.9",
+            "--sampling-seed", "42", "--max-tokens", "512"
+        )
         record = json.loads(
             (output / "lineages.json").read_text(encoding="utf-8")
         )
         self.assertEqual(record["top_p"], 0.9)
         self.assertEqual(record["sampling_seed"], 42)
         self.assertEqual(record["max_tokens"], 512)
+        self.assertEqual(record["architect_think"], "medium")
         self.assertTrue(record["automation_notice_sha256"])
 
         lineage = json.loads(
@@ -5831,6 +5944,7 @@ class LineageSamplingParameterTests(unittest.TestCase):
         self.assertEqual(lineage["top_p"], 0.9)
         self.assertEqual(lineage["sampling_seed"], 42)
         self.assertEqual(lineage["max_tokens"], 512)
+        self.assertEqual(lineage["architect_think"], "medium")
 
     def test_unset_knobs_are_recorded_as_null_not_omitted(self):
         output = self.temp / "durable-null"
@@ -5841,7 +5955,7 @@ class LineageSamplingParameterTests(unittest.TestCase):
         lineage = json.loads(
             (output / "lineage-001" / "lineage.json").read_text(encoding="utf-8")
         )
-        for key in ("top_p", "sampling_seed", "max_tokens"):
+        for key in ("architect_think", "top_p", "sampling_seed", "max_tokens"):
             with self.subTest(key=key):
                 self.assertIn(key, record)
                 self.assertIsNone(record[key])
@@ -5862,6 +5976,14 @@ class LineageSamplingParameterTests(unittest.TestCase):
         self.start_run(output, "--top-p", "0.9")
         again = self.start_run(output, "--top-p", "0.9")
         self.assertNotIn("different configuration", again.stderr)
+
+    def test_resume_rejects_a_different_architect_think(self):
+        output = self.temp / "resume-think"
+        self.start_run(output, "--architect-think", "medium")
+        again = self.start_run(output, "--architect-think", "high")
+        self.assertNotEqual(again.returncode, 0)
+        self.assertIn("different configuration", again.stderr)
+        self.assertIn("architect_think", again.stderr)
 
 
 class SharedAutomationNoticeRenderTests(unittest.TestCase):
