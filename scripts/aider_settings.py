@@ -18,6 +18,7 @@ from typing import Any
 EDITOR_TEMPERATURE = 0.0
 EDITOR_SEED = 0
 EDITOR_EDIT_FORMAT = "editor-diff"
+EDITOR_EDIT_FORMATS = ("whole", "editor-diff")
 ARCHITECT_THINK_VALUES = ("low", "medium", "high")
 
 
@@ -42,6 +43,7 @@ def build_model_settings(
     sampling_seed: Any = None,
     max_tokens: Any = None,
     architect_think: Any = None,
+    editor_edit_format: str = EDITOR_EDIT_FORMAT,
 ) -> list[dict[str, Any]]:
     """Return the role-specific settings passed to Aider/LiteLLM.
 
@@ -57,6 +59,10 @@ def build_model_settings(
         raise ValueError(
             "architect and editor models must differ so role-specific sampling "
             "settings cannot collide"
+        )
+    if editor_edit_format not in EDITOR_EDIT_FORMATS:
+        raise ValueError(
+            "editor edit format must be one of " + ", ".join(EDITOR_EDIT_FORMATS)
         )
 
     architect_params: dict[str, int | float | str] = {
@@ -92,7 +98,7 @@ def build_model_settings(
         {
             "name": editor_model,
             "use_repo_map": False,
-            "editor_edit_format": EDITOR_EDIT_FORMAT,
+            "editor_edit_format": editor_edit_format,
             "extra_params": {
                 "temperature": EDITOR_TEMPERATURE,
                 "seed": EDITOR_SEED,
@@ -120,6 +126,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sampling-seed", default="")
     parser.add_argument("--max-tokens", default="")
     parser.add_argument("--architect-think", default="")
+    parser.add_argument("--editor-edit-format", default=EDITOR_EDIT_FORMAT)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--emit", choices=("settings", "sha256"), default="settings")
     return parser.parse_args(argv)
@@ -136,6 +143,7 @@ def main(argv: list[str] | None = None) -> int:
             sampling_seed=args.sampling_seed,
             max_tokens=args.max_tokens,
             architect_think=args.architect_think,
+            editor_edit_format=args.editor_edit_format,
         )
     except (TypeError, ValueError) as error:
         raise SystemExit(f"aider_settings: {error}") from error

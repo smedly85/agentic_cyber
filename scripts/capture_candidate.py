@@ -161,11 +161,17 @@ def write_lines(path: Path, lines: list[str]) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def is_python_bytecode_artifact(relative: Path) -> bool:
+    return "__pycache__" in relative.parts or relative.suffix == ".pyc"
+
+
 def relative_files(root: Path) -> dict[str, Path]:
     return {
         str(path.relative_to(root)): path
         for path in sorted(root.rglob("*"))
-        if path.is_file() and not path.is_symlink()
+        if path.is_file()
+        and not path.is_symlink()
+        and not is_python_bytecode_artifact(path.relative_to(root))
     }
 
 

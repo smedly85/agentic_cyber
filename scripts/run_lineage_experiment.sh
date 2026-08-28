@@ -68,6 +68,8 @@ session, and unset means the flag is absent from the request so the server's own
 default applies):
   --architect-think LEVEL   Native architect thinking level: low, medium, or
                              high. Forwarded as `think`, not reasoning_effort.
+  --editor-edit-format FMT  Editor output protocol: whole or editor-diff
+                             (default: editor-diff).
   --top-p P                  Nucleus sampling mass, 0 <= P <= 1
   --sampling-seed N          Token-selection seed, N >= 0. Named this way on
                              purpose: --seed-file is the checkpoint
@@ -208,6 +210,7 @@ boundary_gate() {
 UTILITY=""
 MODEL=""
 EDITOR_MODEL="ollama_chat/qwen3-coder-next:latest"
+EDITOR_EDIT_FORMAT="editor-diff"
 TEMPERATURE="0"
 # Optional sampling knobs. Empty means "not requested": the value is recorded as
 # a JSON null and no flag is forwarded, so the stage runs exactly as it did
@@ -238,7 +241,7 @@ AIDER_BIN="${AIDER_BIN:-aider}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --utility|--model|--editor-model|--temperature|--lineages|--lineage-start|--max-loops| \
-        --top-p|--sampling-seed|--max-tokens|--architect-think|--model-provenance-json| \
+        --top-p|--sampling-seed|--max-tokens|--architect-think|--editor-edit-format|--model-provenance-json| \
         --timeout|--repair-prompt|--remote-base-url| \
         --remote-api-key-env|--output-dir)
             [[ $# -ge 2 ]] || die "$1 requires a value"
@@ -254,6 +257,7 @@ while [[ $# -gt 0 ]]; do
         --sampling-seed) SAMPLING_SEED="${2:-}"; shift 2 ;;
         --max-tokens) MAX_TOKENS="${2:-}"; shift 2 ;;
         --architect-think) ARCHITECT_THINK="${2:-}"; shift 2 ;;
+        --editor-edit-format) EDITOR_EDIT_FORMAT="${2:-}"; shift 2 ;;
         --model-provenance-json) MODEL_PROVENANCE_JSON="${2:-}"; shift 2 ;;
         --top-k)
             die "--top-k is not supported by this migration; validate and add it as a separate experimental change" ;;
@@ -366,6 +370,10 @@ if [[ -n "$ARCHITECT_THINK" &&
       "$ARCHITECT_THINK" != high ]]; then
     die "--architect-think must be low, medium, or high"
 fi
+if [[ "$EDITOR_EDIT_FORMAT" != whole &&
+      "$EDITOR_EDIT_FORMAT" != editor-diff ]]; then
+    die "--editor-edit-format must be whole or editor-diff"
+fi
 if [[ -n "$REMOTE_BASE_URL" ]]; then
     if [[ "$MODEL" == ollama_chat/* && "$EDITOR_MODEL" == ollama_chat/* ]]; then
         [[ "$REMOTE_BASE_URL" != */v1 && "$REMOTE_BASE_URL" != */v1/ ]] ||
@@ -408,6 +416,7 @@ PLAN_JSON="$(
         --sampling-seed "$SAMPLING_SEED" \
         --max-tokens "$MAX_TOKENS" \
         --architect-think "$ARCHITECT_THINK" \
+        --editor-edit-format "$EDITOR_EDIT_FORMAT" \
         --model-provenance-json "$MODEL_PROVENANCE_JSON" \
         --max-loops "$MAX_LOOPS" \
         --timeout-seconds "$TIMEOUT_SECONDS" \
@@ -448,6 +457,7 @@ STAGE_TABLE="$(
         --sampling-seed "$SAMPLING_SEED" \
         --max-tokens "$MAX_TOKENS" \
         --architect-think "$ARCHITECT_THINK" \
+        --editor-edit-format "$EDITOR_EDIT_FORMAT" \
         --model-provenance-json "$MODEL_PROVENANCE_JSON" \
         --max-loops "$MAX_LOOPS" \
         --timeout-seconds "$TIMEOUT_SECONDS" \
@@ -571,8 +581,9 @@ if [[ "$PRINT_PLAN" -eq 1 ]]; then
     printf '\nOutput dir: %s\n' "$OUTPUT_DIR"
     printf 'Lineages:   %s..%s\n' \
         "$LINEAGE_START" "$((LINEAGE_START + LINEAGES - 1))"
-    printf 'Sampling:   temperature=%s architect-think=%s top-p=%s sampling-seed=%s max-tokens=%s\n' \
+    printf 'Sampling:   temperature=%s architect-think=%s editor-edit-format=%s top-p=%s sampling-seed=%s max-tokens=%s\n' \
         "$TEMPERATURE" "${ARCHITECT_THINK:-null}" \
+        "$EDITOR_EDIT_FORMAT" \
         "${TOP_P:-null}" "${SAMPLING_SEED:-null}" \
         "${MAX_TOKENS:-null}"
     exit 0
@@ -650,6 +661,7 @@ target.write_text(
             "editor_model": plan["editor_model"],
             "architect_mode": plan["architect_mode"],
             "architect_think": plan["architect_think"],
+            "editor_edit_format": plan["editor_edit_format"],
             "model": plan["model"],
             "aider_model_settings": plan["aider_model_settings"],
             "remote_base_url": plan["remote_base_url"],
@@ -692,13 +704,14 @@ if [[ -f "$RUN_METADATA" && "$DRY_RUN" -eq 0 ]]; then
         "$PYTHON_BIN" - "$RUN_METADATA" "$CONFIG_FINGERPRINT" "$UTILITY" \
         "$MODEL" "$EDITOR_MODEL" "$AIDER_VERSION" "$TEMPERATURE" "$MAX_LOOPS" \
             "${TOP_P:-__NONE__}" "${SAMPLING_SEED:-__NONE__}" \
-            "${MAX_TOKENS:-__NONE__}" "${ARCHITECT_THINK:-__NONE__}" <<'PY'
+            "${MAX_TOKENS:-__NONE__}" "${ARCHITECT_THINK:-__NONE__}" \
+            "$EDITOR_EDIT_FORMAT" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 (path, fingerprint, utility, model, editor_model, aider_version, temperature, max_loops,
- top_p, sampling_seed, max_tokens, architect_think) = sys.argv[1:]
+ top_p, sampling_seed, max_tokens, architect_think, editor_edit_format) = sys.argv[1:]
 try:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
 except (OSError, UnicodeError, json.JSONDecodeError) as error:
@@ -726,6 +739,7 @@ expected = {
     "architect_think": (
         None if architect_think == "__NONE__" else architect_think
     ),
+    "editor_edit_format": editor_edit_format,
     "max_loops": int(max_loops),
 }
 differences = [key for key, value in expected.items() if data.get(key) != value]
@@ -765,7 +779,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
     printf 'Aider invocation template:'
     printf ' %q' "$AIDER_BIN" --architect --auto-accept-architect \
         --model "$MODEL" --editor-model "$EDITOR_MODEL" \
-        --weak-model "$EDITOR_MODEL" --editor-edit-format editor-diff \
+        --weak-model "$EDITOR_MODEL" --editor-edit-format "$EDITOR_EDIT_FORMAT" \
         --model-settings-file '<attempt>/aider-model-settings.yml' \
         --message-file '<prompt-file>' --file '<source>' --no-git \
         --map-tokens 0 --no-auto-commits --no-dirty-commits \
@@ -898,6 +912,7 @@ for (( offset = 0; offset < LINEAGES; offset++ )); do
             --sampling-seed "$SAMPLING_SEED" \
             --max-tokens "$MAX_TOKENS" \
             --architect-think "$ARCHITECT_THINK" \
+            --editor-edit-format "$EDITOR_EDIT_FORMAT" \
             --max-loops "$MAX_LOOPS" \
             --fingerprint "$CONFIG_FINGERPRINT" \
             --checkpoint-count "$STAGE_COUNT" \
@@ -944,6 +959,7 @@ for (( offset = 0; offset < LINEAGES; offset++ )); do
         runner_args=(
             --model "$MODEL"
             --editor-model "$EDITOR_MODEL"
+            --editor-edit-format "$EDITOR_EDIT_FORMAT"
             --temperature "$TEMPERATURE"
             --runs 1
             --max-loops "$MAX_LOOPS"
@@ -1177,6 +1193,7 @@ record = {
     "agent_execution_failure_stage": metadata.get("agent_execution_failure_stage"),
     "agent_failure_reason": metadata.get("agent_failure_reason"),
     "architect_think": metadata.get("architect_think"),
+    "editor_edit_format": metadata.get("editor_edit_format"),
     # Timeout provenance, carried into the lineage record so a stage that
     # succeeded or was repaired after a cut-short session is still
     # distinguishable from one whose session finished normally.

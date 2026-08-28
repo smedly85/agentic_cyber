@@ -116,6 +116,8 @@ def optional_int(value: str | None) -> int | None:
 def init_record(args: argparse.Namespace) -> dict[str, Any]:
     if args.architect_think not in ("", "low", "medium", "high"):
         raise StateError("architect think must be low, medium, or high")
+    if args.editor_edit_format not in ("whole", "editor-diff"):
+        raise StateError("editor edit format must be whole or editor-diff")
     return {
         "schema_version": SCHEMA_VERSION,
         "lineage_id": args.lineage_id,
@@ -140,7 +142,7 @@ def init_record(args: argparse.Namespace) -> dict[str, Any]:
         "architect_think": args.architect_think or None,
         "editor_temperature": 0.0,
         "editor_sampling_seed": 0,
-        "editor_edit_format": "editor-diff",
+        "editor_edit_format": args.editor_edit_format,
         "max_loops": int(args.max_loops),
         "config_fingerprint": args.fingerprint,
         "checkpoint_count": int(args.checkpoint_count),
@@ -231,6 +233,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     start.add_argument("--sampling-seed", default="")
     start.add_argument("--max-tokens", default="")
     start.add_argument("--architect-think", default="")
+    start.add_argument("--editor-edit-format", default="editor-diff")
     start.add_argument("--max-loops", default="0")
     start.add_argument("--fingerprint", default="")
     start.add_argument("--checkpoint-count", default="0")

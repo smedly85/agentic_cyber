@@ -1069,6 +1069,7 @@ def analyze_lineage_security(
             "model": run_metadata.get("model"),
             "temperature": run_metadata.get("temperature"),
             "architect_think": run_metadata.get("architect_think"),
+            "editor_edit_format": run_metadata.get("editor_edit_format"),
         },
         formal=formal,
     )
@@ -1089,6 +1090,7 @@ def analyze_lineage_security(
                 "model": run_metadata.get("model"),
                 "temperature": run_metadata.get("temperature"),
                 "architect_think": run_metadata.get("architect_think"),
+                "editor_edit_format": run_metadata.get("editor_edit_format"),
             },
             formal=formal,
         )
@@ -1454,6 +1456,7 @@ def materialize_view(
             "model_provenance": run_metadata.get("model_provenance"),
             "temperature": run_metadata.get("temperature"),
             "architect_think": run_metadata.get("architect_think"),
+            "editor_edit_format": run_metadata.get("editor_edit_format"),
             "agent": run_metadata.get("agent"),
             "max_loops": run_metadata.get("max_loops"),
             "source_path": source_basename,
@@ -1592,6 +1595,7 @@ def render_summary(report: dict[str, Any]) -> str:
         f"* Root: `{report['lineage_root']}`",
         f"* Model: `{report['model']}`  Temperature: {report['temperature']}",
         f"* Architect think: {report.get('architect_think') or '(server default)'}",
+        f"* Editor edit format: {report.get('editor_edit_format') or '(legacy unspecified)'}",
         f"* Checkpoints: {' -> '.join(report['checkpoints'])}",
         f"* Configuration fingerprint: `{report['config_fingerprint']}`",
         "",
@@ -1971,6 +1975,7 @@ def main(argv: list[str] | None = None) -> int:
         "model_provenance": run_metadata.get("model_provenance"),
         "temperature": run_metadata.get("temperature"),
         "architect_think": run_metadata.get("architect_think"),
+        "editor_edit_format": run_metadata.get("editor_edit_format"),
         "agent": run_metadata.get("agent"),
         "max_loops": run_metadata.get("max_loops"),
         "config_fingerprint": (

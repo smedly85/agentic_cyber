@@ -120,7 +120,7 @@ def require_diagnostic_packages() -> tuple[Any, Any, Any, Any, Any]:
 
 
 ANALYZER_VERSION = "5.2.0"
-PAPER_SCHEMA_VERSION = 7
+PAPER_SCHEMA_VERSION = 8
 
 PAPER_METRICS_COLUMNS = [
     "Issue",
@@ -128,6 +128,7 @@ PAPER_METRICS_COLUMNS = [
     "Model",
     "Temp",
     "Architect Think",
+    "Editor Edit Format",
     "Reliability Scope",
     "Population N",
     "Lineages Started",
@@ -163,6 +164,7 @@ PAPER_DESCRIPTIVE_COLUMNS = [
     "Model",
     "Temp",
     "Architect Think",
+    "Editor Edit Format",
     "Raw Architecture Families",
     "Architecture Family-Discovery AUC@K",
     "Architecture Vendi Score",
@@ -882,7 +884,8 @@ def normalize_repair_metadata(
         elif agent_exit == 124:
             agent_execution_stage = "timeout"
         elif explicit_agent_stage in {
-            "timeout", "opencode", "aider", "permission", "token_limit"
+            "timeout", "opencode", "aider", "permission", "token_limit",
+            "editor_output",
         }:
             agent_execution_stage = str(explicit_agent_stage)
         else:
@@ -1546,6 +1549,9 @@ def build_paper_metrics_row(
         "Architect Think": experiment_metadata.get(
             "architect_think", summary.get("architect_think")
         ),
+        "Editor Edit Format": experiment_metadata.get(
+            "editor_edit_format", summary.get("editor_edit_format")
+        ),
         "Reliability Scope": (
             "parent_lineage_experiment" if is_lineage_view else "current_experiment"
         ),
@@ -1619,6 +1625,9 @@ def build_paper_descriptive_row(
         "Temp": experiment_metadata.get("temperature", summary.get("temperature")),
         "Architect Think": experiment_metadata.get(
             "architect_think", summary.get("architect_think")
+        ),
+        "Editor Edit Format": experiment_metadata.get(
+            "editor_edit_format", summary.get("editor_edit_format")
         ),
         "Raw Architecture Families": architecture_primary.get("raw_family_count"),
         "Architecture Family-Discovery AUC@K": architecture_primary.get(
@@ -4070,6 +4079,9 @@ def main() -> int:
                 "model": experiment_metadata.get("model"),
                 "temperature": experiment_metadata.get("temperature"),
                 "architect_think": experiment_metadata.get("architect_think"),
+                "editor_edit_format": experiment_metadata.get(
+                    "editor_edit_format"
+                ),
             },
             formal=args.formal_analysis,
         )
@@ -4367,6 +4379,7 @@ def main() -> int:
         "editor_model": experiment_metadata.get("editor_model"),
         "architect_mode": experiment_metadata.get("architect_mode", False),
         "architect_think": experiment_metadata.get("architect_think"),
+        "editor_edit_format": experiment_metadata.get("editor_edit_format"),
         "model_provenance": experiment_metadata.get("model_provenance"),
         "temperature": experiment_metadata.get("temperature"),
         "runs_analyzed": n,

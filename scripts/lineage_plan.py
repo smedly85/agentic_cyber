@@ -13,8 +13,9 @@ and harder to get wrong than comparing a dozen fields: the fingerprint covers
 the resolved manifest, the *contents* of every checkpoint prompt, the contents
 of the judge script, each checkpoint's cumulative implemented flags, each
 checkpoint's visible test bundle, the Aider/model-pair/repair settings the stages run
-under, the whole sampling configuration (temperature, architect_think, top_p,
-sampling_seed, max_tokens), explicit model-definition provenance, and the shared automation notice that is expanded into every
+under, the editor edit format, the whole sampling configuration (temperature,
+architect_think, top_p, sampling_seed, max_tokens), explicit model-definition
+provenance, and the shared automation notice that is expanded into every
 prompt. The number of lineages is deliberately excluded, so extending an
 existing run from 10 lineages to 15 is allowed while editing a prompt, changing
 a sampling knob or rewording the notice is not.
@@ -154,6 +155,7 @@ def resolve_plan(
     remote_base_url: str = "",
     remote_api_key_env: str = "",
     architect_think: Any = None,
+    editor_edit_format: str = aider_settings.EDITOR_EDIT_FORMAT,
 ) -> dict[str, Any]:
     # `agent` remains only as a Python-call compatibility slot for older test
     # and analysis helpers. It is not emitted, fingerprinted or exposed by the
@@ -167,6 +169,11 @@ def resolve_plan(
         raise ManifestError(
             "architect_think must be one of "
             + ", ".join(aider_settings.ARCHITECT_THINK_VALUES)
+        )
+    if editor_edit_format not in aider_settings.EDITOR_EDIT_FORMATS:
+        raise ManifestError(
+            "editor_edit_format must be one of "
+            + ", ".join(aider_settings.EDITOR_EDIT_FORMATS)
         )
     if not remote_base_url:
         remote_transport = "default"
@@ -419,7 +426,7 @@ def resolve_plan(
         "architect_think": architect_think,
         "editor_temperature": aider_settings.EDITOR_TEMPERATURE,
         "editor_sampling_seed": aider_settings.EDITOR_SEED,
-        "editor_edit_format": aider_settings.EDITOR_EDIT_FORMAT,
+        "editor_edit_format": editor_edit_format,
         # Bundle-only callers resolve checkpoints with an empty model because
         # they need no inference configuration. Formal shell entry points
         # require --model before resolving a runnable plan.
@@ -432,6 +439,7 @@ def resolve_plan(
                 sampling_seed=sampling_seed,
                 max_tokens=max_tokens,
                 architect_think=architect_think,
+                editor_edit_format=editor_edit_format,
             )
             if architect_model
             else []
@@ -463,7 +471,7 @@ def fingerprint(plan: dict[str, Any]) -> str:
     each checkpoint's visible test bundle, via its bundle fingerprint; the
     Aider version, architect/editor model pair, architect mode, fixed editor
     sampling, repair budget and per-invocation timeout the stages run under;
-    the full sampling configuration (temperature, architect_think, top_p,
+    the selected editor edit format; the full sampling configuration (temperature, architect_think, top_p,
     sampling_seed, max_tokens -- a null among them is itself a condition, meaning the server
     default applied); explicit model-definition provenance such as an Ollama
     Modelfile top_k value; and the shared automation notice, via
@@ -538,6 +546,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sampling-seed", default="")
     parser.add_argument("--max-tokens", default="")
     parser.add_argument("--architect-think", default="")
+    parser.add_argument(
+        "--editor-edit-format", default=aider_settings.EDITOR_EDIT_FORMAT
+    )
     parser.add_argument("--model-provenance-json", default="")
     parser.add_argument("--remote-base-url", default="")
     parser.add_argument("--remote-api-key-env", default="")
@@ -572,6 +583,7 @@ def main(argv: list[str] | None = None) -> int:
         sampling_seed=args.sampling_seed,
         max_tokens=args.max_tokens,
         architect_think=args.architect_think,
+        editor_edit_format=args.editor_edit_format,
         model_provenance_json=args.model_provenance_json,
         editor_model=args.editor_model,
         aider_version=args.aider_version,

@@ -22,6 +22,7 @@ RUNNER_HELPERS = (
     REPO_ROOT / "scripts" / "capture_candidate.py",
     REPO_ROOT / "scripts" / "repair_prompt.py",
     REPO_ROOT / "scripts" / "aider_settings.py",
+    REPO_ROOT / "scripts" / "aider_output.py",
     REPO_ROOT / "scripts" / "opencode_stats.py",
     REPO_ROOT / "scripts" / "prompt_render.py",
     REPO_ROOT / "scripts" / "temperature_value.py",
@@ -1015,6 +1016,11 @@ source.write_text(value + "\\n")
 print(json.dumps({"total_tokens": invocation + 10}))
 if scenario == "token-limit":
     print("Model ollama_chat/qwen3.8:27b has hit a token limit!")
+if scenario == "malformed-editor":
+    print("<<<<<<< SEARCH")
+    print("old")
+    print("=======")
+    print("new")
 if scenario in {"agent-error", "infrastructure-failure"}:
     raise SystemExit(42)
 if scenario == "timeout":
@@ -1186,7 +1192,10 @@ def test_attempt_records_aider_model_settings(tmp_path: Path):
         tmp_path,
         scenario="valid",
         max_loops=0,
-        extra_args=["--architect-think", "medium"],
+        extra_args=[
+            "--architect-think", "medium",
+            "--editor-edit-format", "whole",
+        ],
     )
 
     assert result.returncode == 0, result.stderr
@@ -1199,6 +1208,7 @@ def test_attempt_records_aider_model_settings(tmp_path: Path):
         "think": "medium",
     }
     assert settings[1]["name"] == "ollama_chat/qwen3-coder-next:latest"
+    assert settings[1]["editor_edit_format"] == "whole"
     assert settings[1]["extra_params"] == {"temperature": 0.0, "seed": 0}
     assert metadata["aider_model_settings"] == settings
     assert metadata["aider_model_settings_sha256"] == (
@@ -1210,6 +1220,7 @@ def test_attempt_records_aider_model_settings(tmp_path: Path):
     assert metadata["editor_model"] == "ollama_chat/qwen3-coder-next:latest"
     assert metadata["architect_mode"] is True
     assert metadata["architect_think"] == "medium"
+    assert metadata["editor_edit_format"] == "whole"
     assert (attempt / "aider.log").is_file()
     assert not (attempt / "opencode.log").exists()
 
@@ -1219,7 +1230,10 @@ def test_aider_invocation_is_one_shot_scoped_and_noninteractive(tmp_path: Path):
         tmp_path,
         scenario="valid",
         max_loops=0,
-        extra_args=["--editor-model", "fixed/editor"],
+        extra_args=[
+            "--editor-model", "fixed/editor",
+            "--editor-edit-format", "whole",
+        ],
     )
 
     assert result.returncode == 0, result.stderr
@@ -1235,6 +1249,7 @@ def test_aider_invocation_is_one_shot_scoped_and_noninteractive(tmp_path: Path):
         assert flag in args
     assert args[args.index("--model") + 1] == "fake/model"
     assert args[args.index("--editor-model") + 1] == "fixed/editor"
+    assert args[args.index("--editor-edit-format") + 1] == "whole"
     assert "--yes-always" not in args
     assert "--test" not in args
 
@@ -1415,6 +1430,26 @@ def test_aider_token_limit_is_not_no_progress(tmp_path: Path):
     assert metadata["loops"][0]["agent_token_limit"] is True
 
 
+def test_malformed_editor_diff_is_agent_execution_failure(tmp_path: Path):
+    output, result, invocations, _ = run_experiment(
+        tmp_path,
+        scenario="malformed-editor",
+        max_loops=3,
+        extra_args=["--editor-edit-format", "editor-diff"],
+    )
+    assert result.returncode == 0, result.stderr
+    metadata = json.loads(
+        (output / "attempt-001" / "metadata.json").read_text(encoding="utf-8")
+    )
+    assert invocations == 1
+    assert metadata["agent_execution_failure"] is True
+    assert metadata["agent_execution_failure_stage"] == "editor_output"
+    assert metadata["agent_failure_reason"] == "invalid_edit_format"
+    assert metadata["stop_reason"] == "agent_execution_failure"
+    assert metadata["stop_reason"] != "no_progress"
+    assert metadata["loops"][0]["agent_invalid_editor_output"] is True
+
+
 def test_timeout_is_failed_valid_agent_trial(tmp_path: Path):
     output, result, invocations, _ = run_experiment(
         tmp_path,
@@ -1483,6 +1518,7 @@ def test_candidate_validation_failures_are_not_infrastructure(tmp_path: Path):
     assert build_metadata["build_exit_code"] != 0
     assert build_metadata["infrastructure_failure"] is False
     assert build_metadata["agent_execution_failure"] is False
+    assert build_metadata["agent_failure_reason"] != "invalid_edit_format"
 
     public_output, result, _, _ = run_experiment(
         tmp_path / "public",

@@ -74,6 +74,8 @@ these flags existed):
   --architect-think LEVEL   Native architect thinking level: low, medium, or
                              high. Sent directly as the string-valued `think`
                              parameter; never translated to reasoning_effort.
+  --editor-edit-format FMT  Editor output protocol: whole or editor-diff
+                             (default: editor-diff).
   --top-p P                  Nucleus sampling mass, 0 <= P <= 1. Sent as
                              top_p.
   --sampling-seed N          Pseudorandom seed for token selection, N >= 0.
@@ -296,6 +298,7 @@ run_logged_command() {
     start_ns="$(date +%s%N)"
     (
         set +e
+        export PYTHONDONTWRITEBYTECODE=1
         eval "$command"
     ) >>"$logfile" 2>&1
     status=$?
@@ -319,6 +322,7 @@ run_final_command() {
     start_ns="$(date +%s%N)"
     (
         set +e
+        export PYTHONDONTWRITEBYTECODE=1
         eval "$command"
     ) >"$logfile" 2>&1
     status=$?
@@ -336,7 +340,7 @@ run_aider() {
     local invocation="$4"
     local kind="$5"
     local current_log start_ns end_ns status runtime_ms isolation_rejected
-    local token_limit
+    local token_limit invalid_editor_output
     local env_args
 
     current_log="$attempt_dir/.aider-current.log"
@@ -440,9 +444,16 @@ run_aider() {
     if grep -Fq 'has hit a token limit!' "$current_log"; then
         token_limit=true
     fi
+    invalid_editor_output=false
+    if "$PYTHON_BIN" "$AIDER_OUTPUT_TOOL" \
+            --log "$current_log" \
+            --editor-edit-format "$EDITOR_EDIT_FORMAT"; then
+        invalid_editor_output=true
+    fi
     rm -f "$current_log"
-    printf '%s %s %s %s\n' \
-        "$status" "$runtime_ms" "$isolation_rejected" "$token_limit"
+    printf '%s %s %s %s %s\n' \
+        "$status" "$runtime_ms" "$isolation_rejected" "$token_limit" \
+        "$invalid_editor_output"
 }
 
 make_loop_record() {
@@ -465,6 +476,7 @@ import sys
     validation_success,
     source_sha256,
     token_limit,
+    invalid_editor_output,
     agent_failure_reason,
 ) = sys.argv[1:]
 print(json.dumps({
@@ -482,6 +494,7 @@ print(json.dumps({
     "validation_success": validation_success == "true",
     "source_sha256": source_sha256,
     "agent_token_limit": token_limit == "true",
+    "agent_invalid_editor_output": invalid_editor_output == "true",
     "agent_failure_reason": agent_failure_reason or None,
 }, separators=(",", ":")))
 PY
@@ -546,7 +559,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --model|--editor-model|--prompt|--source|--source-mode|--temperature|--temp-min| \
         --temp-max|--temp-points|--temp-list|--runs|--max-loops| \
-        --top-p|--sampling-seed|--max-tokens|--architect-think|--model-provenance-json| \
+        --top-p|--sampling-seed|--max-tokens|--architect-think|--editor-edit-format|--model-provenance-json| \
         --repair-prompt| \
         --test-dir|--seed-file|--keep-glob|--build-cmd|--base-test-cmd| \
         --feature-test-cmd|--test-cmd|--extra-test-cmd|--timeout|--output-dir| \
@@ -573,6 +586,7 @@ while [[ $# -gt 0 ]]; do
         --sampling-seed) SAMPLING_SEED="${2:-}"; shift 2 ;;
         --max-tokens) MAX_TOKENS="${2:-}"; shift 2 ;;
         --architect-think) ARCHITECT_THINK="${2:-}"; shift 2 ;;
+        --editor-edit-format) EDITOR_EDIT_FORMAT="${2:-}"; shift 2 ;;
         --model-provenance-json) MODEL_PROVENANCE_JSON="${2:-}"; shift 2 ;;
         --top-k)
             # Native ollama_chat can carry top_k, but changing that experimental
@@ -648,6 +662,8 @@ CAPTURE_TOOL="$REPO/scripts/capture_candidate.py"
 
 AIDER_SETTINGS_TOOL="$REPO/scripts/aider_settings.py"
 [[ -f "$AIDER_SETTINGS_TOOL" ]] || die "Aider settings helper not found: $AIDER_SETTINGS_TOOL"
+AIDER_OUTPUT_TOOL="$REPO/scripts/aider_output.py"
+[[ -f "$AIDER_OUTPUT_TOOL" ]] || die "Aider output helper not found: $AIDER_OUTPUT_TOOL"
 
 # ---------------------------------------------------------------------------
 # Standalone cleanup of existing runs
@@ -748,6 +764,10 @@ if [[ -n "$ARCHITECT_THINK" &&
       "$ARCHITECT_THINK" != medium &&
       "$ARCHITECT_THINK" != high ]]; then
     die "--architect-think must be low, medium, or high"
+fi
+if [[ "$EDITOR_EDIT_FORMAT" != whole &&
+      "$EDITOR_EDIT_FORMAT" != editor-diff ]]; then
+    die "--editor-edit-format must be whole or editor-diff"
 fi
 
 "$PYTHON_BIN" - "$SOURCE_PATH" <<'PY' ||
@@ -1028,7 +1048,7 @@ write_metadata "$OUTPUT_DIR/sweep.json" \
     model_provenance "__JSON__:${MODEL_PROVENANCE_JSON:-null}" \
     editor_temperature 0 \
     editor_sampling_seed 0 \
-    editor_edit_format editor-diff \
+    editor_edit_format "$EDITOR_EDIT_FORMAT" \
     remote_base_url "$REMOTE_BASE_URL" \
     remote_api_key_env "$REMOTE_API_KEY_ENV" \
     remote_transport "$REMOTE_TRANSPORT" \
@@ -1099,6 +1119,7 @@ for temperature in "${TEMPERATURES_ARR[@]}"; do
                 "${TOP_P:-__NONE__}" "${SAMPLING_SEED:-__NONE__}" \
                 "${MAX_TOKENS:-__NONE__}" \
                 "${ARCHITECT_THINK:-__NONE__}" \
+                "$EDITOR_EDIT_FORMAT" \
                 "${MODEL_PROVENANCE_JSON:-__NONE__}" \
                 "${REMOTE_BASE_URL:-__NONE__}" \
                 "${REMOTE_API_KEY_ENV:-__NONE__}" \
@@ -1129,6 +1150,7 @@ data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
     sampling_seed,
     max_tokens,
     architect_think,
+    editor_edit_format,
     model_provenance_json,
     remote_base_url,
     remote_api_key_env,
@@ -1157,7 +1179,7 @@ expected = {
     ),
     "editor_temperature": 0,
     "editor_sampling_seed": 0,
-    "editor_edit_format": "editor-diff",
+    "editor_edit_format": editor_edit_format,
     "remote_base_url": None if remote_base_url == "__NONE__" else remote_base_url,
     "remote_api_key_env": (
         None if remote_api_key_env == "__NONE__" else remote_api_key_env
@@ -1218,7 +1240,7 @@ PY
         architect_think "$(optional_string "$ARCHITECT_THINK")" \
         editor_temperature 0 \
         editor_sampling_seed 0 \
-        editor_edit_format editor-diff \
+        editor_edit_format "$EDITOR_EDIT_FORMAT" \
         remote_base_url "$([[ -n "$REMOTE_BASE_URL" ]] && printf '__STR__:%s' "$REMOTE_BASE_URL" || printf '__JSON__:null')" \
         remote_api_key_env "$([[ -n "$REMOTE_API_KEY_ENV" ]] && printf '__STR__:%s' "$REMOTE_API_KEY_ENV" || printf '__JSON__:null')" \
         remote_transport "$REMOTE_TRANSPORT" \
@@ -1317,6 +1339,7 @@ PY
             --sampling-seed "$SAMPLING_SEED" \
             --max-tokens "$MAX_TOKENS" \
             --architect-think "$ARCHITECT_THINK" \
+            --editor-edit-format "$EDITOR_EDIT_FORMAT" \
             --output "$AIDER_MODEL_SETTINGS_FILE" \
             --emit sha256 >"$attempt_dir/aider-model-settings.sha256" ||
             die "failed to build per-attempt Aider model settings"
@@ -1395,7 +1418,7 @@ PY
             fi
 
             read -r agent_exit agent_ms invocation_isolation_rejected \
-                invocation_token_limit < <(
+                invocation_token_limit invocation_invalid_editor_output < <(
                 run_aider \
                     "$attempt_dir/aider.log" \
                     "$workdir" \
@@ -1433,7 +1456,8 @@ PY
                 candidate_available_after_initial_session="$invocation_candidate_present"
                 if [[ "$agent_exit" -eq 0 &&
                       "$invocation_isolation_rejected" == false &&
-                      "$invocation_token_limit" == false ]]; then
+                      "$invocation_token_limit" == false &&
+                      "$invocation_invalid_editor_output" == false ]]; then
                     initial_session_completed=true
                 fi
                 if [[ "$invocation_timed_out" == true &&
@@ -1454,6 +1478,14 @@ PY
                 agent_execution_failure_stage_json='"token_limit"'
                 agent_failure_reason_json='"output_token_limit"'
                 invocation_agent_failure_reason="output_token_limit"
+            elif [[ "$invocation_invalid_editor_output" == true ]]; then
+                # Only concrete protocol evidence reaches this branch. Failed
+                # tests and unchanged candidates are not edit-format failures.
+                invocation_agent_execution_failed=true
+                agent_execution_failed=true
+                agent_execution_failure_stage_json='"editor_output"'
+                agent_failure_reason_json='"invalid_edit_format"'
+                invocation_agent_failure_reason="invalid_edit_format"
             elif [[ "$invocation_isolation_rejected" == true ]]; then
                 # A rejected permission means the sandbox boundary held, not
                 # that the model produced work. Unchanged.
@@ -1534,6 +1566,7 @@ PY
                 "$agent_ms" "$build_ms" "$base_test_ms" \
                 "$feature_test_ms" "$validation_success" "$source_sha" \
                 "$invocation_token_limit" \
+                "$invocation_invalid_editor_output" \
                 "$invocation_agent_failure_reason")")
 
             printf '    loop %s: build=%s base=%s checkpoint=%s\n' \

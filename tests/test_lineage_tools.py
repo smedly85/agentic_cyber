@@ -37,6 +37,7 @@ MANIFEST_DIR = REPO_ROOT / "experiments" / "utilities"
 
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 import analyze_lineages  # noqa: E402
+import aider_output  # noqa: E402
 import aider_settings  # noqa: E402
 import capture_candidate  # noqa: E402
 import checkpoint_boundary_gate  # noqa: E402
@@ -1761,6 +1762,19 @@ class ResumeFingerprintTests(unittest.TestCase):
         )
         self.assertIsNone(plans[None]["architect_think"])
 
+    def test_editor_edit_formats_are_distinct_and_fingerprinted(self):
+        whole = self.plan(editor_edit_format="whole")
+        editor_diff = self.plan(editor_edit_format="editor-diff")
+        self.assertEqual(whole["editor_edit_format"], "whole")
+        self.assertEqual(editor_diff["editor_edit_format"], "editor-diff")
+        self.assertNotEqual(
+            whole["config_fingerprint"], editor_diff["config_fingerprint"]
+        )
+        self.assertEqual(
+            whole["config_fingerprint"],
+            self.plan(editor_edit_format="whole")["config_fingerprint"],
+        )
+
     def test_omitted_think_preserves_the_historical_fingerprint_shape(self):
         plan = self.plan()
         historical = dict(plan)
@@ -2407,10 +2421,12 @@ class RunnerTestDirDestinationTests(unittest.TestCase):
             source = root / "bundle"
             (source / "suites").mkdir(parents=True)
             (source / "runner.py").write_text("original\n", encoding="utf-8")
+            (source / "cases.json").write_text('{"ok": true}\n', encoding="utf-8")
             workdir = root / "workdir"
             visible = workdir / "tests" / "demo-test-suite"
             (visible / "suites").mkdir(parents=True)
             (visible / "runner.py").write_text("TAMPERED\n", encoding="utf-8")
+            (visible / "cases.json").write_text('{"ok": false}\n', encoding="utf-8")
             attempt = root / "attempt"
             attempt.mkdir()
 
@@ -2421,7 +2437,34 @@ class RunnerTestDirDestinationTests(unittest.TestCase):
             self.assertFalse(report["clean"])
             self.assertEqual(
                 report["directories"]["tests/demo-test-suite"]["modified"],
-                ["runner.py"],
+                ["cases.json", "runner.py"],
+            )
+
+    def test_python_bytecode_does_not_count_as_test_tampering(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "bundle"
+            source.mkdir()
+            (source / "engine.py").write_text("VALUE = 1\n", encoding="utf-8")
+            workdir = root / "workdir"
+            visible = workdir / "tests" / "demo-test-suite"
+            shutil.copytree(source, visible)
+            cache = visible / "__pycache__"
+            cache.mkdir()
+            (cache / "engine.cpython-314.pyc").write_bytes(b"runtime bytecode")
+            (visible / "loose.pyc").write_bytes(b"runtime bytecode")
+            attempt = root / "attempt"
+            attempt.mkdir()
+
+            report = capture_candidate.check_test_dirs(
+                workdir, attempt, root,
+                [f"{source}:tests/demo-test-suite"],
+            )
+            self.assertTrue(report["clean"])
+            self.assertEqual(
+                report["directories"]["tests/demo-test-suite"]["added"], []
             )
 
 
@@ -2897,6 +2940,7 @@ class SamplingParameterSurfaceTests(unittest.TestCase):
                 "--editor-model", "ollama_chat/qwen3-coder-next:latest",
                 "--temperature", "0",
                 "--architect-think", "medium",
+                "--editor-edit-format", "whole",
             ],
             capture_output=True,
             text=True,
@@ -2915,7 +2959,20 @@ class SamplingParameterSurfaceTests(unittest.TestCase):
         self.assertEqual(
             settings[1]["extra_params"], {"temperature": 0.0, "seed": 0}
         )
+        self.assertEqual(settings[1]["editor_edit_format"], "whole")
+
+    def test_editor_diff_remains_a_selectable_editor_format(self):
+        settings = aider_settings.build_model_settings(
+            "ollama_chat/qwen3.8:27b",
+            "ollama_chat/qwen3-coder-next:latest",
+            0,
+            architect_think="medium",
+            editor_edit_format="editor-diff",
+        )
         self.assertEqual(settings[1]["editor_edit_format"], "editor-diff")
+        self.assertEqual(settings[1]["extra_params"], {"temperature": 0.0, "seed": 0})
+        self.assertEqual(settings[0]["extra_params"]["think"], "medium")
+
 
     def test_architect_think_levels_remain_strings(self):
         observed = []
@@ -2981,6 +3038,29 @@ class SamplingParameterSurfaceTests(unittest.TestCase):
                          "There is no --top-k"):
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, self.text)
+
+
+class AiderOutputClassificationTests(unittest.TestCase):
+    def test_incomplete_editor_diff_is_concrete_protocol_failure(self):
+        text = "<<<<<<< SEARCH\nold\n=======\nnew\n"
+        self.assertTrue(aider_output.has_invalid_editor_output(text, "editor-diff"))
+
+    def test_complete_editor_diff_is_not_protocol_failure(self):
+        text = "<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE\n"
+        self.assertFalse(aider_output.has_invalid_editor_output(text, "editor-diff"))
+
+    def test_ordinary_failure_text_is_not_protocol_failure(self):
+        self.assertFalse(
+            aider_output.has_invalid_editor_output("tests failed: exit 1", "editor-diff")
+        )
+
+    def test_whole_requires_an_explicit_malformed_output_diagnostic(self):
+        self.assertFalse(aider_output.has_invalid_editor_output("plain source", "whole"))
+        self.assertTrue(
+            aider_output.has_invalid_editor_output(
+                "Aider: malformed whole-file response", "whole"
+            )
+        )
 
 
 class PromptAutomationNoticeTests(unittest.TestCase):
@@ -5387,6 +5467,7 @@ parser.add_argument("--top-p", default="")
 parser.add_argument("--sampling-seed", default="")
 parser.add_argument("--max-tokens", default="")
 parser.add_argument("--architect-think", default="")
+parser.add_argument("--editor-edit-format", default="editor-diff")
 parser.add_argument("--max-loops", type=int, default=3)
 parser.add_argument("--timeout-seconds", type=int, default=1800)
 parser.add_argument("--remote-base-url", default="")
@@ -5395,7 +5476,8 @@ args, _ = parser.parse_known_args()
 temperature = float(args.temperature)
 fingerprint = hashlib.sha256(
     json.dumps(
-        {"temperature": temperature, "architect_think": args.architect_think or None},
+        {"temperature": temperature, "architect_think": args.architect_think or None,
+         "editor_edit_format": args.editor_edit_format},
         sort_keys=True,
     ).encode()
 ).hexdigest()
@@ -5435,7 +5517,7 @@ else:
         "max_tokens": None if not args.max_tokens else int(args.max_tokens),
         "architect_think": args.architect_think or None,
         "editor_temperature": 0.0, "editor_sampling_seed": 0,
-        "editor_edit_format": "editor-diff", "aider_model_settings": [],
+        "editor_edit_format": args.editor_edit_format, "aider_model_settings": [],
         "remote_base_url": args.remote_base_url or None,
         "remote_api_key_env": args.remote_api_key_env or None,
         "remote_transport": "default", "max_loops": args.max_loops,
@@ -5483,7 +5565,7 @@ while [[ $# -gt 0 ]]; do
         --output-dir) output_dir="$2"; shift 2 ;;
         --source) source_path="$2"; shift 2 ;;
         --seed-file) seed_spec="$2"; shift 2 ;;
-        --model|--editor-model|--runs|--max-loops|--timeout|--prompt|--source-mode|--test-dir|--build-cmd|--base-test-cmd|--feature-test-cmd|--extra-test-cmd|--repair-prompt|--remote-base-url|--remote-api-key-env|--top-p|--sampling-seed|--max-tokens|--architect-think|--model-provenance-json)
+        --model|--editor-model|--editor-edit-format|--runs|--max-loops|--timeout|--prompt|--source-mode|--test-dir|--build-cmd|--base-test-cmd|--feature-test-cmd|--extra-test-cmd|--repair-prompt|--remote-base-url|--remote-api-key-env|--top-p|--sampling-seed|--max-tokens|--architect-think|--model-provenance-json)
             shift 2 ;;
         *) shift ;;
     esac
@@ -5768,11 +5850,13 @@ class LineageSamplingParameterTests(unittest.TestCase):
 
     def test_every_stage_receives_every_requested_knob(self):
         stages = self.dry_run_stages(
-            "--architect-think", "medium", "--top-p", "0.9",
+            "--architect-think", "medium", "--editor-edit-format", "whole",
+            "--top-p", "0.9",
             "--sampling-seed", "42", "--max-tokens", "512"
         )
         self.assertTrue(stages)
         for flag, value in (("--architect-think", "medium"),
+                            ("--editor-edit-format", "whole"),
                             ("--top-p", "0.9"), ("--sampling-seed", "42"),
                             ("--max-tokens", "512")):
             with self.subTest(flag=flag):
@@ -5792,6 +5876,12 @@ class LineageSamplingParameterTests(unittest.TestCase):
         self.assertTrue(first and later)
         for line in first + later:
             self.assertIn("--top-p 0.5", line)
+
+    def test_default_editor_diff_is_forwarded_to_every_stage(self):
+        stages = self.dry_run_stages()
+        self.assertTrue(stages)
+        for line in stages:
+            self.assertIn("--editor-edit-format editor-diff", line)
 
     def test_omitted_knobs_are_not_forwarded_at_all(self):
         stages = self.dry_run_stages()
@@ -5882,6 +5972,7 @@ class LineageSamplingParameterTests(unittest.TestCase):
             (("--max-tokens", "0"), "--max-tokens must be"),
             (("--max-tokens", "abc"), "--max-tokens must be"),
             (("--architect-think", "true"), "--architect-think must be"),
+            (("--editor-edit-format", "diff"), "--editor-edit-format must be"),
         ):
             output = self.temp / f"bad-{abs(hash(arguments))}"
             with self.subTest(arguments=arguments):
@@ -5926,7 +6017,8 @@ class LineageSamplingParameterTests(unittest.TestCase):
     def test_durable_records_carry_the_sampling_configuration(self):
         output = self.temp / "durable"
         self.start_run(
-            output, "--architect-think", "medium", "--top-p", "0.9",
+            output, "--architect-think", "medium", "--editor-edit-format", "whole",
+            "--top-p", "0.9",
             "--sampling-seed", "42", "--max-tokens", "512"
         )
         record = json.loads(
@@ -5936,6 +6028,7 @@ class LineageSamplingParameterTests(unittest.TestCase):
         self.assertEqual(record["sampling_seed"], 42)
         self.assertEqual(record["max_tokens"], 512)
         self.assertEqual(record["architect_think"], "medium")
+        self.assertEqual(record["editor_edit_format"], "whole")
         self.assertTrue(record["automation_notice_sha256"])
 
         lineage = json.loads(
@@ -5945,6 +6038,7 @@ class LineageSamplingParameterTests(unittest.TestCase):
         self.assertEqual(lineage["sampling_seed"], 42)
         self.assertEqual(lineage["max_tokens"], 512)
         self.assertEqual(lineage["architect_think"], "medium")
+        self.assertEqual(lineage["editor_edit_format"], "whole")
 
     def test_unset_knobs_are_recorded_as_null_not_omitted(self):
         output = self.temp / "durable-null"
@@ -5984,6 +6078,14 @@ class LineageSamplingParameterTests(unittest.TestCase):
         self.assertNotEqual(again.returncode, 0)
         self.assertIn("different configuration", again.stderr)
         self.assertIn("architect_think", again.stderr)
+
+    def test_resume_rejects_a_different_editor_edit_format(self):
+        output = self.temp / "resume-editor-format"
+        self.start_run(output, "--editor-edit-format", "whole")
+        again = self.start_run(output, "--editor-edit-format", "editor-diff")
+        self.assertNotEqual(again.returncode, 0)
+        self.assertIn("different configuration", again.stderr)
+        self.assertIn("editor_edit_format", again.stderr)
 
 
 class SharedAutomationNoticeRenderTests(unittest.TestCase):
