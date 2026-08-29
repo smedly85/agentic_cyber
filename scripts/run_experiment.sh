@@ -85,6 +85,9 @@ these flags existed):
   --max-tokens N             Cap on generated tokens per session, N >= 1. Sent
                              as max_tokens, replacing the model's own output
                              limit.
+  --num-ctx N                Ollama total context capacity, N >= 1. Sent as
+                             num_ctx to both architect and editor. Independent
+                             from --max-tokens; unset preserves Aider sizing.
   --model-provenance-json J  Metadata-only JSON object for model-definition
                              controls such as base_model/top_k/top_k_control.
                              It is never added to an Aider request.
@@ -531,6 +534,7 @@ TEMP_LIST_SET=0
 TOP_P=""
 SAMPLING_SEED=""
 MAX_TOKENS=""
+NUM_CTX=""
 ARCHITECT_THINK=""
 MODEL_PROVENANCE_JSON=""
 RUNS=1
@@ -571,7 +575,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --model|--editor-model|--prompt|--source|--source-mode|--temperature|--temp-min| \
         --temp-max|--temp-points|--temp-list|--runs|--max-loops| \
-        --top-p|--sampling-seed|--max-tokens|--architect-think|--editor-edit-format|--model-provenance-json| \
+        --top-p|--sampling-seed|--max-tokens|--num-ctx|--architect-think|--editor-edit-format|--model-provenance-json| \
         --repair-prompt| \
         --test-dir|--seed-file|--keep-glob|--build-cmd|--base-test-cmd| \
         --feature-test-cmd|--test-cmd|--extra-test-cmd|--timeout|--output-dir| \
@@ -597,6 +601,7 @@ while [[ $# -gt 0 ]]; do
         --top-p) TOP_P="${2:-}"; shift 2 ;;
         --sampling-seed) SAMPLING_SEED="${2:-}"; shift 2 ;;
         --max-tokens) MAX_TOKENS="${2:-}"; shift 2 ;;
+        --num-ctx) NUM_CTX="${2:-}"; shift 2 ;;
         --architect-think) ARCHITECT_THINK="${2:-}"; shift 2 ;;
         --editor-edit-format) EDITOR_EDIT_FORMAT="${2:-}"; shift 2 ;;
         --model-provenance-json) MODEL_PROVENANCE_JSON="${2:-}"; shift 2 ;;
@@ -776,6 +781,10 @@ fi
 if [[ -n "$MAX_TOKENS" ]]; then
     [[ "$MAX_TOKENS" =~ ^[1-9][0-9]*$ ]] ||
         die "--max-tokens must be a positive integer"
+fi
+if [[ -n "$NUM_CTX" ]]; then
+    [[ "$NUM_CTX" =~ ^[1-9][0-9]*$ ]] ||
+        die "--num-ctx must be a positive integer"
 fi
 if [[ -n "$ARCHITECT_THINK" &&
       "$ARCHITECT_THINK" != low &&
@@ -1157,6 +1166,7 @@ write_metadata "$OUTPUT_DIR/sweep.json" \
     top_p "$(optional_number "$TOP_P")" \
     sampling_seed "$(optional_number "$SAMPLING_SEED")" \
     max_tokens "$(optional_number "$MAX_TOKENS")" \
+    num_ctx "$(optional_number "$NUM_CTX")" \
     architect_think "$(optional_string "$ARCHITECT_THINK")" \
     runs_per_temperature "$RUNS" \
     max_loops "$MAX_LOOPS" \
@@ -1186,6 +1196,7 @@ else
 fi
 printf 'Attempts:    %s per temperature\n' "$RUNS"
 printf 'Max loops:   %s\n' "$MAX_LOOPS"
+printf 'Num ctx:     %s\n' "${NUM_CTX:-(Aider default)}"
 printf 'Output:      %s\n\n' "$OUTPUT_DIR"
 
 # ---------------------------------------------------------------------------
@@ -1212,6 +1223,7 @@ for temperature in "${TEMPERATURES_ARR[@]}"; do
                 "${ANALYSIS_DIVERSITY_K_MAX:-__NONE__}" \
                 "${TOP_P:-__NONE__}" "${SAMPLING_SEED:-__NONE__}" \
                 "${MAX_TOKENS:-__NONE__}" \
+                "${NUM_CTX:-__NONE__}" \
                 "${ARCHITECT_THINK:-__NONE__}" \
                 "$EDITOR_EDIT_FORMAT" \
                 "${MODEL_PROVENANCE_JSON:-__NONE__}" \
@@ -1243,6 +1255,7 @@ data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
     top_p,
     sampling_seed,
     max_tokens,
+    num_ctx,
     architect_think,
     editor_edit_format,
     model_provenance_json,
@@ -1268,6 +1281,7 @@ expected = {
     "top_p": None if top_p == "__NONE__" else float(top_p),
     "sampling_seed": None if sampling_seed == "__NONE__" else int(sampling_seed),
     "max_tokens": None if max_tokens == "__NONE__" else int(max_tokens),
+    "num_ctx": None if num_ctx == "__NONE__" else int(num_ctx),
     "architect_think": (
         None if architect_think == "__NONE__" else architect_think
     ),
@@ -1331,6 +1345,7 @@ PY
         top_p "$(optional_number "$TOP_P")" \
         sampling_seed "$(optional_number "$SAMPLING_SEED")" \
         max_tokens "$(optional_number "$MAX_TOKENS")" \
+        num_ctx "$(optional_number "$NUM_CTX")" \
         architect_think "$(optional_string "$ARCHITECT_THINK")" \
         editor_temperature 0 \
         editor_sampling_seed 0 \
@@ -1434,6 +1449,7 @@ PY
             --top-p "$TOP_P" \
             --sampling-seed "$SAMPLING_SEED" \
             --max-tokens "$MAX_TOKENS" \
+            --num-ctx "$NUM_CTX" \
             --architect-think "$ARCHITECT_THINK" \
             --editor-edit-format "$EDITOR_EDIT_FORMAT" \
             --output "$AIDER_MODEL_SETTINGS_FILE" \
@@ -1874,6 +1890,7 @@ PY
             top_p "$(optional_number "$TOP_P")" \
             sampling_seed "$(optional_number "$SAMPLING_SEED")" \
             max_tokens "$(optional_number "$MAX_TOKENS")" \
+            num_ctx "$(optional_number "$NUM_CTX")" \
             architect_think "$(optional_string "$ARCHITECT_THINK")" \
             architect_sampling "__JSON__:$("$PYTHON_BIN" -c 'import json,sys; s=json.loads(sys.argv[1]); print(json.dumps(s[0]["extra_params"],separators=(",",":")))' "$AIDER_MODEL_SETTINGS_JSON")" \
             editor_sampling "__JSON__:$("$PYTHON_BIN" -c 'import json,sys; s=json.loads(sys.argv[1]); print(json.dumps(s[1]["extra_params"],separators=(",",":")))' "$AIDER_MODEL_SETTINGS_JSON")" \

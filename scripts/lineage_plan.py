@@ -14,7 +14,7 @@ the resolved manifest, the *contents* of every checkpoint prompt, the contents
 of the judge script, each checkpoint's cumulative implemented flags, each
 checkpoint's visible test bundle, the Aider/model-pair/repair settings the stages run
 under, the editor edit format, the whole sampling configuration (temperature,
-architect_think, top_p, sampling_seed, max_tokens), explicit model-definition
+architect_think, top_p, sampling_seed, max_tokens, num_ctx), explicit model-definition
 provenance, and the shared automation notice that is expanded into every
 prompt. The number of lineages is deliberately excluded, so extending an
 existing run from 10 lineages to 15 is allowed while editing a prompt, changing
@@ -149,6 +149,7 @@ def resolve_plan(
     top_p: Any = None,
     sampling_seed: Any = None,
     max_tokens: Any = None,
+    num_ctx: Any = None,
     model_provenance_json: Any = None,
     editor_model: str = "ollama_chat/qwen3-coder-next:latest",
     aider_version: str = "unknown",
@@ -378,6 +379,10 @@ def resolve_plan(
                 "separator or a newline"
             )
 
+    parsed_num_ctx = optional_int(num_ctx, "num_ctx")
+    if parsed_num_ctx is not None and parsed_num_ctx < 1:
+        raise ManifestError("num_ctx must be a positive integer")
+
     plan = {
         "schema_version": SCHEMA_VERSION,
         "manifest": str(manifest_path.relative_to(repo).as_posix()),
@@ -421,6 +426,9 @@ def resolve_plan(
         "top_p": optional_float(top_p, "top_p"),
         "sampling_seed": optional_int(sampling_seed, "sampling_seed"),
         "max_tokens": optional_int(max_tokens, "max_tokens"),
+        # Ollama's total context capacity, independent from max_tokens (the
+        # generated-token cap). Null preserves Aider's dynamic sizing.
+        "num_ctx": parsed_num_ctx,
         # Native Ollama/Qwen architect thinking control. This is deliberately a
         # string, not reasoning_effort and not a boolean.
         "architect_think": architect_think,
@@ -438,6 +446,7 @@ def resolve_plan(
                 top_p=top_p,
                 sampling_seed=sampling_seed,
                 max_tokens=max_tokens,
+                num_ctx=parsed_num_ctx,
                 architect_think=architect_think,
                 editor_edit_format=editor_edit_format,
             )
@@ -472,7 +481,7 @@ def fingerprint(plan: dict[str, Any]) -> str:
     Aider version, architect/editor model pair, architect mode, fixed editor
     sampling, repair budget and per-invocation timeout the stages run under;
     the selected editor edit format; the full sampling configuration (temperature, architect_think, top_p,
-    sampling_seed, max_tokens -- a null among them is itself a condition, meaning the server
+    sampling_seed, max_tokens, num_ctx -- a null among them is itself a condition, meaning the server
     default applied); explicit model-definition provenance such as an Ollama
     Modelfile top_k value; and the shared automation notice, via
     automation_notice_sha256, since it is expanded into every prompt the model
@@ -492,6 +501,10 @@ def fingerprint(plan: dict[str, Any]) -> str:
     # generated Aider settings.
     if material.get("architect_think") is None:
         material.pop("architect_think", None)
+    # Preserve fingerprints from before the optional control existed when it
+    # is omitted. Every explicit value remains scientific fingerprint material.
+    if material.get("num_ctx") is None:
+        material.pop("num_ctx", None)
     canonical = json.dumps(material, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -548,6 +561,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--top-p", default="")
     parser.add_argument("--sampling-seed", default="")
     parser.add_argument("--max-tokens", default="")
+    parser.add_argument("--num-ctx", default="")
     parser.add_argument("--architect-think", default="")
     parser.add_argument(
         "--editor-edit-format", default=aider_settings.EDITOR_EDIT_FORMAT
@@ -585,6 +599,7 @@ def main(argv: list[str] | None = None) -> int:
         top_p=args.top_p,
         sampling_seed=args.sampling_seed,
         max_tokens=args.max_tokens,
+        num_ctx=args.num_ctx,
         architect_think=args.architect_think,
         editor_edit_format=args.editor_edit_format,
         model_provenance_json=args.model_provenance_json,

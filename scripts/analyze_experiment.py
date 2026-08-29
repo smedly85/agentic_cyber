@@ -128,6 +128,7 @@ PAPER_METRICS_COLUMNS = [
     "Model",
     "Temp",
     "Architect Think",
+    "Num Ctx",
     "Editor Edit Format",
     "Reliability Scope",
     "Population N",
@@ -164,6 +165,7 @@ PAPER_DESCRIPTIVE_COLUMNS = [
     "Model",
     "Temp",
     "Architect Think",
+    "Num Ctx",
     "Editor Edit Format",
     "Raw Architecture Families",
     "Architecture Family-Discovery AUC@K",
@@ -1549,6 +1551,7 @@ def build_paper_metrics_row(
         "Architect Think": experiment_metadata.get(
             "architect_think", summary.get("architect_think")
         ),
+        "Num Ctx": experiment_metadata.get("num_ctx", summary.get("num_ctx")),
         "Editor Edit Format": experiment_metadata.get(
             "editor_edit_format", summary.get("editor_edit_format")
         ),
@@ -1626,6 +1629,7 @@ def build_paper_descriptive_row(
         "Architect Think": experiment_metadata.get(
             "architect_think", summary.get("architect_think")
         ),
+        "Num Ctx": experiment_metadata.get("num_ctx", summary.get("num_ctx")),
         "Editor Edit Format": experiment_metadata.get(
             "editor_edit_format", summary.get("editor_edit_format")
         ),
@@ -4079,6 +4083,7 @@ def main() -> int:
                 "model": experiment_metadata.get("model"),
                 "temperature": experiment_metadata.get("temperature"),
                 "architect_think": experiment_metadata.get("architect_think"),
+                "num_ctx": experiment_metadata.get("num_ctx"),
                 "editor_edit_format": experiment_metadata.get(
                     "editor_edit_format"
                 ),
@@ -4379,6 +4384,7 @@ def main() -> int:
         "editor_model": experiment_metadata.get("editor_model"),
         "architect_mode": experiment_metadata.get("architect_mode", False),
         "architect_think": experiment_metadata.get("architect_think"),
+        "num_ctx": experiment_metadata.get("num_ctx"),
         "editor_edit_format": experiment_metadata.get("editor_edit_format"),
         "model_provenance": experiment_metadata.get("model_provenance"),
         "temperature": experiment_metadata.get("temperature"),

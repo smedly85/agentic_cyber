@@ -42,6 +42,7 @@ def build_model_settings(
     top_p: Any = None,
     sampling_seed: Any = None,
     max_tokens: Any = None,
+    num_ctx: Any = None,
     architect_think: Any = None,
     editor_edit_format: str = EDITOR_EDIT_FORMAT,
 ) -> list[dict[str, Any]]:
@@ -82,12 +83,26 @@ def build_model_settings(
     parsed_top_p = optional_float(top_p)
     parsed_seed = optional_int(sampling_seed)
     parsed_max_tokens = optional_int(max_tokens)
+    parsed_num_ctx = optional_int(num_ctx)
+    if parsed_num_ctx is not None and parsed_num_ctx < 1:
+        raise ValueError("num ctx must be a positive integer")
     if parsed_top_p is not None:
         architect_params["top_p"] = parsed_top_p
     if parsed_seed is not None:
         architect_params["seed"] = parsed_seed
     if parsed_max_tokens is not None:
         architect_params["max_tokens"] = parsed_max_tokens
+    if parsed_num_ctx is not None:
+        architect_params["num_ctx"] = parsed_num_ctx
+
+    editor_params: dict[str, int | float] = {
+        "temperature": EDITOR_TEMPERATURE,
+        "seed": EDITOR_SEED,
+    }
+    if parsed_num_ctx is not None:
+        # Pin both roles. Otherwise Aider may dynamically resize the editor's
+        # Ollama request even though the architect is explicitly controlled.
+        editor_params["num_ctx"] = parsed_num_ctx
 
     return [
         {
@@ -99,10 +114,7 @@ def build_model_settings(
             "name": editor_model,
             "use_repo_map": False,
             "editor_edit_format": editor_edit_format,
-            "extra_params": {
-                "temperature": EDITOR_TEMPERATURE,
-                "seed": EDITOR_SEED,
-            },
+            "extra_params": editor_params,
         },
     ]
 
@@ -125,6 +137,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--top-p", default="")
     parser.add_argument("--sampling-seed", default="")
     parser.add_argument("--max-tokens", default="")
+    parser.add_argument("--num-ctx", default="")
     parser.add_argument("--architect-think", default="")
     parser.add_argument("--editor-edit-format", default=EDITOR_EDIT_FORMAT)
     parser.add_argument("--output", type=Path)
@@ -142,6 +155,7 @@ def main(argv: list[str] | None = None) -> int:
             top_p=args.top_p,
             sampling_seed=args.sampling_seed,
             max_tokens=args.max_tokens,
+            num_ctx=args.num_ctx,
             architect_think=args.architect_think,
             editor_edit_format=args.editor_edit_format,
         )

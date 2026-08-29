@@ -76,6 +76,9 @@ default applies):
                              source-inheritance file and the two senses of
                              "seed" must not be confused.
   --max-tokens N             Cap on generated tokens per session, N >= 1
+  --num-ctx N                Ollama total context capacity, N >= 1. Sent to
+                             both architect and editor, independently from
+                             --max-tokens. Unset preserves Aider sizing.
   --model-provenance-json J  Metadata-only JSON object for model-definition
                              controls, e.g. base_model/top_k/top_k_control.
                              It is fingerprinted and never sent in requests.
@@ -222,6 +225,7 @@ TEMPERATURE="0"
 TOP_P=""
 SAMPLING_SEED=""
 MAX_TOKENS=""
+NUM_CTX=""
 ARCHITECT_THINK=""
 MODEL_PROVENANCE_JSON=""
 LINEAGES=1
@@ -246,7 +250,7 @@ AIDER_BIN="${AIDER_BIN:-aider}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --utility|--model|--editor-model|--temperature|--lineages|--lineage-start|--max-loops| \
-        --top-p|--sampling-seed|--max-tokens|--architect-think|--editor-edit-format|--model-provenance-json| \
+        --top-p|--sampling-seed|--max-tokens|--num-ctx|--architect-think|--editor-edit-format|--model-provenance-json| \
         --timeout|--repair-prompt|--remote-base-url| \
         --remote-api-key-env|--output-dir)
             [[ $# -ge 2 ]] || die "$1 requires a value"
@@ -261,6 +265,7 @@ while [[ $# -gt 0 ]]; do
         --top-p) TOP_P="${2:-}"; shift 2 ;;
         --sampling-seed) SAMPLING_SEED="${2:-}"; shift 2 ;;
         --max-tokens) MAX_TOKENS="${2:-}"; shift 2 ;;
+        --num-ctx) NUM_CTX="${2:-}"; shift 2 ;;
         --architect-think) ARCHITECT_THINK="${2:-}"; shift 2 ;;
         --editor-edit-format) EDITOR_EDIT_FORMAT="${2:-}"; shift 2 ;;
         --model-provenance-json) MODEL_PROVENANCE_JSON="${2:-}"; shift 2 ;;
@@ -370,6 +375,10 @@ if [[ -n "$MAX_TOKENS" ]]; then
     [[ "$MAX_TOKENS" =~ ^[1-9][0-9]*$ ]] ||
         die "--max-tokens must be a positive integer"
 fi
+if [[ -n "$NUM_CTX" ]]; then
+    [[ "$NUM_CTX" =~ ^[1-9][0-9]*$ ]] ||
+        die "--num-ctx must be a positive integer"
+fi
 if [[ -n "$ARCHITECT_THINK" &&
       "$ARCHITECT_THINK" != low &&
       "$ARCHITECT_THINK" != medium &&
@@ -441,6 +450,7 @@ PLAN_JSON="$(
         --top-p "$TOP_P" \
         --sampling-seed "$SAMPLING_SEED" \
         --max-tokens "$MAX_TOKENS" \
+        --num-ctx "$NUM_CTX" \
         --architect-think "$ARCHITECT_THINK" \
         --editor-edit-format "$EDITOR_EDIT_FORMAT" \
         --model-provenance-json "$MODEL_PROVENANCE_JSON" \
@@ -482,6 +492,7 @@ STAGE_TABLE="$(
         --top-p "$TOP_P" \
         --sampling-seed "$SAMPLING_SEED" \
         --max-tokens "$MAX_TOKENS" \
+        --num-ctx "$NUM_CTX" \
         --architect-think "$ARCHITECT_THINK" \
         --editor-edit-format "$EDITOR_EDIT_FORMAT" \
         --model-provenance-json "$MODEL_PROVENANCE_JSON" \
@@ -599,7 +610,7 @@ fi
 
 if [[ "$PRINT_PLAN" -eq 1 ]]; then
     # The plan JSON already carries architect_think, top_p, sampling_seed,
-    # max_tokens and the
+    # max_tokens, num_ctx and the
     # automation-notice hash, all of which are inside config_fingerprint; these
     # lines restate the sampling settings in the same human-readable form the
     # run banner uses.
@@ -607,11 +618,11 @@ if [[ "$PRINT_PLAN" -eq 1 ]]; then
     printf '\nOutput dir: %s\n' "$OUTPUT_DIR"
     printf 'Lineages:   %s..%s\n' \
         "$LINEAGE_START" "$((LINEAGE_START + LINEAGES - 1))"
-    printf 'Sampling:   temperature=%s architect-think=%s editor-edit-format=%s top-p=%s sampling-seed=%s max-tokens=%s\n' \
+    printf 'Sampling:   temperature=%s architect-think=%s editor-edit-format=%s top-p=%s sampling-seed=%s max-tokens=%s num-ctx=%s\n' \
         "$TEMPERATURE" "${ARCHITECT_THINK:-null}" \
         "$EDITOR_EDIT_FORMAT" \
         "${TOP_P:-null}" "${SAMPLING_SEED:-null}" \
-        "${MAX_TOKENS:-null}"
+        "${MAX_TOKENS:-null}" "${NUM_CTX:-null}"
     exit 0
 fi
 
@@ -687,6 +698,7 @@ target.write_text(
             "editor_model": plan["editor_model"],
             "architect_mode": plan["architect_mode"],
             "architect_think": plan["architect_think"],
+            "num_ctx": plan["num_ctx"],
             "editor_edit_format": plan["editor_edit_format"],
             "model": plan["model"],
             "aider_model_settings": plan["aider_model_settings"],
@@ -736,13 +748,14 @@ if [[ -f "$RUN_METADATA" && "$DRY_RUN" -eq 0 ]]; then
         "$MODEL" "$EDITOR_MODEL" "$AIDER_VERSION" "$TEMPERATURE" "$MAX_LOOPS" \
             "${TOP_P:-__NONE__}" "${SAMPLING_SEED:-__NONE__}" \
             "${MAX_TOKENS:-__NONE__}" "${ARCHITECT_THINK:-__NONE__}" \
+            "${NUM_CTX:-__NONE__}" \
             "$EDITOR_EDIT_FORMAT" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 (path, fingerprint, utility, model, editor_model, aider_version, temperature, max_loops,
- top_p, sampling_seed, max_tokens, architect_think, editor_edit_format) = sys.argv[1:]
+ top_p, sampling_seed, max_tokens, architect_think, num_ctx, editor_edit_format) = sys.argv[1:]
 try:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
 except (OSError, UnicodeError, json.JSONDecodeError) as error:
@@ -767,6 +780,7 @@ expected = {
     "top_p": None if top_p == "__NONE__" else float(top_p),
     "sampling_seed": None if sampling_seed == "__NONE__" else int(sampling_seed),
     "max_tokens": None if max_tokens == "__NONE__" else int(max_tokens),
+    "num_ctx": None if num_ctx == "__NONE__" else int(num_ctx),
     "architect_think": (
         None if architect_think == "__NONE__" else architect_think
     ),
@@ -799,6 +813,7 @@ printf 'Temperature:  %s\n' "$TEMPERATURE"
 printf 'Top-p:        %s\n' "${TOP_P:-(server default)}"
 printf 'Sampling seed: %s\n' "${SAMPLING_SEED:-(server default)}"
 printf 'Max tokens:   %s\n' "${MAX_TOKENS:-(server default)}"
+printf 'Num ctx:      %s\n' "${NUM_CTX:-(Aider default)}"
 printf 'Architect think: %s\n' "${ARCHITECT_THINK:-(server default)}"
 printf 'Lineages:     %s (numbered %s..%s)\n' \
     "$LINEAGES" "$LINEAGE_START" "$((LINEAGE_START + LINEAGES - 1))"
@@ -871,6 +886,7 @@ record.update(
         "top_p": plan["top_p"],
         "sampling_seed": plan["sampling_seed"],
         "max_tokens": plan["max_tokens"],
+        "num_ctx": plan["num_ctx"],
         "automation_notice_sha256": plan["automation_notice_sha256"],
         "editor_temperature": plan["editor_temperature"],
         "editor_sampling_seed": plan["editor_sampling_seed"],
@@ -950,6 +966,7 @@ for (( offset = 0; offset < LINEAGES; offset++ )); do
             --top-p "$TOP_P" \
             --sampling-seed "$SAMPLING_SEED" \
             --max-tokens "$MAX_TOKENS" \
+            --num-ctx "$NUM_CTX" \
             --architect-think "$ARCHITECT_THINK" \
             --editor-edit-format "$EDITOR_EDIT_FORMAT" \
             --max-loops "$MAX_LOOPS" \
@@ -1023,6 +1040,7 @@ for (( offset = 0; offset < LINEAGES; offset++ )); do
         [[ -n "$TOP_P" ]] && runner_args+=(--top-p "$TOP_P")
         [[ -n "$SAMPLING_SEED" ]] && runner_args+=(--sampling-seed "$SAMPLING_SEED")
         [[ -n "$MAX_TOKENS" ]] && runner_args+=(--max-tokens "$MAX_TOKENS")
+        [[ -n "$NUM_CTX" ]] && runner_args+=(--num-ctx "$NUM_CTX")
         [[ -n "$ARCHITECT_THINK" ]] &&
             runner_args+=(--architect-think "$ARCHITECT_THINK")
         [[ -n "$BASE_TEST_CMD" ]] && runner_args+=(--base-test-cmd "$BASE_TEST_CMD")
@@ -1233,6 +1251,7 @@ record = {
     "agent_execution_failure_stage": metadata.get("agent_execution_failure_stage"),
     "agent_failure_reason": metadata.get("agent_failure_reason"),
     "architect_think": metadata.get("architect_think"),
+    "num_ctx": metadata.get("num_ctx"),
     "editor_edit_format": metadata.get("editor_edit_format"),
     # Timeout provenance, carried into the lineage record so a stage that
     # succeeded or was repaired after a cut-short session is still

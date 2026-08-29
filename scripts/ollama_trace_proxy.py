@@ -112,7 +112,9 @@ def request_metadata(
         "think": parsed.get("think") if parsed else None,
         "options": {
             key: options[key]
-            for key in ("temperature", "num_predict", "top_p", "top_k", "seed")
+            for key in (
+                "temperature", "num_predict", "num_ctx", "top_p", "top_k", "seed"
+            )
             if key in options
         },
         "message_count": len(messages),

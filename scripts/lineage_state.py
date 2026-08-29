@@ -139,6 +139,7 @@ def init_record(args: argparse.Namespace) -> dict[str, Any]:
         "top_p": optional_float(args.top_p),
         "sampling_seed": optional_int(args.sampling_seed),
         "max_tokens": optional_int(args.max_tokens),
+        "num_ctx": optional_int(args.num_ctx),
         "architect_think": args.architect_think or None,
         "editor_temperature": 0.0,
         "editor_sampling_seed": 0,
@@ -232,6 +233,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     start.add_argument("--top-p", default="")
     start.add_argument("--sampling-seed", default="")
     start.add_argument("--max-tokens", default="")
+    start.add_argument("--num-ctx", default="")
     start.add_argument("--architect-think", default="")
     start.add_argument("--editor-edit-format", default="editor-diff")
     start.add_argument("--max-loops", default="0")
