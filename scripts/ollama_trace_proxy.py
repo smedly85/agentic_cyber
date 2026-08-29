@@ -13,6 +13,7 @@ import argparse
 import http.client
 import json
 import os
+import socketserver
 import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -204,6 +205,15 @@ class TraceStore:
 
 class OllamaTraceServer(ThreadingHTTPServer):
     daemon_threads = True
+
+    def server_bind(self) -> None:
+        # HTTPServer.server_bind() calls socket.getfqdn(host), which can block
+        # indefinitely when loopback reverse/FQDN resolution is broken. This
+        # proxy binds only to an explicit loopback address and needs no FQDN.
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
 
     def __init__(self, address: tuple[str, int], upstream: str, store: TraceStore):
         super().__init__(address, OllamaTraceHandler)
