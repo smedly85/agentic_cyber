@@ -155,6 +155,10 @@ Remote endpoints:
   --remote-api-key-env NAME  Optional environment variable containing the
                              endpoint key. An unauthenticated openai/* gateway
                              receives the conventional dummy value "ollama".
+  --ollama-trace             DIAGNOSTIC ONLY: route native Ollama calls through
+                             a per-attempt loopback proxy and retain request
+                             JSON plus completion metadata under
+                             attempt-*/ollama-trace/. Disabled by default.
 
 Directory layout:
   <output-dir>/
@@ -358,7 +362,12 @@ run_aider() {
         "TMPDIR=$AIDER_HOME/tmp"
         "GIT_CEILING_DIRECTORIES=$(dirname "$workdir")"
     )
-    if [[ "$REMOTE_TRANSPORT" == "ollama_native" ]]; then
+    if [[ "$OLLAMA_TRACE" -eq 1 ]]; then
+        env_args+=("OLLAMA_API_BASE=$OLLAMA_TRACE_PROXY_URL")
+        if [[ -n "$REMOTE_API_KEY_ENV" ]]; then
+            env_args+=("OLLAMA_API_KEY=${!REMOTE_API_KEY_ENV}")
+        fi
+    elif [[ "$REMOTE_TRANSPORT" == "ollama_native" ]]; then
         env_args+=("OLLAMA_API_BASE=$REMOTE_BASE_URL")
         if [[ -n "$REMOTE_API_KEY_ENV" ]]; then
             env_args+=("OLLAMA_API_KEY=${!REMOTE_API_KEY_ENV}")
@@ -541,6 +550,9 @@ NO_ANALYSIS=0
 REMOTE_BASE_URL=""
 REMOTE_API_KEY_ENV=""
 REMOTE_TRANSPORT="default"
+OLLAMA_TRACE=0
+OLLAMA_TRACE_PROXY_PID=""
+OLLAMA_TRACE_PROXY_URL=""
 ANALYSIS_THRESHOLD=""
 ANALYSIS_ARCHITECTURE_THRESHOLD=""
 ANALYSIS_STRATEGY_THRESHOLD=""
@@ -617,6 +629,7 @@ while [[ $# -gt 0 ]]; do
         --force) FORCE=1; shift ;;
         --remote-base-url) REMOTE_BASE_URL="${2:-}"; shift 2 ;;
         --remote-api-key-env) REMOTE_API_KEY_ENV="${2:-}"; shift 2 ;;
+        --ollama-trace) OLLAMA_TRACE=1; shift ;;
         --analysis-threshold) ANALYSIS_THRESHOLD="${2:-}"; shift 2 ;;
         --analysis-architecture-threshold)
             ANALYSIS_ARCHITECTURE_THRESHOLD="${2:-}"; shift 2 ;;
@@ -664,6 +677,11 @@ AIDER_SETTINGS_TOOL="$REPO/scripts/aider_settings.py"
 [[ -f "$AIDER_SETTINGS_TOOL" ]] || die "Aider settings helper not found: $AIDER_SETTINGS_TOOL"
 AIDER_OUTPUT_TOOL="$REPO/scripts/aider_output.py"
 [[ -f "$AIDER_OUTPUT_TOOL" ]] || die "Aider output helper not found: $AIDER_OUTPUT_TOOL"
+OLLAMA_TRACE_TOOL="$REPO/scripts/ollama_trace_proxy.py"
+if [[ "$OLLAMA_TRACE" -eq 1 ]]; then
+    [[ -f "$OLLAMA_TRACE_TOOL" ]] ||
+        die "Ollama trace proxy not found: $OLLAMA_TRACE_TOOL"
+fi
 
 # ---------------------------------------------------------------------------
 # Standalone cleanup of existing runs
@@ -856,6 +874,28 @@ if [[ -n "$REMOTE_API_KEY_ENV" ]]; then
     [[ -n "${!REMOTE_API_KEY_ENV:-}" ]] ||
         die "$REMOTE_API_KEY_ENV is not set (export it, or omit --remote-api-key-env for an unauthenticated Ollama endpoint)"
 fi
+if [[ "$OLLAMA_TRACE" -eq 1 ]]; then
+    [[ "$MODEL" == ollama_chat/* && "$EDITOR_MODEL" == ollama_chat/* ]] ||
+        die "--ollama-trace requires ollama_chat/* architect and editor models"
+    OLLAMA_TRACE_UPSTREAM="${REMOTE_BASE_URL:-http://127.0.0.1:11434}"
+    "$PYTHON_BIN" - "$OLLAMA_TRACE_UPSTREAM" <<'PY' ||
+import sys
+from urllib.parse import urlsplit
+
+value = urlsplit(sys.argv[1])
+valid = (
+    value.scheme == "http"
+    and value.hostname in {"127.0.0.1", "localhost", "::1"}
+    and value.path in {"", "/"}
+    and not value.query
+    and not value.fragment
+)
+raise SystemExit(0 if valid else 1)
+PY
+        die "--ollama-trace requires a loopback native Ollama root (for example http://127.0.0.1:11434)"
+else
+    OLLAMA_TRACE_UPSTREAM=""
+fi
 
 PROMPT_ABS="$(resolve_repo_path "$PROMPT")"
 [[ -f "$PROMPT_ABS" ]] || die "prompt not found: $PROMPT_ABS"
@@ -868,7 +908,59 @@ PROMPT_ABS="$(resolve_repo_path "$PROMPT")"
 RENDER_TOOL="$REPO/scripts/prompt_render.py"
 [[ -f "$RENDER_TOOL" ]] || die "prompt renderer not found: $RENDER_TOOL"
 RENDERED_PROMPT="$(mktemp)" || die "cannot create the rendered prompt file"
-trap 'rm -f "$RENDERED_PROMPT"' EXIT
+cleanup() {
+    if [[ -n "${OLLAMA_TRACE_PROXY_PID:-}" ]]; then
+        kill "$OLLAMA_TRACE_PROXY_PID" 2>/dev/null || true
+        wait "$OLLAMA_TRACE_PROXY_PID" 2>/dev/null || true
+        OLLAMA_TRACE_PROXY_PID=""
+    fi
+    rm -f "${RENDERED_PROMPT:-}"
+}
+trap cleanup EXIT
+
+start_ollama_trace_proxy() {
+    local trace_dir="$attempt_dir/ollama-trace"
+    local ready_file="$attempt_dir/.ollama-trace-ready"
+    local proxy_log="$attempt_dir/ollama-trace-proxy.log"
+    local readiness_checks=0
+
+    [[ "$OLLAMA_TRACE" -eq 1 ]] || return 0
+    [[ -z "$OLLAMA_TRACE_PROXY_PID" ]] ||
+        die "internal error: an Ollama trace proxy is already running"
+    rm -f "$ready_file"
+    "$PYTHON_BIN" "$OLLAMA_TRACE_TOOL" \
+        --upstream "$OLLAMA_TRACE_UPSTREAM" \
+        --trace-dir "$trace_dir" \
+        --allowed-root "$attempt_dir" \
+        --ready-file "$ready_file" >"$proxy_log" 2>&1 &
+    OLLAMA_TRACE_PROXY_PID=$!
+
+    while [[ ! -s "$ready_file" ]]; do
+        if ! kill -0 "$OLLAMA_TRACE_PROXY_PID" 2>/dev/null; then
+            wait "$OLLAMA_TRACE_PROXY_PID" 2>/dev/null || true
+            OLLAMA_TRACE_PROXY_PID=""
+            die "Ollama trace proxy failed to start; see $proxy_log"
+        fi
+        readiness_checks=$((readiness_checks + 1))
+        if [[ "$readiness_checks" -ge 200 ]]; then
+            die "Ollama trace proxy did not become ready; see $proxy_log"
+        fi
+        sleep 0.05
+    done
+    IFS= read -r OLLAMA_TRACE_PROXY_URL <"$ready_file"
+    [[ "$OLLAMA_TRACE_PROXY_URL" == http://127.0.0.1:* ]] ||
+        die "Ollama trace proxy reported a non-loopback address"
+}
+
+stop_ollama_trace_proxy() {
+    [[ -n "$OLLAMA_TRACE_PROXY_PID" ]] || return 0
+    kill "$OLLAMA_TRACE_PROXY_PID" 2>/dev/null || true
+    wait "$OLLAMA_TRACE_PROXY_PID" 2>/dev/null || true
+    OLLAMA_TRACE_PROXY_PID=""
+    OLLAMA_TRACE_PROXY_URL=""
+    rm -f "$attempt_dir/.ollama-trace-ready"
+}
+
 "$PYTHON_BIN" "$RENDER_TOOL" --repo "$REPO" --prompt "$PROMPT_ABS" \
     --output "$RENDERED_PROMPT" ||
     die "cannot render the automation notice into $PROMPT_ABS"
@@ -1052,6 +1144,8 @@ write_metadata "$OUTPUT_DIR/sweep.json" \
     remote_base_url "$REMOTE_BASE_URL" \
     remote_api_key_env "$REMOTE_API_KEY_ENV" \
     remote_transport "$REMOTE_TRANSPORT" \
+    ollama_trace_enabled "$([[ "$OLLAMA_TRACE" -eq 1 ]] && printf true || printf false)" \
+    ollama_trace_path "$([[ "$OLLAMA_TRACE" -eq 1 ]] && printf '__STR__:temp-*/attempt-*/ollama-trace' || printf '__JSON__:null')" \
     prompt "$PROMPT_ABS" \
     source_workdir_path "$SOURCE_PATH" \
     source_path "$SOURCE_FLAT" \
@@ -1244,6 +1338,8 @@ PY
         remote_base_url "$([[ -n "$REMOTE_BASE_URL" ]] && printf '__STR__:%s' "$REMOTE_BASE_URL" || printf '__JSON__:null')" \
         remote_api_key_env "$([[ -n "$REMOTE_API_KEY_ENV" ]] && printf '__STR__:%s' "$REMOTE_API_KEY_ENV" || printf '__JSON__:null')" \
         remote_transport "$REMOTE_TRANSPORT" \
+        ollama_trace_enabled "$([[ "$OLLAMA_TRACE" -eq 1 ]] && printf true || printf false)" \
+        ollama_trace_path "$([[ "$OLLAMA_TRACE" -eq 1 ]] && printf '__STR__:attempt-*/ollama-trace' || printf '__JSON__:null')" \
         prompt "$PROMPT_ABS" \
         prompt_copy "$experiment_dir/prompt.md" \
         automation_notice_sha256 "$AUTOMATION_NOTICE_SHA256" \
@@ -1366,6 +1462,8 @@ PY
         : >"$attempt_dir/build.log"
         : >"$attempt_dir/base-tests.log"
         : >"$attempt_dir/feature-tests.log"
+
+        start_ollama_trace_proxy
 
         current_prompt="$RENDERED_PROMPT"
         repair_loops=0
@@ -1646,6 +1744,11 @@ PY
         done
         # ---- end loop -----------------------------------------------------
 
+        # Aider is the only traced process. Stop before controller validation
+        # artifacts are captured so the proxy can never become agent-visible
+        # input or repair feedback.
+        stop_ollama_trace_proxy
+
         # Every path above breaks with a reason; this only guards a future edit
         # that lets the bound expire instead.
         [[ -n "$stop_reason" ]] || stop_reason="loop_limit"
@@ -1780,6 +1883,8 @@ PY
             remote_base_url "$([[ -n "$REMOTE_BASE_URL" ]] && printf '__STR__:%s' "$REMOTE_BASE_URL" || printf '__JSON__:null')" \
             remote_api_key_env "$([[ -n "$REMOTE_API_KEY_ENV" ]] && printf '__STR__:%s' "$REMOTE_API_KEY_ENV" || printf '__JSON__:null')" \
             remote_transport "$REMOTE_TRANSPORT" \
+            ollama_trace_enabled "$([[ "$OLLAMA_TRACE" -eq 1 ]] && printf true || printf false)" \
+            ollama_trace_path "$([[ "$OLLAMA_TRACE" -eq 1 ]] && printf '__STR__:ollama-trace' || printf '__JSON__:null')" \
             source_path "$SOURCE_FLAT" \
             source_workdir_path "$SOURCE_PATH" \
             source_mode "$SOURCE_MODE" \

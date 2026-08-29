@@ -479,8 +479,11 @@ def fingerprint(plan: dict[str, Any]) -> str:
     sees without appearing in any prompt file.
 
     Deliberately excluded: the number of lineages (extending a run is a valid
-    resume) and the output directory (relocating results is not a condition
-    change).
+    resume), the output directory (relocating results is not a condition
+    change), and opt-in Ollama transport tracing. The trace proxy forwards the
+    same request bytes once and streams the same response bytes without changing
+    model-visible inputs or generation parameters, so tracing is instrumentation
+    rather than a scientific condition.
     """
     material = {key: value for key, value in plan.items() if key != "config_fingerprint"}
     # Historical plans predate this optional key. Omitting the new control is

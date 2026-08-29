@@ -99,6 +99,10 @@ Passed through to scripts/run_experiment.sh:
   --remote-base-url URL      Native Ollama root for ollama_chat/* models, or
                              an OpenAI-compatible URL for openai/* models
   --remote-api-key-env NAME  Optional env var holding that endpoint's key
+  --ollama-trace             DIAGNOSTIC ONLY: enable the per-attempt loopback
+                             Ollama trace proxy in every stage. Disabled by
+                             default and excluded from the scientific
+                             configuration fingerprint.
 
 Output:
   --output-dir DIR           Lineage root. Default:
@@ -229,6 +233,7 @@ REPAIR_TEMPLATE=""
 KEEP_WORKDIR=0
 REMOTE_BASE_URL=""
 REMOTE_API_KEY_ENV=""
+OLLAMA_TRACE=0
 OUTPUT_DIR=""
 FORCE=0
 PRINT_PLAN=0
@@ -276,6 +281,7 @@ while [[ $# -gt 0 ]]; do
         --keep-workdir) KEEP_WORKDIR=1; shift ;;
         --remote-base-url) REMOTE_BASE_URL="${2:-}"; shift 2 ;;
         --remote-api-key-env) REMOTE_API_KEY_ENV="${2:-}"; shift 2 ;;
+        --ollama-trace) OLLAMA_TRACE=1; shift ;;
         --output-dir) OUTPUT_DIR="${2:-}"; shift 2 ;;
         --force) FORCE=1; shift ;;
         --print-plan) PRINT_PLAN=1; shift ;;
@@ -387,6 +393,26 @@ fi
 if [[ -n "$REMOTE_API_KEY_ENV" ]]; then
     [[ -n "${!REMOTE_API_KEY_ENV:-}" ]] ||
         die "$REMOTE_API_KEY_ENV is not set"
+fi
+if [[ "$OLLAMA_TRACE" -eq 1 ]]; then
+    [[ "$MODEL" == ollama_chat/* && "$EDITOR_MODEL" == ollama_chat/* ]] ||
+        die "--ollama-trace requires ollama_chat/* architect and editor models"
+    trace_upstream="${REMOTE_BASE_URL:-http://127.0.0.1:11434}"
+    "$PYTHON_BIN" - "$trace_upstream" <<'PY' ||
+import sys
+from urllib.parse import urlsplit
+
+value = urlsplit(sys.argv[1])
+valid = (
+    value.scheme == "http"
+    and value.hostname in {"127.0.0.1", "localhost", "::1"}
+    and value.path in {"", "/"}
+    and not value.query
+    and not value.fragment
+)
+raise SystemExit(0 if valid else 1)
+PY
+        die "--ollama-trace requires a loopback native Ollama root"
 fi
 
 if command -v "$AIDER_BIN" >/dev/null 2>&1; then
@@ -640,12 +666,12 @@ if [[ -n "$REQUIRED_PLATFORM" && "$REQUIRED_PLATFORM" != "None" &&
             # denominator pollution this preflight exists to prevent.
             "$PYTHON_BIN" - "$RUN_METADATA_PATH" "$PLAN_JSON" \
                 "$REQUIRED_PLATFORM" "$HOST_PLATFORM" "$CONFIG_FINGERPRINT" \
-                "$(timestamp)" <<'PYPRE'
+                "$(timestamp)" "$OLLAMA_TRACE" <<'PYPRE'
 import json
 import sys
 from pathlib import Path
 
-path, plan_json, required, host, fingerprint, created = sys.argv[1:]
+path, plan_json, required, host, fingerprint, created, ollama_trace = sys.argv[1:]
 plan = json.loads(plan_json)
 target = Path(path)
 target.parent.mkdir(parents=True, exist_ok=True)
@@ -668,6 +694,11 @@ target.write_text(
             "remote_api_key_env": plan["remote_api_key_env"],
             "remote_transport": plan["remote_transport"],
             "config_fingerprint": fingerprint,
+            "ollama_trace_enabled": ollama_trace == "1",
+            "ollama_trace_path": (
+                "lineage-*/*/temp-*/attempt-*/ollama-trace"
+                if ollama_trace == "1" else None
+            ),
             "run_status": "platform_incompatible",
             "required_platform": required,
             "host_platform": host,
@@ -790,12 +821,12 @@ fi
 
 if [[ "$DRY_RUN" -eq 0 ]]; then
     "$PYTHON_BIN" - "$RUN_METADATA" "$PLAN_JSON" "$REPO" "$REPO_COMMIT" \
-        "$LINEAGE_START" "$LINEAGES" "$(timestamp)" <<'PY'
+        "$LINEAGE_START" "$LINEAGES" "$(timestamp)" "$OLLAMA_TRACE" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-path, plan_json, repository, commit, start, count, created = sys.argv[1:]
+path, plan_json, repository, commit, start, count, created, ollama_trace = sys.argv[1:]
 plan = json.loads(plan_json)
 target = Path(path)
 
@@ -858,6 +889,14 @@ record.update(
         "required_platform": plan.get("required_platform"),
         "host_platform": plan.get("host_platform"),
         "config_fingerprint": plan["config_fingerprint"],
+        # Transparent transport instrumentation only. It changes neither the
+        # request bytes nor model parameters, so it is metadata but not
+        # scientific fingerprint material.
+        "ollama_trace_enabled": ollama_trace == "1",
+        "ollama_trace_path": (
+            "lineage-*/*/temp-*/attempt-*/ollama-trace"
+            if ollama_trace == "1" else None
+        ),
         "checkpoints": plan["checkpoints"],
         "planned_lineage_ids": planned_lineage_ids,
         "lineages_planned": len(planned_lineage_ids),
@@ -994,6 +1033,7 @@ for (( offset = 0; offset < LINEAGES; offset++ )); do
         [[ -n "$REMOTE_BASE_URL" ]] && runner_args+=(--remote-base-url "$REMOTE_BASE_URL")
         [[ -n "$REMOTE_API_KEY_ENV" ]] &&
             runner_args+=(--remote-api-key-env "$REMOTE_API_KEY_ENV")
+        [[ "$OLLAMA_TRACE" -eq 1 ]] && runner_args+=(--ollama-trace)
 
         if [[ "$stage_mode" == "existing" ]]; then
             # Seeded from the immediately preceding candidate of THIS lineage
