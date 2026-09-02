@@ -1,6 +1,7 @@
 """Conservative C call-graph reachability and structural selection helpers.
 
-The graph records only directly named calls.  Function-pointer dispatch,
+The graph records directly named calls and explicitly supported, statically
+identifiable callback arguments. Other function-pointer dispatch,
 preprocessor-generated calls, and calls hidden in unavailable translation
 units remain unresolved rather than being guessed.
 """
@@ -14,8 +15,9 @@ from collections import Counter, deque
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-CALL_GRAPH_SCHEMA_VERSION = 1
+CALL_GRAPH_SCHEMA_VERSION = 2
 SELECTION_POLICIES = ("SHALLOW", "RANDOM", "DEEP")
+KNOWN_CALLBACK_ARGUMENTS = {"qsort": -1}
 SENSITIVE_CALL_CATEGORIES = {
     "allocation": {"malloc", "calloc", "realloc", "reallocarray", "free", "strdup"},
     "buffer": {
@@ -48,6 +50,65 @@ def _identifier(node: Any, data: bytes) -> str | None:
     return _identifier(child, data) if child is not None else None
 
 
+def _callback_identifier(node: Any, data: bytes) -> str | None:
+    """Resolve only a bare identifier, optionally wrapped in parentheses/&."""
+    if node.type == "identifier":
+        return data[node.start_byte:node.end_byte].decode("utf-8", "replace")
+    if node.type in {"parenthesized_expression", "pointer_expression"}:
+        named = list(node.named_children)
+        if len(named) == 1:
+            return _callback_identifier(named[0], data)
+    return None
+
+
+def _regex_callback_uses(body: str) -> list[dict[str, str]]:
+    uses: list[dict[str, str]] = []
+    for api, argument_index in KNOWN_CALLBACK_ARGUMENTS.items():
+        for match in re.finditer(rf"\b{re.escape(api)}\s*\(", body):
+            cursor = match.end()
+            depth = 1
+            quote: str | None = None
+            escaped = False
+            while cursor < len(body) and depth:
+                character = body[cursor]
+                if quote is not None:
+                    if escaped:
+                        escaped = False
+                    elif character == "\\":
+                        escaped = True
+                    elif character == quote:
+                        quote = None
+                elif character in {'"', "'"}:
+                    quote = character
+                elif character == "(":
+                    depth += 1
+                elif character == ")":
+                    depth -= 1
+                cursor += 1
+            if depth:
+                continue
+            arguments_text = body[match.end():cursor - 1]
+            arguments: list[str] = []
+            start = 0
+            nested = 0
+            for index, character in enumerate(arguments_text):
+                nested += (character == "(") - (character == ")")
+                if character == "," and nested == 0:
+                    arguments.append(arguments_text[start:index])
+                    start = index + 1
+            arguments.append(arguments_text[start:])
+            try:
+                argument = arguments[argument_index]
+            except IndexError:
+                continue
+            identifier = re.fullmatch(
+                r"\s*&?\s*\(*\s*([A-Za-z_]\w*)\s*\)*\s*", argument
+            )
+            if identifier:
+                uses.append({"api": api, "target_text": identifier.group(1)})
+    return uses
+
+
 def _tree_sitter_definitions(data: bytes, source_file: str) -> list[dict[str, Any]]:
     from scripts.analysis.diversity_validation import _call_name, iter_nodes, parse_source
 
@@ -62,13 +123,26 @@ def _tree_sitter_definitions(data: bytes, source_file: str) -> list[dict[str, An
         if not name or body is None:
             continue
         body_text = parsed.data[body.start_byte:body.end_byte].decode("utf-8", "replace")
-        calls = {
-            call
-            for child in iter_nodes(body)
-            if child.type == "call_expression"
-            for call in [_call_name(child, parsed.data)]
-            if call
-        }
+        calls: set[str] = set()
+        callback_calls: list[dict[str, str]] = []
+        for child in iter_nodes(body):
+            if child.type != "call_expression":
+                continue
+            call = _call_name(child, parsed.data)
+            if not call:
+                continue
+            calls.add(call)
+            if call not in KNOWN_CALLBACK_ARGUMENTS:
+                continue
+            arguments = child.child_by_field_name("arguments")
+            named_arguments = list(arguments.named_children) if arguments is not None else []
+            try:
+                argument = named_arguments[KNOWN_CALLBACK_ARGUMENTS[call]]
+            except IndexError:
+                continue
+            target = _callback_identifier(argument, parsed.data)
+            if target:
+                callback_calls.append({"api": call, "target_text": target})
         definitions.append({
             "function": name,
             "source_file": source_file,
@@ -78,6 +152,7 @@ def _tree_sitter_definitions(data: bytes, source_file: str) -> list[dict[str, An
             "ast_node_count": sum(1 for child in iter_nodes(node) if child.is_named),
             "body": body_text,
             "calls": calls,
+            "callback_calls": callback_calls,
         })
     return definitions
 
@@ -103,6 +178,7 @@ def _regex_definitions(data: bytes, source_file: str) -> list[dict[str, Any]]:
             "ast_node_count": None,
             "body": body,
             "calls": set(_CALL_PATTERN.findall(body)),
+            "callback_calls": _regex_callback_uses(body),
         })
     return definitions
 
@@ -150,17 +226,43 @@ def analyze_sources(
         if file_name_counts[(item["source_file"], item["function"])] == 1
     }
 
-    graph: dict[str, set[str]] = {identifier: set() for identifier in by_id}
+    direct_graph: dict[str, set[str]] = {identifier: set() for identifier in by_id}
+    callback_graph: dict[str, set[str]] = {identifier: set() for identifier in by_id}
     unresolved: list[dict[str, str]] = []
+    unresolved_callbacks: list[dict[str, str]] = []
+
+    def resolve_target(called: str, source_file: str) -> str | None:
+        target = unique_by_name.get(called)
+        if target is None and name_counts[called] > 1:
+            target = local_by_name.get((source_file, called))
+        return target
+
     for identifier, item in by_id.items():
         for called in item["calls"]:
-            target = unique_by_name.get(called)
-            if target is None and name_counts[called] > 1:
-                target = local_by_name.get((item["source_file"], called))
+            target = resolve_target(called, item["source_file"])
             if target is not None:
-                graph[identifier].add(target)
+                direct_graph[identifier].add(target)
             elif name_counts[called] == 0:
                 unresolved.append({"caller": identifier, "callee_text": called})
+        for callback in item["callback_calls"]:
+            called = callback["target_text"]
+            # Callback edges require a globally unique defined target. Unlike
+            # direct calls, do not use same-file proximity as a linkage guess.
+            target = unique_by_name.get(called)
+            if target is not None:
+                callback_graph[identifier].add(target)
+            else:
+                unresolved_callbacks.append({
+                    "caller": identifier,
+                    "api": callback["api"],
+                    "target_text": called,
+                    "reason": "ambiguous_target" if name_counts[called] > 1 else "target_not_found",
+                })
+
+    graph = {
+        identifier: direct_graph[identifier] | callback_graph[identifier]
+        for identifier in by_id
+    }
 
     configured_entries = list(dict.fromkeys(str(item) for item in entry_points))
     entry_ids = [
@@ -176,15 +278,20 @@ def analyze_sources(
         depths[identifier] = depth
         pending.extend((callee, depth + 1) for callee in sorted(graph[identifier]))
 
-    callers: dict[str, set[str]] = {identifier: set() for identifier in by_id}
-    for caller, callees in graph.items():
+    direct_callers: dict[str, set[str]] = {identifier: set() for identifier in by_id}
+    callback_callers: dict[str, set[str]] = {identifier: set() for identifier in by_id}
+    for caller, callees in direct_graph.items():
         for callee in callees:
-            callers[callee].add(caller)
+            direct_callers[callee].add(caller)
+    for caller, callees in callback_graph.items():
+        for callee in callees:
+            callback_callers[callee].add(caller)
 
     ordered_reachable = sorted(
         depths, key=lambda identifier: (depths[identifier], identifier)
     )
-    ranks = {identifier: index + 1 for index, identifier in enumerate(ordered_reachable)}
+    ordered_eligible = [identifier for identifier in ordered_reachable if identifier not in entry_ids]
+    ranks = {identifier: index + 1 for index, identifier in enumerate(ordered_eligible)}
     functions: list[dict[str, Any]] = []
     for identifier, item in sorted(by_id.items(), key=lambda pair: pair[0]):
         functions.append({
@@ -197,8 +304,17 @@ def analyze_sources(
             "ast_node_count": item["ast_node_count"],
             "call_depth": depths.get(identifier),
             "reachable_from_entry": identifier in depths,
-            "direct_callers": sorted(callers[identifier]),
-            "direct_callees": sorted(graph[identifier]),
+            "diversification_eligible": identifier in depths and identifier not in entry_ids,
+            "callers": sorted(direct_callers[identifier] | callback_callers[identifier]),
+            "callees": sorted(graph[identifier]),
+            "direct_callers": sorted(direct_callers[identifier]),
+            "direct_callees": sorted(direct_graph[identifier]),
+            "callback_callers": sorted(callback_callers[identifier]),
+            "callback_callees": sorted(callback_graph[identifier]),
+            "outgoing_call_edges": [
+                *({"target": target, "edge_type": "direct_call"} for target in sorted(direct_graph[identifier])),
+                *({"target": target, "edge_type": "callback"} for target in sorted(callback_graph[identifier])),
+            ],
             "analysis_method": method,
             "diversification_rank": ranks.get(identifier),
         })
@@ -229,12 +345,18 @@ def analyze_sources(
         "resolved_entry_points": sorted(entry_ids),
         "function_reachability": functions,
         "reachable_function_count": reachable_count,
+        "diversification_eligible_function_count": len(ordered_eligible),
         "unreachable_function_count": len(functions) - reachable_count,
         "max_reachable_call_depth": max(depths.values()) if depths else None,
         "functions_by_call_depth": by_depth,
-        "structural_exposure_ranking": ordered_reachable,
+        "call_depth_ranking": ordered_reachable,
+        "structural_exposure_ranking": ordered_eligible,
         "security_sensitive_calls": sinks,
         "unresolved_direct_calls": sorted(unresolved, key=lambda item: (item["caller"], item["callee_text"])),
+        "unresolved_callback_targets": sorted(
+            unresolved_callbacks,
+            key=lambda item: (item["caller"], item["api"], item["target_text"]),
+        ),
     }
 
 
@@ -283,14 +405,17 @@ def selection_size(reachable_count: int, *, k: int | None = None, percent: float
 def select_functions(
     analysis: Mapping[str, Any], *, policy: str, k: int | None = None,
     percent: float | None = None, seed: int = 1,
+    include_entry_points: bool = False,
 ) -> dict[str, Any]:
-    """Select equal-count reachable functions using a structural control policy."""
+    """Select an equal function-count budget using a structural policy."""
     normalized_policy = policy.upper()
     if normalized_policy not in SELECTION_POLICIES:
         raise ValueError(f"unknown selection policy: {policy}")
+    entry_points = set(analysis.get("resolved_entry_points", []))
     eligible = [
         dict(item) for item in analysis.get("function_reachability", [])
         if item.get("reachable_from_entry") is True and isinstance(item.get("call_depth"), int)
+        and (include_entry_points or item.get("function_id") not in entry_points)
     ]
     count = selection_size(len(eligible), k=k, percent=percent)
     shallow = sorted(eligible, key=lambda item: (item["call_depth"], item["function_id"]))
@@ -311,7 +436,10 @@ def select_functions(
     return {
         "selection_policy": normalized_policy,
         "selection_seed": seed if normalized_policy == "RANDOM" else None,
+        "include_entry_points": include_entry_points,
         "selection_budget": {"k": k, "percent": percent},
+        "selection_budget_unit": "function_count",
+        "selection_universe_function_count": len(eligible),
         "selected_functions": [item["function_id"] for item in selected],
         "selected_function_count": len(selected),
         "selected_depths": {item["function_id"]: item["call_depth"] for item in selected},
@@ -324,11 +452,12 @@ def select_functions(
 
 def reachability_report(analysis: Mapping[str, Any], *, top: int = 5) -> dict[str, Any]:
     """Compact per-candidate report; missing reachability is never inferred."""
-    count = min(max(top, 0), int(analysis.get("reachable_function_count") or 0))
+    count = min(max(top, 0), int(analysis.get("diversification_eligible_function_count") or 0))
     shallow = select_functions(analysis, policy="SHALLOW", k=count)
     deep = select_functions(analysis, policy="DEEP", k=count)
     return {
         "reachable_function_count": analysis.get("reachable_function_count"),
+        "diversification_eligible_function_count": analysis.get("diversification_eligible_function_count"),
         "unreachable_function_count": analysis.get("unreachable_function_count"),
         "max_reachable_call_depth": analysis.get("max_reachable_call_depth"),
         "functions_by_call_depth": analysis.get("functions_by_call_depth", {}),

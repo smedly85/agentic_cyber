@@ -26,6 +26,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     budget.add_argument("--k", type=int, default=3)
     budget.add_argument("--percent", type=float)
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--include-entry-points", action="store_true")
     parser.add_argument("--force-fallback", action="store_true")
     args = parser.parse_args(argv)
     if not args.source.is_file():
@@ -41,7 +42,10 @@ def main(argv: list[str] | None = None) -> int:
         **analysis,
         "reachability_report": reachability_report(analysis),
         "selection_demonstration": [
-            select_functions(analysis, policy=policy, seed=args.seed, **budget)
+            select_functions(
+                analysis, policy=policy, seed=args.seed,
+                include_entry_points=args.include_entry_points, **budget,
+            )
             for policy in ("SHALLOW", "RANDOM", "DEEP")
         ],
     }

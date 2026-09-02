@@ -26,11 +26,14 @@ corpora, or formal candidate populations.
 ## Structural reachability study
 
 The repository also records a deliberately simple, descriptive call-graph
-measurement. For a function `f`, `d_call(f)` is the minimum number of statically
-resolved direct-call edges from `main` to `f`. Thus `main` has depth zero, its
-direct callees have depth one, and breadth-first traversal assigns the shortest
-depth when several paths or cycles exist. A function without a resolved path
-from `main` is recorded as unreachable with a null depth.
+measurement. For a function `f`, `d_call(f)` is the minimum number of resolved
+call-graph edges from `main` to `f`. Edges include direct identifier calls and
+explicitly supported, statically identifiable callback arguments. The initial
+callback model supports `qsort(..., callback)` without attempting general
+function-pointer analysis. Thus `main` has depth zero, its callees have depth
+one, and breadth-first traversal assigns the shortest depth when several paths
+or cycles exist. A function without a resolved path from `main` is recorded as
+unreachable with a null depth.
 
 This is **call-graph reachability depth**, not literal AST nesting depth. The
 initial hypothesis is intentionally narrow: shallow call-graph depth may be a
@@ -44,27 +47,38 @@ into the rank.
 used by the dynamic evaluator and retains its regex fallback. It records direct
 callers/callees, shortest depth, unreachable functions, per-depth groups,
 source locations, physical function LOC, and Tree-sitter node counts where
-available. `SHALLOW`, seeded `RANDOM`, and `DEEP` helpers select equal numbers
-of reachable functions for either an absolute or percentage budget. The
-selection helpers do not regenerate or otherwise change code.
+available. `main` and other configured entry points remain in call-depth
+reports but are excluded from diversification selection by default. An
+`include_entry_points=true` sensitivity option restores them. `SHALLOW`,
+seeded `RANDOM`, and `DEEP` helpers use equal function-count budgets over the
+eligible set; percentage denominators likewise use eligible functions. Equal
+function count is not equal cost, so selected LOC and AST-node counts remain
+separate descriptive costs. The helpers do not regenerate or change code.
 
 The retrospective study has a separate, initially empty dataset under
 `security/historical/`. Its records must be manually curated from authoritative
-GNU Coreutils or GNU grep sources. Exact vulnerable-function names are mapped
-against a checked-out vulnerable source tree; missing and ambiguous names are
-reported rather than guessed. Absolute depth remains primary. When maximum
-reachable depth is greater than zero, the supporting normalized value is:
+GNU Coreutils or GNU grep sources. Each record carries an exact source revision,
+and a separate manifest associates that identity with a local source tree and
+its C-source fingerprint. No source is downloaded. Each vulnerability is
+mapped and selected against the graph for the version in which it existed;
+only records with exactly identical source identities reuse a cached graph.
+Version unavailable, version mismatch, function missing, function ambiguous,
+mapped but unreachable, and mapped and reachable states remain distinct.
+Absolute depth remains primary. When maximum reachable depth is greater than
+zero, the supporting normalized value is:
 
 ```text
 normalized_depth = vulnerable_function_depth / maximum_reachable_depth
 ```
 
 For selection policy `S`, Historical Vulnerability Coverage at a function or
-percentage budget is the fraction of valid historical function mappings whose
-mapped functions appear in the selected set. This measures how well a
-structural selection policy would have covered historically vulnerable
-function locations. It does not measure future vulnerability prevention.
-Repeated recorded seeds support RANDOM means and confidence intervals.
+percentage budget is aggregated only after every valid record has been selected
+inside its own source-version graph. It is the fraction of verified, valid
+version-specific mappings whose mapped functions appear in those per-version
+selected sets. This measures how well a structural selection policy would have
+covered historically vulnerable function locations. It does not measure future
+vulnerability prevention. Repeated recorded RANDOM seeds support means and a
+deterministic percentile-bootstrap confidence interval.
 Records that have not been source-and-patch verified remain visible in mapping
 output but are excluded from HVC denominators and depth summaries.
 
@@ -78,8 +92,9 @@ generated candidate -> functional finalization -> bounded dynamic evaluator
 Historical evidence never changes lineage generation or dynamic security
 findings, and call-depth metadata never changes either functional or security
 pass/fail outcomes. Static resolution is conservative: direct identifier calls
-are represented, while function pointers, macro-generated calls, dynamically
-dispatched calls, and unavailable translation units may be unresolved.
+and known unambiguous callbacks are represented, while arbitrary function
+pointers, macro-generated calls, dynamically dispatched calls, and unavailable
+translation units may be unresolved.
 
 This document defines the formal RQ3 analysis:
 

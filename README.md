@@ -77,23 +77,31 @@ heuristic to test, not a claim that shallow functions are inherently vulnerable.
 The metadata has no effect on `overall_success`, `security_clean`, repair, or
 promotion.
 
-Reusable helpers select equal-sized `SHALLOW`, deterministic-seeded `RANDOM`,
-and `DEEP` controls by function count or percentage, while also reporting the
-selected function/line/node budget. They prepare a later diversification study;
-they do not invoke an LLM or alter candidates. Inspect a source directly with:
+Direct calls and unambiguous callbacks for known APIs are typed separately;
+`qsort(..., callback)` is currently supported. Entry points remain visible at
+depth zero but are excluded from diversification selection and percentage
+denominators by default. Use `--include-entry-points` for sensitivity analysis.
+
+Reusable helpers select `SHALLOW`, deterministic-seeded `RANDOM`, and `DEEP`
+controls at an equal function-count budget, while also reporting the differing
+line and node costs. Equal function count is not equal cost. They prepare a
+later diversification study; they do not invoke an LLM or alter candidates.
+Inspect a source directly with:
 
 ```bash
 python3 security/analyze_reachability.py \
   --source src/new_sort/new_sort.c --k 3 --seed 1
 ```
 
-The separate `security/historical/` area contains an empty validated schema for
-manual mappings from authoritative GNU Coreutils/GNU grep vulnerability and
-patch sources. Its analysis reports exact-name mapping status, absolute and
-normalized vulnerable-function depth, and Historical Vulnerability Coverage at
-equal function or percentage budgets. Missing/ambiguous functions are never
-guessed, historical metadata never enters lineage results, and the metric only
-describes coverage of known historical locations—not future prevention.
+The separate `security/historical/` area contains empty validated record and
+source-manifest schemas for manual mappings from authoritative GNU
+Coreutils/GNU grep sources. Each record is checked against its exact project,
+affected version, source revision, local tree, and C/C-header fingerprint. HVC is
+computed from per-version selections before aggregation; a single graph is
+never applied across versions. Missing, mismatched, ambiguous, and unreachable
+states remain explicit. Historical metadata never enters lineage results, and
+the metric describes coverage of known historical locations—not future
+prevention.
 
 ## The experimental unit is a lineage
 

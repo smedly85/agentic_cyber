@@ -21,10 +21,12 @@ def load_security_result(path: Path) -> dict[str, Any]:
             "reachability_analysis_completed": False,
             "function_reachability": [],
             "reachable_function_count": None,
+            "diversification_eligible_function_count": None,
             "unreachable_function_count": None,
             "max_reachable_call_depth": None,
             "functions_by_call_depth": {},
             "structural_exposure_ranking": [],
+            "call_depth_ranking": [],
             "reachability_report": None,
         }
     try:
@@ -52,10 +54,12 @@ def load_security_result(path: Path) -> dict[str, Any]:
         "reachability_analysis_completed": reachability_completed,
         "function_reachability": function_reachability if reachability_completed else [],
         "reachable_function_count": raw.get("reachable_function_count") if reachability_completed else None,
+        "diversification_eligible_function_count": raw.get("diversification_eligible_function_count") if reachability_completed else None,
         "unreachable_function_count": raw.get("unreachable_function_count") if reachability_completed else None,
         "max_reachable_call_depth": raw.get("max_reachable_call_depth") if reachability_completed else None,
         "functions_by_call_depth": raw.get("functions_by_call_depth") if reachability_completed else {},
         "structural_exposure_ranking": raw.get("structural_exposure_ranking") if reachability_completed else [],
+        "call_depth_ranking": raw.get("call_depth_ranking") if reachability_completed else [],
         "reachability_report": raw.get("reachability_report") if reachability_completed else None,
     }
 
@@ -89,6 +93,12 @@ def aggregate_security_results(records: Iterable[Mapping[str, Any]]) -> dict[str
         if isinstance(row.get("reachable_function_count"), int)
         and not isinstance(row.get("reachable_function_count"), bool)
     ]
+    eligible_counts = [
+        int(row["diversification_eligible_function_count"])
+        for row in reachability_rows
+        if isinstance(row.get("diversification_eligible_function_count"), int)
+        and not isinstance(row.get("diversification_eligible_function_count"), bool)
+    ]
     maximum_depths = [
         int(row["max_reachable_call_depth"])
         for row in reachability_rows
@@ -99,6 +109,7 @@ def aggregate_security_results(records: Iterable[Mapping[str, Any]]) -> dict[str
         "reachability_evaluated_count": len(reachability_rows),
         "reachability_unevaluated_count": len(rows) - len(reachability_rows),
         "mean_reachable_function_count": statistics.fmean(reachable_counts) if reachable_counts else None,
+        "mean_diversification_eligible_function_count": statistics.fmean(eligible_counts) if eligible_counts else None,
         "mean_max_reachable_call_depth": statistics.fmean(maximum_depths) if maximum_depths else None,
         "missing_reachability_semantics": "not_characterized; never assigned an inferred depth",
     }
