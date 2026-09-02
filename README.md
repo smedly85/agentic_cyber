@@ -14,6 +14,87 @@ measurement. The existing behavioral-consistency tool is retained as an
 optional post-hoc diagnostic and documented separately in
 `docs/execution_consistency_methodology.md`.
 
+## Independent functional and security evaluation
+
+Every new candidate has two independent dimensions:
+
+```text
+Functional validation:
+Does the implementation satisfy the utility specification?
+
+Security evaluation:
+Can adversarial inputs cause unsafe behavior despite functional correctness?
+```
+
+Generation is followed by visible tests and eligible repair, then by the
+controller-only held-out functional judge. That result finalizes
+`overall_success`. Only afterward does `security/run_security_evaluator.py`
+build the source with AddressSanitizer and UndefinedBehaviorSanitizer and run a
+bounded, deterministic, utility-specific adversarial campaign. Security output
+is never shown to the LLM, never starts repair, never changes candidate
+promotion, and never changes `overall_success`. In particular,
+`overall_success=true` and `security_clean=false` is a valid and important
+observation.
+
+Each evaluated attempt receives `security_results.json` and, for findings,
+reproduction evidence under `security_artifacts/`. Missing results in older
+runs mean `security_evaluation_completed=false`; they are never counted as
+clean. `security_clean=true` means only that no security finding was discovered
+within the bounded evaluation. It does not prove that the implementation is
+secure.
+
+The lineage runner enables the stage by default. Its smoke defaults are 10
+seconds, 100 inputs, a two-second per-input timeout, and seed 1. Adjust them
+with `--security-fuzz-seconds`, `--security-max-inputs`, `--security-timeout`,
+and `--security-seed`; use larger recorded budgets for formal evaluation.
+Coverage-guided libFuzzer and CodeQL are optional future enhancements: the
+portable baseline uses the repository's existing adversarial-generation and C
+parser approach and records `fuzz_coverage: null` rather than inventing a
+coverage measurement.
+
+For example, a longer (still bounded) formal configuration can use:
+
+```bash
+scripts/run_lineage_experiment.sh ... \
+  --security-fuzz-seconds 300 --security-max-inputs 10000 \
+  --security-timeout 5 --security-seed 1
+```
+
+Validate the evaluator itself independently with:
+
+```bash
+python3 security/calibration/run_calibration.py \
+  --output build/security-calibration
+```
+
+## Call-graph reachability and diversification priority
+
+New security results also carry descriptive function-level reachability. The
+measurement is the shortest static call-graph distance from `main`; it is not
+AST nesting depth. Lower-depth functions receive earlier deterministic
+*diversification priority*, with function identity breaking ties. This is a
+heuristic to test, not a claim that shallow functions are inherently vulnerable.
+The metadata has no effect on `overall_success`, `security_clean`, repair, or
+promotion.
+
+Reusable helpers select equal-sized `SHALLOW`, deterministic-seeded `RANDOM`,
+and `DEEP` controls by function count or percentage, while also reporting the
+selected function/line/node budget. They prepare a later diversification study;
+they do not invoke an LLM or alter candidates. Inspect a source directly with:
+
+```bash
+python3 security/analyze_reachability.py \
+  --source src/new_sort/new_sort.c --k 3 --seed 1
+```
+
+The separate `security/historical/` area contains an empty validated schema for
+manual mappings from authoritative GNU Coreutils/GNU grep vulnerability and
+patch sources. Its analysis reports exact-name mapping status, absolute and
+normalized vulnerable-function depth, and Historical Vulnerability Coverage at
+equal function or percentage budgets. Missing/ambiguous functions are never
+guessed, historical metadata never enters lineage results, and the metric only
+describes coverage of known historical locations—not future prevention.
+
 ## The experimental unit is a lineage
 
 A **lineage** is one complete sequential walk through every checkpoint of a

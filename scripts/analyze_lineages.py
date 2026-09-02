@@ -68,6 +68,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
+from analysis.security_results import aggregate_security_results  # noqa: E402
+
 # Reused, never reimplemented: the interval formula lives with the other
 # diversity statistics. It is imported on first use rather than at module
 # import, because scripts/analysis/diversity_metrics.py pulls in NumPy and
@@ -109,6 +111,8 @@ VIEW_ATTEMPT_FILES = (
     "base-tests.log",
     "feature-tests.log",
     "extra-tests.log",
+    "security-tests.log",
+    "security_results.json",
 )
 
 # Metrics in a population view's report that are computed against the view's
@@ -711,6 +715,20 @@ def build_stage_rows(lineages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "agent_exit_code": stage.get("agent_exit_code"),
                     "initial_agent_exit_code": stage.get("initial_agent_exit_code"),
                     "total_agent_runtime_ms": stage.get("total_agent_runtime_ms"),
+                    "security_evaluation_completed": stage.get(
+                        "security_evaluation_completed", False
+                    ),
+                    "security_clean": stage.get("security_clean"),
+                    "security_finding_count": stage.get("security_finding_count", 0),
+                    "unique_security_findings": stage.get(
+                        "unique_security_findings", []
+                    ),
+                    "unique_crash_signatures": stage.get(
+                        "unique_crash_signatures", []
+                    ),
+                    "time_to_first_security_finding_seconds": stage.get(
+                        "time_to_first_security_finding_seconds"
+                    ),
                 }
             )
     return rows
@@ -1422,6 +1440,11 @@ def materialize_view(
             origin = attempt_source / name
             if origin.is_file():
                 shutil.copy2(origin, attempt_target / name)
+        security_artifacts = attempt_source / "security_artifacts"
+        if security_artifacts.is_dir():
+            shutil.copytree(
+                security_artifacts, attempt_target / "security_artifacts"
+            )
         (attempt_target / "COMPLETE").write_text("", encoding="utf-8")
 
         index.append(
@@ -1906,6 +1929,14 @@ def main(argv: list[str] | None = None) -> int:
     reliability = build_reliability(lineages, order, never_started)
     checkpoints_detail = build_checkpoint_rows(lineages, order)
     stage_rows = build_stage_rows(lineages)
+    dynamic_security_summary = aggregate_security_results(stage_rows)
+    dynamic_security_summary["lineages_with_security_findings"] = len({
+        str(row.get("lineage_id"))
+        for row in stage_rows
+        if row.get("lineage_id") is not None
+        and row.get("security_evaluation_completed") is True
+        and int(row.get("security_finding_count") or 0) > 0
+    })
     provenance_problems = check_seed_provenance(lineages)
     transitions = [] if args.skip_change else build_transitions(lineages)
     transition_summary = build_transition_summary(transitions)
@@ -2023,6 +2054,8 @@ def main(argv: list[str] | None = None) -> int:
         "seed_provenance_problems": provenance_problems,
         "populations": populations,
         "security_analysis": security_report,
+        "dynamic_security_evaluation": dynamic_security_summary,
+        **dynamic_security_summary,
         "paper_facing_result": (
             "lineage_paper_metrics_row.json" if parent_paper_row else None
         ),
@@ -2065,6 +2098,10 @@ def main(argv: list[str] | None = None) -> int:
             "repair_eligibility_reason",
             "seed", "seed_sha256", "candidate", "candidate_sha256",
             "total_agent_runtime_ms",
+            "security_evaluation_completed", "security_clean",
+            "security_finding_count", "unique_security_findings",
+            "unique_crash_signatures",
+            "time_to_first_security_finding_seconds",
         ],
     )
     if transitions:

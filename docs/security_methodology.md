@@ -1,5 +1,86 @@
 # RQ3 security methodology
 
+## Dynamic post-validation evaluator
+
+The repository now also records a dynamic security dimension in each new
+attempt's `security_results.json`. This stage runs after visible repair and the
+hidden functional oracle have finalized `overall_success`. ASan/UBSan-backed
+utility-specific adversarial execution checks memory/undefined behavior,
+signals, bounded termination and resource behavior, and filesystem containment
+inside disposable fixtures. Normalized signatures and complete triggering
+artifacts support later failure-set-diversity analysis.
+
+Dynamic findings are confirmed runtime observations, while the static analysis
+described below remains a separate source-level measurement. Attacker-reachable
+functions and sensitive calls are descriptive exposure data, not findings on
+their own. An evaluator infrastructure failure is represented by
+`security_evaluation_completed=false` and cannot be counted as either a clean
+candidate or a candidate vulnerability. Conversely, `security_clean=true`
+means only "no security finding was discovered within the bounded evaluation";
+it is not a claim that the implementation is secure.
+
+The seeded programs in `security/calibration/fixtures/` exist solely to validate
+the evaluator. They never enter lineage generation, prompts, repair, functional
+corpora, or formal candidate populations.
+
+## Structural reachability study
+
+The repository also records a deliberately simple, descriptive call-graph
+measurement. For a function `f`, `d_call(f)` is the minimum number of statically
+resolved direct-call edges from `main` to `f`. Thus `main` has depth zero, its
+direct callees have depth one, and breadth-first traversal assigns the shortest
+depth when several paths or cycles exist. A function without a resolved path
+from `main` is recorded as unreachable with a null depth.
+
+This is **call-graph reachability depth**, not literal AST nesting depth. The
+initial hypothesis is intentionally narrow: shallow call-graph depth may be a
+useful heuristic for prioritizing code to diversify. Shallow does not mean
+vulnerable, and the resulting order is called a structural exposure or
+diversification-priority ranking—not a vulnerability ranking. No dataflow,
+control-flow depth, sensitive-call count, or vulnerability likelihood is folded
+into the rank.
+
+`security/common/callgraph.py` extends the same Tree-sitter characterization
+used by the dynamic evaluator and retains its regex fallback. It records direct
+callers/callees, shortest depth, unreachable functions, per-depth groups,
+source locations, physical function LOC, and Tree-sitter node counts where
+available. `SHALLOW`, seeded `RANDOM`, and `DEEP` helpers select equal numbers
+of reachable functions for either an absolute or percentage budget. The
+selection helpers do not regenerate or otherwise change code.
+
+The retrospective study has a separate, initially empty dataset under
+`security/historical/`. Its records must be manually curated from authoritative
+GNU Coreutils or GNU grep sources. Exact vulnerable-function names are mapped
+against a checked-out vulnerable source tree; missing and ambiguous names are
+reported rather than guessed. Absolute depth remains primary. When maximum
+reachable depth is greater than zero, the supporting normalized value is:
+
+```text
+normalized_depth = vulnerable_function_depth / maximum_reachable_depth
+```
+
+For selection policy `S`, Historical Vulnerability Coverage at a function or
+percentage budget is the fraction of valid historical function mappings whose
+mapped functions appear in the selected set. This measures how well a
+structural selection policy would have covered historically vulnerable
+function locations. It does not measure future vulnerability prevention.
+Repeated recorded seeds support RANDOM means and confidence intervals.
+Records that have not been source-and-patch verified remain visible in mapping
+output but are excluded from HVC denominators and depth summaries.
+
+The two security-oriented studies remain independent:
+
+```text
+historical source + curated mapping -> call depth -> SHALLOW/RANDOM/DEEP study
+generated candidate -> functional finalization -> bounded dynamic evaluator
+```
+
+Historical evidence never changes lineage generation or dynamic security
+findings, and call-depth metadata never changes either functional or security
+pass/fail outcomes. Static resolution is conservative: direct identifier calls
+are represented, while function pointers, macro-generated calls, dynamically
+dispatched calls, and unavailable translation units may be unresolved.
+
 This document defines the formal RQ3 analysis:
 
 > Among functionally successful implementations, what security-relevant static

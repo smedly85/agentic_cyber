@@ -59,6 +59,7 @@ from analysis.diversity_validation import (
     validation_distances,
 )
 from analysis import security_diagnostics
+from analysis.security_results import aggregate_security_results, load_security_result
 
 
 # ---------------------------------------------------------------------------
@@ -3398,6 +3399,7 @@ def main() -> int:
     print("\nAnalyzing candidates...")
     for index, attempt in enumerate(attempts, start=1):
         raw_metadata = read_json(attempt / "metadata.json")
+        raw_metadata.update(load_security_result(attempt / "security_results.json"))
         if experiment_format == "sandbox_run":
             test_exit = raw_metadata.get("test_exit_code")
             public_success = test_exit == 0 and raw_metadata.get("opencode_exit_code") == 0
@@ -4290,6 +4292,7 @@ def main() -> int:
         )
 
     n = len(rows)
+    dynamic_security_summary = aggregate_security_results(rows)
     successful = sum(bool(row.get(population_membership_key)) for row in rows)
     source_size_summary = build_source_size_summary(rows, population_membership_key)
     reliability_summary = build_reliability_summary(rows)
@@ -4496,6 +4499,8 @@ def main() -> int:
         },
         "security_analysis": security_summary,
         "security_diagnostics": security_summary,
+        "dynamic_security_evaluation": dynamic_security_summary,
+        **dynamic_security_summary,
         "tool_paths": tool_paths,
     }
     for metric, interval in summary["uncertainty"]["wilson_95_percent"].items():

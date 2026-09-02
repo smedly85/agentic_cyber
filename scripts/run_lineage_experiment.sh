@@ -106,6 +106,11 @@ Passed through to scripts/run_experiment.sh:
                              Ollama trace proxy in every stage. Disabled by
                              default and excluded from the scientific
                              configuration fingerprint.
+  --security-fuzz-seconds N  Post-validation security budget (default: 10)
+  --security-seed N          Deterministic security seed (default: 1)
+  --security-timeout N       Per-input security timeout (default: 2)
+  --security-max-inputs N    Security input-count budget (default: 100)
+  --no-security-evaluation   Disable the independent post-validation stage
 
 Output:
   --output-dir DIR           Lineage root. Default:
@@ -243,6 +248,11 @@ FORCE=0
 PRINT_PLAN=0
 LIST_UTILITIES=0
 DRY_RUN=0
+SECURITY_EVALUATION=1
+SECURITY_FUZZ_SECONDS="10"
+SECURITY_SEED="1"
+SECURITY_TIMEOUT="2"
+SECURITY_MAX_INPUTS="100"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 AIDER_BIN="${AIDER_BIN:-aider}"
@@ -251,7 +261,8 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --utility|--model|--editor-model|--temperature|--lineages|--lineage-start|--max-loops| \
         --top-p|--sampling-seed|--max-tokens|--num-ctx|--architect-think|--editor-edit-format|--model-provenance-json| \
-        --timeout|--repair-prompt|--remote-base-url| \
+        --timeout|--repair-prompt|--remote-base-url|--security-fuzz-seconds| \
+        --security-seed|--security-timeout|--security-max-inputs| \
         --remote-api-key-env|--output-dir)
             [[ $# -ge 2 ]] || die "$1 requires a value"
             ;;
@@ -281,6 +292,11 @@ while [[ $# -gt 0 ]]; do
         --agent)
             die "--agent was removed with the OpenCode backend; Aider always runs in architect mode" ;;
         --timeout) TIMEOUT_SECONDS="${2:-}"; shift 2 ;;
+        --security-fuzz-seconds) SECURITY_FUZZ_SECONDS="${2:-}"; shift 2 ;;
+        --security-seed) SECURITY_SEED="${2:-}"; shift 2 ;;
+        --security-timeout) SECURITY_TIMEOUT="${2:-}"; shift 2 ;;
+        --security-max-inputs) SECURITY_MAX_INPUTS="${2:-}"; shift 2 ;;
+        --no-security-evaluation) SECURITY_EVALUATION=0; shift ;;
         --allow-no-progress) ALLOW_NO_PROGRESS=1; shift ;;
         --repair-prompt) REPAIR_TEMPLATE="${2:-}"; shift 2 ;;
         --keep-workdir) KEEP_WORKDIR=1; shift ;;
@@ -348,6 +364,12 @@ fi
     die "--lineage-start must be a positive integer"
 [[ "$MAX_LOOPS" =~ ^[0-9]+$ ]] || die "--max-loops must be a non-negative integer"
 [[ "$TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || die "--timeout must be a non-negative integer"
+[[ "$SECURITY_SEED" =~ ^[0-9]+$ ]] || die "--security-seed must be a non-negative integer"
+[[ "$SECURITY_MAX_INPUTS" =~ ^[1-9][0-9]*$ ]] || die "--security-max-inputs must be a positive integer"
+"$PYTHON_BIN" -c 'import math,sys; value=float(sys.argv[1]); raise SystemExit(not math.isfinite(value) or value <= 0)' "$SECURITY_FUZZ_SECONDS" 2>/dev/null ||
+    die "--security-fuzz-seconds must be a positive finite number"
+"$PYTHON_BIN" -c 'import math,sys; value=float(sys.argv[1]); raise SystemExit(not math.isfinite(value) or value <= 0)' "$SECURITY_TIMEOUT" 2>/dev/null ||
+    die "--security-timeout must be a positive finite number"
 TEMPERATURE="$(
     "$PYTHON_BIN" "$TEMPERATURE_TOOL" canonical "$TEMPERATURE"
 )" || die "--temperature must be numeric and finite"
@@ -477,6 +499,10 @@ EXECUTABLE_PATH="$(plan_field executable_path)"
 TEST_DIR="$(plan_field test_dir)"
 BASE_TEST_CMD="$(plan_field base_test_command)"
 EXTRA_TEST_CMD="$(plan_field extra_test_command)"
+SECURITY_CMD='"$SECURITY_PYTHON" "$SECURITY_ROOT/security/run_security_evaluator.py" --utility '"$UTILITY"' --source '"$SOURCE_PATH"' --output "$SECURITY_OUTPUT" --artifacts "$SECURITY_ARTIFACTS" --security-fuzz-seconds "$SECURITY_FUZZ_SECONDS" --security-seed "$SECURITY_SEED" --security-timeout "$SECURITY_TIMEOUT" --security-max-inputs "$SECURITY_MAX_INPUTS"'
+if [[ "$SECURITY_EVALUATION" -eq 0 ]]; then
+    SECURITY_CMD=""
+fi
 CONFIG_FINGERPRINT="$(plan_field config_fingerprint)"
 REQUIRED_PLATFORM="$(plan_field required_platform)"
 HOST_PLATFORM="$(plan_field host_platform)"
@@ -836,14 +862,30 @@ fi
 
 if [[ "$DRY_RUN" -eq 0 ]]; then
     "$PYTHON_BIN" - "$RUN_METADATA" "$PLAN_JSON" "$REPO" "$REPO_COMMIT" \
-        "$LINEAGE_START" "$LINEAGES" "$(timestamp)" "$OLLAMA_TRACE" <<'PY'
+        "$LINEAGE_START" "$LINEAGES" "$(timestamp)" "$OLLAMA_TRACE" \
+        "$SECURITY_EVALUATION" "$SECURITY_FUZZ_SECONDS" "$SECURITY_SEED" \
+        "$SECURITY_TIMEOUT" "$SECURITY_MAX_INPUTS" <<'PY'
+import hashlib
 import json
 import sys
 from pathlib import Path
 
-path, plan_json, repository, commit, start, count, created, ollama_trace = sys.argv[1:]
+(path, plan_json, repository, commit, start, count, created, ollama_trace,
+ security_enabled, security_seconds, security_seed, security_timeout,
+ security_max_inputs) = sys.argv[1:]
 plan = json.loads(plan_json)
 target = Path(path)
+security_configuration = {
+    "enabled": security_enabled == "1",
+    "fuzz_seconds": float(security_seconds),
+    "seed": int(security_seed),
+    "per_input_timeout_seconds": float(security_timeout),
+    "max_inputs": int(security_max_inputs),
+    "evaluator": "security/run_security_evaluator.py",
+}
+security_fingerprint = hashlib.sha256(
+    json.dumps(security_configuration, sort_keys=True, separators=(",", ":")).encode()
+).hexdigest()
 
 record = {}
 if target.is_file():
@@ -905,6 +947,10 @@ record.update(
         "required_platform": plan.get("required_platform"),
         "host_platform": plan.get("host_platform"),
         "config_fingerprint": plan["config_fingerprint"],
+        # Security is independent instrumentation, so it has its own frozen
+        # fingerprint and cannot perturb the generation configuration hash.
+        "security_configuration": security_configuration,
+        "security_run_configuration_fingerprint": security_fingerprint,
         # Transparent transport instrumentation only. It changes neither the
         # request bytes nor model parameters, so it is metadata but not
         # scientific fingerprint material.
@@ -1045,6 +1091,15 @@ for (( offset = 0; offset < LINEAGES; offset++ )); do
             runner_args+=(--architect-think "$ARCHITECT_THINK")
         [[ -n "$BASE_TEST_CMD" ]] && runner_args+=(--base-test-cmd "$BASE_TEST_CMD")
         [[ -n "$EXTRA_TEST_CMD" ]] && runner_args+=(--extra-test-cmd "$EXTRA_TEST_CMD")
+        if [[ -n "$SECURITY_CMD" ]]; then
+            runner_args+=(
+                --security-cmd "$SECURITY_CMD"
+                --security-fuzz-seconds "$SECURITY_FUZZ_SECONDS"
+                --security-seed "$SECURITY_SEED"
+                --security-timeout "$SECURITY_TIMEOUT"
+                --security-max-inputs "$SECURITY_MAX_INPUTS"
+            )
+        fi
         [[ "$ALLOW_NO_PROGRESS" -eq 1 ]] && runner_args+=(--allow-no-progress)
         [[ "$KEEP_WORKDIR" -eq 1 ]] && runner_args+=(--keep-workdir)
         [[ -n "$REPAIR_TEMPLATE" ]] && runner_args+=(--repair-prompt "$REPAIR_TEMPLATE")
@@ -1161,6 +1216,14 @@ if metadata_path.is_file():
     except (OSError, UnicodeError, json.JSONDecodeError):
         metadata = {}
 
+security = {}
+security_path = attempt / "security_results.json"
+if security_path.is_file():
+    try:
+        security = json.loads(security_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        security = {}
+
 candidate_sha = None
 if candidate.is_file():
     digest = hashlib.sha256()
@@ -1273,6 +1336,26 @@ record = {
     "base_test_exit_code": metadata.get("base_test_exit_code"),
     "feature_test_exit_code": metadata.get("feature_test_exit_code"),
     "extra_test_exit_code": metadata.get("extra_test_exit_code"),
+    # Missing results are unknown/unevaluated, never implicitly clean. These
+    # fields are observational and play no part in `success` above.
+    "security_evaluation_completed": security.get("security_evaluation_completed") is True,
+    "security_clean": (
+        security.get("security_clean")
+        if security.get("security_evaluation_completed") is True else None
+    ),
+    "security_evaluator_exit_code": metadata.get("security_evaluator_exit_code"),
+    "security_results": (
+        str(security_path.as_posix()) if security_path.is_file() else None
+    ),
+    "security_finding_count": len(security.get("unique_security_findings") or []),
+    "unique_security_findings": [
+        item.get("signature") for item in security.get("unique_security_findings", [])
+        if isinstance(item, dict) and item.get("signature")
+    ],
+    "unique_crash_signatures": list(security.get("unique_crash_signatures") or []),
+    "time_to_first_security_finding_seconds": security.get(
+        "time_to_first_security_finding_seconds"
+    ),
     "test_dir_integrity": metadata.get("test_dir_integrity"),
     "total_agent_runtime_ms": metadata.get(
         "total_agent_runtime_ms", metadata.get("total_opencode_runtime_ms")

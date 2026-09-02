@@ -128,8 +128,16 @@ Validation (all run by the controller inside the working directory):
   --build-cmd CMD            Build command
   --base-test-cmd CMD        Regression test command
   --feature-test-cmd CMD     Checkpoint test command (alias: --test-cmd)
-  --extra-test-cmd CMD       Sanitizer/hidden command, run once at the end and
-                             never used as repair feedback
+  --extra-test-cmd CMD       Hidden functional command, run once after repair
+                             and never used as repair feedback
+  --security-cmd CMD         Independent post-validation security evaluator.
+                             Runs only after functional overall_success is
+                             finalized; its findings never affect repair or
+                             functional success.
+  --security-fuzz-seconds N  Security runtime budget (default: 10)
+  --security-seed N          Recorded deterministic security seed (default: 1)
+  --security-timeout N       Per-input security timeout seconds (default: 2)
+  --security-max-inputs N    Security input-count budget (default: 100)
 
 Output and cleanup:
   --output-dir DIR           Sweep root. Default:
@@ -172,7 +180,8 @@ Directory layout:
       baseline/<source-basename>
       attempt-001/
         metadata.json  aider.log  aider-model-settings.yml  build.log
-        base-tests.log  feature-tests.log  extra-tests.log
+        base-tests.log  feature-tests.log  extra-tests.log security-tests.log
+        security_results.json security_artifacts/
         repair-prompt-1.md ...
         candidate/          flattened source files the agent produced
         tampered-tests/     only when a visible test was modified
@@ -546,6 +555,11 @@ BUILD_CMD=""
 BASE_TEST_CMD=""
 FEATURE_TEST_CMD=""
 EXTRA_TEST_CMD=""
+SECURITY_CMD=""
+SECURITY_FUZZ_SECONDS="10"
+SECURITY_SEED="1"
+SECURITY_TIMEOUT="2"
+SECURITY_MAX_INPUTS="100"
 TIMEOUT_SECONDS=1800
 FORCE=0
 KEEP_WORKDIR=0
@@ -578,7 +592,9 @@ while [[ $# -gt 0 ]]; do
         --top-p|--sampling-seed|--max-tokens|--num-ctx|--architect-think|--editor-edit-format|--model-provenance-json| \
         --repair-prompt| \
         --test-dir|--seed-file|--keep-glob|--build-cmd|--base-test-cmd| \
-        --feature-test-cmd|--test-cmd|--extra-test-cmd|--timeout|--output-dir| \
+        --feature-test-cmd|--test-cmd|--extra-test-cmd|--security-cmd| \
+        --security-fuzz-seconds|--security-seed|--security-timeout| \
+        --security-max-inputs|--timeout|--output-dir| \
         --prune-only|--remote-base-url|--remote-api-key-env| \
         --analysis-threshold|--analysis-architecture-threshold| \
         --analysis-strategy-threshold|--analysis-diversity-k-max)
@@ -626,6 +642,11 @@ while [[ $# -gt 0 ]]; do
         --base-test-cmd) BASE_TEST_CMD="${2:-}"; shift 2 ;;
         --feature-test-cmd|--test-cmd) FEATURE_TEST_CMD="${2:-}"; shift 2 ;;
         --extra-test-cmd) EXTRA_TEST_CMD="${2:-}"; shift 2 ;;
+        --security-cmd) SECURITY_CMD="${2:-}"; shift 2 ;;
+        --security-fuzz-seconds) SECURITY_FUZZ_SECONDS="${2:-}"; shift 2 ;;
+        --security-seed) SECURITY_SEED="${2:-}"; shift 2 ;;
+        --security-timeout) SECURITY_TIMEOUT="${2:-}"; shift 2 ;;
+        --security-max-inputs) SECURITY_MAX_INPUTS="${2:-}"; shift 2 ;;
         --timeout) TIMEOUT_SECONDS="${2:-}"; shift 2 ;;
         --output-dir) OUTPUT_DIR="${2:-}"; shift 2 ;;
         --keep-workdir) KEEP_WORKDIR=1; shift ;;
@@ -757,6 +778,12 @@ print(value)
 PY
 )" || die "--max-loops is too large for this platform"
 [[ "$TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || die "--timeout must be a non-negative integer"
+[[ "$SECURITY_SEED" =~ ^[0-9]+$ ]] || die "--security-seed must be a non-negative integer"
+[[ "$SECURITY_MAX_INPUTS" =~ ^[1-9][0-9]*$ ]] || die "--security-max-inputs must be a positive integer"
+"$PYTHON_BIN" -c 'import math,sys; value=float(sys.argv[1]); raise SystemExit(not math.isfinite(value) or value <= 0)' "$SECURITY_FUZZ_SECONDS" 2>/dev/null ||
+    die "--security-fuzz-seconds must be a positive finite number"
+"$PYTHON_BIN" -c 'import math,sys; value=float(sys.argv[1]); raise SystemExit(not math.isfinite(value) or value <= 0)' "$SECURITY_TIMEOUT" 2>/dev/null ||
+    die "--security-timeout must be a positive finite number"
 [[ "$SOURCE_MODE" == "existing" || "$SOURCE_MODE" == "new" ]] ||
     die "--source-mode must be existing or new"
 
@@ -1176,6 +1203,11 @@ write_metadata "$OUTPUT_DIR/sweep.json" \
     base_test_command "__STR__:$BASE_TEST_CMD" \
     feature_test_command "__STR__:$FEATURE_TEST_CMD" \
     extra_test_command "__STR__:$EXTRA_TEST_CMD" \
+    security_command "__STR__:$SECURITY_CMD" \
+    security_fuzz_seconds "$SECURITY_FUZZ_SECONDS" \
+    security_seed "$SECURITY_SEED" \
+    security_timeout "$SECURITY_TIMEOUT" \
+    security_max_inputs "$SECURITY_MAX_INPUTS" \
     timeout_seconds "$TIMEOUT_SECONDS" \
     timeout_enforced "$TIMEOUT_ENFORCED" \
     created_at "$(timestamp)"
@@ -1370,6 +1402,11 @@ PY
         base_test_command "__STR__:$BASE_TEST_CMD" \
         feature_test_command "__STR__:$FEATURE_TEST_CMD" \
         extra_test_command "__STR__:$EXTRA_TEST_CMD" \
+        security_command "__STR__:$SECURITY_CMD" \
+        security_fuzz_seconds "$SECURITY_FUZZ_SECONDS" \
+        security_seed "$SECURITY_SEED" \
+        security_timeout "$SECURITY_TIMEOUT" \
+        security_max_inputs "$SECURITY_MAX_INPUTS" \
         timeout_seconds "$TIMEOUT_SECONDS" \
         timeout_enforced "$TIMEOUT_ENFORCED" \
         analysis_architecture_threshold "$RESOLVED_ARCHITECTURE_THRESHOLD" \
@@ -1808,7 +1845,7 @@ PY
             loop_limit_reached=true
         fi
 
-        # Hidden/sanitizer evaluation: after the loop, never fed back as repair.
+        # Hidden functional evaluation: after the loop, never fed back as repair.
         #
         # HELDOUT_ROOT lets a committed manifest name a path OUTSIDE the
         # sandbox. The command is eval'd in the controller's shell with the
@@ -1833,6 +1870,44 @@ PY
               "$public_validation_success" == false ||
               "$extra_test_exit" -ne 0 ]]; then
             overall_success=false
+        fi
+
+        # The functional outcome above is final. Security is a separate,
+        # controller-only observation and cannot alter it or enter a repair
+        # prompt. Only functionally successful candidates are in scope for the
+        # post-validation evaluator.
+        security_test_exit=""
+        security_test_ms=0
+        security_evaluation_completed=false
+        security_clean_json=null
+        if [[ "$overall_success" == true && -n "$SECURITY_CMD" ]]; then
+            export SECURITY_ROOT="$REPO"
+            export SECURITY_PYTHON="$PYTHON_BIN"
+            export SECURITY_OUTPUT="$attempt_dir/security_results.json"
+            export SECURITY_ARTIFACTS="$attempt_dir/security_artifacts"
+            export SECURITY_FUZZ_SECONDS SECURITY_SEED SECURITY_TIMEOUT SECURITY_MAX_INPUTS
+            read -r security_test_exit security_test_ms < <(
+                cd "$workdir" &&
+                run_final_command "$attempt_dir/security-tests.log" "$SECURITY_CMD"
+            )
+            read -r security_evaluation_completed security_clean_json < <(
+                "$PYTHON_BIN" - "$attempt_dir/security_results.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+try:
+    data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError):
+    print("false null")
+else:
+    completed = data.get("security_evaluation_completed") is True
+    clean = data.get("security_clean") if completed else None
+    print("true" if completed else "false", json.dumps(clean))
+PY
+            )
+        else
+            : >"$attempt_dir/security-tests.log"
         fi
 
         # Flatten the sources, record any test tampering, drop the workdir.
@@ -1912,6 +1987,11 @@ PY
             base_test_exit_code "$base_test_exit" \
             feature_test_exit_code "$feature_test_exit" \
             extra_test_exit_code "$extra_test_exit" \
+            security_evaluator_exit_code "$(optional_number "$security_test_exit")" \
+            security_evaluator_runtime_ms "$security_test_ms" \
+            security_evaluation_completed "$security_evaluation_completed" \
+            security_clean "__JSON__:$security_clean_json" \
+            security_results_path "$([[ -f "$attempt_dir/security_results.json" ]] && printf '__STR__:security_results.json' || printf '__JSON__:null')" \
             agent_runtime_ms "$total_agent_ms" \
             build_runtime_ms "$total_build_ms" \
             base_test_runtime_ms "$total_base_test_ms" \
