@@ -151,6 +151,36 @@ class CallGraphReachabilityTests(unittest.TestCase):
         self.assertEqual(rows["helper"]["call_depth"], 0)
         self.assertEqual(rows["leaf"]["call_depth"], 1)
 
+    def test_source_qualified_entry_seeds_only_the_requested_program(self):
+        result = analyze_sources(
+            [
+                ("sort.c", b"static void sort_helper(void) {}\nint main(void) { sort_helper(); }"),
+                ("chmod.c", b"static void chmod_helper(void) {}\nint main(void) { chmod_helper(); }"),
+            ],
+            entry_points=("sort.c::main",),
+            force_fallback=True,
+        )
+        rows = functions_by_id(result)
+        self.assertEqual(result["resolved_entry_points"], ["sort.c::main"])
+        self.assertEqual(rows["sort.c::main"]["call_depth"], 0)
+        self.assertEqual(rows["sort_helper"]["call_depth"], 1)
+        self.assertIsNone(rows["chmod.c::main"]["call_depth"])
+        self.assertIsNone(rows["chmod_helper"]["call_depth"])
+
+    def test_source_qualified_entry_reports_missing_and_ambiguous(self):
+        missing = analyze_sources(
+            [("program.c", b"int main(void) { return 0; }")],
+            entry_points=("program.c::missing",), force_fallback=True,
+        )
+        ambiguous = analyze_sources(
+            [("program.c", b"int main(void) { return 0; }\nint main(void) { return 1; }")],
+            entry_points=("program.c::main",), force_fallback=True,
+        )
+        self.assertEqual(missing["entry_point_resolutions"][0]["status"], "not_found")
+        self.assertEqual(missing["resolved_entry_points"], [])
+        self.assertEqual(ambiguous["entry_point_resolutions"][0]["status"], "ambiguous")
+        self.assertEqual(ambiguous["resolved_entry_points"], [])
+
     def test_entry_points_are_excluded_from_selection_by_default(self):
         result = analyze(SELECTION_SOURCE)
         for policy in ("SHALLOW", "RANDOM", "DEEP"):

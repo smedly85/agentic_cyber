@@ -100,8 +100,8 @@ def check_platform(manifest: dict) -> None:
     for line in (
         f"runner.py: PLATFORM INCOMPATIBLE -- this frozen suite requires "
         f"{required}, but this host is {actual}.",
-        f"  Its expected results were produced and validated on {required} "
-        f"and do not describe {actual}.",
+        f"  Its formal expected results must be produced and validated on "
+        f"{required} and do not describe {actual}.",
         "  This is an infrastructure/platform incompatibility, NOT a "
         "candidate failure: no verdict is reported.",
     ):
@@ -113,14 +113,18 @@ def load_manifest(path: str | None, all_flags: bool) -> dict:
     """Load the flag/tag-filtering manifest out of config.json (or whatever
     --config points at). --all-flags bypasses it entirely (oracle self-check:
     run every case regardless of what's "implemented")."""
-    if all_flags:
-        return {"implemented": None, "excluded_tags": [],
-                "unimplemented_policy": "skip"}
     if not path or not os.path.exists(path):
         return {"implemented": None, "excluded_tags": [],
                 "unimplemented_policy": "skip"}
     with open(path) as f:
         m = json.load(f)
+    if all_flags:
+        # Bypass only case filtering. The frozen platform contract remains
+        # load-bearing even for an oracle self-pass or an ad-hoc full-suite
+        # invocation; --all-flags must not turn a Darwin corpus neutral.
+        return {"implemented": None, "excluded_tags": [],
+                "unimplemented_policy": "skip",
+                "required_platform": m.get("required_platform")}
     m.setdefault("excluded_tags", [])
     m.setdefault("unimplemented_policy", "skip")
     return m

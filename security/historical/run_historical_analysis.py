@@ -49,7 +49,8 @@ def main(argv: list[str] | None = None) -> int:
     graph_summaries = {
         identifier: {
             key: graph[key] for key in (
-                "analysis_method", "entry_points", "resolved_entry_points",
+                "analysis_method", "analyzed_source_files", "entry_points",
+                "resolved_entry_points", "entry_point_resolutions",
                 "reachable_function_count", "diversification_eligible_function_count",
                 "unreachable_function_count", "max_reachable_call_depth",
                 "functions_by_call_depth",

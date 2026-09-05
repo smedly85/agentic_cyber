@@ -3,7 +3,7 @@
 Shared execution core for the exhaustive sort test suite.
 
 ONE module runs every subprocess in this project:
-  - gen/freeze.py  (the oracle: runs /usr/bin/sort to freeze golden outputs)
+  - gen/freeze.py  (the oracle: runs verified GNU sort 9.11 to freeze goldens)
   - runner.py      (the judge: runs the candidate and compares)
   - diff_fuzz.py   (the fuzzer: runs both live)
 

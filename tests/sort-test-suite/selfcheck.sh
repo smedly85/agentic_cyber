@@ -18,7 +18,7 @@
 # inside freeze, after the run had already started.
 #
 # Usage: ./selfcheck.sh [config.json]
-#        SORT_ORACLE_BIN=/usr/bin/sort ./selfcheck.sh
+#        SORT_ORACLE_BIN=/opt/homebrew/bin/gsort ./selfcheck.sh
 #        ./selfcheck.sh config.json --publish   # overwrite suites/ (see below)
 set -u
 
@@ -56,9 +56,6 @@ for arg in "$@"; do [ "$arg" = "--publish" ] && PUBLISH=1; done
 ORACLE_TOOL=../reference_generators/oracle_contract.py
 SORT=$(python3 "$ORACLE_TOOL" resolve --suite sort --config "$CONFIG" \
                               --suite-root .)
-SUITES=(); for s in suites/*.json suites/*.json.gz; do
-  [ -f "$s" ] && [[ "$(basename "$s")" != "MANIFEST.json" ]] && SUITES+=("$s")
-done
 fail=0
 
 # Permission-sensitive gate. Several fault cases assert that an operation is
@@ -88,10 +85,10 @@ ROOTMSG
 fi
 
 # Platform gate, before regeneration and before the oracle self-pass. This
-# suite's frozen goldens are Linux-specific for two independent reasons, both
-# recorded in config.json's _platform_contract, which the shared checker prints:
-# the obsolete +POS key syntax resolves differently on Darwin (obs-pos-posixly),
-# and fault-devfull needs /dev/full, which Darwin does not provide at all.
+# suite's frozen goldens are Darwin-specific: obs-pos-posixly records Darwin's
+# +POS behavior, and the generated corpus deliberately omits the Linux-only
+# fault-devfull case. The reason is recorded in config.json's
+# _platform_contract and suites/MANIFEST.json.
 #
 # Regenerating on the wrong host would redefine the benchmark; running the
 # oracle self-pass there would report the ORACLE as broken for a difference that
@@ -126,10 +123,7 @@ fi
 # redefine what every candidate is scored against. Without --publish the
 # regenerated corpus is only compared with the committed one, which is the
 # stronger check anyway -- it proves the committed goldens are reproducible.
-if [ "$PUBLISH" = 1 ]; then
-  echo "  publishing regenerated suites into suites/ (--publish)"
-  cp /tmp/exh_g1/*.json.gz /tmp/exh_g1/MANIFEST.json suites/ 2>/dev/null
-else
+if [ "$PUBLISH" = 0 ]; then
   # Compares decompressed CASES over the tiers config.json declares as
   # generated, and audits the inventory. A gzip byte-diff could neither
   # say what changed nor distinguish a separately-maintained file from a
@@ -140,10 +134,23 @@ else
     echo "  (re-run with --publish only if changing the benchmark is intended)"
     fail=1
   fi
+  if diff -u suites/MANIFEST.json /tmp/exh_g1/MANIFEST.json >/dev/null; then
+    echo "  committed manifest provenance reproduces exactly: OK"
+  else
+    echo "  MANIFEST.json differs from regenerated provenance"
+    diff -u suites/MANIFEST.json /tmp/exh_g1/MANIFEST.json || true
+    fail=1
+  fi
 fi
 
 echo "== gate 3: oracle self-pass (the oracle must be 100%) =="
-if python3 runner.py "${SUITES[@]}" --all-flags -- "$SORT" >/tmp/exh_oracle.log 2>&1; then
+FRESH_SUITES=(); for s in /tmp/exh_g1/*.json /tmp/exh_g1/*.json.gz; do
+  [ -f "$s" ] && [[ "$(basename "$s")" != "MANIFEST.json" ]] && FRESH_SUITES+=("$s")
+done
+# Separately maintained regressions are part of the frozen judging corpus even
+# though regeneration correctly does not reproduce them.
+[ ! -f suites/fuzz_regressions.json.gz ] || FRESH_SUITES+=(suites/fuzz_regressions.json.gz)
+if python3 runner.py "${FRESH_SUITES[@]}" --all-flags -- "$SORT" >/tmp/exh_oracle.log 2>&1; then
   tail -1 /tmp/exh_oracle.log
 else
   echo "  ORACLE SELF-PASS FAILED:"; tail -20 /tmp/exh_oracle.log; fail=1
@@ -153,7 +160,7 @@ echo "== gate 4: teeth check (wrong oracles must FAIL) =="
 # 4a. busybox sort differs from GNU sort on many options -> must be caught
 # (skipped entirely if busybox isn't installed -- optional sanity check)
 if command -v busybox >/dev/null; then
-  if python3 runner.py "${SUITES[@]}" --all-flags -- "$(command -v busybox)" sort \
+  if python3 runner.py "${FRESH_SUITES[@]}" --all-flags -- "$(command -v busybox)" sort \
        >/tmp/exh_bb.log 2>&1; then
     echo "  TEETH FAIL: busybox sort passed the suite (suite too weak)"; fail=1
   else
@@ -166,7 +173,7 @@ cat >/tmp/exh_shim_rev <<SH
 exec "$SORT" -r "\$@"
 SH
 chmod +x /tmp/exh_shim_rev
-if python3 runner.py suites/singles.json* --all-flags -- /tmp/exh_shim_rev \
+if python3 runner.py /tmp/exh_g1/singles.json* --all-flags -- /tmp/exh_shim_rev \
      >/tmp/exh_shim.log 2>&1; then
   echo "  TEETH FAIL: reverse shim passed (suite too weak)"; fail=1
 else
@@ -174,5 +181,12 @@ else
 fi
 
 echo
+if [ "$fail" = 0 ] && [ "$PUBLISH" = 1 ]; then
+  echo "  publishing validated regenerated suites into suites/ (--publish)"
+  if ! cp /tmp/exh_g1/*.json.gz /tmp/exh_g1/MANIFEST.json suites/ 2>/dev/null; then
+    echo "  PUBLISH FAILED: could not copy validated corpus into suites/" >&2
+    fail=1
+  fi
+fi
 if [ "$fail" = 0 ]; then echo "SELFCHECK: ALL GATES PASSED"; else echo "SELFCHECK: FAILURES"; fi
 exit $fail

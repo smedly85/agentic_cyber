@@ -15,7 +15,7 @@ behavior between releases, so goldens frozen against one version are not the
 goldens another version produces. The suites already recorded which version they
 were frozen from --
 
-    tests/sort-test-suite/suites/MANIFEST.json   "sort (GNU coreutils) 9.4"
+    tests/sort-test-suite/suites/MANIFEST.json   "sort (GNU coreutils) 9.11"
     tests/mkdir-test-suite/suites/MANIFEST.json  "mkdir (GNU coreutils) 9.11"
     tests/grep-test-suite/suites/MANIFEST.json   "grep (GNU grep) 3.12"
 
@@ -78,10 +78,15 @@ SUITES: dict[str, dict[str, Any]] = {
         "manifest_key": "sort_version",
         "toolkit": "GNU coreutils",
         "candidates": (
-            "/usr/bin/sort",
-            "/bin/sort",
             "/opt/homebrew/opt/coreutils/libexec/gnubin/sort",
             "/usr/local/opt/coreutils/libexec/gnubin/sort",
+            "/opt/homebrew/bin/gsort",
+            "/usr/local/bin/gsort",
+        ),
+        "aliases": ("gsort",),
+        "fallback_candidates": (
+            "/usr/bin/sort",
+            "/bin/sort",
         ),
     },
     "mkdir": {
@@ -156,6 +161,13 @@ def resolve(suite: str, config_path: Path | None = None,
     if configured:
         return configured
     for candidate in SUITES[suite]["candidates"]:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    for alias in SUITES[suite].get("aliases", ()):
+        found = shutil.which(alias)
+        if found:
+            return found
+    for candidate in SUITES[suite].get("fallback_candidates", ()):
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
     found = shutil.which(SUITES[suite]["program"])
@@ -241,7 +253,13 @@ def verify(suite: str, suite_root: Path, binary: str,
 
     found = program_version(suite, line)
     wanted = required_version(suite, suite_root, config_path)
-    if wanted and found and found != wanted:
+    if found is None:
+        problems.append(
+            f"cannot parse a {wanted_toolkit} version from {binary!r} "
+            f"(--version said {line!r}); refusing to regenerate without "
+            "an exact oracle version."
+        )
+    elif wanted and found != wanted:
         problems.append(
             f"oracle version mismatch: this suite's frozen goldens were "
             f"produced by {wanted_toolkit} {wanted}, but {binary!r} is "

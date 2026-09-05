@@ -7,7 +7,7 @@ import json
 import random
 import statistics
 from collections import Counter
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterable, Mapping, Sequence
 
 from security.common.callgraph import SELECTION_POLICIES, analyze_source_tree, select_functions
@@ -24,13 +24,27 @@ REQUIRED_FIELDS = {
 }
 MANIFEST_FIELDS = {
     "upstream_project": str, "affected_version": str, "source_revision": str,
-    "source_tree": str, "source_tree_sha256": str,
+    "source_tree": str, "source_tree_sha256": str, "programs": dict,
 }
+PROGRAM_FIELDS = {"entry_point": dict, "source_globs": list}
+ENTRY_POINT_FIELDS = {"source_file": str, "function": str}
 MAPPED_STATES = {"mapped_and_reachable", "mapped_but_unreachable"}
 
 
 class HistoricalDataError(ValueError):
     pass
+
+
+class ProgramAnalysisError(ValueError):
+    def __init__(
+        self, status: str, message: str, *,
+        source_qualified_entry_point: str | None = None,
+        resolved_source_files: Sequence[str] = (),
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.source_qualified_entry_point = source_qualified_entry_point
+        self.resolved_source_files = list(resolved_source_files)
 
 
 def _validate_fields(value: Mapping[str, Any], fields: Mapping[str, type]) -> list[str]:
@@ -84,6 +98,21 @@ def validate_records(records: Any) -> list[str]:
     return errors
 
 
+def _relative_scope_path_error(value: str, *, allow_glob: bool) -> str | None:
+    if not value.strip():
+        return "must not be empty"
+    if "\\" in value:
+        return "must use forward slashes"
+    path = PurePosixPath(value)
+    if path.is_absolute() or PureWindowsPath(value).drive:
+        return "must be relative to the source tree"
+    if ".." in path.parts:
+        return "must not escape the source tree"
+    if not allow_glob and any(character in value for character in "*?["):
+        return "must be an exact path, not a glob"
+    return None
+
+
 def validate_manifest_entry(entry: Mapping[str, Any]) -> list[str]:
     errors = _validate_fields(entry, MANIFEST_FIELDS)
     for field in ("affected_version", "source_revision", "source_tree"):
@@ -97,6 +126,48 @@ def validate_manifest_entry(entry: Mapping[str, Any]) -> list[str]:
         and all(character in "0123456789abcdef" for character in fingerprint.lower())
     ):
         errors.append("source_tree_sha256 must be a 64-character hexadecimal digest")
+    programs = entry.get("programs")
+    if isinstance(programs, dict):
+        if not programs:
+            errors.append("programs must contain at least one utility")
+        for utility, program in programs.items():
+            prefix = f"programs.{utility}"
+            if utility not in ALLOWED_UTILITIES:
+                errors.append(f"{prefix}: unsupported utility")
+            if not isinstance(program, Mapping):
+                errors.append(f"{prefix}: must be an object")
+                continue
+            errors.extend(
+                f"{prefix}: {error}"
+                for error in _validate_fields(program, PROGRAM_FIELDS)
+            )
+            entry_point = program.get("entry_point")
+            if isinstance(entry_point, Mapping):
+                errors.extend(
+                    f"{prefix}.entry_point: {error}"
+                    for error in _validate_fields(entry_point, ENTRY_POINT_FIELDS)
+                )
+                source_file = entry_point.get("source_file")
+                function = entry_point.get("function")
+                if isinstance(source_file, str):
+                    path_error = _relative_scope_path_error(source_file, allow_glob=False)
+                    if path_error:
+                        errors.append(f"{prefix}.entry_point.source_file: {path_error}")
+                if isinstance(function, str) and not function.strip():
+                    errors.append(f"{prefix}.entry_point.function must not be empty")
+            globs = program.get("source_globs")
+            if isinstance(globs, list):
+                if not globs:
+                    errors.append(f"{prefix}.source_globs must not be empty")
+                if any(not isinstance(pattern, str) for pattern in globs):
+                    errors.append(f"{prefix}.source_globs entries must be strings")
+                strings = [pattern for pattern in globs if isinstance(pattern, str)]
+                if len(set(strings)) != len(strings):
+                    errors.append(f"{prefix}.source_globs entries must be unique")
+                for pattern in strings:
+                    path_error = _relative_scope_path_error(pattern, allow_glob=True)
+                    if path_error:
+                        errors.append(f"{prefix}.source_globs: {path_error}: {pattern}")
     return errors
 
 
@@ -196,9 +267,82 @@ def _source_resolution(
     return "source_version_matched", entry, None
 
 
+def _resolve_program_scope(
+    source_tree: Path, program: Mapping[str, Any],
+) -> tuple[str, list[str]]:
+    """Resolve one manifest program scope to a stable, contained C-file list."""
+    root = source_tree.resolve()
+    entry_point = program.get("entry_point")
+    globs = program.get("source_globs")
+    if not isinstance(entry_point, Mapping) or not isinstance(globs, list):
+        raise ProgramAnalysisError(
+            "analysis_scope_invalid", "program scope metadata is incomplete"
+        )
+    source_file = entry_point.get("source_file")
+    function = entry_point.get("function")
+    if not isinstance(source_file, str) or not isinstance(function, str):
+        raise ProgramAnalysisError(
+            "analysis_scope_invalid", "program entry point metadata is invalid"
+        )
+    qualified_entry = f"{PurePosixPath(source_file).as_posix()}::{function}"
+    for value, allow_glob in ((source_file, False), *((item, True) for item in globs)):
+        if not isinstance(value, str):
+            raise ProgramAnalysisError(
+                "analysis_scope_invalid", "program source globs must be strings"
+            )
+        path_error = _relative_scope_path_error(value, allow_glob=allow_glob)
+        if path_error:
+            raise ProgramAnalysisError(
+                "analysis_scope_invalid", f"{path_error}: {value}",
+                source_qualified_entry_point=qualified_entry,
+            )
+
+    matched: dict[str, Path] = {}
+    try:
+        for pattern in globs:
+            for candidate in root.glob(pattern):
+                resolved = candidate.resolve()
+                try:
+                    relative = resolved.relative_to(root).as_posix()
+                except ValueError as error:
+                    raise ProgramAnalysisError(
+                        "analysis_scope_invalid",
+                        f"source glob resolves outside the source tree: {pattern}",
+                        source_qualified_entry_point=qualified_entry,
+                        resolved_source_files=sorted(matched),
+                    ) from error
+                if resolved.is_file() and resolved.suffix.lower() == ".c":
+                    matched[relative] = resolved
+    except (OSError, ValueError) as error:
+        if isinstance(error, ProgramAnalysisError):
+            raise
+        raise ProgramAnalysisError(
+            "analysis_scope_invalid", f"cannot resolve program source globs: {error}",
+            source_qualified_entry_point=qualified_entry,
+            resolved_source_files=sorted(matched),
+        ) from error
+    resolved_files = sorted(matched)
+    if not resolved_files:
+        raise ProgramAnalysisError(
+            "analysis_scope_empty", "program source globs matched no C files",
+            source_qualified_entry_point=qualified_entry,
+        )
+    normalized_entry_file = PurePosixPath(source_file).as_posix()
+    if normalized_entry_file not in matched:
+        raise ProgramAnalysisError(
+            "entry_point_outside_scope",
+            "configured entry-point source file is outside the resolved program scope",
+            source_qualified_entry_point=qualified_entry,
+            resolved_source_files=resolved_files,
+        )
+    return qualified_entry, resolved_files
+
+
 def map_record_to_graph(
     record: Mapping[str, Any], analysis: Mapping[str, Any], *,
     source_analysis_id: str | None = None,
+    source_qualified_entry_point: str | None = None,
+    resolved_source_files: Sequence[str] = (),
 ) -> dict[str, Any]:
     target = str(record["vulnerable_function"])
     matches = [
@@ -231,11 +375,15 @@ def map_record_to_graph(
         "source_revision": record["source_revision"],
         "vulnerable_function": target,
         "source_version_status": "source_version_matched",
+        "source_version_error": None, "analysis_error": None,
         "mapping_status": status, "verified": record["verified"],
         "eligible_for_hvc": record["verified"] is True and status in MAPPED_STATES,
         "source_analysis_id": source_analysis_id,
+        "source_qualified_entry_point": source_qualified_entry_point,
+        "resolved_source_files": list(resolved_source_files),
         "mapped_function_id": matched.get("function_id") if matched else None,
         "call_depth": depth,
+        "reachable_from_entry": matched.get("reachable_from_entry") if matched else None,
         "reachable_from_main": matched.get("reachable_from_entry") if matched else None,
         "total_reachable_functions": analysis.get("reachable_function_count"),
         "diversification_eligible_function_count": analysis.get("diversification_eligible_function_count"),
@@ -245,18 +393,28 @@ def map_record_to_graph(
 
 
 def _unevaluable_mapping(
-    record: Mapping[str, Any], status: str, reason: str | None,
+    record: Mapping[str, Any], status: str, reason: str | None, *,
+    source_version_status: str | None = None,
+    source_analysis_id: str | None = None,
+    source_qualified_entry_point: str | None = None,
+    resolved_source_files: Sequence[str] = (),
 ) -> dict[str, Any]:
+    source_error = source_version_status is None
     return {
         "vulnerability_id": record["id"], "utility": record["utility"],
         "upstream_project": record["upstream_project"],
         "affected_version": record["affected_version"],
         "source_revision": record["source_revision"],
         "vulnerable_function": record["vulnerable_function"],
-        "source_version_status": status, "source_version_error": reason,
+        "source_version_status": source_version_status or status,
+        "source_version_error": reason if source_error else None,
+        "analysis_error": None if source_error else reason,
         "mapping_status": status, "verified": record["verified"],
-        "eligible_for_hvc": False, "source_analysis_id": None,
+        "eligible_for_hvc": False, "source_analysis_id": source_analysis_id,
+        "source_qualified_entry_point": source_qualified_entry_point,
+        "resolved_source_files": list(resolved_source_files),
         "mapped_function_id": None, "call_depth": None,
+        "reachable_from_entry": None,
         "reachable_from_main": None, "total_reachable_functions": None,
         "diversification_eligible_function_count": None,
         "maximum_reachable_depth": None, "normalized_depth": None,
@@ -268,7 +426,10 @@ def analyze_versioned_records(
     force_fallback: bool = False,
 ) -> dict[str, Any]:
     """Analyze every record against its exact vulnerable source identity."""
-    cache: dict[tuple[str, str, str, str], tuple[str, dict[str, Any]]] = {}
+    cache: dict[
+        tuple[str, str, str, str, str, str, tuple[str, ...]],
+        tuple[str, dict[str, Any]],
+    ] = {}
     mappings: list[dict[str, Any]] = []
     graphs: dict[str, dict[str, Any]] = {}
     hits = 0
@@ -278,7 +439,30 @@ def analyze_versioned_records(
             mappings.append(_unevaluable_mapping(record, source_status, reason))
             continue
         source_tree = Path(str(source.get("resolved_source_tree", source["source_tree"])))
-        cache_key = (*_identity(record), str(source_tree))
+        programs = source.get("programs")
+        program = programs.get(record["utility"]) if isinstance(programs, Mapping) else None
+        if not isinstance(program, Mapping):
+            mappings.append(_unevaluable_mapping(
+                record,
+                "program_scope_unavailable",
+                f"source manifest has no program scope for utility: {record['utility']}",
+                source_version_status="source_version_matched",
+            ))
+            continue
+        try:
+            qualified_entry, resolved_files = _resolve_program_scope(source_tree, program)
+        except ProgramAnalysisError as error:
+            mappings.append(_unevaluable_mapping(
+                record, error.status, str(error),
+                source_version_status="source_version_matched",
+                source_qualified_entry_point=error.source_qualified_entry_point,
+                resolved_source_files=error.resolved_source_files,
+            ))
+            continue
+        cache_key = (
+            *_identity(record), str(source_tree), str(record["utility"]),
+            qualified_entry, tuple(resolved_files),
+        )
         if cache_key in cache:
             analysis_id, graph = cache[cache_key]
             hits += 1
@@ -286,11 +470,52 @@ def analyze_versioned_records(
             analysis_id = hashlib.sha256(json.dumps({
                 "identity": _identity(record), "source_tree": str(source_tree),
                 "source_tree_sha256": source["source_tree_sha256"],
+                "utility": record["utility"],
+                "source_qualified_entry_point": qualified_entry,
+                "resolved_source_files": resolved_files,
             }, sort_keys=True).encode()).hexdigest()
-            graph = analyze_source_tree(source_tree, force_fallback=force_fallback)
+            try:
+                graph = analyze_source_tree(
+                    source_tree, entry_points=(qualified_entry,),
+                    source_files=resolved_files, force_fallback=force_fallback,
+                )
+            except (OSError, ValueError) as error:
+                mappings.append(_unevaluable_mapping(
+                    record, "analysis_scope_invalid",
+                    f"cannot analyze resolved program source scope: {error}",
+                    source_version_status="source_version_matched",
+                    source_qualified_entry_point=qualified_entry,
+                    resolved_source_files=resolved_files,
+                ))
+                continue
+            graph["historical_program_scope"] = {
+                "utility": record["utility"],
+                "source_qualified_entry_point": qualified_entry,
+                "resolved_source_files": resolved_files,
+            }
             cache[cache_key] = (analysis_id, graph)
             graphs[analysis_id] = graph
-        mapping = map_record_to_graph(record, graph, source_analysis_id=analysis_id)
+        resolution = graph.get("entry_point_resolutions", [{}])[0]
+        entry_status = resolution.get("status")
+        if entry_status != "resolved":
+            status = {
+                "not_found": "entry_point_not_found",
+                "ambiguous": "entry_point_ambiguous",
+            }.get(str(entry_status), "entry_point_unresolved")
+            mapping = _unevaluable_mapping(
+                record, status,
+                f"configured source-qualified entry point is {entry_status}",
+                source_version_status="source_version_matched",
+                source_analysis_id=analysis_id,
+                source_qualified_entry_point=qualified_entry,
+                resolved_source_files=resolved_files,
+            )
+        else:
+            mapping = map_record_to_graph(
+                record, graph, source_analysis_id=analysis_id,
+                source_qualified_entry_point=qualified_entry,
+                resolved_source_files=resolved_files,
+            )
         mapping["source_tree"] = str(source_tree)
         mapping["source_tree_sha256"] = source["source_tree_sha256"]
         mappings.append(mapping)
@@ -321,8 +546,15 @@ def version_specific_hvc(
             covered.append(str(mapping["vulnerability_id"]))
         details.append({
             "vulnerability_id": mapping["vulnerability_id"],
+            "utility": mapping["utility"],
             "source_revision": mapping["source_revision"],
             "source_analysis_id": mapping["source_analysis_id"],
+            "source_qualified_entry_point": mapping["source_qualified_entry_point"],
+            "resolved_source_files": list(mapping["resolved_source_files"]),
+            "reachable_function_count": mapping["total_reachable_functions"],
+            "diversification_eligible_function_count": mapping[
+                "diversification_eligible_function_count"
+            ],
             "mapped_function_id": mapping["mapped_function_id"],
             "covered": is_covered, **selection,
         })

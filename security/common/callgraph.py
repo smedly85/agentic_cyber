@@ -12,7 +12,7 @@ import math
 import random
 import re
 from collections import Counter, deque
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterable, Mapping
 
 CALL_GRAPH_SCHEMA_VERSION = 2
@@ -197,9 +197,10 @@ def analyze_sources(
     force_fallback: bool = False,
 ) -> dict[str, Any]:
     """Analyze one or more C translation units without inventing indirect edges."""
+    source_items = [(str(source_file), data) for source_file, data in sources]
     definitions: list[dict[str, Any]] = []
     methods: set[str] = set()
-    for source_file, data in sources:
+    for source_file, data in source_items:
         parsed, method = _definitions(data, source_file, force_fallback)
         definitions.extend(parsed)
         methods.add(method)
@@ -265,10 +266,38 @@ def analyze_sources(
     }
 
     configured_entries = list(dict.fromkeys(str(item) for item in entry_points))
-    entry_ids = [
-        identifier for identifier, item in by_id.items()
-        if item["function"] in configured_entries
-    ]
+    entry_ids: list[str] = []
+    entry_point_resolutions: list[dict[str, Any]] = []
+    for specification in configured_entries:
+        if "::" in specification:
+            source_file, function = specification.rsplit("::", 1)
+            matches = [
+                identifier for identifier, item in by_id.items()
+                if item["source_file"] == source_file and item["function"] == function
+            ]
+            qualified = True
+        else:
+            source_file, function = None, specification
+            matches = [
+                identifier for identifier, item in by_id.items()
+                if item["function"] == function
+            ]
+            qualified = False
+        status = "not_found" if not matches else (
+            "ambiguous" if qualified and len(matches) > 1 else "resolved"
+        )
+        resolved = sorted(matches) if status == "resolved" else []
+        entry_ids.extend(resolved)
+        entry_point_resolutions.append({
+            "entry_point": specification,
+            "source_file": source_file,
+            "function": function,
+            "source_qualified": qualified,
+            "status": status,
+            "matching_function_ids": sorted(matches),
+            "resolved_function_ids": resolved,
+        })
+    entry_ids = list(dict.fromkeys(entry_ids))
     depths: dict[str, int] = {}
     pending: deque[tuple[str, int]] = deque((identifier, 0) for identifier in sorted(entry_ids))
     while pending:
@@ -341,8 +370,10 @@ def analyze_sources(
     return {
         "schema_version": CALL_GRAPH_SCHEMA_VERSION,
         "analysis_method": method,
+        "analyzed_source_files": sorted({item[0] for item in source_items}),
         "entry_points": configured_entries,
         "resolved_entry_points": sorted(entry_ids),
+        "entry_point_resolutions": entry_point_resolutions,
         "function_reachability": functions,
         "reachable_function_count": reachable_count,
         "diversification_eligible_function_count": len(ordered_eligible),
@@ -380,10 +411,32 @@ def analyze_source_file(
 
 def analyze_source_tree(
     source_tree: Path, *, entry_points: Iterable[str] = ("main",), force_fallback: bool = False,
+    source_files: Iterable[str | Path] | None = None,
 ) -> dict[str, Any]:
-    files = sorted(path for path in source_tree.rglob("*.c") if path.is_file())
+    root = source_tree.resolve()
+    if source_files is None:
+        files = sorted(path for path in root.rglob("*.c") if path.is_file())
+    else:
+        scoped: dict[str, Path] = {}
+        for value in source_files:
+            text = str(value).replace("\\", "/")
+            relative = PurePosixPath(text)
+            if (
+                not text or relative.is_absolute() or ".." in relative.parts
+                or PureWindowsPath(text).drive
+            ):
+                raise ValueError(f"source file must be a safe relative path: {value}")
+            candidate = root.joinpath(*relative.parts).resolve()
+            try:
+                normalized = candidate.relative_to(root).as_posix()
+            except ValueError as error:
+                raise ValueError(f"source file escapes source tree: {value}") from error
+            if not candidate.is_file() or candidate.suffix.lower() != ".c":
+                raise ValueError(f"source file is not an existing C file: {value}")
+            scoped[normalized] = candidate
+        files = [scoped[name] for name in sorted(scoped)]
     return analyze_sources(
-        [(path.relative_to(source_tree).as_posix(), path.read_bytes()) for path in files],
+        [(path.relative_to(root).as_posix(), path.read_bytes()) for path in files],
         entry_points=entry_points,
         force_fallback=force_fallback,
     )

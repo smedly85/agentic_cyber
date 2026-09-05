@@ -140,7 +140,8 @@ CAND=$(cfg paths.candidate_bin) || {
   echo "run_all.sh: paths.candidate_bin is not set in $CONFIG" >&2; exit 2; }
 CAND_ASAN=$(cfg paths.candidate_asan_bin --default ./candidate_asan)
 CAND_SRC=$(cfg paths.candidate_src --default "")
-ORACLE=$(cfg paths.oracle_bin --default /usr/bin/sort)
+ORACLE=$(python3 ../reference_generators/oracle_contract.py resolve \
+    --suite sort --config "$CONFIG" --suite-root .)
 [ -n "$FUZZ_SECS" ] || FUZZ_SECS=$(cfg fuzz.time_budget_s --default 60)
 
 if [ ! -x "$CAND" ]; then

@@ -19,7 +19,7 @@ hardcoded; pass --candidate/--oracle explicitly to override.
 
 Usage:
   diff_fuzz.py --config config.json --time-budget 60 --seed 1
-  diff_fuzz.py --candidate ./my-sort --oracle /usr/bin/sort --time-budget 60
+  diff_fuzz.py --candidate ./my-sort --oracle /opt/homebrew/bin/gsort --time-budget 60
 """
 from __future__ import annotations
 
@@ -32,6 +32,10 @@ import os
 import random
 import sys
 import time
+from pathlib import Path
+
+SUITE_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(SUITE_ROOT.parent))
 
 import engine
 import props
@@ -40,6 +44,7 @@ from gen import combos
 from model import flag_model as fm
 from model import constraints as ct
 import config as cfgmod
+from reference_generators import oracle_contract, platform_contract
 
 
 def _b64(b: bytes) -> str:
@@ -272,8 +277,9 @@ def main():
     ap.add_argument("--candidate",
                     help="defaults to paths.candidate_bin in --config")
     ap.add_argument("--oracle",
-                    help="defaults to paths.oracle_bin in --config "
-                         "(default /usr/bin/sort)")
+                    help="GNU coreutils 9.11 sort; else $SORT_ORACLE_BIN, "
+                         "paths.oracle_bin, or a conventional GNU/Homebrew "
+                         "location")
     ap.add_argument("--time-budget", type=float, default=60)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--json-report", help="write machine-readable summary here")
@@ -285,8 +291,23 @@ def main():
         print("error: no candidate binary -- pass --candidate or set "
               "paths.candidate_bin in config.json", file=sys.stderr)
         sys.exit(2)
-    _ORACLE_BIN = args.oracle or cfgmod.get(cfg, "paths.oracle_bin",
-                                             "/usr/bin/sort")
+    config_path = Path(args.config)
+    platform_problems = platform_contract.check(config_path, "sort")
+    if platform_problems:
+        for problem in platform_problems:
+            print(problem, file=sys.stderr)
+        sys.exit(2)
+
+    _ORACLE_BIN = oracle_contract.resolve("sort", config_path, args.oracle)
+    oracle_problems = oracle_contract.verify(
+        "sort", SUITE_ROOT, _ORACLE_BIN, config_path
+    )
+    if oracle_problems:
+        for problem in oracle_problems:
+            print(f"oracle_contract: {problem}", file=sys.stderr)
+        sys.exit(2)
+    print(f"oracle: {_ORACLE_BIN} -- "
+          f"{oracle_contract.version_line(_ORACLE_BIN)}")
 
     cand = os.path.abspath(candidate)
     implemented = load_manifest(args.config)

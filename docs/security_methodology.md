@@ -59,9 +59,12 @@ The retrospective study has a separate, initially empty dataset under
 `security/historical/`. Its records must be manually curated from authoritative
 GNU Coreutils or GNU grep sources. Each record carries an exact source revision,
 and a separate manifest associates that identity with a local source tree and
-its C-source fingerprint. No source is downloaded. Each vulnerability is
-mapped and selected against the graph for the version in which it existed;
-only records with exactly identical source identities reuse a cached graph.
+its C-source fingerprint. For each utility at that revision, the manifest also
+defines an exact source-qualified entry point and deterministic C-file scope.
+No source is downloaded. Each vulnerability is mapped and selected against its
+utility-specific graph for the version in which it existed; graphs are cached
+only when the source identity, utility, entry point, and resolved file scope are
+identical.
 Version unavailable, version mismatch, function missing, function ambiguous,
 mapped but unreachable, and mapped and reachable states remain distinct.
 Absolute depth remains primary. When maximum reachable depth is greater than
@@ -73,12 +76,13 @@ normalized_depth = vulnerable_function_depth / maximum_reachable_depth
 
 For selection policy `S`, Historical Vulnerability Coverage at a function or
 percentage budget is aggregated only after every valid record has been selected
-inside its own source-version graph. It is the fraction of verified, valid
-version-specific mappings whose mapped functions appear in those per-version
-selected sets. This measures how well a structural selection policy would have
-covered historically vulnerable function locations. It does not measure future
-vulnerability prevention. Repeated recorded RANDOM seeds support means and a
-deterministic percentile-bootstrap confidence interval.
+inside its own utility-specific source-version graph. It is the fraction of
+verified, valid version-specific mappings whose mapped functions appear in
+those per-utility, per-version selected sets. This measures how well a
+structural selection policy would have covered historically vulnerable
+function locations. It does not measure future vulnerability prevention.
+Repeated recorded RANDOM seeds support means and a deterministic
+percentile-bootstrap confidence interval.
 Records that have not been source-and-patch verified remain visible in mapping
 output but are excluded from HVC denominators and depth summaries.
 

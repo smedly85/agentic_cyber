@@ -4,9 +4,11 @@ An exhaustive, GNU-sort-backed test suite for any `sort`-like binary: every
 flag alone, every valid flag pairing, every 3- and 4-flag combination of the
 bounded ladder, curated/random higher-order combos,
 I/O fault injection, adversarial inputs, ASan/UBSan, and live differential
-fuzzing against real GNU `sort`. `suites/` ships **756 reproducibly generated
-golden cases** — the seven tiers `gen/generate.py` produces, whose per-tier counts
-are recorded in `suites/MANIFEST.json` — alongside
+fuzzing against real GNU `sort`. The seven reproducibly generated tiers and
+their counts are recorded in `suites/MANIFEST.json`. The Darwin generator
+produces **755 cases**; an infrastructure-only checkout prepared for the
+Vessel re-freeze may still contain the old 756-case Linux corpus until the
+explicit Vessel-side publish step below. The generated tiers sit alongside
 `suites/fuzz_regressions.json.gz`, a **separately maintained, accreting
 regression corpus** that `diff_fuzz.py` appends to whenever the live
 differential fuzzer finds a new distinct bug. Its size grows over time and is
@@ -37,10 +39,12 @@ unrelated to the bounded checkpoint sequence above, and
 
 ## Platform contract
 
-> **This suite's frozen goldens require Linux *and* GNU coreutils 9.11.**
+> **The formal sort contract requires Darwin/macOS *and* GNU coreutils 9.11.**
 > Both halves are load-bearing; the version alone is not enough.
 
-Two independent reasons, each measured rather than assumed.
+The target formal corpus describes the actual Vessel execution environment. It is not
+platform-neutral, and a Linux run must be rejected as an infrastructure
+incompatibility rather than scored as a candidate failure.
 
 **1. Obsolete `+POS` key syntax resolves differently by platform.** The same
 9.11 binary honours `+1` as an obsolete key specification on Linux and reads it
@@ -50,25 +54,18 @@ as a filename on Darwin:
 |---|---|---|
 | `sort +1`, `POSIXLY_CORRECT=1` (case `obs-pos-posixly`) | exit **0**, sorted output, empty stderr | exit **2**, empty stdout, `sort: cannot read: +1: No such file or directory` |
 
-Confirmed by generating the corpus with the *same* coreutils 9.11 build on both
-platforms: every other case in all seven generated tiers is byte-identical across
-the two hosts, so this is a genuine platform difference rather than a suite,
-engine or locale defect. (Collation, the usual source of platform variance in
-`sort`, is already neutralised — `engine.py` pins `LC_ALL`, `LANG` and
-`LANGUAGE` to `C` for every judged invocation.)
+The Darwin golden must record the Darwin result directly; the candidate evaluator
+does not emulate Linux. Collation is controlled separately: `engine.py` pins
+`LC_ALL`, `LANG` and `LANGUAGE` to `C` for every judged invocation.
 
-**2. The corpus cannot be generated on Darwin at all.** The `fault-devfull`
-case writes to `/dev/full` to provoke ENOSPC on output. `/dev/full` is a
-Linux-only device node; on macOS `engine.py` fails with `PermissionError:
-Operation not permitted: '/dev/full'` and generation aborts partway, so the
-`faults` and `random` tiers are never written.
+**`fault-devfull` is deliberately excluded by Darwin generation.** That case writes to
+Linux's `/dev/full` device to provoke ENOSPC. macOS has no such device, so
+`gen/curated_cases.py` omits the case when building the Darwin corpus. The
+omission and its reason are recorded in `suites/MANIFEST.json`. Because the
+case is not in the frozen corpus, the candidate runner neither expects nor
+executes it, and it contributes no skip or failure.
 
-This is why **`sort` is gated to Linux while `mkdir` is gated to Darwin**. The
-two suites are platform-specific in opposite directions, each for a recorded
-reason: mkdir's is symbolic `-m` mode resolution, sort's is the two above. The
-split is deliberate, not an artifact of the machines they were first built on.
-
-| Enforced at | Behavior on a non-Linux host |
+| Enforced at | Behavior on a non-Darwin host |
 |---|---|
 | `selfcheck.sh` | stops **before** regeneration and before the oracle self-pass, exit 2 |
 | `runner.py` (candidate evaluation) | `check_platform` exits **3 = PLATFORM INCOMPATIBLE**, distinct from 1 (a case failed) |
@@ -91,14 +88,15 @@ against one release are not what another release produces.
 | | |
 |---|---|
 | Pinned version | **GNU coreutils 9.11** |
-| Required platform | **Linux** (see the platform contract above) |
+| Required platform | **Darwin/macOS** (see the platform contract above) |
 | Recorded in | `suites/MANIFEST.json` (`sort_version`), `config.json` (`oracle_version_required`, `required_platform`) |
 | Override | `SORT_ORACLE_BIN` environment variable |
 
 ### Re-pin history
 
-Re-pinned from 9.4 to 9.11 to match the mkdir suite, which was already on 9.11.
-Regenerating all 756 generated cases against 9.11 on the same platform changed
+The former Linux corpus was re-pinned from 9.4 to 9.11 to match the mkdir
+suite, which was already on 9.11. Regenerating all 756 generated cases against
+9.11 on Linux changed
 **two**, both of which quote the version by construction:
 
 | case | 9.4 | 9.11 |
@@ -106,22 +104,26 @@ Regenerating all 756 generated cases against 9.11 on the same platform changed
 | `single-version-x-none` | `sort (GNU coreutils) 9.4`, © 2023 | `sort (GNU coreutils) 9.11`, © 2026 |
 | `single-help-x-none` | `--help` text, 5548 bytes | `--help` text, 9368 bytes |
 
-The other 749 were byte-identical, so the re-pin carried **no behavioral
-change**. `fuzz_regressions.json.gz` is separately maintained and was not
-regenerated.
+The Darwin re-freeze changes `obs-pos-posixly` from exit 0 with sorted
+stdout to exit 2 with empty stdout and the Darwin GNU 9.11 missing-file
+diagnostic. It also omitted `fault-devfull` for the platform reason above,
+reducing the generated corpus from 756 to 755 cases. The old Linux corpus is
+retained only until the Vessel publish step and is not the formal sort corpus.
+`fuzz_regressions.json.gz` is separately maintained and is not regenerated.
 
 Selection order, implemented by `tests/reference_generators/oracle_contract.py`:
 
 1. an explicit `--sort-bin` / `--oracle-bin` argument
 2. `$SORT_ORACLE_BIN`
 3. `paths.oracle_bin` in `config.json`
-4. conventional locations (`/usr/bin/sort`, Homebrew gnubin, …)
+4. conventional GNU locations (Homebrew gnubin/`gsort` first, then system paths)
 
-Prefer the environment variable — it needs no edit to a tracked file, so a
-Linux, WSL and macOS checkout can each point at their own coreutils:
+Prefer the environment variable — it needs no edit to a tracked file. On
+macOS, `/usr/bin/sort` is BSD sort and the verifier will refuse it; point to
+the Homebrew/coreutils 9.11 binary explicitly:
 
 ```bash
-SORT_ORACLE_BIN=/usr/bin/sort ./selfcheck.sh
+SORT_ORACLE_BIN=/opt/homebrew/bin/gsort ./selfcheck.sh
 ```
 
 `selfcheck.sh` verifies **before regenerating anything** that the binary exists,
@@ -135,16 +137,64 @@ the committed goldens are reproducible without letting one machine silently
 redefine the benchmark. Re-pinning is a deliberate act: update
 `oracle_version_required`, re-freeze with `--publish`, and say so in the commit.
 
-Judging a candidate needs **no oracle at all** — it runs entirely from the
-frozen goldens. The oracle path never reaches an agent-visible stage bundle.
+### Vessel re-freeze and publish
+
+Do not publish the Darwin goldens from a Windows or Linux development host.
+On Vessel, first identify and verify the pinned oracle, then run the complete
+selfcheck without publication:
+
+```bash
+cd tests/sort-test-suite
+export SORT_ORACLE_BIN=/Users/sonjabrown/opt/coreutils-9.11/bin/sort
+printf 'oracle path: %s\n' "$SORT_ORACLE_BIN"
+"$SORT_ORACLE_BIN" --version
+./selfcheck.sh config.json
+```
+
+During the one-time Linux-to-Darwin transition, that comparison is expected to
+exit nonzero because the committed corpus is still the old Linux freeze. It
+must report only the measured Darwin change to `obs-pos-posixly`, omission of
+`fault-devfull`, and the corresponding manifest/count changes; the temporary
+Darwin corpus must still pass the oracle and teeth gates.
+
+After reviewing that dry-run comparison, publish with a separate explicit
+command. `--publish` copies nothing until both deterministic regenerations,
+the 100% oracle self-pass, and the wrong-oracle teeth checks have succeeded:
+
+```bash
+./selfcheck.sh config.json --publish
+./selfcheck.sh config.json
+SORT_ORACLE_BIN="$SORT_ORACLE_BIN" python3 gen/heldout.py --check
+```
+
+The second, non-publishing selfcheck is the final comparison against the newly
+committed Darwin corpus. From the repository root, then run `make test`,
+`git diff --check`, and verify `git status --short runs` is empty before
+committing the generated suite files. Finally, exercise the lineage preflight
+without starting a formal lineage by adding `--dry-run` to the normal Vessel
+command:
+
+```bash
+cd ../..
+bash scripts/run_lineage_experiment.sh --utility sort \
+  ...normal arguments... --dry-run
+```
+
+On Vessel this must not print `platform_incompatible`.
+
+Ordinary candidate judging needs **no oracle at all** — it runs entirely from
+the frozen goldens. GNU sort 9.11 is required only for regeneration,
+selfcheck, and live differential fuzzing. The oracle path never reaches an
+agent-visible stage bundle.
 
 ## 1. One-time setup
 
 Edit **`config.json`** — it's the only file you should need to touch:
 
 - `paths.candidate_bin` — path to your compiled sort binary. **Required.**
-- `paths.oracle_bin` — a real GNU `sort` (default `/usr/bin/sort`). Only
-  needed for the fuzz pass and for regenerating `suites/`.
+- `paths.oracle_bin` — an optional real GNU coreutils 9.11 `sort`. Prefer
+  `SORT_ORACLE_BIN` on macOS; an empty value searches Homebrew locations. Only
+  needed for differential fuzzing, regeneration, and selfcheck.
 - `paths.candidate_asan_bin` / `candidate_src` / `cc` / `cc_flags` —
   optional, for the ASan/UBSan pass. Either point `candidate_asan_bin` at a
   binary you already built yourself with sanitizers (any language), or,
@@ -174,7 +224,8 @@ your own reporting.
                  # and a deliberately-wrong sort is correctly failed
 ```
 
-Requires `paths.oracle_bin` to be a working GNU `sort`.
+Requires Darwin and a working GNU coreutils 9.11 `sort`; BSD `/usr/bin/sort`
+is rejected before regeneration.
 
 ## Combinatorial coverage of the bounded ladder
 

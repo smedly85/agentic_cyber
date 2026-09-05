@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Constraint table for GNU sort 9.4 option combinations.
+Constraint table for GNU sort 9.11 option combinations.
 
 is_valid(flag_ids, values) -> Verdict
     Verdict is OK, or (CONFLICT, rule_id). Used by the generator to route a
@@ -14,8 +14,8 @@ predict_error(rule_id) -> ExpectedError(exit_code)
     cross-checked against observed GNU exit codes during freeze; a mismatch
     aborts generation (it means the model is wrong).
 
-All rules and exit codes were confirmed empirically against
-/usr/bin/sort (GNU coreutils 9.4); see the plan's constraint table.
+All rules and exit codes were confirmed empirically against the pinned GNU
+coreutils 9.11 oracle; see the plan's constraint table.
 """
 from __future__ import annotations
 

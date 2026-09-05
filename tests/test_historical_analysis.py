@@ -13,12 +13,15 @@ from security.historical.analysis import (
     load_records,
     load_source_manifest,
     map_record_to_graph,
+    source_tree_sha256,
+    validate_manifest_entry,
     version_specific_hvc,
 )
 
 
 REPO = Path(__file__).resolve().parents[1]
 FIXTURES = REPO / "tests" / "fixtures" / "historical"
+MULTI_PROGRAM = FIXTURES / "multi_program"
 
 
 def fixture_records():
@@ -194,6 +197,135 @@ class HistoricalAnalysisTests(unittest.TestCase):
                 self.assertTrue(schema["items"]["$ref"].startswith("#/$defs/"))
                 definition = schema["items"]["$ref"].removeprefix("#/$defs/")
                 self.assertEqual(schema["$defs"][definition]["type"], "object")
+
+    def test_sort_scope_excludes_other_program_from_every_hvc_policy(self):
+        records = load_records(MULTI_PROGRAM / "records.json")
+        manifest = load_source_manifest(MULTI_PROGRAM / "source_manifest.json")
+        versioned = analyze_versioned_records(
+            records[:1], manifest, force_fallback=True
+        )
+        mapping = versioned["historical_function_mappings"][0]
+        graph = versioned["call_graphs"][mapping["source_analysis_id"]]
+        rows = graph["function_reachability"]
+        self.assertEqual(mapping["source_qualified_entry_point"], "sort.c::main")
+        self.assertEqual(mapping["resolved_source_files"], ["sort.c"])
+        self.assertEqual(graph["analyzed_source_files"], ["sort.c"])
+        self.assertEqual(
+            [row["function"] for row in rows if row["call_depth"] == 0], ["main"]
+        )
+        self.assertEqual(graph["reachable_function_count"], 3)
+        self.assertEqual(graph["diversification_eligible_function_count"], 2)
+        self.assertFalse(any("chmod" in row["function"] for row in rows))
+
+        for policy in ("SHALLOW", "RANDOM", "DEEP"):
+            hvc = version_specific_hvc(
+                versioned, policy=policy, percent=100, seed=29
+            )
+            detail = hvc["per_vulnerability_selections"][0]
+            self.assertEqual(detail["selection_universe_function_count"], 2)
+            self.assertEqual(detail["diversification_eligible_function_count"], 2)
+            self.assertEqual(detail["resolved_source_files"], ["sort.c"])
+            self.assertEqual(detail["source_qualified_entry_point"], "sort.c::main")
+            self.assertFalse(any("chmod" in name for name in detail["selected_functions"]))
+        half = version_specific_hvc(versioned, policy="SHALLOW", percent=50)
+        self.assertEqual(
+            half["per_vulnerability_selections"][0]["selected_function_count"], 1
+        )
+
+    def test_same_revision_different_utilities_use_distinct_graphs(self):
+        records = load_records(MULTI_PROGRAM / "records.json")
+        manifest = load_source_manifest(MULTI_PROGRAM / "source_manifest.json")
+        versioned = analyze_versioned_records(
+            records, manifest, force_fallback=True
+        )
+        mappings = {
+            item["utility"]: item
+            for item in versioned["historical_function_mappings"]
+        }
+        self.assertEqual(versioned["call_graphs_constructed"], 2)
+        self.assertEqual(versioned["call_graph_cache_hits"], 0)
+        self.assertNotEqual(
+            mappings["sort"]["source_analysis_id"],
+            mappings["chmod"]["source_analysis_id"],
+        )
+        self.assertEqual(mappings["sort"]["resolved_source_files"], ["sort.c"])
+        self.assertEqual(mappings["chmod"]["resolved_source_files"], ["chmod.c"])
+
+    def test_invalid_empty_and_outside_program_scopes_are_explicit(self):
+        record = load_records(MULTI_PROGRAM / "records.json")[0]
+        base_manifest = load_source_manifest(MULTI_PROGRAM / "source_manifest.json")
+
+        escaping = copy.deepcopy(base_manifest[0])
+        escaping["programs"]["sort"]["source_globs"] = ["../*.c"]
+        self.assertTrue(any(
+            "must not escape" in error for error in validate_manifest_entry(escaping)
+        ))
+        escaping_result = analyze_versioned_records(
+            [record], [escaping], force_fallback=True
+        )["historical_function_mappings"][0]
+        self.assertEqual(escaping_result["mapping_status"], "analysis_scope_invalid")
+
+        empty = copy.deepcopy(base_manifest[0])
+        empty["programs"]["sort"]["source_globs"] = ["missing/*.c"]
+        empty_result = analyze_versioned_records(
+            [record], [empty], force_fallback=True
+        )["historical_function_mappings"][0]
+        self.assertEqual(empty_result["mapping_status"], "analysis_scope_empty")
+
+        outside = copy.deepcopy(base_manifest[0])
+        outside["programs"]["sort"]["entry_point"]["source_file"] = "chmod.c"
+        outside_result = analyze_versioned_records(
+            [record], [outside], force_fallback=True
+        )["historical_function_mappings"][0]
+        self.assertEqual(outside_result["mapping_status"], "entry_point_outside_scope")
+
+        unsupported_record = {**record, "utility": "grep"}
+        unsupported_result = analyze_versioned_records(
+            [unsupported_record], base_manifest, force_fallback=True
+        )["historical_function_mappings"][0]
+        self.assertEqual(unsupported_result["mapping_status"], "program_scope_unavailable")
+
+    def test_missing_and_ambiguous_historical_entry_points_are_unevaluable(self):
+        record = load_records(MULTI_PROGRAM / "records.json")[0]
+        manifest = load_source_manifest(MULTI_PROGRAM / "source_manifest.json")
+        missing = copy.deepcopy(manifest[0])
+        missing["programs"]["sort"]["entry_point"]["function"] = "missing"
+        missing_result = analyze_versioned_records(
+            [record], [missing], force_fallback=True
+        )["historical_function_mappings"][0]
+        self.assertEqual(missing_result["mapping_status"], "entry_point_not_found")
+        self.assertFalse(missing_result["eligible_for_hvc"])
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "program.c").write_text(
+                "int main(void) { return 0; }\nint main(void) { return 1; }\n",
+                encoding="utf-8",
+            )
+            ambiguous_record = {
+                **record,
+                "affected_version": "ambiguous",
+                "source_revision": "ambiguous-revision",
+            }
+            ambiguous_manifest = [{
+                "upstream_project": "gnu-coreutils",
+                "affected_version": "ambiguous",
+                "source_revision": "ambiguous-revision",
+                "source_tree": str(root),
+                "resolved_source_tree": str(root),
+                "source_tree_sha256": source_tree_sha256(root),
+                "programs": {
+                    "sort": {
+                        "entry_point": {"source_file": "program.c", "function": "main"},
+                        "source_globs": ["program.c"],
+                    }
+                },
+            }]
+            ambiguous_result = analyze_versioned_records(
+                [ambiguous_record], ambiguous_manifest, force_fallback=True
+            )["historical_function_mappings"][0]
+        self.assertEqual(ambiguous_result["mapping_status"], "entry_point_ambiguous")
+        self.assertFalse(ambiguous_result["eligible_for_hvc"])
 
 
 if __name__ == "__main__":

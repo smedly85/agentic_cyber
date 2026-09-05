@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Canonical model of the GNU sort flag surface (coreutils 9.4).
+Canonical model of the GNU sort flag surface (coreutils 9.11).
 
 Every flag has a stable ID (its short form where one exists, else the long
 option). Long aliases normalize to that ID. Each flag records:

@@ -11,16 +11,14 @@ A frozen corpus records what a specific utility version did on a specific
 operating system. When the same version behaves differently on another OS, the
 corpus stops describing that host, and running it there produces conclusions
 about the platform rather than about the candidate. Two suites in this
-repository are platform-specific, in opposite directions:
+repository are platform-specific:
 
     mkdir  Darwin  GNU coreutils 9.11 resolves a symbolic mode argument that
                    does not itself set the rwx bits from a 0755 departure on
                    Linux and a 0777 departure on Darwin.
-    sort   Linux   9.11 honours the obsolete `+POS` key syntax on Linux but
-                   reads `+1` as a filename on Darwin (case obs-pos-posixly),
-                   and the fault-devfull case needs /dev/full, a Linux-only
-                   device node, so the corpus cannot even be generated on
-                   Darwin.
+    sort   Darwin  GNU coreutils 9.11 reads `+1` as a filename under
+                   POSIXLY_CORRECT (case obs-pos-posixly). The Darwin corpus
+                   omits fault-devfull because /dev/full is Linux-only.
 
 Both of those are recorded in the suite's own config.json under
 `_platform_contract`; this module prints that text rather than restating it, so
@@ -89,8 +87,8 @@ def check(config_path: Path, suite: str) -> list[str]:
         f"selfcheck.sh: refusing to run on {actual}; the {suite} suite "
         f"requires {required}.",
         "",
-        f"  The frozen goldens under suites/ were produced AND validated on "
-        f"{required}, so on this host:",
+        f"  The formal goldens under suites/ must be produced AND validated "
+        f"on {required}, so on this host:",
         "",
         "    * regeneration would silently redefine the benchmark, and",
         "    * the oracle self-pass would report GNU coreutils as broken for a",

@@ -13,6 +13,7 @@ build_faults(corpus) -> fault-injection cases
 from __future__ import annotations
 
 import os
+import platform
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -176,9 +177,21 @@ def build_adversarial(corpus, seed=1):
 
 # --- fault-injection tier ----------------------------------------------------
 
-def build_faults(corpus):
+DEVFULL_EXCLUSION_REASON = "Linux-only /dev/full ENOSPC device"
+
+
+def platform_exclusions(host_platform=None):
+    """Generated cases intentionally absent from this platform's corpus."""
+    host_platform = host_platform or platform.system()
+    if host_platform == "Darwin":
+        return {"fault-devfull": DEVFULL_EXCLUSION_REASON}
+    return {}
+
+
+def build_faults(corpus, host_platform=None):
     cases = []
     g = corpus["generic"]
+    excluded = platform_exclusions(host_platform)
 
     # -o into an unwritable directory
     cases.append(make_case(
@@ -200,11 +213,15 @@ def build_faults(corpus):
         "fault-missing", ["nope.txt"], [], "generic", b"",
         tags=["fault"], faults={"missing": ["nope.txt"]}, use_stdin=False,
         exact_stderr=True, stdin_modes=["pipe"]))
-    # write to /dev/full (ENOSPC on output)
-    cases.append(make_case(
-        "fault-devfull", [], [], "generic", g,
-        tags=["fault"], faults={"stdout": "/dev/full"},
-        exact_stderr=True, check="none", stdin_modes=["pipe"]))
+    # Linux provides /dev/full as a deterministic ENOSPC output target. macOS
+    # has no equivalent device, so the Darwin freeze deliberately omits this
+    # case instead of inventing an expected result or emulating a Linux device.
+    # The generator records the omission and reason in suites/MANIFEST.json.
+    if "fault-devfull" not in excluded:
+        cases.append(make_case(
+            "fault-devfull", [], [], "generic", g,
+            tags=["fault"], faults={"stdout": "/dev/full"},
+            exact_stderr=True, check="none", stdin_modes=["pipe"]))
     # EPIPE: downstream reader closed
     cases.append(make_case(
         "fault-epipe", [], [], "manylines",

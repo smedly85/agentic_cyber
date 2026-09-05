@@ -25,9 +25,8 @@ data the candidate actually sorts. Expected values are then re-derived by
 `gen/freeze.py:freeze_case`, the same function and the same pinned oracle the
 visible corpus uses.
 
-Requires the pinned GNU coreutils 9.11 sort, on Linux (see the suite's platform
-contract: obsolete +POS handling differs on Darwin, and fault-devfull needs
-/dev/full).
+Requires the pinned GNU coreutils 9.11 sort on Darwin, the suite's frozen
+platform. The visible Darwin corpus omits the Linux-only fault-devfull case.
 
 Usage:
   SORT_ORACLE_BIN=~/opt/cu-9.11/bin/sort python3 gen/heldout.py
@@ -52,9 +51,11 @@ sys.path.insert(0, str(SUITE_ROOT))
 sys.path.insert(0, str(SUITE_ROOT.parent))
 sys.path.insert(0, str(SUITE_ROOT / "gen"))
 
-from reference_generators import heldout_contract, oracle_contract  # noqa: E402
-from gen import freeze  # noqa: E402
-
+from reference_generators import (  # noqa: E402
+    heldout_contract,
+    oracle_contract,
+    platform_contract,
+)
 # The bounded new_sort ladder. Held-out cases never leave it.
 LADDER_FLAGS = {"-r", "-f", "-u", "-c"}
 
@@ -172,6 +173,8 @@ def dual_of(case: dict, sort_bin: str) -> dict:
 
 
 def build_corpus(sort_bin: str) -> dict:
+    from gen import freeze
+
     held_cases = []
     for case in select(visible_cases()):
         held = dual_of(case, sort_bin)
@@ -215,6 +218,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     config = SUITE_ROOT / "config.json"
+    platform_problems = platform_contract.check(config, "sort")
+    if platform_problems:
+        for problem in platform_problems:
+            print(problem, file=sys.stderr)
+        return 2
     sort_bin = oracle_contract.resolve("sort", config, args.sort_bin)
     # Verified for --check too, unlike chmod's and grep's generators. Those can
     # re-derive expectations from a model offline; every sort expectation comes

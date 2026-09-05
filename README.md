@@ -96,12 +96,14 @@ python3 security/analyze_reachability.py \
 The separate `security/historical/` area contains empty validated record and
 source-manifest schemas for manual mappings from authoritative GNU
 Coreutils/GNU grep sources. Each record is checked against its exact project,
-affected version, source revision, local tree, and C/C-header fingerprint. HVC is
-computed from per-version selections before aggregation; a single graph is
-never applied across versions. Missing, mismatched, ambiguous, and unreachable
-states remain explicit. Historical metadata never enters lineage results, and
-the metric describes coverage of known historical locations—not future
-prevention.
+affected version, source revision, local tree, and C/C-header fingerprint. The
+source manifest also supplies the exact source-qualified entry point and C-file
+scope for each utility at that revision. HVC is computed from per-utility,
+per-version selections before aggregation; a graph is never shared across
+different versions or utilities. Missing, mismatched, ambiguous, and
+unreachable states remain explicit. Historical metadata never enters lineage
+results, and the metric describes coverage of known historical locations—not
+future prevention.
 
 ## The experimental unit is a lineage
 
@@ -185,8 +187,8 @@ make the agent create `src/new_grep/new_grep.c` and `src/new_chmod/new_chmod.c`
 from scratch.
 
 Two suites carry a platform contract, because their expected results were frozen
-by running a real system binary: `sort` requires Linux and `mkdir` requires
-Darwin (`tests/<utility>-test-suite/config.json`, `required_platform`). `grep`
+by running a real system binary: `sort` and `mkdir` require Darwin
+(`tests/<utility>-test-suite/config.json`, `required_platform`). `grep`
 and `chmod` declare none — their goldens come from specification models written
 for this project.
 
@@ -1003,7 +1005,7 @@ agentic_cyber/
     ├── chmod-test-suite/                   # Model-derived goldens, isolated fixtures
     ├── grep-test-suite/                    # Model-derived goldens
     ├── mkdir-test-suite/                   # System-oracle goldens (requires Darwin)
-    ├── sort-test-suite/                    # System-oracle goldens (requires Linux)
+    ├── sort-test-suite/                    # System-oracle goldens (requires Darwin)
     ├── reference_generators/               # Specification models, outside every suite
     ├── test_execution_consistency.py       # Behavioral fingerprinting and agreement
     ├── test_lineage_tools.py               # Manifests, stage plan, lineage aggregation

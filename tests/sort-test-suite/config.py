@@ -12,7 +12,7 @@ sort-like binary is a one-file edit.
 Usage as a library (from any .py file in this suite):
     from config import load, get
     cfg = load("config.json")
-    oracle = get(cfg, "paths.oracle_bin", "/usr/bin/sort")
+    candidate = get(cfg, "paths.candidate_bin")
 
 Usage from shell (so run_all.sh / build_asan.sh / selfcheck.sh never have
 to hand-parse JSON):
