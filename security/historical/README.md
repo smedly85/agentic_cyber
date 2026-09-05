@@ -1,18 +1,22 @@
 # Historical vulnerability dataset
 
-`records.json` is intentionally empty. Historical mappings must be curated
-from authoritative upstream advisories and patches; this repository does not
-ship fabricated CVEs or guessed function mappings. Each record must satisfy
-`schema.json`, and `verified=true` should be set only after both the source and
-patch references have been checked.
+`records.json` is an array and is intentionally empty. Historical mappings
+must be curated from authoritative upstream advisories and patches; this
+repository does not ship fabricated CVEs or guessed function mappings. `schema.json` validates the
+complete array in `records.json`, matching the array root required by the Python
+loader. `verified=true` should be set only after both the source and patch
+references have been checked.
 
 This dataset is research input for the retrospective structural study. It is
 never copied into lineage results and never affects generation, functional
 validation, dynamic security findings, repair, or promotion.
 
-Each record supplies an exact `source_revision`. `source_manifest.json`
-associates that identity with a local checked-out tree and a fingerprint of the
-C inputs. The analyzer does not download sources. Compute the fingerprint with
+Each record is tied to the exact vulnerable source identity
+`(upstream_project, affected_version, source_revision)`. `source_manifest.json`
+is an array that associates each identity with a local checked-out tree and a
+fingerprint of the C inputs. `source_manifest.schema.json` validates that
+complete array, matching the array root required by the Python loader. The
+analyzer does not download sources. Compute the fingerprint with
 `source_tree_sha256()` from `security.historical.analysis`, then run:
 
 ```bash
