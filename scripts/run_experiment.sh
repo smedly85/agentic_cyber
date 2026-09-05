@@ -356,7 +356,10 @@ run_aider() {
     local invocation="$4"
     local kind="$5"
     local current_log start_ns end_ns status runtime_ms isolation_rejected
-    local token_limit invalid_editor_output
+    local token_limit invalid_editor_output current_log_available
+    local durable_log_available current_log_parent_available
+    local current_log_parent_writable tee_status log_capture_condition
+    local -a pipeline_status
     local env_args
 
     current_log="$attempt_dir/.aider-current.log"
@@ -451,8 +454,12 @@ run_aider() {
             env -i "${env_args[@]}" "${aider_command[@]}" </dev/null
         )
     fi 2>&1 | tee "$current_log" >>"$logfile"
-    # The exit status of Aider itself, not of tee.
-    status="${PIPESTATUS[0]}"
+    # Snapshot the whole pipeline immediately: even a shell assignment resets
+    # PIPESTATUS. The Aider status remains the invocation status; tee's status
+    # is separate observable log-capture evidence and never replaces it.
+    pipeline_status=("${PIPESTATUS[@]}")
+    status="${pipeline_status[0]}"
+    tee_status="${pipeline_status[1]}"
     end_ns="$(date +%s%N)"
     runtime_ms=$(( (end_ns - start_ns) / 1000000 ))
 
@@ -461,20 +468,43 @@ run_aider() {
     # source and explicit read-only context. Test tampering remains independently
     # detected by capture_candidate.py.
     isolation_rejected=false
-    token_limit=false
-    if grep -Fq 'has hit a token limit!' "$current_log"; then
-        token_limit=true
+    current_log_parent_available=false
+    [[ -d "$(dirname "$current_log")" ]] && current_log_parent_available=true
+    current_log_parent_writable=false
+    [[ -w "$(dirname "$current_log")" ]] && current_log_parent_writable=true
+    durable_log_available=false
+    [[ -f "$logfile" ]] && durable_log_available=true
+
+    # These are observations derived from the per-invocation parser log. They
+    # are tri-state: absence of the log means unknown, never false. In
+    # particular, do not let grep or aider_output.py touch a missing path: both
+    # produce misleading diagnostics, and pathlib emits a traceback.
+    current_log_available=false
+    token_limit=unknown
+    invalid_editor_output=unknown
+    log_capture_condition=current_log_missing_after_pipeline
+    if [[ -f "$current_log" ]]; then
+        current_log_available=true
+        log_capture_condition=none
+        token_limit=false
+        if grep -Fq 'has hit a token limit!' "$current_log"; then
+            token_limit=true
+        fi
+        invalid_editor_output=false
+        if "$PYTHON_BIN" "$AIDER_OUTPUT_TOOL" \
+                --log "$current_log" \
+                --editor-edit-format "$EDITOR_EDIT_FORMAT"; then
+            invalid_editor_output=true
+        fi
+        rm -f "$current_log"
+    else
+        warn "Aider invocation $invocation current log unavailable after pipeline (tee_exit=$tee_status parent_directory_available=$current_log_parent_available parent_directory_writable=$current_log_parent_writable durable_log_available=$durable_log_available); token-limit and editor-output observations are unknown"
     fi
-    invalid_editor_output=false
-    if "$PYTHON_BIN" "$AIDER_OUTPUT_TOOL" \
-            --log "$current_log" \
-            --editor-edit-format "$EDITOR_EDIT_FORMAT"; then
-        invalid_editor_output=true
-    fi
-    rm -f "$current_log"
-    printf '%s %s %s %s %s\n' \
+    printf '%s %s %s %s %s %s %s %s %s %s %s\n' \
         "$status" "$runtime_ms" "$isolation_rejected" "$token_limit" \
-        "$invalid_editor_output"
+        "$invalid_editor_output" "$current_log_available" "$tee_status" \
+        "$current_log_parent_available" "$current_log_parent_writable" \
+        "$durable_log_available" "$log_capture_condition"
 }
 
 make_loop_record() {
@@ -498,8 +528,22 @@ import sys
     source_sha256,
     token_limit,
     invalid_editor_output,
+    current_log_available,
+    tee_exit,
+    log_parent_available,
+    log_parent_writable,
+    durable_log_available,
+    log_capture_condition,
     agent_failure_reason,
 ) = sys.argv[1:]
+
+
+def observed_boolean(value):
+    if value == "unknown":
+        return None
+    return value == "true"
+
+
 print(json.dumps({
     "loop": int(loop),
     "kind": kind,
@@ -514,8 +558,16 @@ print(json.dumps({
     "feature_test_runtime_ms": int(feature_test_ms),
     "validation_success": validation_success == "true",
     "source_sha256": source_sha256,
-    "agent_token_limit": token_limit == "true",
-    "agent_invalid_editor_output": invalid_editor_output == "true",
+    "agent_token_limit": observed_boolean(token_limit),
+    "agent_invalid_editor_output": observed_boolean(invalid_editor_output),
+    "agent_current_log_available": current_log_available == "true",
+    "agent_log_capture_tee_exit_code": int(tee_exit),
+    "agent_log_parent_directory_available": log_parent_available == "true",
+    "agent_log_parent_directory_writable": log_parent_writable == "true",
+    "agent_durable_log_available": durable_log_available == "true",
+    "agent_log_capture_condition": (
+        None if log_capture_condition == "none" else log_capture_condition
+    ),
     "agent_failure_reason": agent_failure_reason or None,
 }, separators=(",", ":")))
 PY
@@ -1554,6 +1606,11 @@ PY
         validation_completed_after_timeout=false
         repair_eligible=false
         repair_eligibility_reason="not_evaluated"
+        # Post-invocation log-capture evidence is recorded separately from the
+        # setup-only infrastructure_failure classification. It must not erase
+        # an independently validated candidate outcome.
+        agent_log_capture_complete=true
+        agent_log_capture_issue_observed=false
 
         # ---- generate / validate / continue -------------------------------
         # Loop 0 is the initial generation; loops 1..MAX_LOOPS are repairs, so
@@ -1569,7 +1626,12 @@ PY
             fi
 
             read -r agent_exit agent_ms invocation_isolation_rejected \
-                invocation_token_limit invocation_invalid_editor_output < <(
+                invocation_token_limit invocation_invalid_editor_output \
+                invocation_current_log_available invocation_tee_exit \
+                invocation_log_parent_available \
+                invocation_log_parent_writable \
+                invocation_durable_log_available \
+                invocation_log_capture_condition < <(
                 run_aider \
                     "$attempt_dir/aider.log" \
                     "$workdir" \
@@ -1585,6 +1647,10 @@ PY
             fi
             if [[ "$invocation_isolation_rejected" == true ]]; then
                 agent_isolation_rejected=true
+            fi
+            if [[ "$invocation_current_log_available" != true ]]; then
+                agent_log_capture_complete=false
+                agent_log_capture_issue_observed=true
             fi
 
             # Did this session leave a source behind? A timeout is only fatal
@@ -1718,6 +1784,12 @@ PY
                 "$feature_test_ms" "$validation_success" "$source_sha" \
                 "$invocation_token_limit" \
                 "$invocation_invalid_editor_output" \
+                "$invocation_current_log_available" \
+                "$invocation_tee_exit" \
+                "$invocation_log_parent_available" \
+                "$invocation_log_parent_writable" \
+                "$invocation_durable_log_available" \
+                "$invocation_log_capture_condition" \
                 "$invocation_agent_failure_reason")")
 
             printf '    loop %s: build=%s base=%s checkpoint=%s\n' \
@@ -2011,6 +2083,8 @@ PY
             infrastructure_failure false \
             infrastructure_failure_stage "__JSON__:null" \
             infrastructure_failure_classification_inferred false \
+            agent_log_capture_complete "$agent_log_capture_complete" \
+            agent_log_capture_issue_observed "$agent_log_capture_issue_observed" \
             agent_execution_failure "$agent_execution_failed" \
             agent_execution_failure_stage "__JSON__:$agent_execution_failure_stage_json" \
             agent_failure_reason "__JSON__:$agent_failure_reason_json" \
