@@ -17,7 +17,8 @@ checkpoint, and only marked `completed` once the final checkpoint has passed:
                record still in this state at analysis time means the controller
                died; the analyzer reports it as controller_interrupted.
     stopped    a checkpoint failed. The lineage ended normally, unsuccessfully.
-    completed  every checkpoint passed and final/ was written.
+    completed  every public checkpoint passed and final/ was written. Held-out
+               evaluation does not control this state or promotion.
 
 Every write goes through `write_atomic`, which writes a sibling temporary file
 and `os.replace`s it into place. `os.replace` is atomic on POSIX and on Windows,
@@ -28,7 +29,8 @@ Used from scripts/run_lineage_experiment.sh, one subprocess per transition:
 
     lineage_state.py --path L/lineage.json init  --lineage-id lineage-001 ...
     lineage_state.py --path L/lineage.json stage --stage-json '{...}'
-    lineage_state.py --path L/lineage.json finish --success true
+    lineage_state.py --path L/lineage.json finish \
+        --public-checkpoint-completion true
 """
 
 from __future__ import annotations
@@ -41,7 +43,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 STATE_RUNNING = "running"
 STATE_STOPPED = "stopped"
@@ -154,7 +156,11 @@ def init_record(args: argparse.Namespace) -> dict[str, Any]:
         "current_checkpoint": None,
         "checkpoints_completed": 0,
         "completed_checkpoint_ids": [],
+        "public_checkpoint_completion": False,
+        # Compatibility for schema <=2 readers. Despite its old name, this
+        # field has always represented public trajectory completion.
         "end_to_end_success": False,
+        "end_to_end_success_semantics": "legacy_public_checkpoint_completion",
         "failure_stage": None,
         "failure_reason": None,
         "final_source": None,
@@ -198,10 +204,15 @@ def apply_stage(record: dict[str, Any], stage: dict[str, Any],
 
 
 def finish_record(record: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
-    success = args.success == "true"
-    record["end_to_end_success"] = success
-    record["state"] = STATE_COMPLETED if success else STATE_STOPPED
-    if success:
+    completed = args.public_checkpoint_completion == "true"
+    record["schema_version"] = SCHEMA_VERSION
+    record["public_checkpoint_completion"] = completed
+    record["end_to_end_success"] = completed
+    record["end_to_end_success_semantics"] = (
+        "legacy_public_checkpoint_completion"
+    )
+    record["state"] = STATE_COMPLETED if completed else STATE_STOPPED
+    if completed:
         record["failure_stage"] = None
         record["failure_reason"] = None
         record["final_source"] = f"final/{args.source_basename}"
@@ -245,7 +256,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     stage.add_argument("--stage-json", required=True)
 
     done = sub.add_parser("finish")
-    done.add_argument("--success", choices=("true", "false"), required=True)
+    done.add_argument(
+        "--public-checkpoint-completion",
+        choices=("true", "false"),
+        required=True,
+    )
     done.add_argument("--failure-stage", default="")
     done.add_argument("--failure-reason", default="")
     done.add_argument("--source-basename", default="")

@@ -27,8 +27,10 @@ Three things it deliberately does not do:
     once, after the last repair loop, and never renders its output into a
     continuation prompt.
 
-Exit status is the runner's own, so a held-out failure surfaces as a nonzero
-`extra_test_exit_code` in the attempt metadata.
+Exit 0/1 is the runner's pass/candidate-failure verdict. Exit 2 means this
+wrapper could not produce a verdict, and exit 3 preserves the runner's platform
+incompatibility result. The status is recorded as `extra_test_exit_code` in the
+attempt metadata.
 """
 
 from __future__ import annotations
@@ -46,6 +48,13 @@ sys.path.insert(0, str(REPO / "tests"))
 from reference_generators import heldout_contract  # noqa: E402
 
 
+# Keep candidate verdicts distinct from controller/configuration failures. The
+# suite runner returns 0 for pass, 1 for case failures, and 3 when its frozen
+# platform contract is unavailable. This wrapper reserves 2 for failures that
+# prevented a held-out verdict from being produced at all.
+HELDOUT_INFRASTRUCTURE_EXIT = 2
+
+
 def bundled_config(workdir: Path, test_dir: str) -> Path:
     """The per-checkpoint config the stage bundle placed in the sandbox."""
     return workdir / test_dir / "config.json"
@@ -59,19 +68,24 @@ def implemented_flags(config_path: Path) -> list[str]:
     manifest -- there is nowhere in it to vary the flags per stage.
     """
     if not config_path.is_file():
-        raise SystemExit(
+        print(
             f"heldout_judge: no bundled config at {config_path}; cannot tell "
-            "which checkpoint this is"
+            "which checkpoint this is",
+            file=sys.stderr,
         )
+        raise SystemExit(HELDOUT_INFRASTRUCTURE_EXIT)
     try:
         data = json.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise SystemExit(f"heldout_judge: cannot read {config_path}: {error}")
+        print(f"heldout_judge: cannot read {config_path}: {error}", file=sys.stderr)
+        raise SystemExit(HELDOUT_INFRASTRUCTURE_EXIT)
     flags = data.get("implemented")
     if not isinstance(flags, list):
-        raise SystemExit(
-            f"heldout_judge: {config_path} has no 'implemented' list"
+        print(
+            f"heldout_judge: {config_path} has no 'implemented' list",
+            file=sys.stderr,
         )
+        raise SystemExit(HELDOUT_INFRASTRUCTURE_EXIT)
     return [str(flag) for flag in flags]
 
 
@@ -93,8 +107,8 @@ def main(argv: list[str] | None = None) -> int:
     corpus = heldout_contract.corpus_path(suite_root)
     if not corpus.is_file():
         print(f"heldout_judge: no held-out corpus for {args.utility} "
-              f"({corpus}); nothing to run", file=sys.stderr)
-        return 0
+              f"({corpus}); no verdict produced", file=sys.stderr)
+        return HELDOUT_INFRASTRUCTURE_EXIT
 
     flags = implemented_flags(bundled_config(args.workdir, args.test_dir))
 

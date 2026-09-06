@@ -128,11 +128,17 @@ single utility:
 The experiment then repeats that whole lineage `N` times independently. `N` is a
 command-line value (`--lineages`), not a constant in the code.
 
-Two denominators are reported and never conflated:
+The analyzer reports two reliability concepts and never conflates them:
 
-* **reliability** is measured over every lineage **started**
-* **final diversity** compares only the lineages that **completed every
-  checkpoint**, and its report states both numbers
+* **public checkpoint completion** means every public checkpoint passed and the
+  candidate was available for promotion; it alone controls lineage progression
+* **end-to-end functional success** additionally requires the final
+  checkpoint's held-out evaluation to have completed and passed
+* **final diversity** compares only end-to-end functionally successful finals
+
+Held-out failure at an intermediate checkpoint never blocks the next public
+checkpoint and is never included in repair feedback. A missing or unavailable
+final held-out verdict is reported as unknown, not as a pass or model failure.
 
 A stopped lineage is never replaced with another attempt to round out the number
 of finished implementations.
@@ -400,9 +406,10 @@ bash scripts/run_lineage_experiment.sh \
     --output-dir runs/formal/grep-qwen3-topk40-t0-p05-seed42-maxtok32768-loops1-n10
 ```
 
-Its `analysis/summary.md` reports 10 lineages started, 7 successful final
-implementations, and an end-to-end completion rate of 0.700 (95% Wilson
-0.397–0.892), with all three stops at checkpoint 000.
+Its historical analysis predates the explicit functional-success fields. New
+analysis reports public checkpoint completion separately from final held-out
+functional success and does not infer a hidden pass from the legacy completion
+field.
 
 ### Output layout
 
@@ -440,13 +447,13 @@ the end:
 |---|---|
 | `running` | created by the controller; the walk has not finished |
 | `stopped` | a checkpoint failed — the lineage ended normally, unsuccessfully |
-| `completed` | every checkpoint passed and `final/` was written |
+| `completed` | every public checkpoint passed and `final/` was written; held-out status does not control this state |
 
 A record still in `running` at analysis time means the controller itself died,
 and the analyzer classifies it as `controller_interrupted`: counted in the
-denominator, never counted as a successful final, and reported under its own
-reason rather than as an implementation failure. A lineage directory with no
-record or with an unparseable one is likewise counted and reported
+denominator, never counted as publicly complete or functionally successful,
+and reported under its own reason rather than as an implementation failure. A
+lineage directory with no record or with an unparseable one is likewise counted and reported
 (`missing_record`, `malformed_record`) instead of being silently skipped —
 skipping shrinks the denominator in exactly the direction that flatters the
 result, because interruptions are likeliest in the long, repair-heavy lineages.
@@ -497,14 +504,16 @@ python3 scripts/analyze_lineages.py \
     --checkpoint-diversity
 ```
 
-This writes `analysis/lineage_report.json`, `analysis/lineage_stages.csv` and
-`analysis/summary.md`, covering the end-to-end completion rate over all lineages
-started, the count of lineages stopped at each checkpoint and why, and repair
-behavior per checkpoint. Infrastructure failures and agent-execution failures
-stay distinguishable from implementation and test failures, using the
+This writes `analysis/lineage_report.json`, `analysis/lineage_outcomes.csv`,
+`analysis/lineage_stages.csv` and `analysis/summary.md`. Public checkpoint
+completion is reported separately from end-to-end functional success. The
+latter is true only for a publicly completed lineage whose final stage has
+`extra_test_exit_code == 0`; exit 1 is a functional failure, while a missing or
+non-verdict result is null/unknown. Infrastructure failures and agent-execution
+failures stay distinguishable from implementation and test failures, using the
 single-stage runner's own metadata vocabulary rather than a second
-classification. It also re-checks seed provenance from the recorded hashes, so a
-pooled or hand-edited result set cannot pass silently.
+classification. It also re-checks seed provenance from the recorded hashes, so
+a pooled or hand-edited result set cannot pass silently.
 
 Two change tables are written against the baseline each measurement actually
 has, never against the population view's placeholder baseline:
@@ -518,27 +527,32 @@ row. `--skip-change` omits these change outputs.
 
 For diversity it materializes each population under
 `analysis/populations/<label>/` and runs `scripts/analyze_experiment.py` on it.
-The **final** population is the last stage of every lineage that completed every
-checkpoint; `--checkpoint-diversity` additionally analyzes the successful
+The **final** population is the last stage of every end-to-end functionally
+successful lineage. Publicly completed artifacts remain retained when hidden
+evaluation fails or is unavailable, but they do not enter final diversity.
+`--checkpoint-diversity` additionally analyzes public-checkpoint-successful
 implementations at each intermediate checkpoint, including those from lineages
 that stopped later. `--skip-diversity` aggregates outcomes only. A population
 with fewer than two members is skipped with its reason rather than reported as a
 failure — diversity over one implementation is undefined, not failed.
 
-`summary.md` always states both `lineages started = N` and
-`successful final implementations = n`; the completion rate is never computed
-over the survivors.
+`summary.md` always states the started count, public checkpoint completion, and
+final held-out passed/failed/unknown counts. The functional success rate uses
+all started lineages when every outcome is known; otherwise it is reported as
+unknown rather than silently treating unevaluated outcomes as failures.
 
-Each population view records `analysis_population_member: true` and
-`population_selection_basis: lineage_stage_success`. Its paper row retains
+Each population view records `analysis_population_member: true`. Final views
+record `population_selection_basis: end_to_end_functional_success`; checkpoint
+views record `population_selection_basis: public_checkpoint_stage_success`.
+Its paper row retains
 population size and structural coverage but sets reliability and Pass@k to NA
 with `reliability_scope: parent_lineage_experiment`; it also sets empty-baseline
 maintenance-change fields to NA. Baseline-independent physical source LOC and
 source-byte descriptors remain supported in final and checkpoint population
 views. The parent
-`analysis/lineage_paper_metrics.csv` combines all-started lineage completion
-with the final population's structural metrics. Thus 7 finals from 10 started
-lineages report completion 0.70, never 7/7.
+`analysis/lineage_paper_metrics.csv` combines all-started public and functional
+reliability with the functionally successful final population's structural
+metrics.
 
 Note that stages themselves are not analyzed individually: the controller passes
 `--no-analysis` to the stage runner, so `analyze_experiment.py` runs only on the
@@ -917,11 +931,13 @@ candidate availability, artifact validation, and workflow success. A
 non-salvageable Aider error is an agent-execution failure. A
 timeout that leaves a candidate remains an incomplete invocation, but the
 controller may validate and repair that artifact and the workflow may succeed.
-Build, public-test, and
-hidden/extra-evaluator failures are candidate/workflow failures after
-generation. A `feature_test_exit_code` of 3 is the suite's platform gate
-refusing to judge on this host, and is classified with the infrastructure
-failures rather than counted against the candidate.
+Build and public-test failures control checkpoint promotion. Hidden evaluation
+runs afterward and never controls promotion or repair; its final-checkpoint
+verdict controls only end-to-end functional classification. A held-out wrapper,
+configuration, platform, or missing-result condition is reported as unknown
+rather than as a candidate failure. A `feature_test_exit_code` of 3 is the
+suite's platform gate refusing to judge on this host, and is classified with
+the infrastructure failures rather than counted against the candidate.
 
 A per-session timeout needs `timeout` or `gtimeout` on `PATH`. When neither is
 available the runner warns, runs sessions unwrapped, and records

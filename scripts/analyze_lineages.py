@@ -8,10 +8,12 @@ stage of that same lineage produced.
 Four questions are reported separately, because they need different populations
 and different baselines and must not be blended:
 
-  A. END-TO-END RELIABILITY, over every lineage STARTED. Completion rate,
-     stopping checkpoint, infrastructure attrition, repair usage per checkpoint.
+  A. RELIABILITY, over every lineage STARTED. Public checkpoint completion and
+     end-to-end functional success are reported separately, along with stopping
+     checkpoint, infrastructure attrition, and repair usage per checkpoint.
 
-  B. FINAL-POPULATION DIVERSITY, over the successful completed finals only.
+  B. FINAL-POPULATION DIVERSITY, over end-to-end functionally successful finals
+     only.
      Delegated wholesale to `scripts/analyze_experiment.py` by materializing the
      population as a view it already knows how to read.
 
@@ -38,12 +40,15 @@ in the final view, by name, and are answered properly by C and D instead. See
 Reliability and diversity deliberately use different denominators, and both are
 always reported:
 
-    lineages started                 = every lineage the run attempted
-    successful final implementations = those that passed every checkpoint
+    lineages started                    = every lineage the run attempted
+    publicly completed lineages         = those that passed every checkpoint
+    functionally successful finals      = public completers whose final held-out
+                                          evaluation explicitly passed
 
 A lineage that stopped is retained and counted. It is never replaced with
-another attempt to keep the number of finals round, and the completion rate is
-never computed over the survivors.
+another attempt to keep the number of finals round. Public completion and
+functional success rates use the all-started denominator; a functional rate is
+left unknown when any required outcome is unknown.
 
 Usage:
   python3 scripts/analyze_lineages.py --lineage-root runs/lineages/sort/MODEL/temp-0
@@ -63,7 +68,7 @@ import sys
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
@@ -352,6 +357,7 @@ def incomplete_record(directory: Path, reason: str) -> dict[str, Any]:
         "lineage_id": directory.name,
         "state": INTERRUPTED_STATE,
         "incomplete_reason": reason,
+        "public_checkpoint_completion": False,
         "end_to_end_success": False,
         "failure_stage": None,
         "failure_reason": reason,
@@ -371,20 +377,87 @@ def classify(record: Mapping[str, Any]) -> str:
         return INTERRUPTED_STATE if state == INTERRUPTED_STATE else state
     if state == "running":
         return INTERRUPTED_STATE
-    if record.get("end_to_end_success"):
+    if (record.get("public_checkpoint_completion") is True
+            or record.get("end_to_end_success") is True):
         return "completed"
     if record.get("finished_at") or record.get("failure_stage"):
         return "stopped"
     return INTERRUPTED_STATE
 
 
-def is_successful(record: Mapping[str, Any]) -> bool:
-    """A final implementation must come from a lineage that actually completed.
+def public_checkpoint_completed(record: Mapping[str, Any]) -> bool:
+    """Whether every public checkpoint passed and produced a promotable source.
 
-    Both conditions are required: an interrupted record must never contribute a
-    final, even if a stale `end_to_end_success` said otherwise.
+    Schema <=2 called this `end_to_end_success`. That legacy field is read only
+    as public-completion evidence; it never fabricates a hidden outcome.
     """
-    return bool(record.get("end_to_end_success")) and classify(record) == "completed"
+    if "public_checkpoint_completion" in record:
+        completed = record.get("public_checkpoint_completion") is True
+    else:
+        completed = record.get("end_to_end_success") is True
+    return completed and classify(record) == "completed"
+
+
+def lineage_functional_outcome(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Derive explicit public and final-held-out outcomes for one lineage.
+
+    The suite runner's held-out verdict codes are 0 (pass) and 1 (candidate
+    failure). Missing codes and non-verdict codes such as wrapper/configuration
+    failure (2) or platform incompatibility (3) are unevaluated, not model
+    failures. A public validation stop is a known end-to-end failure; a
+    controller interruption remains unknown.
+    """
+    public_completed = public_checkpoint_completed(record)
+    legacy_public = record.get("end_to_end_success") is True
+    base = {
+        "lineage_id": record.get("lineage_id"),
+        "lineage_state": classify(record),
+        "public_checkpoint_completion": public_completed,
+        "final_hidden_evaluated": False,
+        "final_hidden_pass": None,
+        "final_hidden_status": "not_reached",
+        "final_extra_test_exit_code": None,
+        "end_to_end_functional_success": False,
+        "legacy_end_to_end_success_public_completion": legacy_public,
+    }
+    if not public_completed:
+        if classify(record) == INTERRUPTED_STATE:
+            base["end_to_end_functional_success"] = None
+            base["final_hidden_status"] = "unknown_controller_interrupted"
+        return base
+
+    stages = record.get("stages")
+    final_stage = stages[-1] if isinstance(stages, list) and stages else None
+    if not isinstance(final_stage, Mapping):
+        base["final_hidden_status"] = "unknown_missing_final_stage"
+        base["end_to_end_functional_success"] = None
+        return base
+
+    exit_code = final_stage.get("extra_test_exit_code")
+    base["final_extra_test_exit_code"] = exit_code
+    if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+        if exit_code == 0:
+            base["final_hidden_evaluated"] = True
+            base["final_hidden_pass"] = True
+            base["final_hidden_status"] = "passed"
+            base["end_to_end_functional_success"] = True
+            return base
+        if exit_code == 1:
+            base["final_hidden_evaluated"] = True
+            base["final_hidden_pass"] = False
+            base["final_hidden_status"] = "failed"
+            base["end_to_end_functional_success"] = False
+            return base
+
+    base["final_hidden_status"] = "unknown_missing_or_unavailable"
+    base["end_to_end_functional_success"] = None
+    return base
+
+
+def end_to_end_functionally_successful(record: Mapping[str, Any]) -> bool:
+    return lineage_functional_outcome(record)[
+        "end_to_end_functional_success"
+    ] is True
 
 
 def normalize_stage_backend_fields(stage: Mapping[str, Any]) -> dict[str, Any]:
@@ -538,14 +611,40 @@ def build_reliability(
     never_started: list[str] | None = None,
 ) -> dict[str, Any]:
     started = len(lineages)
-    completed = [record for record in lineages if is_successful(record)]
+    public_completed = [
+        record for record in lineages if public_checkpoint_completed(record)
+    ]
+    outcomes = [lineage_functional_outcome(record) for record in lineages]
+    functional_passed = [
+        outcome for outcome in outcomes
+        if outcome["end_to_end_functional_success"] is True
+    ]
+    functional_failed = [
+        outcome for outcome in outcomes
+        if outcome["end_to_end_functional_success"] is False
+    ]
+    functional_unknown = [
+        outcome for outcome in outcomes
+        if outcome["end_to_end_functional_success"] is None
+    ]
+    final_hidden_passed = [
+        outcome for outcome in outcomes if outcome["final_hidden_pass"] is True
+    ]
+    final_hidden_failed = [
+        outcome for outcome in outcomes if outcome["final_hidden_pass"] is False
+    ]
+    final_hidden_unknown = [
+        outcome for outcome in outcomes
+        if outcome["public_checkpoint_completion"]
+        and outcome["final_hidden_pass"] is None
+    ]
     interrupted = [record for record in lineages
                    if classify(record) == INTERRUPTED_STATE]
 
     failure_stages: dict[str, int] = {}
     failure_reasons: dict[str, int] = {}
     for record in lineages:
-        if is_successful(record):
+        if public_checkpoint_completed(record):
             continue
         stage = str(record.get("failure_stage")
                     or record.get("current_checkpoint") or "unknown")
@@ -553,19 +652,63 @@ def build_reliability(
         failure_stages[stage] = failure_stages.get(stage, 0) + 1
         failure_reasons[reason] = failure_reasons.get(reason, 0) + 1
 
+    public_rate = len(public_completed) / started if started else None
+    functional_rate = (
+        len(functional_passed) / started
+        if started and not functional_unknown else None
+    )
+
     return {
         # Only lineages the controller actually began. Planned ids with no
         # directory are reported below and deliberately excluded.
         "lineages_started": started,
         "lineages_planned_not_started": len(never_started or []),
         "planned_not_started_lineage_ids": list(never_started or []),
-        "lineages_completed": len(completed),
-        "successful_final_implementations": len(completed),
-        # Denominator is every lineage started, interruptions included. A
-        # lineage is never dropped or replaced to keep the population round.
-        "end_to_end_completion_rate": len(completed) / started if started else None,
-        "end_to_end_completion_interval": wilson(len(completed), started),
-        "completed_lineage_ids": [record["lineage_id"] for record in completed],
+        "publicly_completed_lineages": len(public_completed),
+        "public_checkpoint_completion_rate": public_rate,
+        "public_checkpoint_completion_interval": wilson(
+            len(public_completed), started
+        ),
+        "publicly_completed_lineage_ids": [
+            record["lineage_id"] for record in public_completed
+        ],
+        "final_heldout_evaluations": {
+            "passed": len(final_hidden_passed),
+            "failed": len(final_hidden_failed),
+            "unknown": len(final_hidden_unknown),
+        },
+        "end_to_end_functionally_successful_implementations": len(
+            functional_passed
+        ),
+        "end_to_end_functional_failures": len(functional_failed),
+        "end_to_end_functional_unknown": len(functional_unknown),
+        "end_to_end_functional_success_rate": functional_rate,
+        "end_to_end_functional_success_interval": (
+            wilson(len(functional_passed), started)
+            if functional_rate is not None else None
+        ),
+        "end_to_end_functional_rate_unavailable_reason": (
+            None if functional_rate is not None or not started else
+            f"{len(functional_unknown)} started lineage(s) have an unknown "
+            "functional outcome"
+        ),
+        "end_to_end_functionally_successful_lineage_ids": [
+            str(outcome["lineage_id"]) for outcome in functional_passed
+        ],
+        "end_to_end_functional_unknown_lineage_ids": [
+            str(outcome["lineage_id"]) for outcome in functional_unknown
+        ],
+        # Backward-compatible analyzer keys. Their explicit companion records
+        # that these are public checkpoint completion, not functional success.
+        "lineages_completed": len(public_completed),
+        "end_to_end_completion_rate": public_rate,
+        "end_to_end_completion_interval": wilson(len(public_completed), started),
+        "legacy_end_to_end_completion_semantics": (
+            "public_checkpoint_completion"
+        ),
+        "completed_lineage_ids": [
+            record["lineage_id"] for record in public_completed
+        ],
         "stopped_lineage_ids": [
             record["lineage_id"] for record in lineages
             if classify(record) == "stopped"
@@ -667,11 +810,22 @@ def build_checkpoint_rows(
 def build_stage_rows(lineages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows = []
     for record in lineages:
+        outcome = lineage_functional_outcome(record)
         for stage in record.get("stages", []):
             rows.append(
                 {
                     "lineage_id": record.get("lineage_id"),
-                    "end_to_end_success": is_successful(record),
+                    "public_checkpoint_completion": outcome[
+                        "public_checkpoint_completion"
+                    ],
+                    "final_hidden_evaluated": outcome["final_hidden_evaluated"],
+                    "final_hidden_pass": outcome["final_hidden_pass"],
+                    "end_to_end_functional_success": outcome[
+                        "end_to_end_functional_success"
+                    ],
+                    "legacy_end_to_end_success_public_completion": outcome[
+                        "legacy_end_to_end_success_public_completion"
+                    ],
                     "lineage_state": classify(record),
                     "checkpoint_id": stage.get("checkpoint_id"),
                     "checkpoint_name": stage.get("checkpoint_name"),
@@ -705,6 +859,7 @@ def build_stage_rows(lineages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "workflow_stage_success": stage.get("success"),
                     "build_exit_code": stage.get("build_exit_code"),
                     "feature_test_exit_code": stage.get("feature_test_exit_code"),
+                    "extra_test_exit_code": stage.get("extra_test_exit_code"),
                     # Provenance: which candidate seeded this stage, and what
                     # this stage produced for the next one.
                     "seed": stage.get("seed"),
@@ -896,7 +1051,7 @@ def build_total_change(lineages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     rows: list[dict[str, Any]] = []
     for record in lineages:
-        if not is_successful(record):
+        if not public_checkpoint_completed(record):
             continue
         stages = record.get("stages", [])
         if len(stages) < 2:
@@ -923,6 +1078,13 @@ def build_total_change(lineages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         row.update({f"change_{k}": v for k, v in change_between(first, last).items()})
         rows.append(row)
     return rows
+
+
+def build_lineage_outcome_rows(
+    lineages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """One explicit reliability row per started lineage."""
+    return [lineage_functional_outcome(record) for record in lineages]
 
 
 def successful_transition_identifiers(
@@ -1169,6 +1331,7 @@ def analyze_lineage_security(
         security_transitions,
         SECURITY_TRANSITION_FIELDS,
     )
+
     return {
         "status": final_result["summary"]["status"],
         "security_configuration_fingerprint": final_result["summary"][
@@ -1228,14 +1391,16 @@ def population_members(
     time; see `resolve_stage_paths`.
 
     checkpoint=None selects the FINAL population: the last stage of every
-    lineage that completed every checkpoint. Otherwise it selects every lineage
-    that passed that checkpoint, whether or not the lineage later stopped.
+    lineage that completed every public checkpoint and explicitly passed the
+    final held-out evaluation. Otherwise it selects every lineage that passed
+    that public checkpoint, whether or not the lineage later stopped or its
+    held-out evaluation failed.
     """
     members = []
     for record in lineages:
         stages = record.get("stages", [])
         if checkpoint is None:
-            if not is_successful(record) or not stages:
+            if not end_to_end_functionally_successful(record) or not stages:
                 continue
             members.append(
                 (record["lineage_id"], lineage_directory(record), stages[-1])
@@ -1422,7 +1587,10 @@ def materialize_view(
                 "lineage_stage_dir": stage.get("stage_dir"),
                 "source_path": source_basename,
                 "analysis_population_member": True,
-                "population_selection_basis": "lineage_stage_success",
+                "population_selection_basis": (
+                    "end_to_end_functional_success"
+                    if label == "final" else "public_checkpoint_stage_success"
+                ),
                 "artifact_public_validation_success": stage.get(
                     "public_validation_success",
                     metadata.get("public_validation_success"),
@@ -1469,7 +1637,10 @@ def materialize_view(
             "experiment_format": "lineage_population_view",
             "population": label,
             "reliability_scope": "parent_lineage_experiment",
-            "population_selection_basis": "lineage_stage_success",
+            "population_selection_basis": (
+                "end_to_end_functional_success"
+                if label == "final" else "public_checkpoint_stage_success"
+            ),
             # Points at the view, not the checkout: analyze_experiment.py
             # rebuilds a repository-level paper aggregate under
             # <repository>/runs/experiments, and a lineage analysis must not
@@ -1575,24 +1746,26 @@ def build_parent_lineage_paper_row(
     row = read_json(population_row_path)
     analyzer = experiment_analyzer()
     started = int(reliability["lineages_started"])
-    completed = int(reliability["lineages_completed"])
+    public_completed = int(reliability["publicly_completed_lineages"])
+    functional_successes = int(
+        reliability["end_to_end_functionally_successful_implementations"]
+    )
+    functional_rate = reliability.get("end_to_end_functional_success_rate")
     row.update(
         {
             "Reliability Scope": "parent_lineage_experiment",
             "Population N": final.get("members"),
             "Lineages Started": started,
-            "Lineages Completed": completed,
+            "Lineages Completed": public_completed,
             "Lineage Completion Rate": reliability.get(
-                "end_to_end_completion_rate"
+                "public_checkpoint_completion_rate"
             ),
             "N Attempts": started,
             "Valid Agent Trials": None,
             "Infrastructure Failures": None,
             "Infrastructure Attrition Rate": None,
-            "Successful Runs": completed,
-            "End-to-End Success Rate": reliability.get(
-                "end_to_end_completion_rate"
-            ),
+            "Successful Runs": functional_successes,
+            "End-to-End Success Rate": functional_rate,
             "Conditional Agent Success Rate": None,
             "Initial Public Success Rate": None,
             "Final Public Success Rate": None,
@@ -1601,8 +1774,9 @@ def build_parent_lineage_paper_row(
     )
     for k in (1, 5, 10):
         row[f"Pass@{k}"] = (
-            analyzer.pass_at_k(started, completed, k)
-            if analyzer is not None and k <= started else None
+            analyzer.pass_at_k(started, functional_successes, k)
+            if (analyzer is not None and k <= started
+                and functional_rate is not None) else None
         )
     columns = list(getattr(analyzer, "PAPER_METRICS_COLUMNS", row.keys()))
     return row, columns
@@ -1633,8 +1807,8 @@ def render_summary(report: dict[str, Any]) -> str:
         "finals round.",
         "",
         f"* **lineages started = {reliability['lineages_started']}**",
-        f"* **successful final implementations = "
-        f"{reliability['successful_final_implementations']}**",
+        f"* **publicly completed lineages = "
+        f"{reliability['publicly_completed_lineages']}**",
     ]
     if reliability.get("lineages_planned_not_started"):
         # Reported for transparency, deliberately NOT in the denominator: these
@@ -1657,18 +1831,52 @@ def render_summary(report: dict[str, Any]) -> str:
             + (f" ({detail})" if detail else "")
             + " — started and counted; outcome unknown"
         )
-    rate = reliability["end_to_end_completion_rate"]
-    interval = reliability["end_to_end_completion_interval"]
-    if rate is not None and interval:
+    public_rate = reliability["public_checkpoint_completion_rate"]
+    public_interval = reliability["public_checkpoint_completion_interval"]
+    if public_rate is not None and public_interval:
         lines.append(
-            f"* end-to-end completion rate = {rate:.3f} "
-            f"(95% Wilson {interval['lower']:.3f}–{interval['upper']:.3f})"
+            f"* public checkpoint completion rate = {public_rate:.3f} "
+            f"(95% Wilson {public_interval['lower']:.3f}–"
+            f"{public_interval['upper']:.3f})"
         )
-    elif rate is not None:
-        lines.append(f"* end-to-end completion rate = {rate:.3f}")
+    elif public_rate is not None:
+        lines.append(
+            f"* public checkpoint completion rate = {public_rate:.3f}"
+        )
         lines.append(
             f"* confidence interval unavailable: "
             f"{report['confidence_interval_unavailable_reason']}"
+        )
+    hidden = reliability["final_heldout_evaluations"]
+    lines += [
+        "",
+        "Final held-out evaluations among publicly completed lineages:",
+        f"* passed = {hidden['passed']}",
+        f"* failed = {hidden['failed']}",
+        f"* unknown = {hidden['unknown']}",
+        f"* **end-to-end functionally successful implementations = "
+        f"{reliability['end_to_end_functionally_successful_implementations']}**",
+    ]
+    functional_rate = reliability["end_to_end_functional_success_rate"]
+    functional_interval = reliability["end_to_end_functional_success_interval"]
+    if functional_rate is not None and functional_interval:
+        lines.append(
+            f"* end-to-end functional success rate = {functional_rate:.3f} "
+            f"(95% Wilson {functional_interval['lower']:.3f}–"
+            f"{functional_interval['upper']:.3f})"
+        )
+    elif functional_rate is not None:
+        lines.append(
+            f"* end-to-end functional success rate = {functional_rate:.3f}"
+        )
+        lines.append(
+            f"* confidence interval unavailable: "
+            f"{report['confidence_interval_unavailable_reason']}"
+        )
+    else:
+        lines.append(
+            "* end-to-end functional success rate = unknown: "
+            f"{reliability['end_to_end_functional_rate_unavailable_reason']}"
         )
     lines += ["", "### Where lineages stopped", ""]
     stopped = sum(reliability["failure_stage_counts"].values()) + sum(
@@ -1723,10 +1931,16 @@ def render_summary(report: dict[str, Any]) -> str:
         ]
         for population in report["populations"]:
             members = population["members"]
+            qualification = (
+                "functionally successful"
+                if population["label"] == "final"
+                else "public-checkpoint successful"
+            )
             if population.get("skipped"):
                 lines.append(
-                    f"* **{population['label']}** — {members} successful "
-                    f"implementation{'' if members == 1 else 's'} from "
+                    f"* **{population['label']}** — {members} "
+                    f"{qualification} implementation"
+                    f"{'' if members == 1 else 's'} from "
                     f"{reliability['lineages_started']} lineages started. "
                     "Diversity was not computed: it needs at least 2 "
                     "successful implementations."
@@ -1748,9 +1962,12 @@ def render_summary(report: dict[str, Any]) -> str:
             baseline = report["final_population_baseline"]
             lines += [
                 "",
-                "Final diversity compares only completed lineages. The number "
+                "Final diversity compares only end-to-end functionally "
+                "successful finals. Publicly completed candidates whose final "
+                "held-out evaluation failed or was unavailable retain their "
+                "artifacts but are not members of this population. The number "
                 "of lineages started is stated above and is not replaced by "
-                "the number of finals.",
+                "the number of functional successes.",
                 "",
                 f"**Baseline.** {baseline['why']}, so the view uses "
                 f"`{baseline['kind']}`. Clustering, family, Vendi, discovery, "
@@ -1928,6 +2145,7 @@ def main(argv: list[str] | None = None) -> int:
 
     reliability = build_reliability(lineages, order, never_started)
     checkpoints_detail = build_checkpoint_rows(lineages, order)
+    lineage_outcome_rows = build_lineage_outcome_rows(lineages)
     stage_rows = build_stage_rows(lineages)
     dynamic_security_summary = aggregate_security_results(stage_rows)
     dynamic_security_summary["lineages_with_security_findings"] = len({
@@ -2020,6 +2238,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
         "checkpoints": order,
         "reliability": reliability,
+        "lineage_outcomes": "lineage_outcomes.csv",
         "confidence_interval_unavailable_reason": _WILSON["unavailable_reason"],
         "checkpoints_detail": checkpoints_detail,
         # Change is reported against the baseline each measurement actually
@@ -2079,17 +2298,36 @@ def main(argv: list[str] | None = None) -> int:
             parent_paper_columns,
         )
     write_csv(
+        output_dir / "lineage_outcomes.csv",
+        lineage_outcome_rows,
+        [
+            "lineage_id",
+            "lineage_state",
+            "public_checkpoint_completion",
+            "final_hidden_evaluated",
+            "final_hidden_pass",
+            "final_hidden_status",
+            "final_extra_test_exit_code",
+            "end_to_end_functional_success",
+            "legacy_end_to_end_success_public_completion",
+        ],
+    )
+    write_csv(
         output_dir / "lineage_stages.csv",
         stage_rows,
         [
-            "lineage_id", "end_to_end_success", "checkpoint_id", "checkpoint_name",
+            "lineage_id", "public_checkpoint_completion",
+            "final_hidden_evaluated", "final_hidden_pass",
+            "end_to_end_functional_success",
+            "legacy_end_to_end_success_public_completion",
+            "checkpoint_id", "checkpoint_name",
             "source_mode", "implemented_flags", "success", "failure_reason",
             "initial_success", "repair_loops", "llm_invocations", "success_loop",
             "stop_reason", "loop_limit_reached", "infrastructure_failure",
             "agent_execution_failure", "agent_invocation_completed",
             "agent_invocation_timed_out", "candidate_available_after_timeout",
             "artifact_public_validation_success", "workflow_stage_success",
-            "build_exit_code", "feature_test_exit_code",
+            "build_exit_code", "feature_test_exit_code", "extra_test_exit_code",
             # A stage can now succeed, or be repaired, after a session that ran
             # out of time. These keep that visible per stage rather than only in
             # the attempt metadata underneath it.

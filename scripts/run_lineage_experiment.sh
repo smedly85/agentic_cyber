@@ -990,7 +990,7 @@ for (( offset = 0; offset < LINEAGES; offset++ )); do
     seed_absolute=""
     seed_recorded=""
     stage_records=()
-    end_to_end_success=true
+    public_checkpoint_completion=true
     failure_stage_json=null
     failure_reason_json=null
     lineage_record="$lineage_dir/lineage.json"
@@ -1336,6 +1336,7 @@ record = {
     "base_test_exit_code": metadata.get("base_test_exit_code"),
     "feature_test_exit_code": metadata.get("feature_test_exit_code"),
     "extra_test_exit_code": metadata.get("extra_test_exit_code"),
+    "overall_success": metadata.get("overall_success"),
     # Missing results are unknown/unevaluated, never implicitly clean. These
     # fields are observational and play no part in `success` above.
     "security_evaluation_completed": security.get("security_evaluation_completed") is True,
@@ -1454,7 +1455,7 @@ print(json.dumps(record, separators=(",", ":")))
         )"
 
         if [[ "$stage_success" != true ]]; then
-            end_to_end_success=false
+            public_checkpoint_completion=false
             failure_stage_json="\"$stage_id\""
             failure_reason_json="\"${stage_reason:-unknown}\""
             if [[ "$stage_reason" == "stage_output_contract_failure" ]]; then
@@ -1479,7 +1480,7 @@ print(json.dumps(record, separators=(",", ":")))
     # that passed every checkpoint, so its presence is never ambiguous.
     final_dir="$lineage_dir/final"
     rm -rf "$final_dir"
-    if [[ "$end_to_end_success" == true ]]; then
+    if [[ "$public_checkpoint_completion" == true ]]; then
         mkdir -p "$final_dir"
         cp -p "$seed_absolute" "$final_dir/$SOURCE_BASENAME"
         completed_lineages=$((completed_lineages + 1))
@@ -1487,8 +1488,11 @@ print(json.dumps(record, separators=(",", ":")))
 
     # Every stage was already folded into the record as it finished; this only
     # closes the lineage out, moving it from `running` to `completed`/`stopped`.
-    finish_args=(--success "$end_to_end_success" --source-basename "$SOURCE_BASENAME")
-    if [[ "$end_to_end_success" != true ]]; then
+    finish_args=(
+        --public-checkpoint-completion "$public_checkpoint_completion"
+        --source-basename "$SOURCE_BASENAME"
+    )
+    if [[ "$public_checkpoint_completion" != true ]]; then
         finish_args+=(--failure-stage "$(printf '%s' "$failure_stage_json" | tr -d '"')")
         finish_args+=(--failure-reason "$(printf '%s' "$failure_reason_json" | tr -d '"')")
     fi
@@ -1496,7 +1500,7 @@ print(json.dumps(record, separators=(",", ":")))
         finish "${finish_args[@]}" ||
         die "cannot finalize the lineage record at $lineage_record"
 
-    if [[ "$end_to_end_success" == true ]]; then
+    if [[ "$public_checkpoint_completion" == true ]]; then
         printf '  lineage complete: final/%s\n\n' "$SOURCE_BASENAME"
     else
         printf '  lineage stopped\n\n'
@@ -1509,7 +1513,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
 fi
 
 printf 'Lineages started this invocation:   %s\n' "$started_lineages"
-printf 'Lineages completed all checkpoints: %s\n' "$completed_lineages"
+printf 'Lineages publicly completed all checkpoints: %s\n' "$completed_lineages"
 printf 'Output: %s\n' "$OUTPUT_DIR"
 printf '\nAnalyze with:\n  %s scripts/analyze_lineages.py --lineage-root %s\n' \
     "$PYTHON_BIN" "${OUTPUT_DIR#"$REPO"/}"

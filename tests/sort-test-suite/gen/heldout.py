@@ -8,13 +8,14 @@ every checkpoint's built bundle.
 
 Scope: the bounded ladder, not the whole suite
 ----------------------------------------------
-This suite's visible corpus is 1065 cases covering far more of GNU sort than
+This suite's visible corpus covers far more of GNU sort than
 the `new_sort` experiment asks for -- `-n`, `-k`, `-t`, `-o`, `-m`, `--sort`
-and more. The bounded ladder is base -> -r -> -f -> -u -> -c, and only 69
-visible cases fall inside it. A held-out case must exercise the same functional
-scope as its checkpoint, so duals are drawn only from those 69; a dual using
-`-k` would be testing something no checkpoint introduces and would report the
-scope mismatch as a generalisation failure.
+and more. The bounded ladder is base -> -r -> -f -> -u -> -c. A held-out case
+must exercise the same functional scope as its checkpoint, so duals are drawn
+only from cases whose declared flags and actual argv both stay inside that
+interface; a dual using `-k`, an obsolete `+POS` operand, or a file operand
+would be testing something no checkpoint introduces and would report the scope
+mismatch as a generalisation failure.
 
 Duals are built from the FROZEN visible cases rather than from
 `gen/curated_cases.py`, because sort's case definitions are assembled from
@@ -56,8 +57,86 @@ from reference_generators import (  # noqa: E402
     oracle_contract,
     platform_contract,
 )
-# The bounded new_sort ladder. Held-out cases never leave it.
-LADDER_FLAGS = {"-r", "-f", "-u", "-c"}
+# The bounded new_sort ladder. Held-out cases never leave it. `flags` describes
+# suite capability selection, while `args` is the invocation the candidate
+# actually receives; both must be bounded because GNU-only argv can be attached
+# to a nominal base case with flags=[].
+LADDER_FLAGS = frozenset({"-r", "-f", "-u", "-c"})
+LADDER_SHORT_OPTIONS = frozenset("rfuc")
+LADDER_LONG_OPTIONS = frozenset({
+    "--reverse",
+    "--ignore-case",
+    "--unique",
+    "--check",
+})
+
+
+def bounded_ladder_args(args: object) -> bool:
+    """Whether argv uses only the option surface taught by the ladder.
+
+    Supported short options may be combined or repeated. Long options must be
+    exact because none of the four accepts an argument. Every other token is
+    either an unsupported GNU option, an obsolete `+POS` form, `--`, or a file
+    operand, and is therefore outside the stdin-only new_sort contract.
+    """
+    if args is None:
+        return True
+    if not isinstance(args, (list, tuple)):
+        return False
+    for argument in args:
+        if not isinstance(argument, str):
+            return False
+        if argument in LADDER_LONG_OPTIONS:
+            continue
+        if (len(argument) >= 2 and argument.startswith("-")
+                and not argument.startswith("--")
+                and set(argument[1:]) <= LADDER_SHORT_OPTIONS):
+            continue
+        return False
+    return True
+
+
+def is_bounded_ladder_case(case: dict) -> bool:
+    """Require bounded declared capabilities and bounded actual invocation."""
+    flags = case.get("flags") or []
+    if not isinstance(flags, (list, tuple)):
+        return False
+    if any(not isinstance(flag, str) for flag in flags):
+        return False
+    return set(flags) <= LADDER_FLAGS and bounded_ladder_args(case.get("args"))
+
+
+def _short_option_letters(argument: str) -> str | None:
+    if (len(argument) >= 2 and argument.startswith("-")
+            and not argument.startswith("--")
+            and set(argument[1:]) <= LADDER_SHORT_OPTIONS):
+        return argument[1:]
+    return None
+
+
+def uses_check(args: list[str]) -> bool:
+    return any(
+        argument == "--check"
+        or (_short_option_letters(argument) is not None
+            and "c" in argument[1:])
+        for argument in args
+    )
+
+
+def without_check(args: list[str]) -> list[str]:
+    """Return the same bounded invocation with only check mode removed."""
+    result: list[str] = []
+    for argument in args:
+        if argument == "--check":
+            continue
+        letters = _short_option_letters(argument)
+        if letters is not None:
+            remaining = letters.replace("c", "")
+            if remaining:
+                result.append("-" + remaining)
+        else:
+            result.append(argument)
+    return result
 
 
 def _rotation() -> bytes:
@@ -109,9 +188,7 @@ def realign(raw: bytes, case: dict, sort_bin: str) -> bytes:
     rejection. Running the pinned oracle with the same argv minus the check flag
     restores the ordered-input property with the rotated bytes.
     """
-    args = [a for a in case["args"]
-            if a not in ("-c", "-C", "--check", "--check=quiet",
-                         "--check=silent", "--check=diagnose-first")]
+    args = without_check(case["args"])
     result = subprocess.run([sort_bin, *args], input=raw,
                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     if result.returncode != 0:
@@ -131,7 +208,7 @@ def visible_cases() -> list[dict]:
             data = json.load(handle)
         cases = data["cases"] if isinstance(data, dict) and "cases" in data else data
         for case in cases:
-            if set(case.get("flags") or []) <= LADDER_FLAGS:
+            if is_bounded_ladder_case(case):
                 found.append(case)
     return found
 
@@ -163,8 +240,7 @@ def dual_of(case: dict, sort_bin: str) -> dict:
     }
     held["name"] = heldout_contract.NAME_PREFIX + case["name"]
     raw = dual_payload(base64.b64decode(case["stdin_b64"]))
-    check_mode = any(a in ("-c", "-C", "--check") or a.startswith("--check=")
-                     for a in case["args"])
+    check_mode = uses_check(case["args"])
     if check_mode and case.get("exit_code") == 0:
         raw = realign(raw, case, sort_bin)
     held["stdin_b64"] = base64.b64encode(raw).decode("ascii")
