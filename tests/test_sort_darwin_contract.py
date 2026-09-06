@@ -13,6 +13,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 SUITE = REPO / "tests" / "sort-test-suite"
+UNIQUE_PROMPT = REPO / "prompts" / "new_sort" / "003_unique.md"
 
 
 class SortDarwinContractTests(unittest.TestCase):
@@ -104,6 +105,41 @@ class SortDarwinContractTests(unittest.TestCase):
                     check=False,
                 )
                 self.assertEqual(completed.returncode, 2, completed.stderr)
+
+
+class SortUniquePromptContractTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.prompt = UNIQUE_PROMPT.read_text(encoding="utf-8")
+
+    def test_secondary_order_does_not_select_unique_representative(self) -> None:
+        self.assertNotIn(
+            "choose one representative using the normal deterministic secondary order",
+            self.prompt,
+        )
+        self.assertIn("Without `-u`, ordinary `-f` ordering", self.prompt)
+        self.assertIn("With both `-f` and `-u`", self.prompt)
+        self.assertIn(
+            "The original-byte secondary comparison\n"
+            "must not distinguish members of that group or choose the retained member.",
+            self.prompt,
+        )
+
+    def test_case_insensitive_unique_keeps_first_input_record(self) -> None:
+        self.assertIn(
+            "For input order `abc` then `ABC`, retain `abc`.", self.prompt
+        )
+        self.assertIn(
+            "For input order `ABC` then `abc`, retain `ABC`.", self.prompt
+        )
+
+    def test_reverse_does_not_change_unique_representative(self) -> None:
+        self.assertIn(
+            "Reverse affects the ordering of the surviving groups, not\n"
+            "which representative survives. Thus `-r` does not change the retained\n"
+            "representative.",
+            self.prompt,
+        )
 
 
 if __name__ == "__main__":

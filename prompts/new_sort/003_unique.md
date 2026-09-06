@@ -46,31 +46,49 @@ When enabled, output one line from each group of equal sorted lines.
 
 Sorting must happen before duplicate removal.
 
-Keep the first line from each equal group in the completed sorted order.
+Ordering comparison and uniqueness equality/representative selection are
+separate concepts.
 
 Without ignore-case, lines are equal only when their bytes are identical.
 
-With ignore-case, lines are equal when their ASCII case-folded values are
-equal.
+Without `-u`, ordinary `-f` ordering is unchanged: compare ASCII case-folded
+bytes first, then, when the folded values are equal, compare the original bytes
+as a deterministic secondary comparison.
 
-The original-byte secondary comparison used by ignore-case must not make case
-variants separate unique groups.
+With both `-f` and `-u`, ASCII case-insensitive comparison determines which
+lines belong to the same unique group. The original-byte secondary comparison
+must not distinguish members of that group or choose the retained member.
+Retain the first input record from each case-insensitive equal group and output
+only that representative.
 
-Example with -f -u:
+For example, this input:
 
-    Apple
-    apple
-    APPLE
+    abc
+    ABC
 
-These belong to one group. Output one of them: the first one in the completed
-sorted order.
+with `-f -u` must output:
+
+    abc
+
+For input order `abc` then `ABC`, retain `abc`.
+
+Conversely, this input:
+
+    ABC
+    abc
+
+with `-f -u` must output:
+
+    ABC
+
+For input order `ABC` then `abc`, retain `ABC`.
 
 ## Reference
 
 Use GNU Coreutils sort 9.11 as behavioral inspiration.
 
-Unique mode must output the first line from each group of lines that compare
-equal.
+Unique mode must use its uniqueness equality rule to form groups and retain the
+first input record from each group.
 
 Implement it independently.
 
@@ -116,27 +134,32 @@ Do not add other options.
 With -u:
 
 - group byte-identical lines
-- output one line per group
+- retain the first input record from each group and output one line per group
 
 With -f -u:
 
 - group lines using ASCII case-insensitive equality
-- output the first line from each group
+- do not use the original-byte secondary comparison to distinguish group
+  members or select a representative
+- retain and output the first input record from each group
 
 With -r -u:
 
 - reverse the sorted order
-- keep the first line from each group in that order
+- retain the first input record from each byte-identical group
 
 With -r -f -u:
 
 - use ASCII case-insensitive equality
-- choose one representative using the normal deterministic secondary order
-- remove the other members of the equal group
-- apply reverse ordering after representative selection
+- form the same unique groups as for `-f -u`
+- retain the same first-input representative as for `-f -u`
+- order the surviving groups in reverse; do not reverse or otherwise change
+  representative selection
 
-Reverse sorting must not change which member of a case-insensitive equal group
-is retained.
+First determine the unique groups and their retained first-input
+representatives. Reverse affects the ordering of the surviving groups, not
+which representative survives. Thus `-r` does not change the retained
+representative.
 
 ## Requirements
 
