@@ -460,7 +460,8 @@ def visible_scope_overrides(suite_root: Path) -> dict[str, Any]:
     repair loop -- numbers that may well be read side by side. Only keys that
     actually need overriding are returned.
 
-    The held-out pass deliberately gets none of this; see `judging_config`.
+    The held-out pass gets the same overrides; visible and held-out corpora
+    differ, but their functional filtering contract must not.
     """
     overrides: dict[str, Any] = {}
     suite_config = suite_root / "config.json"
@@ -471,8 +472,10 @@ def visible_scope_overrides(suite_root: Path) -> dict[str, Any]:
         # identically. Only a populated list actually changes anything.
         if "excluded_tags" in committed:
             overrides["excluded_tags"] = list(committed["excluded_tags"])
+        if isinstance(committed.get("scope"), dict):
+            overrides["scope"] = dict(committed["scope"])
     if judge_wrapper_pins_stdin_only(suite_root):
-        overrides["scope"] = {"stdin_only": True}
+        overrides.setdefault("scope", {})["stdin_only"] = True
     return overrides
 
 
@@ -486,20 +489,19 @@ def judging_config(
 ) -> Path:
     """A throwaway config for one judging pass. Nothing in the repository is modified.
 
-    The base is the minimal shape `heldout_judge.py` writes, and the held-out
-    pass must keep matching it: that script is what actually ran the held-out
-    corpus during the experiment, so a held-out fingerprint judged under
-    different filtering would not describe the pass the experiment recorded. The
-    held-out pass therefore passes no overrides.
+    The base is the minimal runner shape and `scope_overrides` carries the
+    suite-specific checkpoint contract. Both visible and held-out passes use
+    those overrides, matching `heldout_judge.py`: the corpora differ, but case
+    selection and platform semantics do not.
 
     Both passes carry the suite's `required_platform` when it declares one. That
-    key is not a scope filter but an abort gate: sort's goldens describe Linux
-    and mkdir's describe Darwin, so on the wrong host the runner must refuse
-    rather than report host artifacts as behavior. Omitting it would let this
-    measurement silently fingerprint the platform instead of the candidate.
+    key is not a scope filter but an abort gate: sort and mkdir's goldens
+    describe Darwin, so on the wrong host the runner must refuse rather than
+    report host artifacts as behavior. Omitting it would let this measurement
+    silently fingerprint the platform instead of the candidate.
 
-    `scope_overrides` is how the visible pass narrows to the corpus the
-    checkpoint was really judged on; see `visible_scope_overrides`.
+    `scope_overrides` narrows both passes to the functional scope the checkpoint
+    was really judged on; see `visible_scope_overrides`.
     """
     config: dict[str, Any] = {
         "paths": {"candidate_bin": str(candidate_bin)},
@@ -509,7 +511,10 @@ def judging_config(
     }
     suite_config = suite_root / "config.json"
     if suite_config.is_file():
-        required_platform = read_json(suite_config).get("required_platform")
+        committed = read_json(suite_config)
+        if isinstance(committed.get("unimplemented_policy"), str):
+            config["unimplemented_policy"] = committed["unimplemented_policy"]
+        required_platform = committed.get("required_platform")
         if required_platform:
             config["required_platform"] = required_platform
     config.update(scope_overrides or {})
@@ -634,18 +639,23 @@ def measure_run(
             ),
         }
 
-    # Two configs, deliberately. The visible pass reproduces the scope the
-    # checkpoint was really judged and repaired under; the held-out pass keeps
-    # matching `heldout_judge.py`'s config exactly.
+    # Separate files because the runner accepts one config per pass. Their
+    # filtering contract is identical; only the visible and held-out corpora
+    # passed to the runner differ.
+    judging_scope = visible_scope_overrides(suite_root)
     visible_config = judging_config(
         suite_root,
         binary,
         flags,
         workdir / "visible-config.json",
-        scope_overrides=visible_scope_overrides(suite_root),
+        scope_overrides=judging_scope,
     )
     heldout_config = judging_config(
-        suite_root, binary, flags, workdir / "heldout-config.json"
+        suite_root,
+        binary,
+        flags,
+        workdir / "heldout-config.json",
+        scope_overrides=judging_scope,
     )
     try:
         visible = judge(
@@ -693,7 +703,7 @@ def measure_run(
         corpora=[heldout_corpus],
         case_results=heldout_results,
         implemented=flags,
-        scope_configuration={},
+        scope_configuration=visible_scope,
     )
     combined_results = sorted(
         namespaced_results(VISIBLE_NAMESPACE, visible_results)

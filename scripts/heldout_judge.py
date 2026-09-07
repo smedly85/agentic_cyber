@@ -16,12 +16,13 @@ Three things it deliberately does not do:
     and inherits its comparison semantics exactly. A second comparator could
     disagree with the visible pass and nobody would know which was right.
 
-  * It does not choose which cases to run. The suite's runner already filters by
-    the cumulative `implemented` flag list, which is how the visible pass gets
-    per-checkpoint selection. This reads that same list out of the bundled
-    config in the sandbox -- the one `stage_test_bundle.py` wrote for this
-    checkpoint -- so the held-out pass is scoped to exactly the checkpoint being
-    judged, with no per-checkpoint configuration of its own to drift.
+  * It does not choose which cases to run. The suite's runner already applies
+    the cumulative `implemented` flags and the bundle's filtering/scope
+    contract, which is how the visible pass gets per-checkpoint selection. This
+    reads that same contract out of the bundled config in the sandbox -- the one
+    `stage_test_bundle.py` wrote for this checkpoint -- so the held-out pass is
+    scoped to exactly the checkpoint being judged, with no per-checkpoint
+    configuration of its own to drift.
 
   * It does not feed anything back. `run_experiment.sh` runs the extra command
     once, after the last repair loop, and never renders its output into a
@@ -41,6 +42,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "tests"))
@@ -54,18 +56,42 @@ from reference_generators import heldout_contract  # noqa: E402
 # prevented a held-out verdict from being produced at all.
 HELDOUT_INFRASTRUCTURE_EXIT = 2
 
+# These are the parts of the per-checkpoint bundle that affect which cases the
+# native runner selects or whether it may judge on this host. Paths and the
+# suite's generation/build settings are deliberately not inherited: the hidden
+# pass supplies its own corpus and candidate and must not acquire a path back to
+# the public corpus or an oracle.
+JUDGING_CONTRACT_FIELDS = (
+    "implemented",
+    "unimplemented_policy",
+    "excluded_tags",
+    "scope",
+    "required_platform",
+)
+JUDGING_CONTRACT_TYPES = {
+    "unimplemented_policy": str,
+    "excluded_tags": list,
+    "scope": dict,
+    "required_platform": str,
+}
+
 
 def bundled_config(workdir: Path, test_dir: str) -> Path:
     """The per-checkpoint config the stage bundle placed in the sandbox."""
     return workdir / test_dir / "config.json"
 
 
-def implemented_flags(config_path: Path) -> list[str]:
-    """The cumulative flag list for the checkpoint under judgement.
+def hidden_runner_config(config_path: Path, candidate: str) -> dict[str, Any]:
+    """Copy the bundled checkpoint's filtering contract for hidden judging.
 
     Read from the sandbox's own bundled config rather than passed in, because
     `extra_test_command` is one string shared by every checkpoint in the
-    manifest -- there is nowhere in it to vary the flags per stage.
+    manifest -- there is nowhere in it to vary the flags or scope per stage.
+
+    Only runner-relevant contract fields are copied. In particular, bundled
+    paths are not: the held-out corpus is selected separately by
+    `heldout_contract.corpus_path`, and the candidate path must be the candidate
+    supplied for this invocation rather than the bundle's placeholder.
     """
     if not config_path.is_file():
         print(
@@ -75,18 +101,42 @@ def implemented_flags(config_path: Path) -> list[str]:
         )
         raise SystemExit(HELDOUT_INFRASTRUCTURE_EXIT)
     try:
-        data = json.loads(config_path.read_text(encoding="utf-8"))
+        bundled = json.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         print(f"heldout_judge: cannot read {config_path}: {error}", file=sys.stderr)
         raise SystemExit(HELDOUT_INFRASTRUCTURE_EXIT)
-    flags = data.get("implemented")
+    if not isinstance(bundled, dict):
+        print(
+            f"heldout_judge: {config_path} must contain a JSON object",
+            file=sys.stderr,
+        )
+        raise SystemExit(HELDOUT_INFRASTRUCTURE_EXIT)
+
+    flags = bundled.get("implemented")
     if not isinstance(flags, list):
         print(
             f"heldout_judge: {config_path} has no 'implemented' list",
             file=sys.stderr,
         )
         raise SystemExit(HELDOUT_INFRASTRUCTURE_EXIT)
-    return [str(flag) for flag in flags]
+
+    for field, expected_type in JUDGING_CONTRACT_TYPES.items():
+        if field in bundled and not isinstance(bundled[field], expected_type):
+            print(
+                f"heldout_judge: {config_path} field {field!r} must be "
+                f"{expected_type.__name__}",
+                file=sys.stderr,
+            )
+            raise SystemExit(HELDOUT_INFRASTRUCTURE_EXIT)
+
+    config: dict[str, Any] = {"paths": {"candidate_bin": str(candidate)}}
+    for field in JUDGING_CONTRACT_FIELDS:
+        if field in bundled:
+            config[field] = bundled[field]
+    # Preserve the prior normalization of cumulative flag identifiers while
+    # inheriting all other present fields verbatim.
+    config["implemented"] = [str(flag) for flag in flags]
+    return config
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -110,20 +160,18 @@ def main(argv: list[str] | None = None) -> int:
               f"({corpus}); no verdict produced", file=sys.stderr)
         return HELDOUT_INFRASTRUCTURE_EXIT
 
-    flags = implemented_flags(bundled_config(args.workdir, args.test_dir))
+    runner_config = hidden_runner_config(
+        bundled_config(args.workdir, args.test_dir), args.candidate
+    )
+    flags = runner_config["implemented"]
 
-    # A throwaway config carrying this checkpoint's flags. The suite's runner
-    # reads `implemented` from it and filters the corpus exactly as it filters
-    # the visible one; nothing in the repository is modified.
+    # A throwaway config carrying this checkpoint's judging contract. The
+    # suite's runner applies the same filtering and platform semantics as the
+    # visible pass; nothing in the repository is modified.
     with tempfile.TemporaryDirectory() as temp:
         config = Path(temp) / "heldout-config.json"
         config.write_text(
-            json.dumps({
-                "paths": {"candidate_bin": str(args.candidate)},
-                "implemented": flags,
-                "unimplemented_policy": "skip",
-                "excluded_tags": [],
-            }),
+            json.dumps(runner_config),
             encoding="utf-8",
         )
         command = [

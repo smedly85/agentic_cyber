@@ -113,8 +113,10 @@ comparator could disagree with the recorded verdict and nobody would know which
 was right.
 
 Each pass gets a throwaway config carrying `paths.candidate_bin`, the
-checkpoint's cumulative `implemented` flag list and `unimplemented_policy:
-"skip"`. The flag list is parsed out of the recorded `feature_test_command`,
+checkpoint's cumulative `implemented` flag list, and the suite's relevant
+filtering and platform contract: `unimplemented_policy`, `excluded_tags`,
+`scope`, and `required_platform` when present. The flag list is parsed out of
+the recorded `feature_test_command`,
 whose shape is fixed by `experiments/utilities/<utility>.json` as
 `<judge script> <binary> [FLAG...]`, so the measurement is scoped to the rung
 the experiment actually ran rather than to the ladder. The suite's
@@ -123,8 +125,8 @@ scope filter but an abort gate, and without it the sort and mkdir suites would
 fingerprint the host instead of the candidate. Nothing in the repository is
 modified.
 
-The two passes differ in one respect, deliberately, because they reproduce two
-different real judging paths.
+The two passes use the same filtering contract. They differ only in which
+corpus is handed to the runner.
 
 The **visible** pass reproduces the scope `judge_candidate.sh` applied when the
 checkpoint was actually judged, so that `visible_case_count` and the visible
@@ -140,11 +142,12 @@ overrides are read from the suite and its wrapper rather than hardcoded per
 utility, so a suite that changes its exclusions or its wrapper's scope carries
 the measurement with it.
 
-The **held-out** pass takes none of those overrides, and keeps
-`excluded_tags: []` with no `scope` key. That is not an oversight: it matches
-`scripts/heldout_judge.py`, which is what actually ran the held-out corpus
-during the experiment. A held-out fingerprint judged under different filtering
-would describe a pass the experiment never performed.
+The **held-out** pass inherits those same overrides. This matches
+`scripts/heldout_judge.py`, which copies the bundled checkpoint's relevant
+judging contract while replacing the candidate path and selecting the
+controller-only held-out corpus separately. For sort, `scope.stdin_only = true`
+therefore removes file mode from both passes; mkdir, grep, and chmod declare no
+scope, so no scope is invented for them.
 
 Neither pass can alter a recorded outcome, because no verdict produced here is
 written back.
