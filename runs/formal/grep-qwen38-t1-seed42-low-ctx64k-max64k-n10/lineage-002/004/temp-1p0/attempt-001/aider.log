@@ -1,0 +1,1062 @@
+
+===== LLM INVOCATION 0: INITIAL =====
+
+
+Aider v0.86.2
+Main model: ollama_chat/qwen3.8:27b with architect edit format
+Editor model: ollama_chat/qwen3-coder-next:latest with whole edit format
+Weak model: ollama_chat/qwen3-coder-next:latest
+Git repo: none
+Repo-map: disabled
+Added new_grep.c to the chat.
+Added ../../tests/grep-test-suite/runner.py to the chat (read-only).
+Added ../../tests/grep-test-suite/BUNDLE.json to the chat (read-only).
+Added ../../tests/grep-test-suite/engine.py to the chat (read-only).
+Added ../../tests/grep-test-suite/props.py to the chat (read-only).
+Added ../../tests/grep-test-suite/suites/ignore_case.json to the chat 
+(read-only).
+Added ../../tests/grep-test-suite/judge_candidate.sh to the chat (read-only).
+Added ../../tests/grep-test-suite/suites/with_filename.json to the chat 
+(read-only).
+Added ../../tests/grep-test-suite/config.py to the chat (read-only).
+Added ../../tests/grep-test-suite/suites/recursive.json to the chat (read-only).
+Added ../../tests/grep-test-suite/config.json to the chat (read-only).
+Added ../../tests/grep-test-suite/suites/no_filename.json to the chat 
+(read-only).
+Added ../../tests/grep-test-suite/suites/base.json to the chat (read-only).
+Note: in-chat filenames are always relative to the git working dir, not the 
+current working dir.
+Cur working dir: 
+/Users/sonjabrown/agentic_cyber/runs/formal/grep-qwen38-t1-seed42-low-ctx64k-max
+64k-n10/lineage-002/004/temp-1p0/attempt-001/workdir
+Git working dir: /Users/sonjabrown/agentic_cyber
+
+
+--------------
+► **THINKING**
+
+Let me analyze the task:
+
+1. Add `-i` / `--ignore-case` to new_grep.c
+2. Case folding is ASCII-only: A-Z (0x41-0x5A) fold to a-z, everything else stays the same
+3. The pattern is folded once, then matching is done against folded lines
+4. Output is the original bytes, not folded
+5. Need to handle combined short options like `-iH`, `-ih`, `-ri`, `-rhi`
+
+Key changes needed:
+1. Add a `case_insensitive` bool flag
+2. Parse `-i` in short options and `--ignore-case` in long options
+3. Add a `fold_byte` function that maps A-Z to a-z, everything else unchanged
+4. Modify `line_matches` to accept a case_insensitive flag and do case-insensitive comparison when enabled
+5. Pre-fold the pattern once (as required)
+6. For each line, fold in-place (or compare with folding) - but we need to output original bytes
+
+Let me look at the current `line_matches`:
+```c
+static bool line_matches(const unsigned char *line, size_t len,
+                         const unsigned char *pat, size_t plen) {
+    if (plen == 0) return true;
+    if (plen > len) return false;
+    for (size_t i = 0; i <= len - plen; i++) {
+        if (memcmp(line + i, pat, plen) == 0)
+            return true;
+    }
+    return false;
+}
+```
+
+For case-insensitive matching, I need to compare each byte of the pattern (already folded) against the folded version of the line byte. Since the pattern is pre-folded, I just need to fold the line bytes during comparison.
+
+The approach:
+- Add a `fold_byte` function: if byte is A-Z (0x41-0x5A), return byte + 0x20, else return byte
+- Pre-fold the pattern into a new buffer (done once in main)
+- Modify `line_matches` to take a `bool ci` parameter. When ci is true, compare `fold_byte(line[i])` against `pat[i]` (which is already folded). When ci is false, use memcmp as before.
+
+Actually, let me think about this more carefully. The pattern is folded once. Then for matching, I compare the folded pattern against the folded line. Since folding is a function `f` where `f(A-Z) = a-z` and `f(other) = other`, and the pattern is already `f(pattern)`, I need to check if for some position `i`, for all `j < plen`, `f(line[i+j]) == f(pattern[j])`. But since `f(pattern[j])` is already computed (it's the pre-folded pattern), I just need `f(line[i+j]) == pattern_folded[j]`.
+
+So the modified `line_matches` would be:
+```c
+static bool line_matches(const unsigned char *line, size_t len,
+                         const unsigned char *pat, size_t plen, bool ci) {
+    if (plen == 0) return true;
+    if (plen > len) return false;
+    for (size_t i = 0; i <= len - plen; i++) {
+        bool match = true;
+        for (size_t j = 0; j < plen; j++) {
+            unsigned char lb = ci ? fold_byte(line[i+j]) : line[i+j];
+            if (lb != pat[j]) { match = false; break; }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+```
+
+Where `pat` is already the folded pattern when `ci` is true.
+
+Now for the `search_stream` and `search_file` and `search_dir_recursive` functions - they all need to pass the `ci` flag and the folded pattern through.
+
+Let me plan the changes:
+
+1. Add `static unsigned char fold_byte(unsigned char c)` function
+2. Modify `line_matches` to accept `bool ci` parameter
+3. Modify `search_stream` to accept `bool ci` parameter and pass it to `line_matches`
+4. Modify `search_file` to accept `bool ci` parameter and pass it to `search_stream`
+5. Modify `search_dir_recursive` to accept `bool ci` parameter and pass it to `search_file`
+6. In `main`: add `bool ignore_case = false`, parse `-i` and `--ignore-case`, and when `ignore_case` is true, create a folded copy of the pattern
+
+Let me also check the test cases for `-i` to make sure I understand:
+- `i-stdin-folds-ascii`: pattern "gamma", input has "Gamma" -> matches
+- `i-stdin-uppercase-pattern`: pattern "ALPHA", input has "Alpha", "ALPHA", "alpha", "aLpHE" -> all match (pattern folded is "alpha")
+- `i-stdin-mixed-case-pattern`: pattern "aLpHa" -> folded to "alpha"
+- `i-folds-only-ascii-letters`: pattern "[ABC]" -> folded to "[abc]", line "[abc]" matches, line "{abc}" does NOT match (because `{` != `[` after folding... wait, `{` is 0x7B which is not A-Z so it stays as `{`, and `[` is 0x5B which is not A-Z so it stays as `[`. So `[abc]` has `[` which matches the folded pattern's `[`. And `{abc}` has `{` which doesn't match `[`. Correct.)
+- `i-high-bytes-pass-through-unfolded`: pattern "COLE" folded to "cole", line "École" in UTF-8 is 0xC3 0xA9 "cole" - the high bytes don't fold, so "cole" in the pattern doesn't match 0xC3 0xA9 'c' 'o' 'l' 'e'. Wait, let me re-read.
+
+The test `i-high-bytes-pass-through-unfolded`:
+- args: ["-i", "COLE"]
+- stdin_b64: "w4ljb2xlCsOpQ09MRQpwbGFpbgo="
+- stdout_b64: "w4ljb2xlCsOpQ09MRQo="
+
+Let me decode:
+- stdin: 0xE9 "cole" \n 0xE9 "COLE" \n "plain" \n
+- stdout: 0xE9 "cole" \n 0xE9 "COLE" \n
+
+So 0xE9 is a single high byte (not valid UTF-8, it's the latin-1 'é'). The pattern "COLE" folds to "cole". 
+- Line 1: 0xE9 'c' 'o' 'l' 'e' - contains "cole" starting at position 1 -> match
+- Line 2: 0xE9 'C' 'O' 'L' 'E' - folded: 0xE9 'c' 'o' 'l' 'e' - contains "cole" starting at position 1 -> match
+- Line 3: "plain" - no match
+
+Good, that's consistent.
+
+- `i-nul-bytes-survive-folding`: pattern "NEEDLE" folded to "needle"
+  - stdin_b64: "cHJlAG5lZWRsZQBwb3N0CnBsYWluCv/+bmVlZGxlCg=="
+  - Decoded: "pre" \0 "needle" \0 "post" \n "plain" \n 0xFF 0xFE "needle" \n
+  - stdout: same as lines 1 and 3 (the ones with "needle")
+
+So NUL bytes are part of the line content and don't interfere with matching.
+
+Now let me write the code changes.
+
+The key insight is:
+1. `fold_byte(c)`: if c >= 'A' && c <= 'Z' return c + 0x20, else return c
+2. In main, if `ignore_case`, create a folded copy of the pattern
+3. Pass `ignore_case` through to `line_matches` where it applies `fold_byte` to line bytes before comparing against the (already-folded) pattern
+
+Let me write the diff now.
+
+------------
+► **ANSWER**
+
+Looking at the code and test cases, I need to:
+1. Add a `fold_byte` helper (ASCII A-Z → a-z only)
+2. Pre-fold the pattern once when `-i` is active
+3. Thread a `bool ci` parameter through the search functions
+4. Modify `line_matches` to fold line bytes during comparison when `ci` is true
+5. Parse `-i` and `--ignore-case` in the option parser
+
+Let me implement this:
+
+```c
+// After the existing line_matches function, or replacing it.
+// Changes to new_grep.c:
+```
+
+Here are the specific changes to make to `src/new_grep/new_grep.c`:
+
+**1. Add `fold_byte` function** — insert after the `line_matches` function (or before it):
+
+```c
+static unsigned char fold_byte(unsigned char c) {
+    if (c >= 0x41 && c <= 0x5A) return c + 0x20;
+    return c;
+}
+```
+
+**2. Replace `line_matches`** with a version that accepts a `bool ci` parameter:
+
+```c
+static bool line_matches(const unsigned char *line, size_t len,
+                         const unsigned char *pat, size_t plen, bool ci) {
+    if (plen == 0) return true;
+    if (plen > len) return false;
+    for (size_t i = 0; i <= len - plen; i++) {
+        bool match = true;
+        for (size_t j = 0; j < plen; j++) {
+            unsigned char lb = ci ? fold_byte(line[i + j]) : line[i + j];
+            if (lb != pat[j]) { match = false; break; }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+```
+
+**3. Modify `write_selected`** — no change needed.
+
+**4. Modify `search_stream`** — add `bool ci` parameter and pass it to `line_matches`:
+
+```c
+static int search_stream(FILE *f, const unsigned char *pat, size_t plen,
+                         const char *prefix, bool has_prefix, bool ci,
+                         bool *found) {
+```
+
+And the two calls to `line_matches` become:
+```c
+if (line_matches(buf, len, pat, plen, ci)) {
+```
+
+**5. Modify `search_file`** — add `bool ci` parameter and pass through:
+
+```c
+static int search_file(const char *path, const unsigned char *pat, size_t plen,
+                       const char *prefix, bool has_prefix, bool ci, bool *found) {
+```
+
+And the call to `search_stream` becomes:
+```c
+int rc = search_stream(f, pat, plen, prefix, has_prefix, ci, found);
+```
+
+**6. Modify `search_dir_recursive`** — add `bool ci` parameter and pass through:
+
+```c
+static int search_dir_recursive(const char *dir_path, const unsigned char *pat, size_t plen,
+                                bool has_prefix, bool ci, bool *found, bool *error) {
+```
+
+And the recursive call and `search_file` call become:
+```c
+if (search_dir_recursive(full_path, pat, plen, has_prefix, ci, found, error) != 0)
+```
+```c
+if (search_file(full_path, pat, plen, prefix, has_prefix, ci, found) != 0)
+```
+
+**7. In `main`** — add `bool ignore_case = false;` near the other flag declarations.
+
+**8. In the long-option parsing block**, add after the `--recursive` check:
+```c
+if (strcmp(argv[i], "--ignore-case") == 0) {
+    ignore_case = true;
+    continue;
+}
+```
+
+**9. In the short-option parsing loop**, add:
+```c
+} else if (*p == 'i') {
+    ignore_case = true;
+```
+
+**10. After computing `pat` and `plen` in main**, add the folding step:
+
+```c
+const unsigned char *match_pat = pat;
+unsigned char *folded_pat = NULL;
+if (ignore_case) {
+    folded_pat = xrealloc(NULL, plen + 1);
+    for (size_t j = 0; j < plen; j++)
+        folded_pat[j] = fold_byte(pat[j]);
+    folded_pat[plen] = '\0';
+    match_pat = folded_pat;
+}
+```
+
+Then replace all subsequent uses of `pat` and `plen` in the search calls with `match_pat` (keep `plen` the same since folding doesn't change length). Specifically:
+
+- `search_stream(stdin, pat, plen, ...)` → `search_stream(stdin, match_pat, plen, ..., ignore_case, ...)`
+- `search_file(argv[i], pat, plen, ...)` → `search_file(argv[i], match_pat, plen, ..., ignore_case, ...)`
+- `search_dir_recursive(argv[i], pat, plen, ...)` → `search_dir_recursive(argv[i], match_pat, plen, ..., ignore_case, ...)`
+
+**11. Free `folded_pat`** before the final `return`:
+
+```c
+free(folded_pat);
+if (error) return 2;
+return found ? 0 : 1;
+```
+
+Now let me apply all changes and build:
+
+```bash
+mkdir -p build
+cc -std=c11 -Wall -Wextra -Werror -pedantic -O2 src/new_grep/new_grep.c -o build/new_grep
+```
+
+Let me write the complete modified file:
+
+```c
+#define _POSIX_C_SOURCE 200809L
+#include <dirent.h>
+#include <errno.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+typedef struct {
+    char *path;
+    size_t path_len;
+    size_t path_cap;
+} PathBuf;
+
+static void pathbuf_init(PathBuf *pb) {
+    pb->path = NULL;
+    pb->path_len = 0;
+    pb->path_cap = 0;
+}
+
+static bool pathbuf_append(PathBuf *pb, const char *s, size_t len) {
+    size_t new_len = pb->path_len + len;
+    if (new_len + 1 > pb->path_cap) {
+        size_t new_cap = pb->path_cap ? pb->path_cap * 2 : 256;
+        while (new_len + 1 > new_cap) new_cap *= 2;
+        char *new_path = realloc(pb->path, new_cap);
+        if (!new_path) return false;
+        pb->path = new_path;
+        pb->path_cap = new_cap;
+    }
+    memcpy(pb->path + pb->path_len, s, len);
+    pb->path_len = new_len;
+    pb->path[pb->path_len] = '\0';
+    return true;
+}
+
+static bool pathbuf_append_char(PathBuf *pb, char c) {
+    return pathbuf_append(pb, &c, 1);
+}
+
+static bool pathbuf_append_str(PathBuf *pb, const char *s) {
+    return pathbuf_append(pb, s, strlen(s));
+}
+
+static void pathbuf_truncate(PathBuf *pb, size_t new_len) {
+    pb->path_len = new_len;
+    pb->path[new_len] = '\0';
+}
+
+static void pathbuf_free(PathBuf *pb) {
+    free(pb->path);
+    pb->path = NULL;
+}
+
+static void usage_exit(void) {
+    fprintf(stderr, "usage: new_grep PATTERN [FILE...]\n");
+    exit(2);
+}
+
+static void *xrealloc(void *old, size_t size) {
+    if (size < 1) size = 1;
+    void *p = realloc(old, size);
+    if (!p) {
+        fprintf(stderr, "new_grep: out of memory\n");
+        exit(2);
+    }
+    return p;
+}
+
+static int compare_names(const void *a, const void *b) {
+    return strcmp(*(const char * const *)a, *(const char * const *)b);
+}
+
+static unsigned char fold_byte(unsigned char c) {
+    if (c >= 0x41 && c <= 0x5A) return c + 0x20;
+    return c;
+}
+
+static bool line_matches(const unsigned char *line, size_t len,
+                         const unsigned char *pat, size_t plen, bool ci) {
+    if (plen == 0) return true;
+    if (plen > len) return false;
+    for (size_t i = 0; i <= len - plen; i++) {
+        bool match = true;
+        for (size_t j = 0; j < plen; j++) {
+            unsigned char lb = ci ? fold_byte(line[i + j]) : line[i + j];
+            if (lb != pat[j]) { match = false; break; }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
+static bool write_selected(const char *prefix, bool has_prefix,
+                           const unsigned char *line, size_t len) {
+    if (has_prefix) {
+        size_t plen = strlen(prefix);
+        if (fwrite(prefix, 1, plen, stdout) != plen) return false;
+        if (fputc(':', stdout) == EOF) return false;
+    }
+    if (len > 0 && fwrite(line, 1, len, stdout) != len) return false;
+    return fputc('\n', stdout) != EOF;
+}
+
+static int search_stream(FILE *f, const unsigned char *pat, size_t plen,
+                         const char *prefix, bool has_prefix, bool ci,
+                         bool *found) {
+    unsigned char *buf = NULL;
+    size_t len = 0, cap = 0;
+    int c;
+
+    while ((c = getc(f)) != EOF) {
+        if (c == '\n') {
+            if (line_matches(buf, len, pat, plen, ci)) {
+                if (!write_selected(prefix, has_prefix, buf, len)) {
+                    free(buf);
+                    return -1;
+                }
+                *found = true;
+            }
+            len = 0;
+        } else {
+            if (len + 1 > cap) {
+                cap = cap ? cap * 2 : 256;
+                buf = xrealloc(buf, cap);
+            }
+            buf[len++] = (unsigned char)c;
+        }
+    }
+
+    if (len > 0) {
+        if (line_matches(buf, len, pat, plen, ci)) {
+            if (!write_selected(prefix, has_prefix, buf, len)) {
+                free(buf);
+                return -1;
+            }
+            *found = true;
+        }
+    }
+
+    free(buf);
+    return 0;
+}
+
+static int search_file(const char *path, const unsigned char *pat, size_t plen,
+                       const char *prefix, bool has_prefix, bool ci, bool *found) {
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        fprintf(stderr, "new_grep: %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    if (S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "new_grep: %s: is a directory\n", path);
+        return -1;
+    }
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "new_grep: %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    int rc = search_stream(f, pat, plen, prefix, has_prefix, ci, found);
+    if (fclose(f) != 0) rc = -1;
+    return rc;
+}
+
+static int search_dir_recursive(const char *dir_path, const unsigned char *pat, size_t plen,
+                                bool has_prefix, bool ci, bool *found, bool *error) {
+    DIR *dir = opendir(dir_path);
+    if (!dir) {
+        fprintf(stderr, "new_grep: %s: %s\n", dir_path, strerror(errno));
+        *error = true;
+        return -1;
+    }
+
+    char **names = NULL;
+    size_t count = 0, cap = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+        if (count + 1 > cap) {
+            cap = cap ? cap * 2 : 16;
+            names = xrealloc(names, cap * sizeof(*names));
+        }
+        size_t len = strlen(entry->d_name);
+        names[count] = xrealloc(NULL, len + 1);
+        memcpy(names[count], entry->d_name, len + 1);
+        count++;
+    }
+    closedir(dir);
+
+    qsort(names, count, sizeof(*names), compare_names);
+
+    PathBuf pb;
+    pathbuf_init(&pb);
+    if (!pathbuf_append_str(&pb, dir_path)) {
+        for (size_t i = 0; i < count; i++) free(names[i]);
+        free(names);
+        *error = true;
+        return -1;
+    }
+    if (pb.path_len > 0 && pb.path[pb.path_len - 1] != '/') {
+        if (!pathbuf_append_char(&pb, '/')) {
+            for (size_t i = 0; i < count; i++) free(names[i]);
+            free(names);
+            *error = true;
+            return -1;
+        }
+    }
+    size_t dir_len = pb.path_len;
+
+    for (size_t i = 0; i < count; i++) {
+        size_t name_len = strlen(names[i]);
+        if (!pathbuf_append(&pb, names[i], name_len)) {
+            *error = true;
+            pathbuf_truncate(&pb, dir_len);
+            continue;
+        }
+
+        const char *full_path = pb.path;
+        struct stat st;
+        if (lstat(full_path, &st) == 0) {
+            if (S_ISLNK(st.st_mode)) {
+                /* skip symlinks */
+            } else if (S_ISDIR(st.st_mode)) {
+                if (search_dir_recursive(full_path, pat, plen, has_prefix, ci, found, error) != 0)
+                    *error = true;
+            } else if (S_ISREG(st.st_mode)) {
+                const char *prefix = has_prefix ? full_path : NULL;
+                if (search_file(full_path, pat, plen, prefix, has_prefix, ci, found) != 0)
+                    *error = true;
+            }
+        }
+        pathbuf_truncate(&pb, dir_len);
+    }
+
+    for (size_t i = 0; i < count; i++) free(names[i]);
+    free(names);
+    pathbuf_free(&pb);
+    return *error ? -1 : 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2)
+        usage_exit();
+
+    bool after_ddash = false;
+    int prefix_mode = 0;
+    bool recursive = false;
+    bool ignore_case = false;
+    int pat_idx = -1, file_start = -1;
+
+    for (int i = 1; i < argc; i++) {
+        if (!after_ddash) {
+            if (strcmp(argv[i], "--") == 0) {
+                after_ddash = true;
+                continue;
+            }
+            if (argv[i][0] == '-' && argv[i][1] != '\0') {
+                if (argv[i][1] == '-') {
+                    if (strcmp(argv[i], "--with-filename") == 0) {
+                        prefix_mode = 1;
+                        continue;
+                    }
+                    if (strcmp(argv[i], "--no-filename") == 0) {
+                        prefix_mode = -1;
+                        continue;
+                    }
+                    if (strcmp(argv[i], "--recursive") == 0) {
+                        recursive = true;
+                        continue;
+                    }
+                    if (strcmp(argv[i], "--ignore-case") == 0) {
+                        ignore_case = true;
+                        continue;
+                    }
+                    fprintf(stderr, "new_grep: unknown option: %s\n", argv[i]);
+                    fprintf(stderr, "usage: new_grep PATTERN [FILE...]\n");
+                    exit(2);
+                }
+                for (const char *p = argv[i] + 1; *p; p++) {
+                    if (*p == 'H') {
+                        prefix_mode = 1;
+                    } else if (*p == 'h') {
+                        prefix_mode = -1;
+                    } else if (*p == 'r') {
+                        recursive = true;
+                    } else if (*p == 'i') {
+                        ignore_case = true;
+                    } else {
+                        fprintf(stderr, "new_grep: unknown option: -%c\n", *p);
+                        fprintf(stderr, "usage: new_grep PATTERN [FILE...]\n");
+                        exit(2);
+                    }
+                }
+                continue;
+            }
+        }
+        if (pat_idx == -1)
+            pat_idx = i;
+        else if (file_start == -1)
+            file_start = i;
+    }
+
+    if (pat_idx == -1)
+        usage_exit();
+
+    const unsigned char *pat = (const unsigned char *)argv[pat_idx];
+    size_t plen = strlen(argv[pat_idx]);
+
+    const unsigned char *match_pat = pat;
+    unsigned char *folded_pat = NULL;
+    if (ignore_case) {
+        folded_pat = xrealloc(NULL, plen + 1);
+        for (size_t j = 0; j < plen; j++)
+            folded_pat[j] = fold_byte(pat[j]);
+        folded_pat[plen] = '\0';
+        match_pat = folded_pat;
+    }
+
+    int nfiles = (file_start == -1) ? 0 : argc - file_start;
+
+    bool has_prefix;
+    if (prefix_mode == 1)
+        has_prefix = true;
+    else if (prefix_mode == -1)
+        has_prefix = false;
+    else if (nfiles >= 2)
+        has_prefix = true;
+    else if (recursive && nfiles >= 1) {
+        has_prefix = false;
+        for (int i = file_start; i < argc; i++) {
+            struct stat st;
+            if (stat(argv[i], &st) == 0 && S_ISDIR(st.st_mode)) {
+                has_prefix = true;
+                break;
+            }
+        }
+    } else
+        has_prefix = false;
+
+    bool found = false;
+    bool error = false;
+
+    if (nfiles == 0) {
+        const char *prefix = has_prefix ? "(standard input)" : NULL;
+        if (search_stream(stdin, match_pat, plen, prefix, has_prefix, ignore_case, &found) != 0)
+            error = true;
+    } else {
+        for (int i = file_start; i < argc; i++) {
+            struct stat st;
+            if (stat(argv[i], &st) == 0 && S_ISDIR(st.st_mode)) {
+                if (recursive) {
+                    if (search_dir_recursive(argv[i], match_pat, plen, has_prefix, ignore_case, &found, &error) != 0)
+                        error = true;
+                } else {
+                    fprintf(stderr, "new_grep: %s: is a directory\n", argv[i]);
+                    error = true;
+                }
+            } else {
+                if (search_file(argv[i], match_pat, plen,
+                                has_prefix ? argv[i] : NULL, has_prefix,
+                                ignore_case, &found) != 0)
+                    error = true;
+            }
+        }
+    }
+
+    free(folded_pat);
+    if (error) return 2;
+    return found ? 0 : 1;
+}
+```
+
+Now let me write this to the file and build:
+
+```bash
+mkdir -p build
+cc -std=c11 -Wall -Wextra -Werror -pedantic -O2 src/new_grep/new_grep.c -o build/new_grep
+```
+
+Then run the test suite:
+
+```bash
+tests/grep-test-suite/judge_candidate.sh build/new_grep -H -h -r -i
+```
+Tokens: 28k sent, 6.2k received.
+I will apply the changes to `new_grep.c` to implement case-insensitive matching.
+
+new_grep.c
+```
+#define _POSIX_C_SOURCE 200809L
+#include <dirent.h>
+#include <errno.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+typedef struct {
+    char *path;
+    size_t path_len;
+    size_t path_cap;
+} PathBuf;
+
+static void pathbuf_init(PathBuf *pb) {
+    pb->path = NULL;
+    pb->path_len = 0;
+    pb->path_cap = 0;
+}
+
+static bool pathbuf_append(PathBuf *pb, const char *s, size_t len) {
+    size_t new_len = pb->path_len + len;
+    if (new_len + 1 > pb->path_cap) {
+        size_t new_cap = pb->path_cap ? pb->path_cap * 2 : 256;
+        while (new_len + 1 > new_cap) new_cap *= 2;
+        char *new_path = realloc(pb->path, new_cap);
+        if (!new_path) return false;
+        pb->path = new_path;
+        pb->path_cap = new_cap;
+    }
+    memcpy(pb->path + pb->path_len, s, len);
+    pb->path_len = new_len;
+    pb->path[pb->path_len] = '\0';
+    return true;
+}
+
+static bool pathbuf_append_char(PathBuf *pb, char c) {
+    return pathbuf_append(pb, &c, 1);
+}
+
+static bool pathbuf_append_str(PathBuf *pb, const char *s) {
+    return pathbuf_append(pb, s, strlen(s));
+}
+
+static void pathbuf_truncate(PathBuf *pb, size_t new_len) {
+    pb->path_len = new_len;
+    pb->path[new_len] = '\0';
+}
+
+static void pathbuf_free(PathBuf *pb) {
+    free(pb->path);
+    pb->path = NULL;
+}
+
+static void usage_exit(void) {
+    fprintf(stderr, "usage: new_grep PATTERN [FILE...]\n");
+    exit(2);
+}
+
+static void *xrealloc(void *old, size_t size) {
+    if (size < 1) size = 1;
+    void *p = realloc(old, size);
+    if (!p) {
+        fprintf(stderr, "new_grep: out of memory\n");
+        exit(2);
+    }
+    return p;
+}
+
+static int compare_names(const void *a, const void *b) {
+    return strcmp(*(const char * const *)a, *(const char * const *)b);
+}
+
+static unsigned char fold_byte(unsigned char c) {
+    if (c >= 0x41 && c <= 0x5A) return c + 0x20;
+    return c;
+}
+
+static bool line_matches(const unsigned char *line, size_t len,
+                         const unsigned char *pat, size_t plen, bool ci) {
+    if (plen == 0) return true;
+    if (plen > len) return false;
+    for (size_t i = 0; i <= len - plen; i++) {
+        bool match = true;
+        for (size_t j = 0; j < plen; j++) {
+            unsigned char lb = ci ? fold_byte(line[i + j]) : line[i + j];
+            if (lb != pat[j]) { match = false; break; }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
+static bool write_selected(const char *prefix, bool has_prefix,
+                           const unsigned char *line, size_t len) {
+    if (has_prefix) {
+        size_t plen = strlen(prefix);
+        if (fwrite(prefix, 1, plen, stdout) != plen) return false;
+        if (fputc(':', stdout) == EOF) return false;
+    }
+    if (len > 0 && fwrite(line, 1, len, stdout) != len) return false;
+    return fputc('\n', stdout) != EOF;
+}
+
+static int search_stream(FILE *f, const unsigned char *pat, size_t plen,
+                         const char *prefix, bool has_prefix, bool ci,
+                         bool *found) {
+    unsigned char *buf = NULL;
+    size_t len = 0, cap = 0;
+    int c;
+
+    while ((c = getc(f)) != EOF) {
+        if (c == '\n') {
+            if (line_matches(buf, len, pat, plen, ci)) {
+                if (!write_selected(prefix, has_prefix, buf, len)) {
+                    free(buf);
+                    return -1;
+                }
+                *found = true;
+            }
+            len = 0;
+        } else {
+            if (len + 1 > cap) {
+                cap = cap ? cap * 2 : 256;
+                buf = xrealloc(buf, cap);
+            }
+            buf[len++] = (unsigned char)c;
+        }
+    }
+
+    if (len > 0) {
+        if (line_matches(buf, len, pat, plen, ci)) {
+            if (!write_selected(prefix, has_prefix, buf, len)) {
+                free(buf);
+                return -1;
+            }
+            *found = true;
+        }
+    }
+
+    free(buf);
+    return 0;
+}
+
+static int search_file(const char *path, const unsigned char *pat, size_t plen,
+                       const char *prefix, bool has_prefix, bool ci, bool *found) {
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        fprintf(stderr, "new_grep: %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    if (S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "new_grep: %s: is a directory\n", path);
+        return -1;
+    }
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "new_grep: %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    int rc = search_stream(f, pat, plen, prefix, has_prefix, ci, found);
+    if (fclose(f) != 0) rc = -1;
+    return rc;
+}
+
+static int search_dir_recursive(const char *dir_path, const unsigned char *pat, size_t plen,
+                                bool has_prefix, bool ci, bool *found, bool *error) {
+    DIR *dir = opendir(dir_path);
+    if (!dir) {
+        fprintf(stderr, "new_grep: %s: %s\n", dir_path, strerror(errno));
+        *error = true;
+        return -1;
+    }
+
+    char **names = NULL;
+    size_t count = 0, cap = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+        if (count + 1 > cap) {
+            cap = cap ? cap * 2 : 16;
+            names = xrealloc(names, cap * sizeof(*names));
+        }
+        size_t len = strlen(entry->d_name);
+        names[count] = xrealloc(NULL, len + 1);
+        memcpy(names[count], entry->d_name, len + 1);
+        count++;
+    }
+    closedir(dir);
+
+    qsort(names, count, sizeof(*names), compare_names);
+
+    PathBuf pb;
+    pathbuf_init(&pb);
+    if (!pathbuf_append_str(&pb, dir_path)) {
+        for (size_t i = 0; i < count; i++) free(names[i]);
+        free(names);
+        *error = true;
+        return -1;
+    }
+    if (pb.path_len > 0 && pb.path[pb.path_len - 1] != '/') {
+        if (!pathbuf_append_char(&pb, '/')) {
+            for (size_t i = 0; i < count; i++) free(names[i]);
+            free(names);
+            *error = true;
+            return -1;
+        }
+    }
+    size_t dir_len = pb.path_len;
+
+    for (size_t i = 0; i < count; i++) {
+        size_t name_len = strlen(names[i]);
+        if (!pathbuf_append(&pb, names[i], name_len)) {
+            *error = true;
+            pathbuf_truncate(&pb, dir_len);
+            continue;
+        }
+
+        const char *full_path = pb.path;
+        struct stat st;
+        if (lstat(full_path, &st) == 0) {
+            if (S_ISLNK(st.st_mode)) {
+                /* skip symlinks */
+            } else if (S_ISDIR(st.st_mode)) {
+                if (search_dir_recursive(full_path, pat, plen, has_prefix, ci, found, error) != 0)
+                    *error = true;
+            } else if (S_ISREG(st.st_mode)) {
+                const char *prefix = has_prefix ? full_path : NULL;
+                if (search_file(full_path, pat, plen, prefix, has_prefix, ci, found) != 0)
+                    *error = true;
+            }
+        }
+        pathbuf_truncate(&pb, dir_len);
+    }
+
+    for (size_t i = 0; i < count; i++) free(names[i]);
+    free(names);
+    pathbuf_free(&pb);
+    return *error ? -1 : 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2)
+        usage_exit();
+
+    bool after_ddash = false;
+    int prefix_mode = 0;
+    bool recursive = false;
+    bool ignore_case = false;
+    int pat_idx = -1, file_start = -1;
+
+    for (int i = 1; i < argc; i++) {
+        if (!after_ddash) {
+            if (strcmp(argv[i], "--") == 0) {
+                after_ddash = true;
+                continue;
+            }
+            if (argv[i][0] == '-' && argv[i][1] != '\0') {
+                if (argv[i][1] == '-') {
+                    if (strcmp(argv[i], "--with-filename") == 0) {
+                        prefix_mode = 1;
+                        continue;
+                    }
+                    if (strcmp(argv[i], "--no-filename") == 0) {
+                        prefix_mode = -1;
+                        continue;
+                    }
+                    if (strcmp(argv[i], "--recursive") == 0) {
+                        recursive = true;
+                        continue;
+                    }
+                    if (strcmp(argv[i], "--ignore-case") == 0) {
+                        ignore_case = true;
+                        continue;
+                    }
+                    fprintf(stderr, "new_grep: unknown option: %s\n", argv[i]);
+                    fprintf(stderr, "usage: new_grep PATTERN [FILE...]\n");
+                    exit(2);
+                }
+                for (const char *p = argv[i] + 1; *p; p++) {
+                    if (*p == 'H') {
+                        prefix_mode = 1;
+                    } else if (*p == 'h') {
+                        prefix_mode = -1;
+                    } else if (*p == 'r') {
+                        recursive = true;
+                    } else if (*p == 'i') {
+                        ignore_case = true;
+                    } else {
+                        fprintf(stderr, "new_grep: unknown option: -%c\n", *p);
+                        fprintf(stderr, "usage: new_grep PATTERN [FILE...]\n");
+                        exit(2);
+                    }
+                }
+                continue;
+            }
+        }
+        if (pat_idx == -1)
+            pat_idx = i;
+        else if (file_start == -1)
+            file_start = i;
+    }
+
+    if (pat_idx == -1)
+        usage_exit();
+
+    const unsigned char *pat = (const unsigned char *)argv[pat_idx];
+    size_t plen = strlen(argv[pat_idx]);
+
+    const unsigned char *match_pat = pat;
+    unsigned char *folded_pat = NULL;
+    if (ignore_case) {
+        folded_pat = xrealloc(NULL, plen + 1);
+        for (size_t j = 0; j < plen; j++)
+            folded_pat[j] = fold_byte(pat[j]);
+        folded_pat[plen] = '\0';
+        match_pat = folded_pat;
+    }
+
+    int nfiles = (file_start == -1) ? 0 : argc - file_start;
+
+    bool has_prefix;
+    if (prefix_mode == 1)
+        has_prefix = true;
+    else if (prefix_mode == -1)
+        has_prefix = false;
+    else if (nfiles >= 2)
+        has_prefix = true;
+    else if (recursive && nfiles >= 1) {
+        has_prefix = false;
+        for (int i = file_start; i < argc; i++) {
+            struct stat st;
+            if (stat(argv[i], &st) == 0 && S_ISDIR(st.st_mode)) {
+                has_prefix = true;
+                break;
+            }
+        }
+    } else
+        has_prefix = false;
+
+    bool found = false;
+    bool error = false;
+
+    if (nfiles == 0) {
+        const char *prefix = has_prefix ? "(standard input)" : NULL;
+        if (search_stream(stdin, match_pat, plen, prefix, has_prefix, ignore_case, &found) != 0)
+            error = true;
+    } else {
+        for (int i = file_start; i < argc; i++) {
+            struct stat st;
+            if (stat(argv[i], &st) == 0 && S_ISDIR(st.st_mode)) {
+                if (recursive) {
+                    if (search_dir_recursive(argv[i], match_pat, plen, has_prefix, ignore_case, &found, &error) != 0)
+                        error = true;
+                } else {
+                    fprintf(stderr, "new_grep: %s: is a directory\n", argv[i]);
+                    error = true;
+                }
+            } else {
+                if (search_file(argv[i], match_pat, plen,
+                                has_prefix ? argv[i] : NULL, has_prefix,
+                                ignore_case, &found) != 0)
+                    error = true;
+            }
+        }
+    }
+
+    free(folded_pat);
+    if (error) return 2;
+    return found ? 0 : 1;
+}
+```
+Tokens: 32k sent, 3.1k received.
+Applied edit to new_grep.c
+Summarization failed for model ollama_chat/qwen3-coder-next:latest: cannot schedule new futures after shutdown
+Summarization failed for model ollama_chat/qwen3.8:27b: cannot schedule new futures after shutdown
+summarizer unexpectedly failed for all models

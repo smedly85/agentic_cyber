@@ -1,0 +1,1851 @@
+
+===== LLM INVOCATION 0: INITIAL =====
+
+
+Aider v0.86.2
+Main model: ollama_chat/qwen3.8:27b with architect edit format
+Editor model: ollama_chat/qwen3-coder-next:latest with whole edit format
+Weak model: ollama_chat/qwen3-coder-next:latest
+Git repo: none
+Repo-map: disabled
+Added new_grep.c to the chat.
+Added ../../tests/grep-test-suite/config.json to the chat (read-only).
+Added ../../tests/grep-test-suite/props.py to the chat (read-only).
+Added ../../tests/grep-test-suite/runner.py to the chat (read-only).
+Added ../../tests/grep-test-suite/engine.py to the chat (read-only).
+Added ../../tests/grep-test-suite/suites/no_filename.json to the chat 
+(read-only).
+Added ../../tests/grep-test-suite/config.py to the chat (read-only).
+Added ../../tests/grep-test-suite/suites/with_filename.json to the chat 
+(read-only).
+Added ../../tests/grep-test-suite/suites/base.json to the chat (read-only).
+Added ../../tests/grep-test-suite/BUNDLE.json to the chat (read-only).
+Added ../../tests/grep-test-suite/suites/recursive.json to the chat (read-only).
+Added ../../tests/grep-test-suite/judge_candidate.sh to the chat (read-only).
+Note: in-chat filenames are always relative to the git working dir, not the 
+current working dir.
+Cur working dir: 
+/Users/sonjabrown/agentic_cyber/runs/formal/grep-qwen38-t1-seed42-low-ctx64k-max
+64k-n10/lineage-005/003/temp-1p0/attempt-001/workdir
+Git working dir: /Users/sonjabrown/agentic_cyber
+
+
+--------------
+► **THINKING**
+
+Let me analyze the task:
+
+1. Add `-r` / `--recursive` flag to new_grep.c
+2. Directory operands are searched recursively (pre-order, sorted by name, skip symlinks)
+3. Regular file operands behave as before
+4. Prefix decision changes: `-r` + at least one directory operand → prefix (unless `-h` given)
+
+Key requirements:
+- Sort directory entries by byte comparison (not locale)
+- Skip symlinks during traversal (but follow them if given directly as operands)
+- Trailing slash handling: `t/` → `t/a.txt` not `t//a.txt`
+- Use explicit work list or bound recursion to avoid stack overflow
+- No external programs
+- C11, `-Wall -Wextra -Werror -pedantic`
+
+Let me look at the test cases to understand expected behavior:
+
+From `recursive.json`:
+- `r-directory-is-traversed-in-name-order`: `-r needle t` → `t/a.txt:alpha needle\nt/b.txt:beta needle\nt/sub/a.txt:also needle\nt/sub/z.txt:deep needle\n`
+  - So pre-order: visit files in current dir (sorted), then descend into subdirs (sorted), each with their files sorted
+  - Wait, looking more carefully: t/a.txt, t/b.txt, t/sub/a.txt, t/sub/z.txt
+  - So it's: for directory t, list entries sorted: a.txt, b.txt, sub. Process a.txt (file), b.txt (file), sub (dir → recurse)
+  - That's pre-order with files processed in order encountered, dirs descended when reached
+  
+  Actually wait - "pre-order" means visit the node, then its children. For a directory, we list entries in sorted order. For each entry: if file, search it; if dir, recurse into it. So the order is:
+  - t/ entries sorted: a.txt, b.txt, sub
+  - t/a.txt (file, search)
+  - t/b.txt (file, search)
+  - t/sub (dir, recurse)
+    - t/sub entries sorted: a.txt, z.txt
+    - t/sub/a.txt (file, search)
+    - t/sub/z.txt (file, search)
+  
+  That matches the expected output.
+
+- `r-skips-symlinks-during-traversal`: has `t/loop` → `.` (symlink to dir) and `t/c.txt` → `a.txt` (symlink to file). Neither appears in output.
+  - Output: `t/a.txt:alpha needle\nt/b.txt:beta needle\nt/sub/a.txt:also needle\nt/sub/z.txt:deep needle\n`
+  - So symlinks are completely skipped during traversal.
+
+- `r-trailing-slash-does-not-double`: operand is `t/`, output names are `t/a.txt` etc.
+
+- `r-directory-and-file-operands-together`: `-r needle t top.txt` → both dir and file results, dir first then file.
+
+- `r-unreadable-file-in-tree-is-an-error`: locked file in tree → stderr mentions it, exit 2, but other files still searched.
+
+- `r-regular-file-operand-is-not-prefixed`: `-r alpha a.txt` where a.txt is a regular file → no prefix.
+
+- `rh-combined-suppresses-prefixes`: `-rh needle t` → no prefix.
+
+- `rH-combined-keeps-prefixes`: `-rH needle t` → prefix.
+
+- `r-H-on-a-single-regular-file`: `-r -H alpha a.txt` → prefix (because -H is explicitly given).
+
+Now let me plan the implementation:
+
+1. Parse `-r` / `--recursive` flag (add `int recursive = 0`)
+2. In the prefix decision: add the case "otherwise `-r` given and at least one operand is a directory: prefix"
+3. Implement recursive directory traversal:
+   - Use `opendir`, `readdir`, `closedir`
+   - Collect entries, sort by name (byte comparison with `memcmp` or `strcmp`)
+   - For each entry: `stat` to determine type
+     - If symlink (`lstat` shows it's a symlink), skip
+     - If regular file, search it
+     - If directory, recurse
+   - Use an iterative approach with a work stack to avoid stack overflow
+
+Actually, let me re-read: "Recursion depth must not be able to exhaust the process: either bound it or use an explicit work list."
+
+I'll use an explicit work stack (LIFO). But wait - the traversal order is pre-order. With a stack, I need to push entries in reverse order so that the first entry is processed first.
+
+Let me think about this more carefully:
+
+Pre-order traversal with sorted entries:
+- For directory D with entries [e1, e2, e3] (sorted):
+  - Process e1 (if file) or recurse into e1 (if dir)
+  - Process e2
+  - Process e3
+
+With a work stack (LIFO), I'd push e3, e2, e1 so that e1 is popped first. But when e1 is a directory, I need to process its contents before e2. So the stack approach needs to handle this differently.
+
+Actually, a simpler approach: use a recursive function but with a bounded depth, or use an explicit stack that mimics the recursive call.
+
+Let me use a different approach: a work list where each item is a directory to process. When we process a directory, we:
+1. Read all entries, sort them
+2. For each entry in order:
+   - If it's a regular file → search it now
+   - If it's a directory → push it onto the stack (but we need it to be processed BEFORE subsequent entries)
+
+Hmm, that's the problem with a simple stack. Let me think again.
+
+Actually, the cleanest approach that satisfies "explicit work list" is to use a recursive function with a depth limit. The requirement says "either bound it or use an explicit work list." A bounded recursion is fine.
+
+Let me just use a recursive function with a depth limit (say 1000). That's simple and correct.
+
+Wait, but the requirement says "Recursion depth must not be able to exhaust the process: either bound it or use an explicit work list." So a bounded recursion is acceptable.
+
+Let me use a recursive helper function `search_dir(const char *dirpath, const char *operand, ...)` with a depth parameter. If depth exceeds a limit (e.g., 1000), return an error.
+
+Actually, for a truly safe approach without stack overflow, let me use an explicit work stack. The key insight is:
+
+Pre-order DFS can be done iteratively with a stack if we push children in reverse order. But the "children" here include both files (to be processed immediately) and directories (to be pushed). Since files should be processed in order and directories should be recursed into in order, I can do:
+
+1. Read directory entries, sort them
+2. Iterate through them in order:
+   - If file: search it
+   - If dir: push onto stack
+
+Wait no, that's wrong. If I have entries [file1, dir1, file2], the expected order is:
+- file1 (search)
+- dir1 (recurse: search all files in dir1)
+- file2 (search)
+
+With a stack approach, I'd need to push file2, then dir1, then process file1. But that doesn't work because when I pop dir1, I need to process all of dir1's contents before file2.
+
+The correct iterative DFS approach:
+- Stack starts with the root directory
+- Pop a directory, read its entries sorted
+- Push entries in REVERSE order (so first entry is on top)
+- When popping an entry:
+  - If file: search it
+  - If dir: it will be popped next (or after any files pushed after it)
+
+Wait, let me think about this differently. The standard iterative DFS:
+
+```
+stack = [root]
+while stack not empty:
+    item = pop(stack)
+    if item is a file: search it
+    if item is a directory:
+        entries = sorted(read(item))
+        for entry in reversed(entries):
+            if entry is a symlink: skip
+            else: push(entry)
+```
+
+Let's trace with: t has entries [a.txt(file), b.txt(file), sub(dir)]
+- stack = [t]
+- pop t, it's a dir, entries = [a.txt, b.txt, sub], push in reverse: push sub, push b.txt, push a.txt
+- stack = [sub, b.txt, a.txt]
+- pop a.txt, it's a file, search it ✓
+- pop b.txt, it's a file, search it ✓
+- pop sub, it's a dir, entries = [a.txt, z.txt], push in reverse: push z.txt, push a.txt
+- stack = [z.txt, sub/a.txt]
+- pop sub/a.txt, search ✓
+- pop sub/z.txt, search ✓
+
+That works! The key is: when we pop a directory, we push its non-symlink entries in reverse order. Files get searched immediately when popped, directories get expanded when popped.
+
+But wait - I need to track the full path for each entry. Let me define a work item as a path string.
+
+Actually, let me reconsider. Using a bounded recursive function is simpler and the spec explicitly allows it ("either bound it or use an explicit work list"). Let me use a recursive function with a max depth of, say, 4096. That's 4096 frames × ~200 bytes = ~800KB stack, which should be fine on most systems with default 8MB stack. Actually to be safe, let me use a smaller limit like 1024.
+
+Hmm, but actually the iterative approach isn't that much more code and is truly safe. Let me go with the iterative approach.
+
+Let me design the data structures:
+
+```c
+typedef struct {
+    char *path;  // full path to the entry
+    int is_dir;  // 1 if directory, 0 if file
+} WorkItem;
+```
+
+Actually, I don't even need `is_dir` - I can just `stat`/`lstat` when I pop the item.
+
+Let me simplify: the work stack just holds paths (strings). When I pop a path:
+1. `lstat` it
+2. If symlink → skip
+3. If regular file → search it
+4. If directory → read entries, sort, push in reverse
+
+Wait, but for the root operand, symlinks should be followed (not skipped). The spec says "A symbolic link named directly as an operand is still followed, exactly as before."
+
+So I need to distinguish: the root operand is always followed (even if symlink), but entries discovered during traversal are skipped if they're symlinks.
+
+I'll handle the root separately: if it's a directory (or symlink to directory), start the traversal. During traversal, skip symlinks.
+
+Let me write the implementation:
+
+```c
+#include <dirent.h>
+#include <limits.h>
+
+// For the work stack, I'll use a dynamic array of strings
+// Since paths can be long, I'll use a fixed max path length or dynamic allocation
+
+#define MAX_DEPTH 4096  // if using bounded recursion
+
+// I'll use bounded recursion for simplicity
+static int search_tree(const char *dirpath, const char *prefix_name,
+                       const unsigned char *pattern, size_t patlen,
+                       int *any_match, int *any_error, int depth) {
+    if (depth > 1024) {
+        fprintf(stderr, "grep: %s: maximum recursion depth exceeded\n", dirpath);
+        *any_error = 1;
+        return -1;
+    }
+    
+    // Read directory entries
+    DIR *dp = opendir(dirpath);
+    if (!dp) {
+        fprintf(stderr, "grep: %s: %s\n", dirpath, strerror(errno));
+        *any_error = 1;
+        return -1;
+    }
+    
+    // Collect entries
+    char **names = NULL;
+    int count = 0, cap = 0;
+    struct dirent *de;
+    while ((de = readdir(dp)) != NULL) {
+        // Skip . and ..
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+        if (count == cap) {
+            cap = cap ? cap * 2 : 16;
+            char **tmp = realloc(names, cap * sizeof *names);
+            if (!tmp) { closedir(dp); free(names); return -1; }
+            names = tmp;
+        }
+        names[count] = strdup(de->d_name);
+        if (!names[count]) { /* error */ }
+        count++;
+    }
+    closedir(dp);
+    
+    // Sort by byte comparison
+    qsort(names, count, sizeof *names, name_compare);
+    
+    // Process each entry
+    for (int i = 0; i < count; i++) {
+        // Build full path: dirpath + "/" + names[i]
+        // But handle trailing slash: if dirpath ends with '/', don't add another
+        char fullpath[PATH_MAX];
+        // ...
+        
+        struct stat st;
+        if (lstat(fullpath, &st) != 0) continue;
+        if (S_ISLNK(st.st_mode)) continue;  // skip symlinks
+        if (S_ISREG(st.st_mode)) {
+            // search file, output with prefix_name
+            // prefix_name is like "t/a.txt"
+        } else if (S_ISDIR(st.st_mode)) {
+            // recurse
+            search_tree(fullpath, ..., depth + 1);
+        }
+    }
+    
+    free all names
+    free(names)
+    return 0;
+}
+```
+
+Wait, I need to think about the prefix name. The prefix for a file found in the tree is `operand/path/relative`. For example, if the operand is `t` and the file is at `t/sub/z.txt`, the prefix is `t/sub/z.txt`.
+
+So I need to track the "display name" prefix. When recursing into `t/sub`, the prefix for files in `t/sub` would be `t/sub/...`.
+
+Let me restructure:
+
+```c
+static int search_tree(const char *real_path, const char *display_prefix,
+                       const unsigned char *pattern, size_t patlen,
+                       int use_prefix, int *any_match, int *any_error, int depth);
+```
+
+Where:
+- `real_path` is the actual filesystem path to the directory
+- `display_prefix` is the prefix to use for output (e.g., "t" or "t/sub")
+
+For a file entry `name` in directory with display_prefix `dp`:
+- real path: `real_path + "/" + name`
+- display name: `dp + "/" + name`
+
+But I need to handle the trailing slash issue. If the operand is `t/`, the display prefix should be `t` (not `t/`).
+
+Let me handle this: when setting up the initial call, strip trailing slashes from the operand for the display prefix.
+
+Actually wait, looking at the test case `r-trailing-slash-does-not-double`:
+- operand is `t/`
+- expected output: `t/a.txt:alpha needle` etc.
+
+So the display name strips trailing slashes. I'll do: when constructing the initial display prefix, strip any trailing `/`.
+
+Now, for the path construction, I need to be careful about PATH_MAX. Let me use dynamic string building to avoid PATH_MAX limitations.
+
+Let me write a helper to join paths:
+
+```c
+static char *join_path(const char *base, const char *name) {
+    // If base ends with '/', just concatenate
+    // Otherwise, base + "/" + name
+    size_t blen = strlen(base);
+    int need_sep = (blen > 0 && base[blen-1] != '/');
+    size_t nlen = strlen(name);
+    size_t total = blen + (need_sep ? 1 : 0) + nlen + 1;
+    char *result = malloc(total);
+    if (!result) return NULL;
+    memcpy(result, base, blen);
+    size_t pos = blen;
+    if (need_sep) result[pos++] = '/';
+    memcpy(result + pos, name, nlen + 1);
+    return result;
+}
+```
+
+Now let me think about the overall structure of the modified main:
+
+1. Parse arguments: add `-r` / `--recursive` recognition
+2. Determine `use_prefix` with the new rule
+3. For each file operand:
+   - If it's a regular file (or symlink to file): search as before
+   - If it's a directory and `-r` is set: call `search_tree`
+   - If it's a directory and `-r` is NOT set: error (as before)
+   - If it doesn't exist: error (as before)
+
+Let me also handle the case where a symlink is given as an operand: we should follow it. The current code uses `stat()` (which follows symlinks) to determine the type, so a symlink to a directory would show as a directory. That's correct behavior for operands.
+
+Now let me write the full implementation. I'll modify the existing code:
+
+Key changes:
+1. Add `#include <dirent.h>` and `#include <limits.h>`
+2. Add `int recursive = 0;` flag
+3. Parse `-r` and `--recursive` in argument parsing
+4. Modify prefix decision logic
+5. Add `search_tree` function
+6. Modify the file processing loop to handle directories when `-r` is set
+
+Let me also think about the `qsort` comparison function:
+
+```c
+static int name_compare(const void *a, const void *b) {
+    const char *sa = *(const char * const *)a;
+    const char *sb = *(const char * const *)b;
+    return strcmp(sa, sb);
+}
+```
+
+Wait, `strcmp` does byte comparison for C strings (it compares unsigned char values). Actually, `strcmp` compares based on the underlying character values, which for ASCII is the same as byte comparison. For non-ASCII, it depends on the locale. But since we set `LC_ALL=C` in the test environment, `strcmp` will do byte comparison.
+
+However, to be safe and not depend on locale, I should use a proper byte comparison:
+
+```c
+static int name_compare(const void *a, const void *b) {
+    const unsigned char *sa = *(const unsigned char * const *)a;
+    const unsigned char *sb = *(const unsigned char * const *)b;
+    while (*sa && *sa == *sb) { sa++; sb++; }
+    return (*sa < *sb) ? -1 : (*sa > *sb) ? 1 : 0;
+}
+```
+
+This is a proper unsigned byte comparison, independent of locale.
+
+Now let me also think about the depth limit. The spec says "Recursion depth must not be able to exhaust the process: either bound it or use an explicit work list." I'll use a bounded recursion with a limit of 1024. If exceeded, I'll treat it as an error.
+
+Actually, re-reading the requirement more carefully: "Do not make unrelated changes." and "Use the existing C11 structure, compiler settings, and error handling."
+
+Let me now write the actual code changes. I'll present them as modifications to the existing file.
+
+Here's my plan for the code:
+
+1. Add includes: `#include <dirent.h>`, `#include <limits.h>`
+2. Add the `name_compare` function
+3. Add a `join_path` helper
+4. Add the `search_tree` recursive function (bounded depth)
+5. In `main`:
+   - Add `int recursive = 0;`
+   - Parse `-r` / `--recursive`
+   - Update prefix logic
+   - In the file loop, handle directory operands when recursive
+
+Let me write this out carefully now.
+
+For the `search_tree` function, I need to pass:
+- The real filesystem path of the directory
+- The display prefix (for output names)
+- The pattern and its length
+- Whether to use prefix in output
+- Pointers to any_match and any_error
+- Current depth
+
+The function will:
+1. Check depth limit
+2. opendir, collect entries, closedir
+3. Sort entries by byte comparison
+4. For each entry:
+   - Build real path and display path
+   - lstat to determine type
+   - Skip if symlink
+   - If regular file: open, search, output
+   - If directory: recurse
+
+Let me be careful about memory management. I'll free all allocated strings at the end.
+
+Actually, let me think about whether to use `PATH_MAX` or dynamic allocation. Since paths can theoretically be longer than `PATH_MAX` (though unlikely in tests), I'll use dynamic allocation to be safe. But for simplicity and given the test cases, `PATH_MAX` should be fine. Let me use `PATH_MAX` for the real path (filesystem) and dynamic allocation for the display name.
+
+Actually, let me just use dynamic allocation for both. It's cleaner.
+
+Let me write the final implementation now:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <dirent.h>
+
+// ... existing code ...
+
+static int name_compare(const void *a, const void *b) {
+    const unsigned char *sa = *(const unsigned char * const *)a;
+    const unsigned char *sb = *(const unsigned char * const *)b;
+    while (*sa && *sa == *sb) { sa++; sb++; }
+    if (*sa == *sb) return 0;
+    return (*sa < *sb) ? -1 : 1;
+}
+
+static char *join_path(const char *base, const char *name) {
+    size_t blen = strlen(base);
+    int need_sep = (blen > 0 && base[blen - 1] != '/');
+    size_t nlen = strlen(name);
+    size_t total = blen + (need_sep ? 1 : 0) + nlen + 1;
+    char *result = malloc(total);
+    if (!result) return NULL;
+    memcpy(result, base, blen);
+    size_t pos = blen;
+    if (need_sep) result[pos++] = '/';
+    memcpy(result + pos, name, nlen + 1);
+    return result;
+}
+
+#define MAX_RECURSION_DEPTH 1024
+
+static int search_tree(const char *dirpath, const char *display,
+                       const unsigned char *pattern, size_t patlen,
+                       int use_prefix, int *any_match, int *any_error,
+                       int depth) {
+    if (depth > MAX_RECURSION_DEPTH) {
+        fprintf(stderr, "grep: %s: recursion depth exceeded\n", display);
+        *any_error = 1;
+        return -1;
+    }
+
+    DIR *dp = opendir(dirpath);
+    if (!dp) {
+        fprintf(stderr, "grep: %s: %s\n", display, strerror(errno));
+        *any_error = 1;
+        return -1;
+    }
+
+    char **names = NULL;
+    int count = 0, cap = 0;
+    struct dirent *de;
+    int oom = 0;
+
+    while ((de = readdir(dp)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        if (count == cap) {
+            int newcap = cap ? cap * 2 : 16;
+            char **tmp = realloc(names, (size_t)newcap * sizeof *tmp);
+            if (!tmp) { oom = 1; break; }
+            names = tmp;
+            cap = newcap;
+        }
+        names[count] = strdup(de->d_name);
+        if (!names[count]) { oom = 1; break; }
+        count++;
+    }
+    closedir(dp);
+
+    if (oom) {
+        for (int i = 0; i < count; i++) free(names[i]);
+        free(names);
+        return -1;
+    }
+
+    qsort(names, (size_t)count, sizeof *names, name_compare);
+
+    for (int i = 0; i < count; i++) {
+        char *realpath = join_path(dirpath, names[i]);
+        char *disp = join_path(display, names[i]);
+        if (!realpath || !disp) {
+            free(realpath);
+            free(disp);
+            for (int j = 0; j < count; j++) free(names[j]);
+            free(names);
+            return -1;
+        }
+
+        struct stat st;
+        if (lstat(realpath, &st) != 0) {
+            free(realpath);
+            free(disp);
+            continue;
+        }
+
+        if (S_ISLNK(st.st_mode)) {
+            free(realpath);
+            free(disp);
+            continue;
+        }
+
+        if (S_ISREG(st.st_mode)) {
+            FILE *fp = fopen(realpath, "rb");
+            if (!fp) {
+                fprintf(stderr, "grep: %s: %s\n", disp, strerror(errno));
+                *any_error = 1;
+            } else {
+                ByteBuf line = {0};
+                int rc;
+                while ((rc = read_line(fp, &line)) == 0) {
+                    if (fixed_match(line.buf, line.len, pattern, patlen)) {
+                        const char *prefix = use_prefix ? disp : NULL;
+                        if (write_line(line.buf, line.len, prefix) != 0) {
+                            free(line.buf);
+                            fclose(fp);
+                            free(realpath);
+                            free(disp);
+                            for (int j = 0; j < count; j++) free(names[j]);
+                            free(names);
+                            return -1;
+                        }
+                        *any_match = 1;
+                    }
+                }
+                if (rc == -2) {
+                    fprintf(stderr, "grep: %s: read error\n", disp);
+                    *any_error = 1;
+                }
+                free(line.buf);
+                fclose(fp);
+            }
+        } else if (S_ISDIR(st.st_mode)) {
+            search_tree(realpath, disp, pattern, patlen,
+                        use_prefix, any_match, any_error, depth + 1);
+        }
+
+        free(realpath);
+        free(disp);
+    }
+
+    for (int i = 0; i < count; i++) free(names[i]);
+    free(names);
+    return 0;
+}
+```
+
+Now for the main function changes:
+
+1. Add `int recursive = 0;`
+2. In the option parsing:
+   - `--recursive` → `recursive = 1`
+   - `-r` in short options → `recursive = 1`
+3. Update prefix logic:
+   ```c
+   int use_prefix;
+   if (prefix_mode > 0) use_prefix = 1;
+   else if (prefix_mode < 0) use_prefix = 0;
+   else if (file_count >= 2) use_prefix = 1;
+   else if (recursive) {
+       // Check if any operand is a directory
+       int any_dir = 0;
+       for (int i = 0; i < file_count; i++) {
+           struct stat st;
+           if (stat(files[i], &st) == 0 && S_ISDIR(st.st_mode)) {
+               any_dir = 1;
+               break;
+           }
+       }
+       use_prefix = any_dir;
+   }
+   else use_prefix = 0;
+   ```
+4. In the file processing loop, when we encounter a directory:
+   - If `recursive`: call `search_tree`
+   - If not `recursive`: error (as before)
+
+Let me also make sure the display name handles trailing slashes. If the operand is `t/`, I should strip trailing slashes for the display prefix.
+
+```c
+// Strip trailing slashes for display
+char *display = strdup(filename);
+while (strlen(display) > 1 && display[strlen(display)-1] == '/')
+    display[strlen(display)-1] = '\0';
+```
+
+Wait, but the real path should keep the trailing slash? Actually no, `opendir("t/")` works the same as `opendir("t")`. And `join_path` handles the case where base doesn't end with `/`. So I can just use the filename as-is for the real path, and strip trailing slashes for display.
+
+Actually, let me re-examine. If operand is `t/`:
+- Real path for opendir: `t/` works fine
+- Display prefix: should be `t` (stripped)
+- Then `join_path("t", "a.txt")` → `t/a.txt` ✓
+
+If operand is `t`:
+- Real path: `t`
+- Display: `t`
+- `join_path("t", "a.txt")` → `t/a.txt` ✓
+
+Good.
+
+Now let me put it all together. I'll write the instructions for the editor.
+
+Actually wait, I need to double-check: in the prefix decision for `-r` with a single directory, the test `r-regular-file-operand-is-not-prefixed` has `-r alpha a.txt` where a.txt is a regular file, and expects NO prefix. My logic handles this: `recursive` is true, but `any_dir` is false (a.txt is a regular file), so `use_prefix = 0`. ✓
+
+And `r-directory-is-traversed-in-name-order` has `-r needle t` where t is a directory, expects prefix. My logic: `recursive` true, `any_dir` true, so `use_prefix = 1`. ✓
+
+Let me also check: what if there are multiple operands, some dirs and some files, with `-r`? The test `r-directory-and-file-operands-together` has `-r needle t top.txt` (2 operands). The old rule "two or more file operands" would already trigger prefix. So this is covered by the `file_count >= 2` check. ✓
+
+What about `-r` with one directory and no other files? That's the `r-directory-is-traversed-in-name-order` case. Covered by the new `recursive && any_dir` rule. ✓
+
+Now let me write the complete modified file. Actually, the instructions say to show only the changes needed, not the entire file. Let me structure my response as clear change instructions.
+
+Wait, re-reading the system prompt: "Just show the changes needed." and "DO NOT show the entire updated function/file/etc!"
+
+So I need to describe the changes clearly. But actually, looking at this more carefully - I'm the architect providing direction to an editor engineer. Let me write clear, unambiguous instructions.
+
+Actually wait - I need to re-read the session conditions: "Begin by inspecting the repository and then implement the change."
+
+So I should actually implement the change, not just describe it. Let me write the full modified file content as the implementation.
+
+Hmm, but the system prompt says "DO NOT show the entire updated function/file/etc!" - that's for the architect role. But the session conditions say to implement. Let me reconcile: I think the system prompt is the general role, but the session conditions override to say "implement the change." Since this is a non-interactive session where I need to actually produce the code, I'll write the implementation.
+
+Let me write the complete new_grep.c with all changes incorporated.
+
+------------
+► **ANSWER**
+
+Looking at the test cases and requirements, I need to add `-r`/`--recursive` support with directory traversal (pre-order, sorted, skip symlinks), update the prefix decision logic, and handle all the edge cases.
+
+Let me implement the changes:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <dirent.h>
+
+typedef struct {
+    unsigned char *buf;
+    size_t len;
+    size_t cap;
+} ByteBuf;
+
+static int buf_reserve(ByteBuf *b, size_t need) {
+    if (b->cap >= need) return 0;
+    size_t newcap = b->cap ? b->cap : 256;
+    while (newcap < need) newcap *= 2;
+    unsigned char *p = realloc(b->buf, newcap);
+    if (!p) return -1;
+    b->buf = p;
+    b->cap = newcap;
+    return 0;
+}
+
+static int buf_push(ByteBuf *b, unsigned char c) {
+    if (buf_reserve(b, b->len + 1) != 0) return -1;
+    b->buf[b->len++] = c;
+    return 0;
+}
+
+static int read_line(FILE *fp, ByteBuf *line) {
+    line->len = 0;
+    int c;
+    int got_any = 0;
+    while ((c = getc(fp)) != EOF) {
+        got_any = 1;
+        if (c == '\n') break;
+        if (buf_push(line, (unsigned char)c) != 0) return -2;
+    }
+    if (c == EOF && !got_any) return -1;
+    return 0;
+}
+
+static int fixed_match(const unsigned char *hay, size_t haylen,
+                       const unsigned char *pat, size_t patlen) {
+    if (patlen == 0) return 1;
+    if (patlen > haylen) return 0;
+    for (size_t i = 0; i <= haylen - patlen; i++) {
+        if (memcmp(hay + i, pat, patlen) == 0) return 1;
+    }
+    return 0;
+}
+
+static int write_line(const unsigned char *data, size_t len, const char *prefix) {
+    if (prefix) {
+        if (fputs(prefix, stdout) == EOF) return -1;
+        if (putc(':', stdout) == EOF) return -1;
+    }
+    if (len > 0) {
+        if (fwrite(data, 1, len, stdout) != len) return -1;
+    }
+    if (putc('\n', stdout) == EOF) return -1;
+    return 0;
+}
+
+static void print_usage(void) {
+    fprintf(stderr, "usage: grep PATTERN [FILE...]\n");
+}
+
+static int name_compare(const void *a, const void *b) {
+    const unsigned char *sa = *(const unsigned char * const *)a;
+    const unsigned char *sb = *(const unsigned char * const *)b;
+    while (*sa && *sa == *sb) { sa++; sb++; }
+    if (*sa == *sb) return 0;
+    return (*sa < *sb) ? -1 : 1;
+}
+
+static char *join_path(const char *base, const char *name) {
+    size_t blen = strlen(base);
+    int need_sep = (blen > 0 && base[blen - 1] != '/');
+    size_t nlen = strlen(name);
+    size_t total = blen + (size_t)(need_sep ? 1 : 0) + nlen + 1;
+    char *result = malloc(total);
+    if (!result) return NULL;
+    memcpy(result, base, blen);
+    size_t pos = blen;
+    if (need_sep) result[pos++] = '/';
+    memcpy(result + pos, name, nlen + 1);
+    return result;
+}
+
+#define MAX_RECURSION_DEPTH 1024
+
+static int search_tree(const char *dirpath, const char *display,
+                       const unsigned char *pattern, size_t patlen,
+                       int use_prefix, int *any_match, int *any_error,
+                       int depth) {
+    if (depth > MAX_RECURSION_DEPTH) {
+        fprintf(stderr, "grep: %s: recursion depth exceeded\n", display);
+        *any_error = 1;
+        return -1;
+    }
+
+    DIR *dp = opendir(dirpath);
+    if (!dp) {
+        fprintf(stderr, "grep: %s: %s\n", display, strerror(errno));
+        *any_error = 1;
+        return -1;
+    }
+
+    char **names = NULL;
+    int count = 0, cap = 0;
+    struct dirent *de;
+    int oom = 0;
+
+    while ((de = readdir(dp)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        if (count == cap) {
+            int newcap = cap ? cap * 2 : 16;
+            char **tmp = realloc(names, (size_t)newcap * sizeof *tmp);
+            if (!tmp) { oom = 1; break; }
+            names = tmp;
+            cap = newcap;
+        }
+        names[count] = strdup(de->d_name);
+        if (!names[count]) { oom = 1; break; }
+        count++;
+    }
+    closedir(dp);
+
+    if (oom) {
+        for (int i = 0; i < count; i++) free(names[i]);
+        free(names);
+        return -1;
+    }
+
+    qsort(names, (size_t)count, sizeof *names, name_compare);
+
+    for (int i = 0; i < count; i++) {
+        char *realpath = join_path(dirpath, names[i]);
+        char *disp = join_path(display, names[i]);
+        if (!realpath || !disp) {
+            free(realpath);
+            free(disp);
+            for (int j = 0; j < count; j++) free(names[j]);
+            free(names);
+            return -1;
+        }
+
+        struct stat st;
+        if (lstat(realpath, &st) != 0) {
+            free(realpath);
+            free(disp);
+            continue;
+        }
+
+        if (S_ISLNK(st.st_mode)) {
+            free(realpath);
+            free(disp);
+            continue;
+        }
+
+        if (S_ISREG(st.st_mode)) {
+            FILE *fp = fopen(realpath, "rb");
+            if (!fp) {
+                fprintf(stderr, "grep: %s: %s\n", disp, strerror(errno));
+                *any_error = 1;
+            } else {
+                ByteBuf line = {0};
+                int rc;
+                while ((rc = read_line(fp, &line)) == 0) {
+                    if (fixed_match(line.buf, line.len, pattern, patlen)) {
+                        const char *prefix = use_prefix ? disp : NULL;
+                        if (write_line(line.buf, line.len, prefix) != 0) {
+                            free(line.buf);
+                            fclose(fp);
+                            free(realpath);
+                            free(disp);
+                            for (int j = 0; j < count; j++) free(names[j]);
+                            free(names);
+                            return -1;
+                        }
+                        *any_match = 1;
+                    }
+                }
+                if (rc == -2) {
+                    fprintf(stderr, "grep: %s: read error\n", disp);
+                    *any_error = 1;
+                }
+                free(line.buf);
+                fclose(fp);
+            }
+        } else if (S_ISDIR(st.st_mode)) {
+            search_tree(realpath, disp, pattern, patlen,
+                        use_prefix, any_match, any_error, depth + 1);
+        }
+
+        free(realpath);
+        free(disp);
+    }
+
+    for (int i = 0; i < count; i++) free(names[i]);
+    free(names);
+    return 0;
+}
+
+static void search_file(const char *filename, const unsigned char *pattern,
+                        size_t patlen, const char *prefix,
+                        int *any_match, int *any_error) {
+    FILE *fp = fopen(filename, "rb");
+    if (!fp) {
+        fprintf(stderr, "grep: %s: %s\n", filename, strerror(errno));
+        *any_error = 1;
+        return;
+    }
+    ByteBuf line = {0};
+    int rc;
+    while ((rc = read_line(fp, &line)) == 0) {
+        if (fixed_match(line.buf, line.len, pattern, patlen)) {
+            if (write_line(line.buf, line.len, prefix) != 0) {
+                free(line.buf);
+                fclose(fp);
+                exit(2);
+            }
+            *any_match = 1;
+        }
+    }
+    if (rc == -2) {
+        fprintf(stderr, "grep: %s: read error\n", filename);
+        *any_error = 1;
+    }
+    free(line.buf);
+    fclose(fp);
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        print_usage();
+        return 2;
+    }
+
+    int prefix_mode = 0;
+    int recursive = 0;
+    int after_terminator = 0;
+    const char *pattern = NULL;
+    const char **files = malloc((size_t)argc * sizeof *files);
+    if (!files) return 2;
+    int file_count = 0;
+
+    for (int i = 1; i < argc; i++) {
+        if (after_terminator) {
+            if (!pattern) {
+                pattern = argv[i];
+            } else {
+                files[file_count++] = argv[i];
+            }
+        } else if (strcmp(argv[i], "--") == 0) {
+            after_terminator = 1;
+        } else if (strcmp(argv[i], "--with-filename") == 0) {
+            prefix_mode = 1;
+        } else if (strcmp(argv[i], "--no-filename") == 0) {
+            prefix_mode = -1;
+        } else if (strcmp(argv[i], "--recursive") == 0) {
+            recursive = 1;
+        } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
+            for (const char *p = argv[i] + 1; *p; p++) {
+                if (*p == 'H') {
+                    prefix_mode = 1;
+                } else if (*p == 'h') {
+                    prefix_mode = -1;
+                } else if (*p == 'r') {
+                    recursive = 1;
+                } else {
+                    free(files);
+                    print_usage();
+                    return 2;
+                }
+            }
+        } else if (!pattern) {
+            pattern = argv[i];
+        } else {
+            files[file_count++] = argv[i];
+        }
+    }
+
+    if (!pattern) {
+        free(files);
+        print_usage();
+        return 2;
+    }
+
+    size_t patlen = strlen(pattern);
+
+    int use_prefix;
+    if (prefix_mode > 0) {
+        use_prefix = 1;
+    } else if (prefix_mode < 0) {
+        use_prefix = 0;
+    } else if (file_count >= 2) {
+        use_prefix = 1;
+    } else if (recursive) {
+        int any_dir = 0;
+        for (int i = 0; i < file_count; i++) {
+            struct stat st;
+            if (stat(files[i], &st) == 0 && S_ISDIR(st.st_mode)) {
+                any_dir = 1;
+                break;
+            }
+        }
+        use_prefix = any_dir;
+    } else {
+        use_prefix = 0;
+    }
+
+    int any_match = 0;
+    int any_error = 0;
+
+    if (file_count == 0) {
+        const char *prefix = use_prefix ? "(standard input)" : NULL;
+        ByteBuf line = {0};
+        int rc;
+        while ((rc = read_line(stdin, &line)) == 0) {
+            if (fixed_match(line.buf, line.len, (const unsigned char *)pattern, patlen)) {
+                if (write_line(line.buf, line.len, prefix) != 0) {
+                    free(line.buf);
+                    free(files);
+                    return 2;
+                }
+                any_match = 1;
+            }
+        }
+        if (rc == -2) {
+            fprintf(stderr, "grep: error reading input\n");
+            free(line.buf);
+            free(files);
+            return 2;
+        }
+        free(line.buf);
+    } else {
+        for (int i = 0; i < file_count; i++) {
+            const char *filename = files[i];
+
+            struct stat st;
+            if (stat(filename, &st) != 0) {
+                fprintf(stderr, "grep: %s: %s\n", filename, strerror(errno));
+                any_error = 1;
+                continue;
+            }
+            if (S_ISDIR(st.st_mode)) {
+                if (!recursive) {
+                    fprintf(stderr, "grep: %s: Is a directory\n", filename);
+                    any_error = 1;
+                    continue;
+                }
+                char *display = strdup(filename);
+                if (!display) { any_error = 1; continue; }
+                size_t dlen = strlen(display);
+                while (dlen > 1 && display[dlen - 1] == '/')
+                    display[--dlen] = '\0';
+                search_tree(filename, display,
+                            (const unsigned char *)pattern, patlen,
+                            use_prefix, &any_match, &any_error, 0);
+                free(display);
+                continue;
+            }
+
+            const char *prefix = use_prefix ? filename : NULL;
+            search_file(filename, (const unsigned char *)pattern, patlen,
+                        prefix, &any_match, &any_error);
+        }
+    }
+
+    free(files);
+
+    if (any_error) return 2;
+    return any_match ? 0 : 1;
+}
+```
+
+Now let me build and test:
+
+```bash
+mkdir -p build
+cc -std=c11 -Wall -Wextra -Werror -pedantic -O2 src/new_grep/new_grep.c -o build/new_grep
+```
+
+Let me write the file and build it:
+
+
+Let me implement the changes to `src/new_grep/new_grep.c`:
+
+```bash
+cat > src/new_grep/new_grep.c << 'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <dirent.h>
+
+typedef struct {
+    unsigned char *buf;
+    size_t len;
+    size_t cap;
+} ByteBuf;
+
+static int buf_reserve(ByteBuf *b, size_t need) {
+    if (b->cap >= need) return 0;
+    size_t newcap = b->cap ? b->cap : 256;
+    while (newcap < need) newcap *= 2;
+    unsigned char *p = realloc(b->buf, newcap);
+    if (!p) return -1;
+    b->buf = p;
+    b->cap = newcap;
+    return 0;
+}
+
+static int buf_push(ByteBuf *b, unsigned char c) {
+    if (buf_reserve(b, b->len + 1) != 0) return -1;
+    b->buf[b->len++] = c;
+    return 0;
+}
+
+static int read_line(FILE *fp, ByteBuf *line) {
+    line->len = 0;
+    int c;
+    int got_any = 0;
+    while ((c = getc(fp)) != EOF) {
+        got_any = 1;
+        if (c == '\n') break;
+        if (buf_push(line, (unsigned char)c) != 0) return -2;
+    }
+    if (c == EOF && !got_any) return -1;
+    return 0;
+}
+
+static int fixed_match(const unsigned char *hay, size_t haylen,
+                       const unsigned char *pat, size_t patlen) {
+    if (patlen == 0) return 1;
+    if (patlen > haylen) return 0;
+    for (size_t i = 0; i <= haylen - patlen; i++) {
+        if (memcmp(hay + i, pat, patlen) == 0) return 1;
+    }
+    return 0;
+}
+
+static int write_line(const unsigned char *data, size_t len, const char *prefix) {
+    if (prefix) {
+        if (fputs(prefix, stdout) == EOF) return -1;
+        if (putc(':', stdout) == EOF) return -1;
+    }
+    if (len > 0) {
+        if (fwrite(data, 1, len, stdout) != len) return -1;
+    }
+    if (putc('\n', stdout) == EOF) return -1;
+    return 0;
+}
+
+static void print_usage(void) {
+    fprintf(stderr, "usage: grep PATTERN [FILE...]\n");
+}
+
+static int name_compare(const void *a, const void *b) {
+    const unsigned char *sa = *(const unsigned char * const *)a;
+    const unsigned char *sb = *(const unsigned char * const *)b;
+    while (*sa && *sa == *sb) { sa++; sb++; }
+    if (*sa == *sb) return 0;
+    return (*sa < *sb) ? -1 : 1;
+}
+
+static char *join_path(const char *base, const char *name) {
+    size_t blen = strlen(base);
+    int need_sep = (blen > 0 && base[blen - 1] != '/');
+    size_t nlen = strlen(name);
+    size_t total = blen + (size_t)(need_sep ? 1 : 0) + nlen + 1;
+    char *result = malloc(total);
+    if (!result) return NULL;
+    memcpy(result, base, blen);
+    size_t pos = blen;
+    if (need_sep) result[pos++] = '/';
+    memcpy(result + pos, name, nlen + 1);
+    return result;
+}
+
+#define MAX_RECURSION_DEPTH 1024
+
+static int search_tree(const char *dirpath, const char *display,
+                       const unsigned char *pattern, size_t patlen,
+                       int use_prefix, int *any_match, int *any_error,
+                       int depth) {
+    if (depth > MAX_RECURSION_DEPTH) {
+        fprintf(stderr, "grep: %s: recursion depth exceeded\n", display);
+        *any_error = 1;
+        return -1;
+    }
+
+    DIR *dp = opendir(dirpath);
+    if (!dp) {
+        fprintf(stderr, "grep: %s: %s\n", display, strerror(errno));
+        *any_error = 1;
+        return -1;
+    }
+
+    char **names = NULL;
+    int count = 0, cap = 0;
+    struct dirent *de;
+    int oom = 0;
+
+    while ((de = readdir(dp)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        if (count == cap) {
+            int newcap = cap ? cap * 2 : 16;
+            char **tmp = realloc(names, (size_t)newcap * sizeof *tmp);
+            if (!tmp) { oom = 1; break; }
+            names = tmp;
+            cap = newcap;
+        }
+        names[count] = strdup(de->d_name);
+        if (!names[count]) { oom = 1; break; }
+        count++;
+    }
+    closedir(dp);
+
+    if (oom) {
+        for (int i = 0; i < count; i++) free(names[i]);
+        free(names);
+        return -1;
+    }
+
+    qsort(names, (size_t)count, sizeof *names, name_compare);
+
+    for (int i = 0; i < count; i++) {
+        char *realpath = join_path(dirpath, names[i]);
+        char *disp = join_path(display, names[i]);
+        if (!realpath || !disp) {
+            free(realpath);
+            free(disp);
+            for (int j = 0; j < count; j++) free(names[j]);
+            free(names);
+            return -1;
+        }
+
+        struct stat st;
+        if (lstat(realpath, &st) != 0) {
+            free(realpath);
+            free(disp);
+            continue;
+        }
+
+        if (S_ISLNK(st.st_mode)) {
+            free(realpath);
+            free(disp);
+            continue;
+        }
+
+        if (S_ISREG(st.st_mode)) {
+            FILE *fp = fopen(realpath, "rb");
+            if (!fp) {
+                fprintf(stderr, "grep: %s: %s\n", disp, strerror(errno));
+                *any_error = 1;
+            } else {
+                ByteBuf line = {0};
+                int rc;
+                while ((rc = read_line(fp, &line)) == 0) {
+                    if (fixed_match(line.buf, line.len, pattern, patlen)) {
+                        const char *prefix = use_prefix ? disp : NULL;
+                        if (write_line(line.buf, line.len, prefix) != 0) {
+                            free(line.buf);
+                            fclose(fp);
+                            free(realpath);
+                            free(disp);
+                            for (int j = 0; j < count; j++) free(names[j]);
+                            free(names);
+                            return -1;
+                        }
+                        *any_match = 1;
+                    }
+                }
+                if (rc == -2) {
+                    fprintf(stderr, "grep: %s: read error\n", disp);
+                    *any_error = 1;
+                }
+                free(line.buf);
+                fclose(fp);
+            }
+        } else if (S_ISDIR(st.st_mode)) {
+            search_tree(realpath, disp, pattern, patlen,
+                        use_prefix, any_match, any_error, depth + 1);
+        }
+
+        free(realpath);
+        free(disp);
+    }
+
+    for (int i = 0; i < count; i++) free(names[i]);
+    free(names);
+    return 0;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        print_usage();
+        return 2;
+    }
+
+    int prefix_mode = 0;
+    int recursive = 0;
+    int after_terminator = 0;
+    const char *pattern = NULL;
+    const char **files = malloc((size_t)argc * sizeof *files);
+    if (!files) return 2;
+    int file_count = 0;
+
+    for (int i = 1; i < argc; i++) {
+        if (after_terminator) {
+            if (!pattern) {
+                pattern = argv[i];
+            } else {
+                files[file_count++] = argv[i];
+            }
+        } else if (strcmp(argv[i], "--") == 0) {
+            after_terminator = 1;
+        } else if (strcmp(argv[i], "--with-filename") == 0) {
+            prefix_mode = 1;
+        } else if (strcmp(argv[i], "--no-filename") == 0) {
+            prefix_mode = -1;
+        } else if (strcmp(argv[i], "--recursive") == 0) {
+            recursive = 1;
+        } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
+            for (const char *p = argv[i] + 1; *p; p++) {
+                if (*p == 'H') {
+                    prefix_mode = 1;
+                } else if (*p == 'h') {
+                    prefix_mode = -1;
+                } else if (*p == 'r') {
+                    recursive = 1;
+                } else {
+                    free(files);
+                    print_usage();
+                    return 2;
+                }
+            }
+        } else if (!pattern) {
+            pattern = argv[i];
+        } else {
+            files[file_count++] = argv[i];
+        }
+    }
+
+    if (!pattern) {
+        free(files);
+        print_usage();
+        return 2;
+    }
+
+    size_t patlen = strlen(pattern);
+
+    int use_prefix;
+    if (prefix_mode > 0) {
+        use_prefix = 1;
+    } else if (prefix_mode < 0) {
+        use_prefix = 0;
+    } else if (file_count >= 2) {
+        use_prefix = 1;
+    } else if (recursive) {
+        int any_dir = 0;
+        for (int i = 0; i < file_count; i++) {
+            struct stat st;
+            if (stat(files[i], &st) == 0 && S_ISDIR(st.st_mode)) {
+                any_dir = 1;
+                break;
+            }
+        }
+        use_prefix = any_dir;
+    } else {
+        use_prefix = 0;
+    }
+
+    int any_match = 0;
+    int any_error = 0;
+
+    if (file_count == 0) {
+        const char *prefix = use_prefix ? "(standard input)" : NULL;
+        ByteBuf line = {0};
+        int rc;
+        while ((rc = read_line(stdin, &line)) == 0) {
+            if (fixed_match(line.buf, line.len, (const unsigned char *)pattern, patlen)) {
+                if (write_line(line.buf, line.len, prefix) != 0) {
+                    free(line.buf);
+                    free(files);
+                    return 2;
+                }
+                any_match = 1;
+            }
+        }
+        if (rc == -2) {
+            fprintf(stderr, "grep: error reading input\n");
+            free(line.buf);
+            free(files);
+            return 2;
+        }
+        free(line.buf);
+    } else {
+        for (int i = 0; i < file_count; i++) {
+            const char *filename = files[i];
+
+            struct stat st;
+            if (stat(filename, &st) != 0) {
+                fprintf(stderr, "grep: %s: %s\n", filename, strerror(errno));
+                any_error = 1;
+                continue;
+            }
+            if (S_ISDIR(st.st_mode)) {
+                if (!recursive) {
+                    fprintf(stderr, "grep: %s: Is a directory\n", filename);
+                    any_error = 1;
+                    continue;
+                }
+                char *display = strdup(filename);
+                if (!display) { any_error = 1; continue; }
+                size_t dlen = strlen(display);
+                while (dlen > 1 && display[dlen - 1] == '/')
+                    display[--dlen] = '\0';
+                search_tree(filename, display,
+                            (const unsigned char *)pattern, patlen,
+                            use_prefix, &any_match, &any_error, 0);
+                free(display);
+                continue;
+            }
+
+            const char *prefix = use_prefix ? filename : NULL;
+            FILE *fp = fopen(filename, "rb");
+            if (!fp) {
+                fprintf(stderr, "grep: %s: %s\n", filename, strerror(errno));
+                any_error = 1;
+                continue;
+            }
+
+            ByteBuf line = {0};
+            int rc;
+            while ((rc = read_line(fp, &line)) == 0) {
+                if (fixed_match(line.buf, line.len, (const unsigned char *)pattern, patlen)) {
+                    if (write_line(line.buf, line.len, prefix) != 0) {
+                        free(line.buf);
+                        fclose(fp);
+                        free(files);
+                        return 2;
+                    }
+                    any_match = 1;
+                }
+            }
+            if (rc == -2) {
+                fprintf(stderr, "grep: %s: read error\n", filename);
+                free(line.buf);
+                fclose(fp);
+                any_error = 1;
+                continue;
+            }
+            free(line.buf);
+            fclose(fp);
+        }
+    }
+
+    free(files);
+
+    if (any_error) return 2;
+    return any_match ? 0 : 1;
+}
+EOF
+```
+
+```bash
+mkdir -p build
+cc -std=c11 -Wall -Wextra -Werror -pedantic -O2 src/new_grep/new_grep.c -o build/new_grep
+```
+
+```bash
+tests/grep-test-suite/judge_candidate.sh build/new_grep -H -h -r
+```
+Tokens: 24k sent, 13k received.
+I will implement the requested changes to add `-r`/`--recursive` support, update the prefix logic, and handle all edge cases as described in the test suite.
+
+The main changes are:
+1. Add `#include <dirent.h>` for directory operations
+2. Add recursive flag parsing (`-r`, `--recursive`)
+3. Implement directory traversal (`search_tree`) with pre-order, sorted, symlink-skipping
+4. Update prefix decision logic to handle recursive mode
+5. Handle trailing slashes in directory paths
+
+Here is the updated file:
+
+new_grep.c
+```
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <dirent.h>
+
+typedef struct {
+    unsigned char *buf;
+    size_t len;
+    size_t cap;
+} ByteBuf;
+
+static int buf_reserve(ByteBuf *b, size_t need) {
+    if (b->cap >= need) return 0;
+    size_t newcap = b->cap ? b->cap : 256;
+    while (newcap < need) newcap *= 2;
+    unsigned char *p = realloc(b->buf, newcap);
+    if (!p) return -1;
+    b->buf = p;
+    b->cap = newcap;
+    return 0;
+}
+
+static int buf_push(ByteBuf *b, unsigned char c) {
+    if (buf_reserve(b, b->len + 1) != 0) return -1;
+    b->buf[b->len++] = c;
+    return 0;
+}
+
+static int read_line(FILE *fp, ByteBuf *line) {
+    line->len = 0;
+    int c;
+    int got_any = 0;
+    while ((c = getc(fp)) != EOF) {
+        got_any = 1;
+        if (c == '\n') break;
+        if (buf_push(line, (unsigned char)c) != 0) return -2;
+    }
+    if (c == EOF && !got_any) return -1;
+    return 0;
+}
+
+static int fixed_match(const unsigned char *hay, size_t haylen,
+                       const unsigned char *pat, size_t patlen) {
+    if (patlen == 0) return 1;
+    if (patlen > haylen) return 0;
+    for (size_t i = 0; i <= haylen - patlen; i++) {
+        if (memcmp(hay + i, pat, patlen) == 0) return 1;
+    }
+    return 0;
+}
+
+static int write_line(const unsigned char *data, size_t len, const char *prefix) {
+    if (prefix) {
+        if (fputs(prefix, stdout) == EOF) return -1;
+        if (putc(':', stdout) == EOF) return -1;
+    }
+    if (len > 0) {
+        if (fwrite(data, 1, len, stdout) != len) return -1;
+    }
+    if (putc('\n', stdout) == EOF) return -1;
+    return 0;
+}
+
+static void print_usage(void) {
+    fprintf(stderr, "usage: grep PATTERN [FILE...]\n");
+}
+
+static int name_compare(const void *a, const void *b) {
+    const char *sa = *(const char * const *)a;
+    const char *sb = *(const char * const *)b;
+    return strcmp(sa, sb);
+}
+
+static char *join_path(const char *base, const char *name) {
+    size_t blen = strlen(base);
+    int need_sep = (blen > 0 && base[blen - 1] != '/');
+    size_t nlen = strlen(name);
+    size_t total = blen + (size_t)(need_sep ? 1 : 0) + nlen + 1;
+    char *result = malloc(total);
+    if (!result) return NULL;
+    memcpy(result, base, blen);
+    size_t pos = blen;
+    if (need_sep) result[pos++] = '/';
+    memcpy(result + pos, name, nlen + 1);
+    return result;
+}
+
+#define MAX_RECURSION_DEPTH 1024
+
+static int search_tree(const char *dirpath, const char *display,
+                       const unsigned char *pattern, size_t patlen,
+                       int use_prefix, int *any_match, int *any_error,
+                       int depth) {
+    if (depth > MAX_RECURSION_DEPTH) {
+        fprintf(stderr, "grep: %s: recursion depth exceeded\n", display);
+        *any_error = 1;
+        return -1;
+    }
+
+    DIR *dp = opendir(dirpath);
+    if (!dp) {
+        fprintf(stderr, "grep: %s: %s\n", display, strerror(errno));
+        *any_error = 1;
+        return -1;
+    }
+
+    char **names = NULL;
+    int count = 0, cap = 0;
+    struct dirent *de;
+    int oom = 0;
+
+    while ((de = readdir(dp)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        if (count == cap) {
+            int newcap = cap ? cap * 2 : 16;
+            char **tmp = realloc(names, (size_t)newcap * sizeof *tmp);
+            if (!tmp) { oom = 1; break; }
+            names = tmp;
+            cap = newcap;
+        }
+        names[count] = strdup(de->d_name);
+        if (!names[count]) { oom = 1; break; }
+        count++;
+    }
+    closedir(dp);
+
+    if (oom) {
+        for (int i = 0; i < count; i++) free(names[i]);
+        free(names);
+        return -1;
+    }
+
+    qsort(names, (size_t)count, sizeof *names, name_compare);
+
+    for (int i = 0; i < count; i++) {
+        char *realpath = join_path(dirpath, names[i]);
+        char *disp = join_path(display, names[i]);
+        if (!realpath || !disp) {
+            free(realpath);
+            free(disp);
+            for (int j = 0; j < count; j++) free(names[j]);
+            free(names);
+            return -1;
+        }
+
+        struct stat st;
+        if (lstat(realpath, &st) != 0) {
+            free(realpath);
+            free(disp);
+            continue;
+        }
+
+        if (S_ISLNK(st.st_mode)) {
+            free(realpath);
+            free(disp);
+            continue;
+        }
+
+        if (S_ISREG(st.st_mode)) {
+            FILE *fp = fopen(realpath, "rb");
+            if (!fp) {
+                fprintf(stderr, "grep: %s: %s\n", disp, strerror(errno));
+                *any_error = 1;
+            } else {
+                ByteBuf line = {0};
+                int rc;
+                while ((rc = read_line(fp, &line)) == 0) {
+                    if (fixed_match(line.buf, line.len, pattern, patlen)) {
+                        const char *prefix = use_prefix ? disp : NULL;
+                        if (write_line(line.buf, line.len, prefix) != 0) {
+                            free(line.buf);
+                            fclose(fp);
+                            free(realpath);
+                            free(disp);
+                            for (int j = 0; j < count; j++) free(names[j]);
+                            free(names);
+                            return -1;
+                        }
+                        *any_match = 1;
+                    }
+                }
+                if (rc == -2) {
+                    fprintf(stderr, "grep: %s: read error\n", disp);
+                    *any_error = 1;
+                }
+                free(line.buf);
+                fclose(fp);
+            }
+        } else if (S_ISDIR(st.st_mode)) {
+            search_tree(realpath, disp, pattern, patlen,
+                        use_prefix, any_match, any_error, depth + 1);
+        }
+
+        free(realpath);
+        free(disp);
+    }
+
+    for (int i = 0; i < count; i++) free(names[i]);
+    free(names);
+    return 0;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        print_usage();
+        return 2;
+    }
+
+    int prefix_mode = 0;
+    int recursive = 0;
+    int after_terminator = 0;
+    const char *pattern = NULL;
+    const char **files = malloc((size_t)argc * sizeof *files);
+    if (!files) return 2;
+    int file_count = 0;
+
+    for (int i = 1; i < argc; i++) {
+        if (after_terminator) {
+            if (!pattern) {
+                pattern = argv[i];
+            } else {
+                files[file_count++] = argv[i];
+            }
+        } else if (strcmp(argv[i], "--") == 0) {
+            after_terminator = 1;
+        } else if (strcmp(argv[i], "--with-filename") == 0) {
+            prefix_mode = 1;
+        } else if (strcmp(argv[i], "--no-filename") == 0) {
+            prefix_mode = -1;
+        } else if (strcmp(argv[i], "--recursive") == 0) {
+            recursive = 1;
+        } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
+            for (const char *p = argv[i] + 1; *p; p++) {
+                if (*p == 'H') {
+                    prefix_mode = 1;
+                } else if (*p == 'h') {
+                    prefix_mode = -1;
+                } else if (*p == 'r') {
+                    recursive = 1;
+                } else {
+                    free(files);
+                    print_usage();
+                    return 2;
+                }
+            }
+        } else if (!pattern) {
+            pattern = argv[i];
+        } else {
+            files[file_count++] = argv[i];
+        }
+    }
+
+    if (!pattern) {
+        free(files);
+        print_usage();
+        return 2;
+    }
+
+    size_t patlen = strlen(pattern);
+
+    int use_prefix;
+    if (prefix_mode > 0) {
+        use_prefix = 1;
+    } else if (prefix_mode < 0) {
+        use_prefix = 0;
+    } else if (file_count >= 2) {
+        use_prefix = 1;
+    } else if (recursive) {
+        int any_dir = 0;
+        for (int i = 0; i < file_count; i++) {
+            struct stat st;
+            if (stat(files[i], &st) == 0 && S_ISDIR(st.st_mode)) {
+                any_dir = 1;
+                break;
+            }
+        }
+        use_prefix = any_dir;
+    } else {
+        use_prefix = 0;
+    }
+
+    int any_match = 0;
+    int any_error = 0;
+
+    if (file_count == 0) {
+        const char *prefix = use_prefix ? "(standard input)" : NULL;
+        ByteBuf line = {0};
+        int rc;
+        while ((rc = read_line(stdin, &line)) == 0) {
+            if (fixed_match(line.buf, line.len, (const unsigned char *)pattern, patlen)) {
+                if (write_line(line.buf, line.len, prefix) != 0) {
+                    free(line.buf);
+                    free(files);
+                    return 2;
+                }
+                any_match = 1;
+            }
+        }
+        if (rc == -2) {
+            fprintf(stderr, "grep: error reading input\n");
+            free(line.buf);
+            free(files);
+            return 2;
+        }
+        free(line.buf);
+    } else {
+        for (int i = 0; i < file_count; i++) {
+            const char *filename = files[i];
+
+            struct stat st;
+            if (stat(filename, &st) != 0) {
+                fprintf(stderr, "grep: %s: %s\n", filename, strerror(errno));
+                any_error = 1;
+                continue;
+            }
+            if (S_ISDIR(st.st_mode)) {
+                if (!recursive) {
+                    fprintf(stderr, "grep: %s: Is a directory\n", filename);
+                    any_error = 1;
+                    continue;
+                }
+                char *display = strdup(filename);
+                if (!display) { any_error = 1; continue; }
+                size_t dlen = strlen(display);
+                while (dlen > 1 && display[dlen - 1] == '/')
+                    display[--dlen] = '\0';
+                search_tree(filename, display,
+                            (const unsigned char *)pattern, patlen,
+                            use_prefix, &any_match, &any_error, 0);
+                free(display);
+                continue;
+            }
+
+            FILE *fp = fopen(filename, "rb");
+            if (!fp) {
+                fprintf(stderr, "grep: %s: %s\n", filename, strerror(errno));
+                any_error = 1;
+                continue;
+            }
+
+            ByteBuf line = {0};
+            int rc;
+            const char *prefix = use_prefix ? filename : NULL;
+            while ((rc = read_line(fp, &line)) == 0) {
+                if (fixed_match(line.buf, line.len, (const unsigned char *)pattern, patlen)) {
+                    if (write_line(line.buf, line.len, prefix) != 0) {
+                        free(line.buf);
+                        fclose(fp);
+                        free(files);
+                        return 2;
+                    }
+                    any_match = 1;
+                }
+            }
+            if (rc == -2) {
+                fprintf(stderr, "grep: %s: read error\n", filename);
+                free(line.buf);
+                fclose(fp);
+                any_error = 1;
+                continue;
+            }
+            free(line.buf);
+            fclose(fp);
+        }
+    }
+
+    free(files);
+
+    if (any_error) return 2;
+    return any_match ? 0 : 1;
+}
+```
+Tokens: 29k sent, 3.0k received.
+Applied edit to new_grep.c
+Summarization failed for model ollama_chat/qwen3-coder-next:latest: cannot schedule new futures after shutdown
+Summarization failed for model ollama_chat/qwen3-coder-next:latest: cannot schedule new futures after shutdown
+Summarization failed for model ollama_chat/qwen3.8:27b: cannot schedule new futures after shutdown
+summarizer unexpectedly failed for all models
+Summarization failed for model ollama_chat/qwen3.8:27b: cannot schedule new futures after shutdown
+summarizer unexpectedly failed for all models

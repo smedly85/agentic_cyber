@@ -1,0 +1,350 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <dirent.h>
+
+// Forward declaration
+static int search_file(const char *filename, const unsigned char *pattern,
+                       size_t pat_len, const char *prefix);
+
+static int contains_pattern(const unsigned char *line, size_t len,
+                            const unsigned char *pattern, size_t pat_len) {
+    if (pat_len == 0) return 1;
+    if (pat_len > len) return 0;
+    for (size_t i = 0; i <= len - pat_len; i++) {
+        if (memcmp(line + i, pattern, pat_len) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static int write_line(const unsigned char *line, size_t len,
+                      const char *prefix) {
+    if (prefix) {
+        size_t plen = strlen(prefix);
+        if (fwrite(prefix, 1, plen, stdout) != plen) return -1;
+        if (fputc(':', stdout) == EOF) return -1;
+    }
+    if (len > 0 && fwrite(line, 1, len, stdout) != len) return -1;
+    if (fputc('\n', stdout) == EOF) return -1;
+    return 0;
+}
+
+static int search_stream(FILE *fp, const unsigned char *pattern, size_t pat_len,
+                         const char *prefix) {
+    int found = 0;
+    size_t cap = 256, size = 0;
+    unsigned char *buf = malloc(cap);
+    if (!buf) return -1;
+
+    int c;
+    while ((c = fgetc(fp)) != EOF) {
+        if (size + 1 > cap) {
+            size_t new_cap = cap * 2;
+            unsigned char *tmp = realloc(buf, new_cap);
+            if (!tmp) { free(buf); return -1; }
+            buf = tmp;
+            cap = new_cap;
+        }
+        if (c == '\n') {
+            if (contains_pattern(buf, size, pattern, pat_len)) {
+                if (write_line(buf, size, prefix) != 0) { free(buf); return -1; }
+                found = 1;
+            }
+            size = 0;
+        } else {
+            buf[size++] = (unsigned char)c;
+        }
+    }
+    if (ferror(fp)) { free(buf); return -1; }
+
+    if (size > 0) {
+        if (contains_pattern(buf, size, pattern, pat_len)) {
+            if (write_line(buf, size, prefix) != 0) { free(buf); return -1; }
+            found = 1;
+        }
+    }
+
+    free(buf);
+    return found ? 0 : 1;
+}
+
+static int cmp_byte(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+static char *join_path(const char *base, const char *name) {
+    size_t blen = strlen(base);
+    size_t nlen = strlen(name);
+    char *result = malloc(blen + 1 + nlen + 1);
+    if (!result) return NULL;
+    memcpy(result, base, blen);
+    result[blen] = '/';
+    memcpy(result + blen + 1, name, nlen + 1);
+    return result;
+}
+
+static void search_directory(const char *dir_path, const unsigned char *pattern,
+                             size_t pat_len, const char *prefix,
+                             int *found_any, int *has_error) {
+    DIR *dp = opendir(dir_path);
+    if (!dp) {
+        fprintf(stderr, "new_grep: %s: %s\n", dir_path, strerror(errno));
+        *has_error = 1;
+        return;
+    }
+
+    struct dirent *entry;
+    char **names = NULL;
+    int count = 0, cap = 0;
+
+    while ((entry = readdir(dp)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+        if (count == cap) {
+            int new_cap = cap ? cap * 2 : 16;
+            char **tmp = realloc(names, (size_t)new_cap * sizeof(char *));
+            if (!tmp) {
+                for (int k = 0; k < count; k++) free(names[k]);
+                free(names);
+                closedir(dp);
+                *has_error = 1;
+                return;
+            }
+            names = tmp;
+            cap = new_cap;
+        }
+        size_t nlen = strlen(entry->d_name);
+        char *copy = malloc(nlen + 1);
+        if (!copy) {
+            for (int k = 0; k < count; k++) free(names[k]);
+            free(names);
+            closedir(dp);
+            *has_error = 1;
+            return;
+        }
+        memcpy(copy, entry->d_name, nlen + 1);
+        names[count++] = copy;
+    }
+    closedir(dp);
+
+    qsort(names, (size_t)count, sizeof(char *), cmp_byte);
+
+    for (int i = 0; i < count; i++) {
+        char *full_path = join_path(dir_path, names[i]);
+        if (!full_path) {
+            for (int k = i; k < count; k++) free(names[k]);
+            free(names);
+            *has_error = 1;
+            return;
+        }
+
+        struct stat st;
+        if (lstat(full_path, &st) == 0) {
+            if (S_ISLNK(st.st_mode)) {
+                /* skip symlinks during traversal */
+            } else if (S_ISREG(st.st_mode)) {
+                const char *file_prefix = NULL;
+                char *built = NULL;
+                if (prefix) {
+                    built = join_path(prefix, names[i]);
+                    if (built) file_prefix = built;
+                }
+                int result = search_file(full_path, pattern, pat_len, file_prefix);
+                if (result == -1) *has_error = 1;
+                else if (result == 0) *found_any = 1;
+                free(built);
+            } else if (S_ISDIR(st.st_mode)) {
+                const char *child_prefix = NULL;
+                char *built = NULL;
+                if (prefix) {
+                    built = join_path(prefix, names[i]);
+                    if (built) child_prefix = built;
+                }
+                search_directory(full_path, pattern, pat_len, child_prefix,
+                                found_any, has_error);
+                free(built);
+            }
+        }
+
+        free(full_path);
+        free(names[i]);
+    }
+    free(names);
+}
+
+static int search_file(const char *filename, const unsigned char *pattern,
+                       size_t pat_len, const char *prefix) {
+    struct stat st;
+    if (stat(filename, &st) == 0 && S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "new_grep: %s: Is a directory\n", filename);
+        return -1;
+    }
+    FILE *fp = fopen(filename, "r");
+    if (!fp) {
+        fprintf(stderr, "new_grep: %s: %s\n", filename, strerror(errno));
+        return -1;
+    }
+    int result = search_stream(fp, pattern, pat_len, prefix);
+    fclose(fp);
+    return result;
+}
+
+static void usage(void) {
+    fprintf(stderr,
+            "Usage: new_grep [-H|-h|-r] [--with-filename] [--no-filename] "
+            "[--recursive] PATTERN [FILE_OR_DIR...]\n");
+}
+
+static char *strip_trailing_slashes(const char *path) {
+    size_t len = strlen(path);
+    while (len > 1 && path[len - 1] == '/')
+        len--;
+    char *copy = malloc(len + 1);
+    if (!copy) return NULL;
+    memcpy(copy, path, len);
+    copy[len] = '\0';
+    return copy;
+}
+
+int main(int argc, char *argv[]) {
+    int show_filename = -1;
+    int recursive = 0;
+    int i = 1;
+    int pattern_idx = -1;
+
+    while (i < argc) {
+        const char *arg = argv[i];
+
+        if (strcmp(arg, "--") == 0) {
+            i++;
+            if (i >= argc) {
+                usage();
+                return 2;
+            }
+            pattern_idx = i;
+            break;
+        }
+
+        if (arg[0] == '-' && arg[1] != '\0') {
+            if (strcmp(arg, "--with-filename") == 0) {
+                show_filename = 1;
+                i++;
+                continue;
+            }
+            if (strcmp(arg, "--no-filename") == 0) {
+                show_filename = 0;
+                i++;
+                continue;
+            }
+            if (strcmp(arg, "--recursive") == 0) {
+                recursive = 1;
+                i++;
+                continue;
+            }
+            if (arg[1] != '\0' && arg[2] != '\0' && arg[0] == '-' && arg[1] != '-') {
+                int valid = 1;
+                for (const char *p = arg + 1; *p; p++) {
+                    if (*p != 'H' && *p != 'h' && *p != 'r') { valid = 0; break; }
+                }
+                if (valid) {
+                    for (const char *p = arg + 1; *p; p++) {
+                        if (*p == 'H') show_filename = 1;
+                        else if (*p == 'h') show_filename = 0;
+                        else if (*p == 'r') recursive = 1;
+                    }
+                    i++;
+                    continue;
+                }
+            }
+            if (arg[1] == 'H' && arg[2] == '\0') {
+                show_filename = 1;
+                i++;
+                continue;
+            }
+            if (arg[1] == 'h' && arg[2] == '\0') {
+                show_filename = 0;
+                i++;
+                continue;
+            }
+            if (arg[1] == 'r' && arg[2] == '\0') {
+                recursive = 1;
+                i++;
+                continue;
+            }
+            usage();
+            return 2;
+        }
+
+        pattern_idx = i;
+        break;
+    }
+
+    if (pattern_idx == -1) {
+        usage();
+        return 2;
+    }
+
+    const char *pattern = argv[pattern_idx];
+    size_t pat_len = strlen(pattern);
+    int file_start = pattern_idx + 1;
+    int file_count = argc - file_start;
+
+    int use_prefix;
+    if (show_filename == 1)
+        use_prefix = 1;
+    else if (show_filename == 0)
+        use_prefix = 0;
+    else if (file_count >= 2)
+        use_prefix = 1;
+    else {
+        use_prefix = 0;
+        if (recursive) {
+            for (int j = 0; j < file_count; j++) {
+                struct stat st;
+                if (stat(argv[file_start + j], &st) == 0 && S_ISDIR(st.st_mode)) {
+                    use_prefix = 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (file_count == 0) {
+        const char *prefix = use_prefix ? "(standard input)" : NULL;
+        int result = search_stream(stdin, (const unsigned char *)pattern, pat_len, prefix);
+        if (result == -1) return 2;
+        return result;
+    }
+
+    int has_error = 0;
+    int found_any = 0;
+
+    for (int j = 0; j < file_count; j++) {
+        const char *fn = argv[file_start + j];
+        struct stat st;
+
+        if (recursive && stat(fn, &st) == 0 && S_ISDIR(st.st_mode)) {
+            char *base = strip_trailing_slashes(fn);
+            if (!base) { has_error = 1; continue; }
+            const char *prefix = use_prefix ? base : NULL;
+            search_directory(base, (const unsigned char *)pattern, pat_len,
+                             prefix, &found_any, &has_error);
+            free(base);
+        } else {
+            const char *prefix = use_prefix ? fn : NULL;
+            int result = search_file(fn, (const unsigned char *)pattern,
+                                     pat_len, prefix);
+            if (result == -1)
+                has_error = 1;
+            else if (result == 0)
+                found_any = 1;
+        }
+    }
+
+    if (has_error) return 2;
+    return found_any ? 0 : 1;
+}
