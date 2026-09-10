@@ -243,8 +243,16 @@ def analyze_sources(
             target = resolve_target(called, item["source_file"])
             if target is not None:
                 direct_graph[identifier].add(target)
-            elif name_counts[called] == 0:
-                unresolved.append({"caller": identifier, "callee_text": called})
+            else:
+                unresolved.append({
+                    "caller": identifier,
+                    "callee_text": called,
+                    "reason": (
+                        "ambiguous_target"
+                        if name_counts[called] > 1
+                        else "target_not_found"
+                    ),
+                })
         for callback in item["callback_calls"]:
             called = callback["target_text"]
             # Callback edges require a globally unique defined target. Unlike
@@ -299,13 +307,30 @@ def analyze_sources(
         })
     entry_ids = list(dict.fromkeys(entry_ids))
     depths: dict[str, int] = {}
-    pending: deque[tuple[str, int]] = deque((identifier, 0) for identifier in sorted(entry_ids))
+    predecessors: dict[str, str | None] = {}
+    pending: deque[tuple[str, int, str | None]] = deque(
+        (identifier, 0, None) for identifier in sorted(entry_ids)
+    )
     while pending:
-        identifier, depth = pending.popleft()
+        identifier, depth, predecessor = pending.popleft()
         if identifier in depths and depths[identifier] <= depth:
             continue
         depths[identifier] = depth
-        pending.extend((callee, depth + 1) for callee in sorted(graph[identifier]))
+        predecessors[identifier] = predecessor
+        pending.extend(
+            (callee, depth + 1, identifier)
+            for callee in sorted(graph[identifier])
+        )
+
+    def shortest_path(identifier: str) -> list[str] | None:
+        if identifier not in depths:
+            return None
+        path: list[str] = []
+        current: str | None = identifier
+        while current is not None:
+            path.append(current)
+            current = predecessors[current]
+        return list(reversed(path))
 
     direct_callers: dict[str, set[str]] = {identifier: set() for identifier in by_id}
     callback_callers: dict[str, set[str]] = {identifier: set() for identifier in by_id}
@@ -332,6 +357,7 @@ def analyze_sources(
             "lines_of_code": item["lines_of_code"],
             "ast_node_count": item["ast_node_count"],
             "call_depth": depths.get(identifier),
+            "shortest_call_path": shortest_path(identifier),
             "reachable_from_entry": identifier in depths,
             "diversification_eligible": identifier in depths and identifier not in entry_ids,
             "callers": sorted(direct_callers[identifier] | callback_callers[identifier]),

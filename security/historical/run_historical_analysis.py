@@ -28,6 +28,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--k", nargs="*", type=int, default=[])
     parser.add_argument("--percent", nargs="*", type=float, default=[10, 25, 50, 100])
     parser.add_argument("--random-seeds", nargs="+", type=int, default=[1])
+    parser.add_argument(
+        "--coverage-study", action="store_true",
+        help="also emit the preserved SHALLOW/RANDOM/DEEP HVC comparison",
+    )
     parser.add_argument("--include-entry-points", action="store_true")
     parser.add_argument("--force-fallback", action="store_true")
     args = parser.parse_args(argv)
@@ -46,6 +50,7 @@ def main(argv: list[str] | None = None) -> int:
         records, manifest, force_fallback=args.force_fallback
     )
     mappings = versioned["historical_function_mappings"]
+    record_mappings = versioned["historical_record_mappings"]
     graph_summaries = {
         identifier: {
             key: graph[key] for key in (
@@ -55,24 +60,26 @@ def main(argv: list[str] | None = None) -> int:
                 "unreachable_function_count", "max_reachable_call_depth",
                 "functions_by_call_depth",
             )
-        }
+        } | {"function_count": len(graph["function_reachability"])}
         for identifier, graph in versioned["call_graphs"].items()
     }
     report = {
-        "schema_version": 2,
+        "schema_version": 3,
         "dataset": str(args.records),
         "source_manifest": str(args.source_manifest),
         "call_graphs_constructed": versioned["call_graphs_constructed"],
         "call_graph_cache_hits": versioned["call_graph_cache_hits"],
         "call_graph_summaries": graph_summaries,
-        "historical_summary": summarize_historical_analysis(mappings),
+        "historical_summary": summarize_historical_analysis(mappings, record_mappings),
         "historical_function_mappings": mappings,
-        **coverage_study(
+        "historical_record_mappings": record_mappings,
+    }
+    if args.coverage_study:
+        report.update(coverage_study(
             versioned, k_values=args.k, percent_values=args.percent,
             random_seeds=args.random_seeds,
             include_entry_points=args.include_entry_points,
-        ),
-    }
+        ))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return 0

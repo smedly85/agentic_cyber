@@ -12,13 +12,13 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from security.common.callgraph import SELECTION_POLICIES, analyze_source_tree, select_functions
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 ALLOWED_UTILITIES = {"sort", "mkdir", "chmod", "grep"}
 ALLOWED_PROJECTS = {"gnu-coreutils", "gnu-grep"}
 REQUIRED_FIELDS = {
     "id": str, "utility": str, "upstream_project": str,
     "affected_version": str, "fixed_version": str, "source_revision": str,
-    "vulnerable_function": str, "patched_functions": list, "cwe": str,
+    "vulnerable_functions": list, "patched_functions": list, "cwe": str,
     "bug_type": str, "attacker_input": str, "source_reference": str,
     "patch_reference": str, "notes": str, "verified": bool,
 }
@@ -26,9 +26,24 @@ MANIFEST_FIELDS = {
     "upstream_project": str, "affected_version": str, "source_revision": str,
     "source_tree": str, "source_tree_sha256": str, "programs": dict,
 }
-PROGRAM_FIELDS = {"entry_point": dict, "source_globs": list}
+PROGRAM_FIELDS = {
+    "entry_point": dict, "source_globs": list, "source_files": list,
+}
 ENTRY_POINT_FIELDS = {"source_file": str, "function": str}
+CENSUS_FIELDS = {
+    "id": str, "package_project": str, "utility_component": str,
+    "target_utility": bool, "provenance": str, "analysis_eligibility": str,
+    "disposition_reason": str, "source_patch_verification_status": str,
+    "references": list,
+}
+CENSUS_PROVENANCE = {
+    "upstream_gnu", "downstream_patch", "predecessor_package",
+    "unrelated_implementation",
+}
+CENSUS_ELIGIBILITY = {"eligible", "excluded", "unresolved"}
+CENSUS_VERIFICATION = {"verified", "partially_verified", "unverified"}
 MAPPED_STATES = {"mapped_and_reachable", "mapped_but_unreachable"}
+HVC_ELIGIBLE_STATE = "mapped_and_reachable"
 
 
 class HistoricalDataError(ValueError):
@@ -47,14 +62,19 @@ class ProgramAnalysisError(ValueError):
         self.resolved_source_files = list(resolved_source_files)
 
 
-def _validate_fields(value: Mapping[str, Any], fields: Mapping[str, type]) -> list[str]:
+def _validate_fields(
+    value: Mapping[str, Any], fields: Mapping[str, type], *,
+    required_fields: Iterable[str] | None = None,
+) -> list[str]:
     errors: list[str] = []
     unknown = sorted(set(value) - set(fields))
     if unknown:
         errors.append(f"unknown fields: {', '.join(unknown)}")
+    required = set(fields) if required_fields is None else set(required_fields)
     for field, expected in fields.items():
         if field not in value:
-            errors.append(f"missing field: {field}")
+            if field in required:
+                errors.append(f"missing field: {field}")
         elif not isinstance(value[field], expected) or (
             expected is bool and type(value[field]) is not bool
         ):
@@ -64,19 +84,32 @@ def _validate_fields(value: Mapping[str, Any], fields: Mapping[str, type]) -> li
 
 def validate_record(record: Mapping[str, Any]) -> list[str]:
     errors = _validate_fields(record, REQUIRED_FIELDS)
-    for field in ("id", "vulnerable_function", "source_revision"):
+    for field in ("id", "source_revision"):
         if isinstance(record.get(field), str) and not record[field].strip():
             errors.append(f"{field} must not be empty")
+    revision = record.get("source_revision")
+    if isinstance(revision, str) and not (
+        len(revision) == 40
+        and all(character in "0123456789abcdef" for character in revision)
+    ):
+        errors.append("source_revision must be a lowercase 40-character Git commit SHA")
     if record.get("utility") not in ALLOWED_UTILITIES:
         errors.append("utility must be sort, mkdir, chmod, or grep")
     if record.get("upstream_project") not in ALLOWED_PROJECTS:
         errors.append("upstream_project must be gnu-coreutils or gnu-grep")
-    patched = record.get("patched_functions")
-    if isinstance(patched, list):
-        if any(not isinstance(item, str) for item in patched):
-            errors.append("patched_functions entries must be strings")
-        if len(set(item for item in patched if isinstance(item, str))) != len(patched):
-            errors.append("patched_functions entries must be unique")
+    for field, require_nonempty in (("vulnerable_functions", True), ("patched_functions", False)):
+        values = record.get(field)
+        if not isinstance(values, list):
+            continue
+        if require_nonempty and not values:
+            errors.append(f"{field} must not be empty")
+        strings = [item for item in values if isinstance(item, str)]
+        if len(strings) != len(values):
+            errors.append(f"{field} entries must be strings")
+        if any(not item.strip() for item in strings):
+            errors.append(f"{field} entries must not be empty")
+        if len(set(strings)) != len(values):
+            errors.append(f"{field} entries must be unique")
     return errors
 
 
@@ -94,6 +127,43 @@ def validate_records(records: Any) -> list[str]:
         if isinstance(identifier, str):
             if identifier in identifiers:
                 errors.append(f"record {index}: duplicate id: {identifier}")
+            identifiers.add(identifier)
+    return errors
+
+
+def validate_census(records: Any) -> list[str]:
+    if not isinstance(records, list):
+        return ["census root must be an array"]
+    errors: list[str] = []
+    identifiers: set[str] = set()
+    for index, record in enumerate(records):
+        prefix = f"record {index}: "
+        if not isinstance(record, Mapping):
+            errors.append(prefix + "must be an object")
+            continue
+        errors.extend(prefix + error for error in _validate_fields(record, CENSUS_FIELDS))
+        for field in ("id", "package_project", "utility_component", "disposition_reason"):
+            if isinstance(record.get(field), str) and not record[field].strip():
+                errors.append(prefix + f"{field} must not be empty")
+        if record.get("provenance") not in CENSUS_PROVENANCE:
+            errors.append(prefix + "invalid provenance")
+        if record.get("analysis_eligibility") not in CENSUS_ELIGIBILITY:
+            errors.append(prefix + "invalid analysis_eligibility")
+        if record.get("source_patch_verification_status") not in CENSUS_VERIFICATION:
+            errors.append(prefix + "invalid source_patch_verification_status")
+        references = record.get("references")
+        if isinstance(references, list):
+            strings = [item for item in references if isinstance(item, str)]
+            if not references:
+                errors.append(prefix + "references must not be empty")
+            if len(strings) != len(references) or any(not item.strip() for item in strings):
+                errors.append(prefix + "references entries must be non-empty strings")
+            if len(set(strings)) != len(references):
+                errors.append(prefix + "references entries must be unique")
+        identifier = record.get("id")
+        if isinstance(identifier, str):
+            if identifier in identifiers:
+                errors.append(prefix + f"duplicate id: {identifier}")
             identifiers.add(identifier)
     return errors
 
@@ -118,6 +188,12 @@ def validate_manifest_entry(entry: Mapping[str, Any]) -> list[str]:
     for field in ("affected_version", "source_revision", "source_tree"):
         if isinstance(entry.get(field), str) and not entry[field].strip():
             errors.append(f"{field} must not be empty")
+    revision = entry.get("source_revision")
+    if isinstance(revision, str) and not (
+        len(revision) == 40
+        and all(character in "0123456789abcdef" for character in revision)
+    ):
+        errors.append("source_revision must be a lowercase 40-character Git commit SHA")
     if entry.get("upstream_project") not in ALLOWED_PROJECTS:
         errors.append("upstream_project must be gnu-coreutils or gnu-grep")
     fingerprint = entry.get("source_tree_sha256")
@@ -139,8 +215,18 @@ def validate_manifest_entry(entry: Mapping[str, Any]) -> list[str]:
                 continue
             errors.extend(
                 f"{prefix}: {error}"
-                for error in _validate_fields(program, PROGRAM_FIELDS)
+                for error in _validate_fields(
+                    program, PROGRAM_FIELDS, required_fields=("entry_point",)
+                )
             )
+            scope_fields = [
+                field for field in ("source_globs", "source_files")
+                if field in program
+            ]
+            if len(scope_fields) != 1:
+                errors.append(
+                    f"{prefix}: exactly one of source_globs or source_files is required"
+                )
             entry_point = program.get("entry_point")
             if isinstance(entry_point, Mapping):
                 errors.extend(
@@ -168,6 +254,23 @@ def validate_manifest_entry(entry: Mapping[str, Any]) -> list[str]:
                     path_error = _relative_scope_path_error(pattern, allow_glob=True)
                     if path_error:
                         errors.append(f"{prefix}.source_globs: {path_error}: {pattern}")
+            source_files = program.get("source_files")
+            if isinstance(source_files, list):
+                if not source_files:
+                    errors.append(f"{prefix}.source_files must not be empty")
+                if any(not isinstance(path, str) for path in source_files):
+                    errors.append(f"{prefix}.source_files entries must be strings")
+                strings = [path for path in source_files if isinstance(path, str)]
+                if len(set(strings)) != len(strings):
+                    errors.append(f"{prefix}.source_files entries must be unique")
+                for path in strings:
+                    path_error = _relative_scope_path_error(path, allow_glob=False)
+                    if path_error:
+                        errors.append(f"{prefix}.source_files: {path_error}: {path}")
+                    elif not path.endswith(".c"):
+                        errors.append(
+                            f"{prefix}.source_files entries must name C files: {path}"
+                        )
     return errors
 
 
@@ -203,6 +306,10 @@ def _load_array(path: Path, validator: Any, label: str) -> list[dict[str, Any]]:
 
 def load_records(path: Path) -> list[dict[str, Any]]:
     return _load_array(path, validate_records, "historical dataset")
+
+
+def load_census(path: Path) -> list[dict[str, Any]]:
+    return _load_array(path, validate_census, "historical CVE census")
 
 
 def load_source_manifest(path: Path) -> list[dict[str, Any]]:
@@ -274,7 +381,11 @@ def _resolve_program_scope(
     root = source_tree.resolve()
     entry_point = program.get("entry_point")
     globs = program.get("source_globs")
-    if not isinstance(entry_point, Mapping) or not isinstance(globs, list):
+    source_files = program.get("source_files")
+    if (
+        not isinstance(entry_point, Mapping)
+        or (isinstance(globs, list) == isinstance(source_files, list))
+    ):
         raise ProgramAnalysisError(
             "analysis_scope_invalid", "program scope metadata is incomplete"
         )
@@ -285,10 +396,16 @@ def _resolve_program_scope(
             "analysis_scope_invalid", "program entry point metadata is invalid"
         )
     qualified_entry = f"{PurePosixPath(source_file).as_posix()}::{function}"
-    for value, allow_glob in ((source_file, False), *((item, True) for item in globs)):
+    scope_values = globs if isinstance(globs, list) else source_files
+    assert isinstance(scope_values, list)
+    allow_scope_glob = isinstance(globs, list)
+    for value, allow_glob in (
+        (source_file, False),
+        *((item, allow_scope_glob) for item in scope_values),
+    ):
         if not isinstance(value, str):
             raise ProgramAnalysisError(
-                "analysis_scope_invalid", "program source globs must be strings"
+                "analysis_scope_invalid", "program source paths must be strings"
             )
         path_error = _relative_scope_path_error(value, allow_glob=allow_glob)
         if path_error:
@@ -299,15 +416,18 @@ def _resolve_program_scope(
 
     matched: dict[str, Path] = {}
     try:
-        for pattern in globs:
-            for candidate in root.glob(pattern):
+        for pattern in scope_values:
+            candidates = root.glob(pattern) if allow_scope_glob else (
+                root.joinpath(*PurePosixPath(pattern).parts),
+            )
+            for candidate in candidates:
                 resolved = candidate.resolve()
                 try:
                     relative = resolved.relative_to(root).as_posix()
                 except ValueError as error:
                     raise ProgramAnalysisError(
                         "analysis_scope_invalid",
-                        f"source glob resolves outside the source tree: {pattern}",
+                        f"source path resolves outside the source tree: {pattern}",
                         source_qualified_entry_point=qualified_entry,
                         resolved_source_files=sorted(matched),
                     ) from error
@@ -317,15 +437,23 @@ def _resolve_program_scope(
         if isinstance(error, ProgramAnalysisError):
             raise
         raise ProgramAnalysisError(
-            "analysis_scope_invalid", f"cannot resolve program source globs: {error}",
+            "analysis_scope_invalid", f"cannot resolve program source paths: {error}",
             source_qualified_entry_point=qualified_entry,
             resolved_source_files=sorted(matched),
         ) from error
     resolved_files = sorted(matched)
     if not resolved_files:
         raise ProgramAnalysisError(
-            "analysis_scope_empty", "program source globs matched no C files",
+            "analysis_scope_empty", "program source scope matched no C files",
             source_qualified_entry_point=qualified_entry,
+        )
+    if isinstance(source_files, list) and len(resolved_files) != len(source_files):
+        missing = sorted(set(source_files) - set(resolved_files))
+        raise ProgramAnalysisError(
+            "analysis_scope_invalid",
+            f"exact program source files are missing or not C files: {', '.join(missing)}",
+            source_qualified_entry_point=qualified_entry,
+            resolved_source_files=resolved_files,
         )
     normalized_entry_file = PurePosixPath(source_file).as_posix()
     if normalized_entry_file not in matched:
@@ -344,7 +472,25 @@ def map_record_to_graph(
     source_qualified_entry_point: str | None = None,
     resolved_source_files: Sequence[str] = (),
 ) -> dict[str, Any]:
-    target = str(record["vulnerable_function"])
+    """Map every declared vulnerable function and retain a CVE-level aggregate."""
+    function_mappings = [
+        _map_function_to_graph(
+            record, target, analysis,
+            source_analysis_id=source_analysis_id,
+            source_qualified_entry_point=source_qualified_entry_point,
+            resolved_source_files=resolved_source_files,
+        )
+        for target in record["vulnerable_functions"]
+    ]
+    return _aggregate_record_mapping(record, function_mappings)
+
+
+def _map_function_to_graph(
+    record: Mapping[str, Any], target: str, analysis: Mapping[str, Any], *,
+    source_analysis_id: str | None = None,
+    source_qualified_entry_point: str | None = None,
+    resolved_source_files: Sequence[str] = (),
+) -> dict[str, Any]:
     matches = [
         item for item in analysis.get("function_reachability", [])
         if item.get("function") == target or item.get("function_id") == target
@@ -377,12 +523,19 @@ def map_record_to_graph(
         "source_version_status": "source_version_matched",
         "source_version_error": None, "analysis_error": None,
         "mapping_status": status, "verified": record["verified"],
-        "eligible_for_hvc": record["verified"] is True and status in MAPPED_STATES,
+        "eligible_for_hvc": record["verified"] is True and status == HVC_ELIGIBLE_STATE,
         "source_analysis_id": source_analysis_id,
         "source_qualified_entry_point": source_qualified_entry_point,
         "resolved_source_files": list(resolved_source_files),
         "mapped_function_id": matched.get("function_id") if matched else None,
         "call_depth": depth,
+        "shortest_call_path": (
+            list(matched.get("shortest_call_path", []))
+            if matched and matched.get("shortest_call_path") is not None
+            else None
+        ),
+        "direct_callers": list(matched.get("direct_callers", [])) if matched else [],
+        "direct_callees": list(matched.get("direct_callees", [])) if matched else [],
         "reachable_from_entry": matched.get("reachable_from_entry") if matched else None,
         "reachable_from_main": matched.get("reachable_from_entry") if matched else None,
         "total_reachable_functions": analysis.get("reachable_function_count"),
@@ -392,8 +545,62 @@ def map_record_to_graph(
     }
 
 
-def _unevaluable_mapping(
-    record: Mapping[str, Any], status: str, reason: str | None, *,
+def _overall_mapping_status(function_mappings: Sequence[Mapping[str, Any]]) -> str:
+    states = {str(item.get("mapping_status")) for item in function_mappings}
+    if len(states) == 1:
+        return next(iter(states))
+    mapped = sum(item.get("mapping_status") in MAPPED_STATES for item in function_mappings)
+    if mapped == len(function_mappings):
+        return "mapped_with_mixed_reachability"
+    if mapped:
+        return "partial_mapping"
+    return "unmapped_functions"
+
+
+def _aggregate_record_mapping(
+    record: Mapping[str, Any], function_mappings: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    mappings = [dict(item) for item in function_mappings]
+    mapped_count = sum(item.get("mapping_status") in MAPPED_STATES for item in mappings)
+    reachable = [
+        item for item in mappings
+        if item.get("mapping_status") == HVC_ELIGIBLE_STATE
+        and isinstance(item.get("call_depth"), int)
+    ]
+    depths = [int(item["call_depth"]) for item in reachable]
+    first = mappings[0]
+    return {
+        "vulnerability_id": record["id"],
+        "utility": record["utility"],
+        "upstream_project": record["upstream_project"],
+        "affected_version": record["affected_version"],
+        "source_revision": record["source_revision"],
+        "vulnerable_functions": list(record["vulnerable_functions"]),
+        "declared_vulnerable_function_count": len(mappings),
+        "successfully_mapped_function_count": mapped_count,
+        "reachable_vulnerable_function_count": len(reachable),
+        "function_mappings": mappings,
+        "minimum_reachable_call_depth": min(depths) if depths else None,
+        "maximum_reachable_call_depth": max(depths) if depths else None,
+        "mapping_status": _overall_mapping_status(mappings),
+        "verified": record["verified"],
+        "eligible_for_hvc": record["verified"] is True and bool(reachable),
+        "source_version_status": first.get("source_version_status"),
+        "source_version_error": first.get("source_version_error"),
+        "analysis_error": first.get("analysis_error"),
+        "source_analysis_id": first.get("source_analysis_id"),
+        "source_qualified_entry_point": first.get("source_qualified_entry_point"),
+        "resolved_source_files": list(first.get("resolved_source_files", [])),
+        "total_reachable_functions": first.get("total_reachable_functions"),
+        "diversification_eligible_function_count": first.get(
+            "diversification_eligible_function_count"
+        ),
+        "maximum_program_call_depth": first.get("maximum_reachable_depth"),
+    }
+
+
+def _unevaluable_function_mapping(
+    record: Mapping[str, Any], target: str, status: str, reason: str | None, *,
     source_version_status: str | None = None,
     source_analysis_id: str | None = None,
     source_qualified_entry_point: str | None = None,
@@ -405,7 +612,7 @@ def _unevaluable_mapping(
         "upstream_project": record["upstream_project"],
         "affected_version": record["affected_version"],
         "source_revision": record["source_revision"],
-        "vulnerable_function": record["vulnerable_function"],
+        "vulnerable_function": target,
         "source_version_status": source_version_status or status,
         "source_version_error": reason if source_error else None,
         "analysis_error": None if source_error else reason,
@@ -414,11 +621,32 @@ def _unevaluable_mapping(
         "source_qualified_entry_point": source_qualified_entry_point,
         "resolved_source_files": list(resolved_source_files),
         "mapped_function_id": None, "call_depth": None,
+        "shortest_call_path": None,
+        "direct_callers": [], "direct_callees": [],
         "reachable_from_entry": None,
         "reachable_from_main": None, "total_reachable_functions": None,
         "diversification_eligible_function_count": None,
         "maximum_reachable_depth": None, "normalized_depth": None,
     }
+
+
+def _unevaluable_record_mapping(
+    record: Mapping[str, Any], status: str, reason: str | None, *,
+    source_version_status: str | None = None,
+    source_analysis_id: str | None = None,
+    source_qualified_entry_point: str | None = None,
+    resolved_source_files: Sequence[str] = (),
+) -> dict[str, Any]:
+    return _aggregate_record_mapping(record, [
+        _unevaluable_function_mapping(
+            record, target, status, reason,
+            source_version_status=source_version_status,
+            source_analysis_id=source_analysis_id,
+            source_qualified_entry_point=source_qualified_entry_point,
+            resolved_source_files=resolved_source_files,
+        )
+        for target in record["vulnerable_functions"]
+    ])
 
 
 def analyze_versioned_records(
@@ -430,34 +658,41 @@ def analyze_versioned_records(
         tuple[str, str, str, str, str, str, tuple[str, ...]],
         tuple[str, dict[str, Any]],
     ] = {}
-    mappings: list[dict[str, Any]] = []
+    function_mappings: list[dict[str, Any]] = []
+    record_mappings: list[dict[str, Any]] = []
     graphs: dict[str, dict[str, Any]] = {}
     hits = 0
     for record in records:
         source_status, source, reason = _source_resolution(record, manifest)
         if source_status != "source_version_matched" or source is None:
-            mappings.append(_unevaluable_mapping(record, source_status, reason))
+            record_mapping = _unevaluable_record_mapping(record, source_status, reason)
+            record_mappings.append(record_mapping)
+            function_mappings.extend(record_mapping["function_mappings"])
             continue
         source_tree = Path(str(source.get("resolved_source_tree", source["source_tree"])))
         programs = source.get("programs")
         program = programs.get(record["utility"]) if isinstance(programs, Mapping) else None
         if not isinstance(program, Mapping):
-            mappings.append(_unevaluable_mapping(
+            record_mapping = _unevaluable_record_mapping(
                 record,
                 "program_scope_unavailable",
                 f"source manifest has no program scope for utility: {record['utility']}",
                 source_version_status="source_version_matched",
-            ))
+            )
+            record_mappings.append(record_mapping)
+            function_mappings.extend(record_mapping["function_mappings"])
             continue
         try:
             qualified_entry, resolved_files = _resolve_program_scope(source_tree, program)
         except ProgramAnalysisError as error:
-            mappings.append(_unevaluable_mapping(
+            record_mapping = _unevaluable_record_mapping(
                 record, error.status, str(error),
                 source_version_status="source_version_matched",
                 source_qualified_entry_point=error.source_qualified_entry_point,
                 resolved_source_files=error.resolved_source_files,
-            ))
+            )
+            record_mappings.append(record_mapping)
+            function_mappings.extend(record_mapping["function_mappings"])
             continue
         cache_key = (
             *_identity(record), str(source_tree), str(record["utility"]),
@@ -480,13 +715,15 @@ def analyze_versioned_records(
                     source_files=resolved_files, force_fallback=force_fallback,
                 )
             except (OSError, ValueError) as error:
-                mappings.append(_unevaluable_mapping(
+                record_mapping = _unevaluable_record_mapping(
                     record, "analysis_scope_invalid",
                     f"cannot analyze resolved program source scope: {error}",
                     source_version_status="source_version_matched",
                     source_qualified_entry_point=qualified_entry,
                     resolved_source_files=resolved_files,
-                ))
+                )
+                record_mappings.append(record_mapping)
+                function_mappings.extend(record_mapping["function_mappings"])
                 continue
             graph["historical_program_scope"] = {
                 "utility": record["utility"],
@@ -502,7 +739,7 @@ def analyze_versioned_records(
                 "not_found": "entry_point_not_found",
                 "ambiguous": "entry_point_ambiguous",
             }.get(str(entry_status), "entry_point_unresolved")
-            mapping = _unevaluable_mapping(
+            record_mapping = _unevaluable_record_mapping(
                 record, status,
                 f"configured source-qualified entry point is {entry_status}",
                 source_version_status="source_version_matched",
@@ -511,17 +748,23 @@ def analyze_versioned_records(
                 resolved_source_files=resolved_files,
             )
         else:
-            mapping = map_record_to_graph(
+            record_mapping = map_record_to_graph(
                 record, graph, source_analysis_id=analysis_id,
                 source_qualified_entry_point=qualified_entry,
                 resolved_source_files=resolved_files,
             )
-        mapping["source_tree"] = str(source_tree)
-        mapping["source_tree_sha256"] = source["source_tree_sha256"]
-        mappings.append(mapping)
+        record_mapping["source_tree"] = str(source_tree)
+        record_mapping["source_tree_sha256"] = source["source_tree_sha256"]
+        for mapping in record_mapping["function_mappings"]:
+            mapping["source_tree"] = str(source_tree)
+            mapping["source_tree_sha256"] = source["source_tree_sha256"]
+        record_mappings.append(record_mapping)
+        function_mappings.extend(record_mapping["function_mappings"])
     return {
         "schema_version": SCHEMA_VERSION,
-        "historical_function_mappings": mappings, "call_graphs": graphs,
+        "historical_function_mappings": function_mappings,
+        "historical_record_mappings": record_mappings,
+        "call_graphs": graphs,
         "call_graphs_constructed": len(graphs), "call_graph_cache_hits": hits,
     }
 
@@ -531,31 +774,49 @@ def version_specific_hvc(
     percent: float | None = None, seed: int = 1,
     include_entry_points: bool = False,
 ) -> dict[str, Any]:
-    mappings = list(versioned.get("historical_function_mappings", []))
+    records = list(versioned.get("historical_record_mappings", []))
     graphs = versioned.get("call_graphs", {})
-    valid = [item for item in mappings if item.get("eligible_for_hvc") is True]
+    valid = [item for item in records if item.get("eligible_for_hvc") is True]
     details: list[dict[str, Any]] = []
     covered: list[str] = []
-    for mapping in valid:
+    for record in valid:
         selection = select_functions(
-            graphs[mapping["source_analysis_id"]], policy=policy, k=k,
+            graphs[record["source_analysis_id"]], policy=policy, k=k,
             percent=percent, seed=seed, include_entry_points=include_entry_points,
         )
-        is_covered = mapping["mapped_function_id"] in set(selection["selected_functions"])
+        selected = set(selection["selected_functions"])
+        location_coverage = [
+            {
+                "vulnerable_function": mapping["vulnerable_function"],
+                "mapping_status": mapping["mapping_status"],
+                "mapped_function_id": mapping["mapped_function_id"],
+                "reachable_from_entry": mapping["reachable_from_entry"],
+                "call_depth": mapping["call_depth"],
+                "selected": (
+                    mapping.get("eligible_for_hvc") is True
+                    and mapping.get("mapped_function_id") in selected
+                ),
+            }
+            for mapping in record["function_mappings"]
+        ]
+        is_covered = any(item["selected"] for item in location_coverage)
         if is_covered:
-            covered.append(str(mapping["vulnerability_id"]))
+            covered.append(str(record["vulnerability_id"]))
         details.append({
-            "vulnerability_id": mapping["vulnerability_id"],
-            "utility": mapping["utility"],
-            "source_revision": mapping["source_revision"],
-            "source_analysis_id": mapping["source_analysis_id"],
-            "source_qualified_entry_point": mapping["source_qualified_entry_point"],
-            "resolved_source_files": list(mapping["resolved_source_files"]),
-            "reachable_function_count": mapping["total_reachable_functions"],
-            "diversification_eligible_function_count": mapping[
+            "vulnerability_id": record["vulnerability_id"],
+            "utility": record["utility"],
+            "source_revision": record["source_revision"],
+            "source_analysis_id": record["source_analysis_id"],
+            "source_qualified_entry_point": record["source_qualified_entry_point"],
+            "resolved_source_files": list(record["resolved_source_files"]),
+            "reachable_function_count": record["total_reachable_functions"],
+            "diversification_eligible_function_count": record[
                 "diversification_eligible_function_count"
             ],
-            "mapped_function_id": mapping["mapped_function_id"],
+            "declared_vulnerable_function_count": record[
+                "declared_vulnerable_function_count"
+            ],
+            "function_location_coverage": location_coverage,
             "covered": is_covered, **selection,
         })
     denominator = len(valid)
@@ -566,8 +827,8 @@ def version_specific_hvc(
         "selection_budget": {"k": k, "percent": percent},
         "selection_budget_unit": "function_count",
         "historical_vulnerabilities_with_valid_version_specific_mappings": denominator,
-        "historical_vulnerabilities_covered": len(covered),
-        "covered_vulnerability_ids": sorted(covered),
+        "historical_vulnerabilities_covered": len(set(covered)),
+        "covered_vulnerability_ids": sorted(set(covered)),
         "historical_vulnerability_coverage_at_budget": len(covered) / denominator if denominator else None,
         "per_vulnerability_selections": details,
     }
@@ -625,19 +886,74 @@ def coverage_study(
     return {"coverage_rows": rows, "random_coverage_aggregates": aggregates}
 
 
-def summarize_historical_analysis(mappings: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    status_counts = Counter(str(item.get("mapping_status")) for item in mappings)
-    valid = [item for item in mappings if item.get("eligible_for_hvc") is True]
-    depths = [item["call_depth"] for item in valid if isinstance(item.get("call_depth"), int)]
+def summarize_historical_analysis(
+    mappings: Sequence[Mapping[str, Any]],
+    record_mappings: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Summarize location depths and each CVE's shallowest reachable location."""
+    if record_mappings is None:
+        grouped: dict[str, list[Mapping[str, Any]]] = {}
+        for mapping in mappings:
+            grouped.setdefault(str(mapping.get("vulnerability_id")), []).append(mapping)
+        records = []
+        for vulnerability_id, locations in grouped.items():
+            depths = [
+                item["call_depth"] for item in locations
+                if item.get("mapping_status") == HVC_ELIGIBLE_STATE
+                and isinstance(item.get("call_depth"), int)
+            ]
+            records.append({
+                "vulnerability_id": vulnerability_id,
+                "mapping_status": _overall_mapping_status(locations),
+                "verified": locations[0].get("verified") is True,
+                "eligible_for_hvc": locations[0].get("verified") is True and bool(depths),
+                "minimum_reachable_call_depth": min(depths) if depths else None,
+            })
+    else:
+        records = list(record_mappings)
+    location_status_counts = Counter(str(item.get("mapping_status")) for item in mappings)
+    record_status_counts = Counter(str(item.get("mapping_status")) for item in records)
+    valid_locations = [item for item in mappings if item.get("eligible_for_hvc") is True]
+    location_depths = [
+        item["call_depth"] for item in valid_locations
+        if isinstance(item.get("call_depth"), int)
+    ]
+    cve_depths = [
+        item["minimum_reachable_call_depth"] for item in records
+        if item.get("verified") is True
+        and isinstance(item.get("minimum_reachable_call_depth"), int)
+    ]
+    record_count = len(records)
     return {
-        "historical_record_count": len(mappings),
-        "mapping_status_counts": dict(sorted(status_counts.items())),
-        "valid_version_specific_mapping_count": len(valid),
-        "unverified_record_count": sum(item.get("verified") is not True for item in mappings),
-        "reachable_mapped_vulnerability_count": len(depths),
-        "vulnerability_depth_distribution": {
-            str(depth): depths.count(depth) for depth in sorted(set(depths))
+        "historical_record_count": record_count,
+        "historical_function_location_count": len(mappings),
+        "function_mapping_status_counts": dict(sorted(location_status_counts.items())),
+        "cve_mapping_status_counts": dict(sorted(record_status_counts.items())),
+        "valid_version_specific_mapping_count": sum(
+            item.get("eligible_for_hvc") is True for item in records
+        ),
+        "unverified_record_count": sum(
+            item.get("verified") is not True for item in records
+        ),
+        "reachable_mapped_vulnerability_count": len(cve_depths),
+        "reachable_vulnerable_function_location_count": len(location_depths),
+        "vulnerable_function_location_depth_distribution": {
+            str(depth): location_depths.count(depth)
+            for depth in sorted(set(location_depths))
         },
-        "mean_vulnerable_function_depth": statistics.fmean(depths) if depths else None,
-        "median_vulnerable_function_depth": statistics.median(depths) if depths else None,
+        "per_cve_shallowest_reachable_depth_distribution": {
+            str(depth): cve_depths.count(depth) for depth in sorted(set(cve_depths))
+        },
+        "mean_vulnerable_function_location_depth": (
+            statistics.fmean(location_depths) if location_depths else None
+        ),
+        "median_vulnerable_function_location_depth": (
+            statistics.median(location_depths) if location_depths else None
+        ),
+        "mean_per_cve_shallowest_reachable_depth": (
+            statistics.fmean(cve_depths) if cve_depths else None
+        ),
+        "median_per_cve_shallowest_reachable_depth": (
+            statistics.median(cve_depths) if cve_depths else None
+        ),
     }
