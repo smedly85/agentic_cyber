@@ -14,7 +14,10 @@ import json
 import shutil
 import subprocess
 import tempfile
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
+
+
+FROZEN_REVISION = "8e075ff8ee11692c5504d8e82a48ed47a7f07ba9"
 
 
 VARIABLES = {
@@ -150,22 +153,90 @@ def verify_manifest(scope: dict[str, object], manifest_path: Path) -> None:
         )
 
 
+def verify_frozen_source_files(source_tree: Path, manifest_path: Path) -> dict[str, object]:
+    """Verify a frozen Linux-derived scope on a non-Linux preparation host."""
+    root = source_tree.resolve()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    matches = [
+        item for item in manifest
+        if item.get("upstream_project") == "gnu-coreutils"
+        and item.get("affected_version") == "9.7"
+        and item.get("source_revision") == FROZEN_REVISION
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            "manifest must have exactly one frozen GNU Coreutils 9.7 source identity"
+        )
+    program = matches[0].get("programs", {}).get("sort", {})
+    source_files = program.get("source_files")
+    if not isinstance(source_files, list) or not source_files:
+        raise RuntimeError("manifest sort.source_files must be a non-empty array")
+    if len(set(source_files)) != len(source_files):
+        raise RuntimeError("manifest sort.source_files contains duplicates")
+    for value in source_files:
+        if not isinstance(value, str):
+            raise RuntimeError("manifest sort.source_files entries must be strings")
+        relative = PurePosixPath(value)
+        if (
+            not value or "\\" in value or relative.is_absolute()
+            or PureWindowsPath(value).drive or ".." in relative.parts
+            or relative.suffix != ".c"
+        ):
+            raise RuntimeError(f"unsafe or non-C frozen source path: {value}")
+        candidate = root.joinpath(*relative.parts).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError as error:
+            raise RuntimeError(f"frozen source path escapes source tree: {value}") from error
+        if not candidate.is_file():
+            raise RuntimeError(f"frozen source file is missing: {value}")
+    entry_file = program.get("entry_point", {}).get("source_file")
+    if entry_file not in source_files:
+        raise RuntimeError("frozen sort entry-point source is outside source_files")
+    return {
+        "scope_kind": "frozen_configured_archive_source_superset",
+        "source_revision": FROZEN_REVISION,
+        "analyzed_source_file_count": len(source_files),
+        "manifest_verified": True,
+        "build_metadata_reverified": False,
+        "build_metadata_reverified_reason": (
+            "the frozen scope was derived from a GNU/Linux GCC configuration; "
+            "this host only verified its exact paths against the authenticated source tree"
+        ),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-tree", type=Path, required=True)
-    parser.add_argument("--makefile", type=Path, required=True)
+    parser.add_argument("--makefile", type=Path)
     parser.add_argument("--verify-manifest", type=Path)
+    parser.add_argument(
+        "--verify-frozen-files-only", action="store_true",
+        help="verify frozen manifest paths without regenerating platform-specific metadata",
+    )
     parser.add_argument(
         "--summary", action="store_true",
         help="omit the full analyzed_source_files array from printed JSON",
     )
     arguments = parser.parse_args()
-    scope = derive_scope(
-        arguments.source_tree, expand_make_variables(arguments.makefile)
-    )
-    if arguments.verify_manifest:
-        verify_manifest(scope, arguments.verify_manifest)
-        scope["manifest_verified"] = True
+    if arguments.verify_frozen_files_only:
+        if arguments.makefile is not None:
+            parser.error("--makefile cannot be used with --verify-frozen-files-only")
+        if arguments.verify_manifest is None:
+            parser.error("--verify-manifest is required with --verify-frozen-files-only")
+        scope = verify_frozen_source_files(
+            arguments.source_tree, arguments.verify_manifest
+        )
+    else:
+        if arguments.makefile is None:
+            parser.error("--makefile is required unless --verify-frozen-files-only is used")
+        scope = derive_scope(
+            arguments.source_tree, expand_make_variables(arguments.makefile)
+        )
+        if arguments.verify_manifest:
+            verify_manifest(scope, arguments.verify_manifest)
+            scope["manifest_verified"] = True
     if arguments.summary:
         scope = {
             key: value for key, value in scope.items()

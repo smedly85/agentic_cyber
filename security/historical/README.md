@@ -69,7 +69,8 @@ bash security/historical/prepare_coreutils_9_7.sh
 
 The script independently verifies that annotated tag `v9.7` peels to commit
 `8e075ff8ee11692c5504d8e82a48ed47a7f07ba9`, verifies GNU's published release
-archive SHA-256, extracts the archive under the ignored
+archive SHA-256 with Python's portable `hashlib.sha256`, extracts the archive
+under the ignored
 `security/historical/sources/coreutils-9.7/` directory, and checks the exact
 C/H fingerprint used by `source_tree_sha256()`:
 
@@ -97,11 +98,14 @@ tree. The configured scope can be reproduced and checked without compiling:
 bash security/historical/prepare_coreutils_9_7_sort_scope.sh
 ```
 
-That wrapper prepares the verified release, runs an out-of-tree configuration
-with `--disable-nls --without-selinux` and `CC='gcc -std=gnu17'`, and checks the
-expanded Automake variables against the exact `source_files` array in the
-manifest. `derive_coreutils_sort_scope.py` fails if a configured archive object
-cannot be mapped deterministically or the frozen list differs.
+On GNU/Linux, that wrapper prepares the verified release, runs an out-of-tree
+configuration with `--disable-nls --without-selinux` and
+`CC='gcc -std=gnu17'`, and checks the expanded Automake variables against the
+exact `source_files` array in the manifest. `derive_coreutils_sort_scope.py`
+fails if a configured archive object cannot be mapped deterministically or the
+frozen list differs. On macOS, it does not misrepresent Apple Clang metadata as
+the frozen GNU/Linux/GCC scope; it instead checks all 329 frozen paths against
+the already revision- and fingerprint-verified source tree.
 
 The scope is intentionally configuration-specific, not platform-independent.
 For example, the inspected Clang 21 configuration activates `lib/float.c`

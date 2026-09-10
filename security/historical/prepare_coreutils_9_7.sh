@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/../.." && pwd)
 sources_dir="$script_dir/sources"
 archive="$sources_dir/coreutils-9.7.tar.xz"
@@ -25,10 +25,23 @@ if ! test -f "$archive"; then
   curl --fail --location --output "$archive" \
     https://ftp.gnu.org/gnu/coreutils/coreutils-9.7.tar.xz
 fi
-printf '%s  %s\n' "$archive_sha256" "$archive" | sha256sum --check --status
+observed_archive_sha256=$(
+  python3 -c \
+    'import hashlib, sys
+digest = hashlib.sha256()
+with open(sys.argv[1], "rb") as source:
+    for block in iter(lambda: source.read(1024 * 1024), b""):
+        digest.update(block)
+print(digest.hexdigest())' \
+    "$archive"
+)
+if test "$observed_archive_sha256" != "$archive_sha256"; then
+  echo "archive checksum mismatch: observed $observed_archive_sha256, expected $archive_sha256" >&2
+  exit 1
+fi
 
 if ! test -d "$source_tree"; then
-  tar --extract --xz --file "$archive" --directory "$sources_dir"
+  tar -xf "$archive" -C "$sources_dir"
 fi
 
 observed_tree_sha256=$(
