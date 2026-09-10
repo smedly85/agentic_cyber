@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+import re
 import statistics
 from collections import Counter
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -44,6 +45,7 @@ CENSUS_ELIGIBILITY = {"eligible", "excluded", "unresolved"}
 CENSUS_VERIFICATION = {"verified", "partially_verified", "unverified"}
 MAPPED_STATES = {"mapped_and_reachable", "mapped_but_unreachable"}
 HVC_ELIGIBLE_STATE = "mapped_and_reachable"
+COMMIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
 
 class HistoricalDataError(ValueError):
@@ -60,6 +62,10 @@ class ProgramAnalysisError(ValueError):
         self.status = status
         self.source_qualified_entry_point = source_qualified_entry_point
         self.resolved_source_files = list(resolved_source_files)
+
+
+def _is_commit_sha(value: Any) -> bool:
+    return isinstance(value, str) and COMMIT_SHA_PATTERN.fullmatch(value) is not None
 
 
 def _validate_fields(
@@ -88,10 +94,7 @@ def validate_record(record: Mapping[str, Any]) -> list[str]:
         if isinstance(record.get(field), str) and not record[field].strip():
             errors.append(f"{field} must not be empty")
     revision = record.get("source_revision")
-    if isinstance(revision, str) and not (
-        len(revision) == 40
-        and all(character in "0123456789abcdef" for character in revision)
-    ):
+    if isinstance(revision, str) and not _is_commit_sha(revision):
         errors.append("source_revision must be a lowercase 40-character Git commit SHA")
     if record.get("utility") not in ALLOWED_UTILITIES:
         errors.append("utility must be sort, mkdir, chmod, or grep")
@@ -189,10 +192,7 @@ def validate_manifest_entry(entry: Mapping[str, Any]) -> list[str]:
         if isinstance(entry.get(field), str) and not entry[field].strip():
             errors.append(f"{field} must not be empty")
     revision = entry.get("source_revision")
-    if isinstance(revision, str) and not (
-        len(revision) == 40
-        and all(character in "0123456789abcdef" for character in revision)
-    ):
+    if isinstance(revision, str) and not _is_commit_sha(revision):
         errors.append("source_revision must be a lowercase 40-character Git commit SHA")
     if entry.get("upstream_project") not in ALLOWED_PROJECTS:
         errors.append("upstream_project must be gnu-coreutils or gnu-grep")
@@ -778,7 +778,10 @@ def version_specific_hvc(
     graphs = versioned.get("call_graphs", {})
     valid = [item for item in records if item.get("eligible_for_hvc") is True]
     details: list[dict[str, Any]] = []
-    covered: list[str] = []
+    eligible_vulnerability_ids = {
+        str(record["vulnerability_id"]) for record in valid
+    }
+    covered_vulnerability_ids: set[str] = set()
     for record in valid:
         selection = select_functions(
             graphs[record["source_analysis_id"]], policy=policy, k=k,
@@ -801,7 +804,7 @@ def version_specific_hvc(
         ]
         is_covered = any(item["selected"] for item in location_coverage)
         if is_covered:
-            covered.append(str(record["vulnerability_id"]))
+            covered_vulnerability_ids.add(str(record["vulnerability_id"]))
         details.append({
             "vulnerability_id": record["vulnerability_id"],
             "utility": record["utility"],
@@ -819,7 +822,8 @@ def version_specific_hvc(
             "function_location_coverage": location_coverage,
             "covered": is_covered, **selection,
         })
-    denominator = len(valid)
+    denominator = len(eligible_vulnerability_ids)
+    covered_count = len(covered_vulnerability_ids)
     return {
         "selection_policy": policy.upper(),
         "selection_seed": seed if policy.upper() == "RANDOM" else None,
@@ -827,9 +831,11 @@ def version_specific_hvc(
         "selection_budget": {"k": k, "percent": percent},
         "selection_budget_unit": "function_count",
         "historical_vulnerabilities_with_valid_version_specific_mappings": denominator,
-        "historical_vulnerabilities_covered": len(set(covered)),
-        "covered_vulnerability_ids": sorted(set(covered)),
-        "historical_vulnerability_coverage_at_budget": len(covered) / denominator if denominator else None,
+        "historical_vulnerabilities_covered": covered_count,
+        "covered_vulnerability_ids": sorted(covered_vulnerability_ids),
+        "historical_vulnerability_coverage_at_budget": (
+            covered_count / denominator if denominator else None
+        ),
         "per_vulnerability_selections": details,
     }
 

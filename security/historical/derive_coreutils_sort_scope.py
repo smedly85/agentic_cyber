@@ -16,8 +16,7 @@ import subprocess
 import tempfile
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
-
-FROZEN_REVISION = "8e075ff8ee11692c5504d8e82a48ed47a7f07ba9"
+from security.historical.analysis import load_source_manifest
 
 
 VARIABLES = {
@@ -132,16 +131,27 @@ def derive_scope(source_tree: Path, variables: dict[str, list[str]]) -> dict[str
     }
 
 
-def verify_manifest(scope: dict[str, object], manifest_path: Path) -> None:
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+def manifest_sort_entry(manifest_path: Path, source_tree: Path) -> dict[str, object]:
+    manifest = load_source_manifest(manifest_path)
+    root = source_tree.resolve()
     matches = [
         item for item in manifest
         if item.get("upstream_project") == "gnu-coreutils"
-        and item.get("affected_version") == "9.7"
+        and isinstance(item.get("programs", {}).get("sort"), dict)
+        and Path(str(item["resolved_source_tree"])).resolve() == root
     ]
     if len(matches) != 1:
-        raise RuntimeError("manifest must have exactly one GNU Coreutils 9.7 entry")
-    frozen = matches[0].get("programs", {}).get("sort", {}).get("source_files")
+        raise RuntimeError(
+            "manifest must have exactly one GNU Coreutils sort identity for the source tree"
+        )
+    return matches[0]
+
+
+def verify_manifest(
+    scope: dict[str, object], manifest_path: Path, source_tree: Path,
+) -> None:
+    entry = manifest_sort_entry(manifest_path, source_tree)
+    frozen = entry.get("programs", {}).get("sort", {}).get("source_files")
     if frozen != scope["analyzed_source_files"]:
         frozen_set = set(frozen) if isinstance(frozen, list) else set()
         derived_set = set(scope["analyzed_source_files"])
@@ -156,18 +166,8 @@ def verify_manifest(scope: dict[str, object], manifest_path: Path) -> None:
 def verify_frozen_source_files(source_tree: Path, manifest_path: Path) -> dict[str, object]:
     """Verify a frozen Linux-derived scope on a non-Linux preparation host."""
     root = source_tree.resolve()
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    matches = [
-        item for item in manifest
-        if item.get("upstream_project") == "gnu-coreutils"
-        and item.get("affected_version") == "9.7"
-        and item.get("source_revision") == FROZEN_REVISION
-    ]
-    if len(matches) != 1:
-        raise RuntimeError(
-            "manifest must have exactly one frozen GNU Coreutils 9.7 source identity"
-        )
-    program = matches[0].get("programs", {}).get("sort", {})
+    entry = manifest_sort_entry(manifest_path, root)
+    program = entry.get("programs", {}).get("sort", {})
     source_files = program.get("source_files")
     if not isinstance(source_files, list) or not source_files:
         raise RuntimeError("manifest sort.source_files must be a non-empty array")
@@ -195,7 +195,7 @@ def verify_frozen_source_files(source_tree: Path, manifest_path: Path) -> dict[s
         raise RuntimeError("frozen sort entry-point source is outside source_files")
     return {
         "scope_kind": "frozen_configured_archive_source_superset",
-        "source_revision": FROZEN_REVISION,
+        "source_revision": entry["source_revision"],
         "analyzed_source_file_count": len(source_files),
         "manifest_verified": True,
         "build_metadata_reverified": False,
@@ -235,7 +235,9 @@ def main() -> int:
             arguments.source_tree, expand_make_variables(arguments.makefile)
         )
         if arguments.verify_manifest:
-            verify_manifest(scope, arguments.verify_manifest)
+            verify_manifest(
+                scope, arguments.verify_manifest, arguments.source_tree
+            )
             scope["manifest_verified"] = True
     if arguments.summary:
         scope = {

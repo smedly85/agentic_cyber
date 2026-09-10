@@ -196,6 +196,27 @@ class MultiFunctionMappingTests(unittest.TestCase):
         self.assertIs(coverage[0]["selected"], False)
         self.assertIs(coverage[1]["selected"], True)
 
+    def test_hvc_duplicate_lower_level_records_use_one_cve_set(self):
+        analyzed = graph(
+            "static void chosen(void) {} "
+            "int main(void) { chosen(); return 0; }"
+        )
+        record = map_record_to_graph(
+            sample_record(["chosen"]), analyzed, source_analysis_id="g"
+        )
+        versioned = {
+            "historical_function_mappings": record["function_mappings"],
+            "historical_record_mappings": [record, copy.deepcopy(record)],
+            "call_graphs": {"g": analyzed},
+        }
+        hvc = version_specific_hvc(versioned, policy="SHALLOW", k=1)
+        self.assertEqual(
+            hvc["historical_vulnerabilities_with_valid_version_specific_mappings"], 1
+        )
+        self.assertEqual(hvc["historical_vulnerabilities_covered"], 1)
+        self.assertEqual(hvc["covered_vulnerability_ids"], ["SYNTHETIC-MULTI"])
+        self.assertEqual(hvc["historical_vulnerability_coverage_at_budget"], 1.0)
+
     def test_single_function_migration_preserves_mapping_behavior(self):
         result = map_record_to_graph(
             sample_record(["vulnerable"]),

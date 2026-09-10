@@ -78,6 +78,10 @@ C/H fingerprint used by `source_tree_sha256()`:
 e089e110944a43864e4b754ba628fc2a7fbf8e59f216a2cbd6c8183d788507e1
 ```
 
+The preparation scripts read the affected version, source revision, source
+tree, and tree fingerprint from `source_manifest.json`; they do not maintain a
+second hard-coded historical identity.
+
 The 9.7 `sort` program itself has one program-owned translation unit,
 `src/sort.c`. The configured GNU/Linux build metadata gives:
 
