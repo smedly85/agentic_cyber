@@ -17,6 +17,7 @@ from security.historical.analysis import (
     validate_source_manifest,
     version_specific_hvc,
 )
+from security.historical.run_historical_analysis import parse_args
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -28,6 +29,14 @@ GREP_REVISION = next(
         (REPO / "security" / "historical" / "source_manifest.json").read_text()
     )
     if item["upstream_project"] == "gnu-grep"
+)
+MKDIR_REVISION = next(
+    item["source_revision"]
+    for item in json.loads(
+        (REPO / "security" / "historical" / "source_manifest.json").read_text()
+    )
+    if item["upstream_project"] == "gnu-coreutils"
+    and item["affected_version"] == "5.2.1"
 )
 
 
@@ -53,6 +62,25 @@ def grep_fixture():
     manifest = copy.deepcopy(fixture_manifest()[1])
     manifest["upstream_project"] = "gnu-grep"
     manifest["programs"] = {"grep": manifest["programs"].pop("sort")}
+    return record, manifest
+
+
+def mkdir_fixture():
+    record = copy.deepcopy(fixture_records()[1])
+    record.update({
+        "id": "SYNTHETIC-MKDIR",
+        "utility": "mkdir",
+        "upstream_project": "gnu-coreutils",
+        "affected_version": "fixture-mkdir",
+        "source_revision": "c" * 40,
+    })
+    manifest = copy.deepcopy(fixture_manifest()[1])
+    manifest.update({
+        "upstream_project": "gnu-coreutils",
+        "affected_version": "fixture-mkdir",
+        "source_revision": "c" * 40,
+    })
+    manifest["programs"] = {"mkdir": manifest["programs"].pop("sort")}
     return record, manifest
 
 
@@ -98,14 +126,18 @@ class HistoricalSchemaTests(unittest.TestCase):
         census = load_census(REPO / "security/historical/cve_census.json")
         manifest = load_source_manifest(REPO / "security/historical/source_manifest.json")
         self.assertEqual([item["id"] for item in records], [
-            "CVE-2025-5278", "CVE-2015-1345",
+            "CVE-2025-5278", "CVE-2015-1345", "CVE-2005-1039",
         ])
         self.assertEqual([item["id"] for item in census], [
-            "CVE-2025-5278", "CVE-2015-1345",
+            "CVE-2025-5278", "CVE-2015-1345", "CVE-2005-1039",
         ])
         self.assertEqual(
             [(item["upstream_project"], item["affected_version"]) for item in manifest],
-            [("gnu-coreutils", "9.7"), ("gnu-grep", "2.21")],
+            [
+                ("gnu-coreutils", "9.7"),
+                ("gnu-grep", "2.21"),
+                ("gnu-coreutils", "5.2.1"),
+            ],
         )
         grep_record = next(item for item in records if item["id"] == "CVE-2015-1345")
         grep_source = next(
@@ -129,6 +161,21 @@ class HistoricalSchemaTests(unittest.TestCase):
                 },
             }],
         )
+        mkdir_record = next(item for item in records if item["id"] == "CVE-2005-1039")
+        mkdir_source = next(
+            item for item in manifest
+            if item["upstream_project"] == "gnu-coreutils"
+            and item["affected_version"] == "5.2.1"
+        )
+        self.assertEqual(mkdir_record["vulnerable_functions"], ["main", "make_path"])
+        self.assertEqual(mkdir_record["fixed_version"], "6.0")
+        self.assertEqual(mkdir_source["programs"]["mkdir"]["entry_point"], {
+            "source_file": "src/mkdir.c", "function": "main",
+        })
+        self.assertEqual(len(mkdir_source["programs"]["mkdir"]["source_files"]), 14)
+        self.assertIn(
+            "lib/makepath.c", mkdir_source["programs"]["mkdir"]["source_files"]
+        )
         try:
             import jsonschema
         except ImportError:
@@ -146,23 +193,25 @@ class HistoricalSchemaTests(unittest.TestCase):
 
 
 class MultiFunctionMappingTests(unittest.TestCase):
-    def test_coreutils_and_grep_identities_resolve_independently(self):
+    def test_two_coreutils_versions_and_grep_resolve_independently(self):
         coreutils_record = fixture_records()[0]
         coreutils_manifest = fixture_manifest()[0]
         grep_record, grep_manifest = grep_fixture()
+        mkdir_record, mkdir_manifest = mkdir_fixture()
         combined = analyze_versioned_records(
-            [coreutils_record, grep_record],
-            [coreutils_manifest, grep_manifest],
+            [coreutils_record, grep_record, mkdir_record],
+            [coreutils_manifest, grep_manifest, mkdir_manifest],
             force_fallback=True,
         )
         rows = {
             item["vulnerability_id"]: item
             for item in combined["historical_function_mappings"]
         }
-        self.assertEqual(combined["call_graphs_constructed"], 2)
+        self.assertEqual(combined["call_graphs_constructed"], 3)
         self.assertEqual(rows["SYNTHETIC-A"]["call_depth"], 1)
         self.assertEqual(rows["SYNTHETIC-GREP"]["call_depth"], 2)
         self.assertEqual(rows["SYNTHETIC-GREP"]["mapped_source_file"], "program.c")
+        self.assertEqual(rows["SYNTHETIC-MKDIR"]["call_depth"], 2)
 
     def test_source_identity_matching_uses_project_version_and_revision(self):
         record, manifest = grep_fixture()
@@ -191,9 +240,27 @@ class MultiFunctionMappingTests(unittest.TestCase):
         self.assertEqual(row["mapping_status"], "source_version_mismatch")
         self.assertEqual(result["call_graphs_constructed"], 0)
 
+    def test_mkdir_source_fingerprint_mismatch_fails_closed(self):
+        record, manifest = mkdir_fixture()
+        manifest["source_tree_sha256"] = "0" * 64
+        result = analyze_versioned_records([record], [manifest], force_fallback=True)
+        row = result["historical_function_mappings"][0]
+        self.assertEqual(row["source_version_status"], "source_version_mismatch")
+        self.assertEqual(row["mapping_status"], "source_version_mismatch")
+        self.assertEqual(result["call_graphs_constructed"], 0)
+
     def test_missing_exact_grep_source_file_fails_closed(self):
         record, manifest = grep_fixture()
         program = manifest["programs"]["grep"]
+        program["source_files"] = [program.pop("source_globs")[0], "missing.c"]
+        result = analyze_versioned_records([record], [manifest], force_fallback=True)
+        row = result["historical_function_mappings"][0]
+        self.assertEqual(row["mapping_status"], "analysis_scope_invalid")
+        self.assertEqual(result["call_graphs_constructed"], 0)
+
+    def test_missing_exact_mkdir_source_file_fails_closed(self):
+        record, manifest = mkdir_fixture()
+        program = manifest["programs"]["mkdir"]
         program["source_files"] = [program.pop("source_globs")[0], "missing.c"]
         result = analyze_versioned_records([record], [manifest], force_fallback=True)
         row = result["historical_function_mappings"][0]
@@ -477,6 +544,44 @@ class MultiFunctionMappingTests(unittest.TestCase):
             "main", "grepbuf", "Fexecute", "kwsexec", "bmexec", "bmexec_trans",
         ])
 
+    def test_mkdir_locations_resolve_uniquely_with_frozen_depths(self):
+        analyzed = analyze_sources([
+            (
+                "lib/makepath.c",
+                b"void make_path(void) {}\n",
+            ),
+            (
+                "src/mkdir.c",
+                b"void make_path(void);\nint main(void) { make_path(); return 0; }\n",
+            ),
+        ], entry_points=("src/mkdir.c::main",), force_fallback=True)
+        result = map_record_to_graph(sample_record(["main", "make_path"]), analyzed)
+        rows = {item["vulnerable_function"]: item for item in result["function_mappings"]}
+        self.assertEqual(rows["main"]["mapping_status"], "mapped_and_reachable")
+        self.assertEqual(rows["main"]["mapped_source_file"], "src/mkdir.c")
+        self.assertEqual(rows["main"]["call_depth"], 0)
+        self.assertEqual(rows["main"]["shortest_call_path"], ["main"])
+        self.assertEqual(rows["make_path"]["mapping_status"], "mapped_and_reachable")
+        self.assertEqual(rows["make_path"]["mapped_source_file"], "lib/makepath.c")
+        self.assertEqual(rows["make_path"]["call_depth"], 1)
+        self.assertEqual(rows["make_path"]["shortest_call_path"], ["main", "make_path"])
+
+    def test_existing_sort_depth_three_regression_shape(self):
+        analyzed = graph(
+            "static void begfield(void) {} "
+            "static void fillbuf(void) { begfield(); } "
+            "static void check(void) { fillbuf(); } "
+            "int main(void) { check(); return 0; }"
+        )
+        row = map_record_to_graph(
+            sample_record(["begfield"]), analyzed
+        )["function_mappings"][0]
+        self.assertEqual(row["mapping_status"], "mapped_and_reachable")
+        self.assertEqual(row["call_depth"], 3)
+        self.assertEqual(row["shortest_call_path"], [
+            "main", "check", "fillbuf", "begfield",
+        ])
+
     def test_gnu_attribute_macro_before_function_name_is_recovered(self):
         analyzed = analyze_source_bytes(
             b"static inline unsigned long _GL_ATTRIBUTE_PURE\n"
@@ -510,6 +615,31 @@ class MultiFunctionMappingTests(unittest.TestCase):
             {field: combined[field] for field in stable_fields},
         )
 
+    def test_third_record_does_not_change_existing_project_results(self):
+        coreutils_record = fixture_records()[0]
+        coreutils_manifest = fixture_manifest()[0]
+        grep_record, grep_manifest = grep_fixture()
+        baseline = analyze_versioned_records(
+            [coreutils_record, grep_record],
+            [coreutils_manifest, grep_manifest],
+            force_fallback=True,
+        )["historical_function_mappings"]
+        mkdir_record, mkdir_manifest = mkdir_fixture()
+        combined = analyze_versioned_records(
+            [coreutils_record, grep_record, mkdir_record],
+            [coreutils_manifest, grep_manifest, mkdir_manifest],
+            force_fallback=True,
+        )["historical_function_mappings"]
+        stable_fields = (
+            "vulnerability_id", "mapping_status", "mapped_function_id",
+            "mapped_source_file", "call_depth", "shortest_call_path",
+            "direct_callers", "direct_callees",
+        )
+        self.assertEqual(
+            [{field: row[field] for field in stable_fields} for row in baseline],
+            [{field: row[field] for field in stable_fields} for row in combined[:2]],
+        )
+
     def test_source_fingerprint_mismatch_still_fails_closed_for_every_location(self):
         manifest = fixture_manifest()
         manifest[0]["source_tree_sha256"] = "0" * 64
@@ -527,12 +657,21 @@ class MultiFunctionMappingTests(unittest.TestCase):
 class HistoricalPreparationTests(unittest.TestCase):
     def test_preparation_scripts_use_portable_python_sha256(self):
         historical = REPO / "security" / "historical"
-        for name in ("prepare_coreutils_9_7.sh", "prepare_grep_2_21.sh"):
+        for name in (
+            "prepare_coreutils_9_7.sh",
+            "prepare_grep_2_21.sh",
+            "prepare_coreutils_5_2_1.sh",
+        ):
             with self.subTest(script=name):
                 text = (historical / name).read_text()
                 self.assertIn("hashlib.sha256", text)
                 self.assertNotIn("sha256sum", text)
+                self.assertNotIn("sha1sum", text)
                 self.assertNotIn("shasum", text)
+        self.assertIn(
+            "hashlib.sha1",
+            (historical / "prepare_coreutils_5_2_1.sh").read_text(),
+        )
 
     def test_grep_scripts_do_not_duplicate_frozen_revision(self):
         historical = REPO / "security" / "historical"
@@ -543,6 +682,25 @@ class HistoricalPreparationTests(unittest.TestCase):
         ):
             with self.subTest(script=name):
                 self.assertNotIn(GREP_REVISION, (historical / name).read_text())
+
+    def test_mkdir_scripts_do_not_duplicate_frozen_revision(self):
+        historical = REPO / "security" / "historical"
+        for name in (
+            "prepare_coreutils_5_2_1.sh",
+            "prepare_coreutils_5_2_1_mkdir_scope.sh",
+            "derive_coreutils_mkdir_scope.py",
+            "check_coreutils_mkdir_scope_sensitivity.py",
+        ):
+            with self.subTest(script=name):
+                self.assertNotIn(MKDIR_REVISION, (historical / name).read_text())
+
+    def test_historical_analysis_does_not_run_hvc_without_opt_in(self):
+        arguments = parse_args([
+            "--source-manifest", str(REPO / "security/historical/source_manifest.json"),
+            "--records", str(REPO / "security/historical/records.json"),
+            "--output", str(REPO / "build/unused-historical-test-output.json"),
+        ])
+        self.assertIs(arguments.coverage_study, False)
 
 
 if __name__ == "__main__":

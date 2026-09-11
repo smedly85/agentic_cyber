@@ -245,6 +245,114 @@ function. Ambiguous direct-call targets are retained as unresolved calls with
 `reason = "ambiguous_target"`; extra translation units therefore cannot change
 resolution silently.
 
+## Reproduce Coreutils 5.2.1 mkdir and its program scope
+
+The third frozen identity is the released GNU Coreutils 5.2.1 source. The
+annotated Savannah tag `v5.2.1` peels to:
+
+```text
+808f8a1f569303c3f6838f2c8706442939d92593
+```
+
+The official `coreutils-5.2.1.tar.bz2` detached signature verifies with GNU's
+official keyring and signing key `FDD2DEACD333CBA1` (Jim Meyering). GNU's
+signed release announcement publishes SHA-1
+`1028755ae0fa9be840576e4837004cf5a9981c45` (and MD5
+`172ee3c315af93d3385ddfbeb843c53f`) for that archive; both match. No
+contemporaneous GNU-published SHA-256 was located, so the repository also
+freezes a portable SHA-256 of the signature-authenticated archive:
+
+```text
+archive SHA-256:          4eb124e9979a3ab1aaac2fbc7c3c55666b6530d2e3157dc0618782908cb2af1e
+whole-tree C/H SHA-256:   7c7ad7a1955ca0ef4a1f899bcd1974a2ab17fee7c6a1a7a239ec08b0aff8ecf5
+```
+
+Prepare, authenticate, build, reproduce the GNU ld link map, and verify the
+frozen source scope with the single Vessel command:
+
+```bash
+bash security/historical/prepare_coreutils_5_2_1_mkdir_scope.sh
+```
+
+`prepare_coreutils_5_2_1.sh` reads the version, peeled revision, tree path, and
+tree fingerprint from the manifest; only the independently calculated archive
+SHA-256 and published archive SHA-1 are stored in the script. It requires the
+annotated upstream tag and
+matching peel, downloads the official archive and signature when absent, uses
+portable Python `hashlib`, verifies the signature whenever `gpgv` is available,
+and fails closed on every required checksum, identity, or fingerprint mismatch.
+
+The 5.2.1 source fixes the entry point at `src/mkdir.c::main`. The configured
+`src/Makefile` declares `mkdir_SOURCES = mkdir.c` and links
+`../lib/libfetish.a` twice around the optional internationalization library.
+For the frozen x86-64 GNU/Linux configuration, `--disable-nls` with
+`CC='gcc -std=gnu89 -fcommon'`, `libfetish.a` has 93 C-derived members. The
+compatibility flags restore the language and tentative-definition behavior
+expected by this 2004 source; the historical target builds successfully with
+current GCC. A GNU ld map proves that only 13 archive members are extracted.
+The formal exact 14-file scope is those members plus `src/mkdir.c`, not the
+94-file configured archive-source superset. On macOS, the wrapper authenticates
+the same source and verifies all frozen paths, but does not claim to reproduce
+the GNU/Linux/GNU-ld member closure.
+
+The function mapping was established before graph construction. For ordinary
+`mkdir -m`, `src/mkdir.c::main` calls `make_dir` and then pathname-based
+`chmod` on the newly created directory. For `mkdir -p -m`, the release calls
+the historically correct `lib/makepath.c::make_path` name; when the requested
+mode has special bits, that helper independently creates the final directory
+and then applies pathname-based `chmod`. Both are therefore vulnerable
+locations. `make_dir` merely creates the object and reports whether it was new,
+so it is a caller-side helper and is not promoted. The later refactored
+`make_dir_parents` is patch provenance, not a name projected backward into the
+5.2.1 mapping.
+
+Upstream commit `52893ffd2a3ff896e0b51f3f35bca191b71a47d4` first hardens
+`main` through descriptor-based `chmod_safer`. Commits `a60cc14` and `76b12f0`
+then replace the old helper and route mkdir through the redesigned
+`make_dir_parents`/`dirchownmod` path. The official 5.97 source still has the
+old pathname changes; the `v6.0` source contains the redesign and an
+open/`fchmod`-capable `dirchownmod` implementation identical in the relevant
+respect to `v6.1`. A later GNU response refers to then-current test version
+6.1, but does not make it the first fixed release. Accordingly, 6.0 is the
+earliest verified upstream fixed release; Debian's 6.10-1 package version is
+not treated as an upstream release identifier. NVD provides only the general
+`NVD-CWE-Other` classification, so no more specific CWE is invented.
+
+As a release-to-repository correspondence check, `src/mkdir.c`,
+`lib/makepath.c`, `src/Makefile.am`, `lib/Makefile.am`, and `configure` from the
+signed archive all have the exact Git blob IDs found at the peeled `v5.2.1`
+commit.
+
+The frozen analysis uses Tree-sitter and resolves `src/mkdir.c::main`. Across
+14 C files it finds 52 functions, 26 reachable functions, maximum reachable
+depth 7, and zero unresolved ambiguous calls. Both locations map uniquely:
+
+| Vulnerable location | Mapping | Raw depth | Shortest static path | Normalized depth |
+| --- | --- | ---: | --- | ---: |
+| `src/mkdir.c::main` | mapped and reachable | 0 | `main` | 0.0 |
+| `lib/makepath.c::make_path` | mapped and reachable | 1 | `main -> make_path` | 1/7 (0.142857) |
+
+The limited scope-sensitivity check keeps those depths and paths stable in the
+minimal two known-path units and the formal 14-file link closure. The broader
+scopes demonstrate why they are diagnostics only:
+
+| Scope | C files | Functions | Reachable | Max depth | Ambiguous calls | Result |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Minimal known-path units (`mkdir.c`, `makepath.c`) | 2 | 4 | 4 | 1 | 0 | both unique; depths 0 and 1 |
+| Frozen linker-exact scope | 14 | 52 | 26 | 7 | 0 | both unique; depths 0 and 1 |
+| Configured archive-source superset | 94 | 278 | 31 | 7 | 2 | `main` ambiguous; `make_path` remains depth 1 |
+| Whole-release C diagnostic | 257 | 1354 | 39 | 7 | 27 | `main` ambiguous; `make_path` remains depth 1 |
+
+The archive superset includes conditional/test code with another parsed
+`main`; the whole release adds every other program entry point and unrelated
+callers such as install. Those units create ambiguous or additional edges but
+do not justify changing the predeclared formal scope or mapping. The raw
+`make_path` depth and structural path do not change; its entry label becomes
+source-qualified (`src/mkdir.c::main`) once duplicate `main` definitions are
+present. Per-scope normalization is 1.0 in the minimal graph and 1/7 in the
+formal graph because each normalization uses that graph's maximum reachable
+depth; only the formal 1/7 value is reported as the historical result.
+
 ## Run depth characterization
 
 After preparation:
