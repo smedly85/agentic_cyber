@@ -147,14 +147,15 @@ def cve_2012_graph_and_record():
         ("src/dfasearch.c", b"void EGexecute(void) {}\n"),
         ("lib/argmatch.c", b"int main(void) { return 0; }\n"),
     ], entry_points=("src/main.c::main",), force_fallback=True)
-    record = sample_record([
-        "lex", "EGexecute", "prtext", "grepbuf", "grep", "prepend_args",
-        "prepend_default_options", "src/main.c::main",
-    ])
+    record = sample_record(["EGexecute"])
     record.update({
         "id": "CVE-2012-5667",
         "utility": "grep",
         "upstream_project": "gnu-grep",
+        "patched_functions": [
+            "lex", "EGexecute", "prtext", "grepbuf", "grep", "prepend_args",
+            "prepend_default_options", "main",
+        ],
     })
     dispatches = [
         {
@@ -278,10 +279,17 @@ class HistoricalSchemaTests(unittest.TestCase):
             if item["upstream_project"] == "gnu-grep"
             and item["affected_version"] == "2.10"
         )
-        self.assertEqual(grep_210_record["vulnerable_functions"], [
-            "lex", "EGexecute", "prtext", "grepbuf", "grep", "prepend_args",
-            "prepend_default_options", "src/main.c::main",
-        ])
+        self.assertEqual(grep_210_record["vulnerable_functions"], ["EGexecute"])
+        formerly_declared = {
+            "lex", "prtext", "grepbuf", "grep", "prepend_args",
+            "prepend_default_options", "main",
+        }
+        self.assertTrue(formerly_declared.issubset(
+            set(grep_210_record["patched_functions"])
+        ))
+        self.assertTrue(formerly_declared.isdisjoint(
+            grep_210_record["vulnerable_functions"]
+        ))
         self.assertEqual(grep_210_record["fixed_version"], "2.11")
         self.assertEqual(grep_210_source["programs"]["grep"]["entry_point"], {
             "source_file": "src/main.c", "function": "main",
@@ -525,7 +533,7 @@ class MultiFunctionMappingTests(unittest.TestCase):
         self.assertEqual(result["successfully_mapped_function_count"], 2)
         self.assertEqual(result["reachable_vulnerable_function_count"], 2)
 
-    def test_cve_2012_locations_retain_individual_mapping_and_depth_states(self):
+    def test_cve_2012_zero_numeric_depth_remains_explicitly_represented(self):
         analyzed, record, dispatches = cve_2012_graph_and_record()
         result = map_record_to_graph(
             record, analyzed, declared_indirect_dispatches=dispatches
@@ -535,39 +543,50 @@ class MultiFunctionMappingTests(unittest.TestCase):
             for item in result["function_mappings"]
         }
         self.assertEqual(list(rows), record["vulnerable_functions"])
-        self.assertEqual(result["successfully_mapped_function_count"], 8)
-        self.assertEqual(result["reachable_vulnerable_function_count"], 6)
-        self.assertEqual(result["minimum_reachable_call_depth"], 0)
-        self.assertEqual(result["maximum_reachable_call_depth"], 4)
-        self.assertEqual(rows["src/main.c::main"]["call_depth"], 0)
-        self.assertEqual(rows["prepend_default_options"]["call_depth"], 1)
-        self.assertEqual(rows["grep"]["call_depth"], 2)
-        self.assertEqual(rows["prepend_args"]["call_depth"], 2)
-        self.assertEqual(rows["grepbuf"]["call_depth"], 3)
-        self.assertEqual(rows["prtext"]["call_depth"], 4)
-        for target in ("lex", "EGexecute"):
-            self.assertEqual(
-                rows[target]["mapping_status"],
-                "mapped_without_resolved_static_path",
-            )
-            self.assertEqual(
-                rows[target]["call_depth_status"],
-                "unresolved_indirect_dispatch",
-            )
-            self.assertIsNone(rows[target]["call_depth"])
+        self.assertEqual(result["successfully_mapped_function_count"], 1)
+        self.assertEqual(result["reachable_vulnerable_function_count"], 0)
+        self.assertIsNone(result["minimum_reachable_call_depth"])
+        self.assertIsNone(result["maximum_reachable_call_depth"])
+        self.assertEqual(result["mapping_status"],
+                         "mapped_without_resolved_static_path")
+        self.assertEqual(rows["EGexecute"]["mapping_status"],
+                         "mapped_without_resolved_static_path")
+        self.assertEqual(rows["EGexecute"]["call_depth_status"],
+                         "unresolved_indirect_dispatch")
+        self.assertIsNone(rows["EGexecute"]["call_depth"])
 
         summary = summarize_historical_analysis(
             result["function_mappings"], [result]
         )
         self.assertEqual(
             summary["vulnerable_function_location_depth_distribution"],
-            {"0": 1, "1": 1, "2": 2, "3": 1, "4": 1},
+            {},
         )
         self.assertEqual(
             summary["per_cve_shallowest_reachable_depth_distribution"],
-            {"0": 1},
+            {},
         )
         self.assertEqual(summary["historical_record_count"], 1)
+        self.assertEqual(summary["historical_function_location_count"], 1)
+        self.assertEqual(summary["cve_mapping_status_counts"], {
+            "mapped_without_resolved_static_path": 1,
+        })
+        self.assertEqual(summary["function_mapping_status_counts"], {
+            "mapped_without_resolved_static_path": 1,
+        })
+        self.assertEqual(summary["function_call_depth_status_counts"], {
+            "unresolved_indirect_dispatch": 1,
+        })
+        self.assertEqual(summary["reachable_mapped_vulnerability_count"], 0)
+
+        # Reachable functions that are merely patch provenance do not enter
+        # either depth distribution.
+        for patched_only in (
+            "lex", "prtext", "grepbuf", "grep", "prepend_args",
+            "prepend_default_options", "main",
+        ):
+            self.assertIn(patched_only, record["patched_functions"])
+            self.assertNotIn(patched_only, rows)
 
     def test_cve_2012_missing_or_ambiguous_sibling_does_not_erase_mappings(self):
         analyzed, record, dispatches = cve_2012_graph_and_record()
@@ -578,18 +597,22 @@ class MultiFunctionMappingTests(unittest.TestCase):
         missing = map_record_to_graph(
             missing_record, analyzed, declared_indirect_dispatches=dispatches
         )
-        self.assertEqual(missing["successfully_mapped_function_count"], 8)
+        self.assertEqual(missing["successfully_mapped_function_count"], 1)
         self.assertEqual(missing["function_mappings"][-1]["mapping_status"],
                          "function_not_found")
-        self.assertEqual(missing["function_mappings"][2]["call_depth"], 4)
+        self.assertEqual(
+            missing["function_mappings"][0]["mapping_status"],
+            "mapped_without_resolved_static_path",
+        )
+        self.assertIsNone(missing["function_mappings"][0]["call_depth"])
 
         ambiguous_graph = analyze_sources([
-            ("first.c", b"static void lex(void) {}\n"),
-            ("second.c", b"static void lex(void) {}\n"),
+            ("first.c", b"static void EGexecute(void) {}\n"),
+            ("second.c", b"static void EGexecute(void) {}\n"),
             ("main.c", b"int main(void) { return 0; }\n"),
         ], force_fallback=True)
         ambiguous = map_record_to_graph(
-            sample_record(["lex"]), ambiguous_graph
+            sample_record(["EGexecute"]), ambiguous_graph
         )["function_mappings"][0]
         self.assertEqual(ambiguous["mapping_status"], "ambiguous_function_name")
         self.assertIsNone(ambiguous["mapped_function_id"])

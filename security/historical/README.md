@@ -419,45 +419,50 @@ failure, tag mismatch, archive mismatch, tree mismatch, or representative
 blob mismatch fails closed. Successful output lists all nine files and prints
 `release_git_correspondence=verified`.
 
-Both CVE-referenced fixes are dated 2012-03-01. Commit
-`cbbc1a45b9f843c811905c97c90a5d31f8e6c189` follows `v2.10` and repairs the
+The original oss-security request demonstrates a searched line larger than
+2 GiB and says this specific problem was fixed by commit
+`cbbc1a45b9f843c811905c97c90a5d31f8e6c189`. The assignment reply assigns
+CVE-2012-5667 to "this issue." That commit follows `v2.10` and repairs the
 DFA/search/kwset long-input size problems; its parent is
 `235aad711285fc6978f6ff26397743930b23f79a`. Commit
-`8fcf61523644df42e1905c81bed26838e0b04f91` follows the first and repairs the
-main program's count, context, argument, and pattern-size integer issues; its
-parent is `4572ea4649d025e51463d48c2d06a1c66134cdb8`. The peeled `v2.10`
-revision is an ancestor of both fixes, the first fix is an ancestor of the
-second, and both are ancestors of the peeled `v2.11` revision
+`8fcf61523644df42e1905c81bed26838e0b04f91` follows the first and repairs
+neighboring main-program count, context, argument, and pattern-size issues;
+its parent is `4572ea4649d025e51463d48c2d06a1c66134cdb8`. The request describes
+both 4572ea46 and 8fcf6152 separately as changes that might be security
+relevant, not as established parts of the assigned issue. The peeled `v2.10`
+revision is an ancestor of all these changes, and cbbc is an ancestor of the
+peeled `v2.11` revision
 `f80de4cb768997b0dd947a7e775d1892105aae5f`. GNU's 2.11 release notes identify
 the long-line crash, oversized context counts, and widened match counts as
-fixed. Thus the formal vulnerable snapshot is the authenticated 2.10 release,
-and the fixed release is 2.11.
+separate fixes. Thus the formal vulnerable snapshot is the authenticated 2.10
+release, and the fixed release for the disclosed long-line issue is 2.11.
 
-The per-function evidence and A/B/C classification are frozen in
-`evidence/CVE-2012-5667.md`. Category A contains a direct unsafe arithmetic,
-narrowing, allocation/index, or count operation over attacker-controlled or
-input-derived data. Category B only propagates a corrected type/interface;
-category C is declaration, structure, cleanup, or support work. The resulting
-eight vulnerable locations are:
+The complete candidate audit is preserved in
+`evidence/CVE-2012-5667.md`. It distinguishes a CVE vulnerable location from
+a nearby potentially security-relevant bug and from a patched/propagated
+robustness correction. A patch-direct unsafe expression is not sufficient for
+CVE membership without disclosure-level evidence. Under that stricter rule,
+the frozen vulnerable mapping is:
 
 ```text
-src/dfa.c::lex
 src/dfasearch.c::EGexecute
-src/main.c::prtext
-src/main.c::grepbuf
-src/main.c::grep
-src/main.c::prepend_args
-src/main.c::prepend_default_options
-src/main.c::main
 ```
 
-The last location is stored as `src/main.c::main` because the conservative
-parser also sees a test-only `main` in the exact linked scope; source
-qualification follows the predeclared evidence and entry point. The broad DFA
-type conversions, the kwset structure-field changes, `context_length_arg`,
-`grepfile`, and `get_nondigit_option` remain patch provenance rather than
-independently counted root sites. The intervening 2.11 `Pexecute` guard is
-useful robustness context but is not one of the two CVE-referenced commits.
+In 2.10, `EGexecute` accepts a `size_t` buffer size but narrows searched-line
+pointer differences and match lengths into smaller regex/index types. A
+wrapped match length can become a huge `size_t` in the result consumed by
+`grepbuf`, producing an invalid beyond-buffer bound. The cbbc fix widens these
+values, rejects unrepresentable regex lengths, handles regex errors, and
+activates the greater-than-2-GiB `tests/big-match` regression.
+
+`lex`, `prtext`, `grepbuf`, `grep`, `prepend_args`,
+`prepend_default_options`, and `src/main.c::main` were previously counted
+because they contained patch-direct arithmetic. They are now removed from
+`vulnerable_functions`: `lex` concerns regex repetition bounds; the main-file
+changes concern separate context/count, argument-vector, or pattern-size
+issues. They remain in `patched_functions` and the evidence audit, which do
+not contribute to vulnerability-depth statistics. Callers such as `grepbuf`
+remain part of the runtime path without becoming vulnerable locations.
 
 The 2.10 entry point is `src/main.c::main`. `src/Makefile.am` declares
 `grep_SOURCES = grep.c`, places seven sources (including `main.c`, `dfa.c`,
@@ -478,28 +483,20 @@ source-qualified entry point is `src/main.c::main`. The mapping result is:
 
 | Vulnerable location | Status | Raw depth | Shortest resolved static path | Normalized depth |
 | --- | --- | ---: | --- | ---: |
-| `src/dfa.c::lex` | mapped; unresolved indirect dispatch | null | null | null |
 | `src/dfasearch.c::EGexecute` | mapped; unresolved indirect dispatch | null | null | null |
-| `src/main.c::prtext` | mapped and reachable | 4 | `main -> grepfile -> grep -> grepbuf -> prtext` | 4/7 |
-| `src/main.c::grepbuf` | mapped and reachable | 3 | `main -> grepfile -> grep -> grepbuf` | 3/7 |
-| `src/main.c::grep` | mapped and reachable | 2 | `main -> grepfile -> grep` | 2/7 |
-| `src/main.c::prepend_args` | mapped and reachable | 2 | `main -> prepend_default_options -> prepend_args` | 2/7 |
-| `src/main.c::prepend_default_options` | mapped and reachable | 1 | `main -> prepend_default_options` | 1/7 |
-| `src/main.c::main` | mapped and reachable | 0 | `main` | 0 |
 
-`lex` is behind the unresolved `main` call through the selected matcher's
-`compile` pointer; `EGexecute` is behind reachable `do_execute` calling the
-selected matcher's `execute` pointer. Both have a resolved static suffix from
-the manifest-declared possible target to the vulnerable function. Those
-declarations remain evidence categories and are not promoted into graph
-edges. The precise result is mapped, but without a resolved static path from
+`EGexecute` is behind reachable `do_execute` calling the selected matcher's
+`execute` pointer. The manifest declaration records this evidence but is not
+promoted into a graph edge. The precise result is mapped, but without a
+resolved static path from
 `src/main.c::main` under the conservative call-graph model; it does not imply
 dead code and no numeric depth is manufactured.
 
-At CVE level, all eight locations map, six are reachable through resolved
-static paths, the numeric minimum is 0, the maximum is 4, and the shallowest
-reachable location is `src/main.c::main`. The aggregation remains one CVE,
-not eight records.
+At CVE level, the one declared location maps uniquely, but zero locations have
+a numeric resolved static path. Minimum depth, maximum depth, and shallowest
+reachable location are therefore null. The CVE remains present in record and
+mapping-status denominators as `mapped_without_resolved_static_path`; only
+numeric depth histograms omit it.
 
 The reproducible diagnostic can be run against the scope wrapper's build
 outputs with `check_grep_2_10_scope_sensitivity.py`. Its result does not alter
@@ -512,11 +509,10 @@ the manifest:
 | Configured archive-source superset | 52 | 296 | 74 | 7 | 5 | 5 | 195 |
 | Whole-release C diagnostic | 236 | 831 | 99 | 9 | 31 | 21 | 227 |
 
-All eight mappings retain their unique intended locations in all four scopes.
-The six numeric depths and shortest paths remain unchanged; `lex` and
-`EGexecute` retain null depth and `unresolved_indirect_dispatch`. The larger
-scopes add resolved source-level edges and, especially in the whole release,
-many duplicate names and ambiguous calls. The minimal scope retains
+`EGexecute` retains its unique intended location, null depth, and
+`unresolved_indirect_dispatch` status in all four scopes. The larger scopes
+add resolved source-level edges and, especially in the whole release, many
+duplicate names and ambiguous calls. The minimal scope retains
 `lib/argmatch.c` solely because its preprocessor-guarded test `main`, also
 visible to the conservative parser in the formal graph, preserves the stable
 source-qualified ID `src/main.c::main`. The formal result remains the
