@@ -51,6 +51,14 @@ for nonnumeric depth states such as `unresolved_indirect_dispatch`. No fixed
 "shallow" cutoff is inferred, and call depth is descriptive rather than a
 claim that shallow functions are vulnerable.
 
+Raw shortest call depth is the primary metric. Normalized depth is retained as
+a secondary descriptive quantity, calculated as
+`raw_depth / maximum_reachable_depth` within one graph. It is not directly
+comparable across historical programs: their frozen scopes and deepest
+reachable chains differ. In particular, adding an unrelated deeper reachable
+chain can change the normalized denominator without changing the vulnerable
+function's raw depth or shortest path.
+
 Existing HVC selection support remains available only as an explicit CLI
 option. A historical CVE is covered by a selection if at least one of its
 verified, mapped-and-reachable vulnerable functions is selected. The HVC
@@ -241,9 +249,16 @@ more duplicate definition names and ambiguous calls. The formal result
 remains the predeclared linker-exact scope, independent of those outcomes.
 
 The call-graph output includes `shortest_call_path` for every reachable
-function. Ambiguous direct-call targets are retained as unresolved calls with
-`reason = "ambiguous_target"`; extra translation units therefore cannot change
-resolution silently.
+function. For a directly called name with multiple project-wide definitions,
+the resolver prefers a unique definition in the caller's source file when one
+exists. If there is no such same-file candidate, the call remains unresolved
+with `reason = "ambiguous_target"`. This same-file fallback is a conservative
+source-level heuristic, not a proof of C linkage or configured preprocessing
+semantics. Exact, build-derived source scopes reduce the competing definitions
+that can trigger it, but cannot eliminate incorrect resolution when conditional
+compilation, macros, or other preprocessing/configuration semantics are not
+modeled. An adversarial unit test keeps this behavior explicit and visible; the
+heuristic is not changed for the current historical results.
 
 ## Reproduce Coreutils 5.2.1 mkdir and its program scope
 
@@ -280,7 +295,10 @@ SHA-256 and published archive SHA-1 are stored in the script. It requires the
 annotated upstream tag and
 matching peel, downloads the official archive and signature when absent, uses
 portable Python `hashlib`, verifies the signature whenever `gpgv` is available,
-and fails closed on every required checksum, identity, or fingerprint mismatch.
+and fails closed on every required checksum, identity, fingerprint, or
+release/Git correspondence mismatch. Network access to Savannah is required on
+every run for the tag check and for fetching the authenticated tag into the
+ignored `security/historical/sources/coreutils-upstream.git` object cache.
 
 The 5.2.1 source fixes the entry point at `src/mkdir.c::main`. The configured
 `src/Makefile` declares `mkdir_SOURCES = mkdir.c` and links
@@ -318,10 +336,12 @@ earliest verified upstream fixed release; Debian's 6.10-1 package version is
 not treated as an upstream release identifier. NVD provides only the general
 `NVD-CWE-Other` classification, so no more specific CWE is invented.
 
-As a release-to-repository correspondence check, `src/mkdir.c`,
-`lib/makepath.c`, `src/Makefile.am`, `lib/Makefile.am`, and `configure` from the
-signed archive all have the exact Git blob IDs found at the peeled `v5.2.1`
-commit.
+As a release-to-repository correspondence check, the preparation script hashes
+`src/mkdir.c`, `lib/makepath.c`, `src/Makefile.am`, `lib/Makefile.am`, and
+`configure` as Git blobs and compares each with the blob at the manifest-derived
+peeled revision. It does not silently skip this check: any missing file, fetch
+failure, tag mismatch, or blob mismatch terminates preparation. Successful
+output includes `release_git_correspondence=verified` and the checked file list.
 
 The frozen analysis uses Tree-sitter and resolves `src/mkdir.c::main`. Across
 14 C files it finds 52 functions, 26 reachable functions, maximum reachable
@@ -367,6 +387,16 @@ python3 security/historical/run_historical_analysis.py \
 Missing or mismatched source versions, fingerprint mismatches, invalid or empty
 scopes, unresolved entry points/functions, ambiguous names, and mapped but
 functions without a resolved static path remain distinct fail-closed states.
+
+Detached-signature verification is conditional for portability. The grep 2.21
+and Coreutils 5.2.1 preparation scripts verify with GNU's keyring when `gpgv`
+is available and always print either
+`signature_status=verified_with_gnu_keyring` or
+`signature_status=not_checked_gpgv_unavailable`. A successful run with the
+latter status does not claim that the signature was reverified on that host;
+the independent upstream tag/revision, mandatory archive checksum, and source
+fingerprint checks still run. Install `gpgv` to require the verified status in
+the preparation output.
 
 The preserved comparison infrastructure is opt-in and is not part of the
 current call-depth smoke test. A later study can add `--coverage-study` plus

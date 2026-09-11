@@ -404,6 +404,16 @@ def source_tree_sha256(source_tree: Path) -> str:
     return digest.hexdigest()
 
 
+def verify_source_tree_sha256(source_tree: Path, expected: str) -> str:
+    """Return the C/H fingerprint or fail closed when it is not the frozen value."""
+    observed = source_tree_sha256(source_tree)
+    if observed.lower() != expected.lower():
+        raise HistoricalDataError(
+            f"source-tree fingerprint mismatch: observed {observed}, expected {expected}"
+        )
+    return observed
+
+
 def _identity(record: Mapping[str, Any]) -> tuple[str, str, str]:
     return (
         str(record["upstream_project"]), str(record["affected_version"]),

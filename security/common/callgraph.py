@@ -1,9 +1,11 @@
 """Conservative C call-graph reachability and structural selection helpers.
 
 The graph records directly named calls and explicitly supported, statically
-identifiable callback arguments. Other function-pointer dispatch,
-preprocessor-generated calls, and calls hidden in unavailable translation
-units remain unresolved rather than being guessed.
+identifiable callback arguments. A directly called name with multiple global
+definitions resolves to a unique same-source-file definition when available;
+this is a source-level fallback, not full C linkage/preprocessor modeling.
+Other function-pointer dispatch, preprocessor-generated calls, and calls hidden
+in unavailable translation units remain unresolved rather than being guessed.
 """
 
 from __future__ import annotations

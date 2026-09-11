@@ -2,21 +2,29 @@ from __future__ import annotations
 
 import copy
 import json
+import os
+import tempfile
 import unittest
 from pathlib import Path
 
 from security.common.callgraph import analyze_source_bytes, analyze_sources
 from security.historical.analysis import (
+    HistoricalDataError,
+    ProgramAnalysisError,
+    _resolve_program_scope,
     analyze_versioned_records,
     load_census,
     load_records,
     load_source_manifest,
     map_record_to_graph,
     summarize_historical_analysis,
+    source_tree_sha256,
     validate_record,
     validate_source_manifest,
+    verify_source_tree_sha256,
     version_specific_hvc,
 )
+from security.historical.derive_coreutils_mkdir_scope import verify_frozen_source_files
 from security.historical.run_historical_analysis import parse_args
 
 
@@ -191,8 +199,60 @@ class HistoricalSchemaTests(unittest.TestCase):
                 schema = json.loads((historical / schema_name).read_text())
                 jsonschema.Draft202012Validator(schema).validate(data)
 
+    def test_duplicate_source_manifest_identity_is_rejected(self):
+        entry = json.loads((FIXTURES / "source_manifest.json").read_text())[0]
+        errors = validate_source_manifest([entry, copy.deepcopy(entry)])
+        self.assertEqual(errors, [
+            "source 1: duplicate source identity: "
+            f"{entry['upstream_project']}/{entry['affected_version']}/"
+            f"{entry['source_revision']}"
+        ])
+
 
 class MultiFunctionMappingTests(unittest.TestCase):
+    def test_program_scope_rejects_parent_traversal_and_symlink_escape(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            source_tree = base / "source"
+            source_tree.mkdir()
+            (source_tree / "entry.c").write_text("int main(void) { return 0; }\n")
+            outside = base / "outside.c"
+            outside.write_text("void outside(void) {}\n")
+            escaped = source_tree / "escaped.c"
+            os.symlink(outside, escaped)
+
+            for source_files in (["../outside.c"], ["entry.c", "escaped.c"]):
+                with self.subTest(source_files=source_files):
+                    with self.assertRaises(ProgramAnalysisError) as raised:
+                        _resolve_program_scope(source_tree, {
+                            "entry_point": {
+                                "source_file": "entry.c", "function": "main",
+                            },
+                            "source_files": source_files,
+                        })
+                    self.assertEqual(raised.exception.status, "analysis_scope_invalid")
+
+    def test_same_file_fallback_is_explicit_for_duplicate_function_names(self):
+        analyzed = analyze_sources([
+            (
+                "caller.c",
+                b"static void duplicate(void) {}\n"
+                b"static void caller(void) { duplicate(); }\n"
+                b"int main(void) { caller(); return 0; }\n",
+            ),
+            ("other.c", b"static void duplicate(void) {}\n"),
+        ], entry_points=("caller.c::main",), force_fallback=True)
+        caller = next(
+            item for item in analyzed["function_reachability"]
+            if item["function"] == "caller"
+        )
+        self.assertEqual(caller["direct_callees"], ["caller.c::duplicate"])
+        self.assertNotIn({
+            "caller": "caller",
+            "callee_text": "duplicate",
+            "reason": "ambiguous_target",
+        }, analyzed["unresolved_direct_calls"])
+
     def test_two_coreutils_versions_and_grep_resolve_independently(self):
         coreutils_record = fixture_records()[0]
         coreutils_manifest = fixture_manifest()[0]
@@ -655,6 +715,65 @@ class MultiFunctionMappingTests(unittest.TestCase):
 
 
 class HistoricalPreparationTests(unittest.TestCase):
+    def _write_mkdir_manifest(self, path, source_tree, source_files):
+        path.write_text(json.dumps([{
+            "upstream_project": "gnu-coreutils",
+            "affected_version": "fixture",
+            "source_revision": "d" * 40,
+            "source_tree": str(source_tree),
+            "source_tree_sha256": "0" * 64,
+            "programs": {
+                "mkdir": {
+                    "entry_point": {
+                        "source_file": "entry.c", "function": "main",
+                    },
+                    "source_files": source_files,
+                },
+            },
+        }]))
+
+    def test_frozen_file_verifier_rejects_traversal_and_symlink_escape(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            source_tree = base / "source"
+            source_tree.mkdir()
+            (source_tree / "entry.c").write_text("int main(void) { return 0; }\n")
+            outside = base / "outside.c"
+            outside.write_text("void outside(void) {}\n")
+            os.symlink(outside, source_tree / "escaped.c")
+            manifest = base / "manifest.json"
+
+            self._write_mkdir_manifest(manifest, source_tree, ["../outside.c"])
+            with self.assertRaises(HistoricalDataError):
+                verify_frozen_source_files(source_tree, manifest)
+
+            self._write_mkdir_manifest(
+                manifest, source_tree, ["entry.c", "escaped.c"]
+            )
+            with self.assertRaisesRegex(RuntimeError, "escapes source tree"):
+                verify_frozen_source_files(source_tree, manifest)
+
+    def test_partial_existing_source_tree_fails_preparation_fingerprint_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source_tree = Path(directory)
+            (source_tree / "one.c").write_text("void one(void) {}\n")
+            (source_tree / "two.h").write_text("void two(void);\n")
+            expected = source_tree_sha256(source_tree)
+            (source_tree / "two.h").unlink()
+            with self.assertRaisesRegex(
+                HistoricalDataError, "source-tree fingerprint mismatch"
+            ):
+                verify_source_tree_sha256(source_tree, expected)
+
+            script = (
+                REPO / "security/historical/prepare_coreutils_5_2_1.sh"
+            ).read_text()
+            self.assertIn("verify_source_tree_sha256", script)
+            self.assertIn(
+                'if test "$observed_tree_sha256" != "$source_tree_sha256"; then',
+                script,
+            )
+
     def test_preparation_scripts_use_portable_python_sha256(self):
         historical = REPO / "security" / "historical"
         for name in (
@@ -693,6 +812,20 @@ class HistoricalPreparationTests(unittest.TestCase):
         ):
             with self.subTest(script=name):
                 self.assertNotIn(MKDIR_REVISION, (historical / name).read_text())
+
+    def test_mkdir_preparation_rechecks_release_git_blob_correspondence(self):
+        script = (
+            REPO / "security/historical/prepare_coreutils_5_2_1.sh"
+        ).read_text()
+        for relative_file in (
+            "src/mkdir.c", "lib/makepath.c", "src/Makefile.am",
+            "lib/Makefile.am", "configure",
+        ):
+            with self.subTest(relative_file=relative_file):
+                self.assertIn(relative_file, script)
+        self.assertIn('git hash-object "$release_file"', script)
+        self.assertIn('"$release_revision:$relative_file"', script)
+        self.assertIn("release_git_correspondence=%s", script)
 
     def test_historical_analysis_does_not_run_hvc_without_opt_in(self):
         arguments = parse_args([

@@ -32,7 +32,16 @@ IFS=$'\t' read -r release_version release_revision source_tree source_tree_sha25
   <<< "$identity"
 archive="$sources_dir/coreutils-$release_version.tar.bz2"
 signature="$archive.sig"
+upstream_git="$sources_dir/coreutils-upstream.git"
+correspondence_files=(
+  src/mkdir.c
+  lib/makepath.c
+  src/Makefile.am
+  lib/Makefile.am
+  configure
+)
 
+printf 'upstream_git_network=required_for_tag_and_release_correspondence\n'
 tag_refs=$(
   git ls-remote https://git.savannah.gnu.org/git/coreutils.git \
     "refs/tags/v$release_version" "refs/tags/v$release_version^{}"
@@ -103,14 +112,47 @@ fi
 
 observed_tree_sha256=$(
   PYTHONPATH="$repo_root" python3 -c \
-    'import sys; from pathlib import Path; from security.historical.analysis import source_tree_sha256; print(source_tree_sha256(Path(sys.argv[1])))' \
-    "$source_tree"
+    'import sys; from pathlib import Path; from security.historical.analysis import verify_source_tree_sha256; print(verify_source_tree_sha256(Path(sys.argv[1]), sys.argv[2]))' \
+    "$source_tree" "$source_tree_sha256"
 )
 if test "$observed_tree_sha256" != "$source_tree_sha256"; then
   echo "source-tree fingerprint mismatch: $observed_tree_sha256" >&2
   exit 1
 fi
 
-printf 'source_revision=%s\narchive_sha256=%s\narchive_sha1=%s\nsignature_status=%s\nsource_tree_sha256=%s\nsource_tree=%s\n' \
+if ! test -d "$upstream_git"; then
+  git init --bare "$upstream_git"
+fi
+if git --git-dir="$upstream_git" config --get remote.origin.url >/dev/null 2>&1; then
+  git --git-dir="$upstream_git" remote set-url origin \
+    https://git.savannah.gnu.org/git/coreutils.git
+else
+  git --git-dir="$upstream_git" remote add origin \
+    https://git.savannah.gnu.org/git/coreutils.git
+fi
+git --git-dir="$upstream_git" fetch --force --no-tags origin \
+  "refs/tags/v$release_version:refs/tags/v$release_version"
+cached_revision=$(git --git-dir="$upstream_git" rev-parse --verify \
+  "refs/tags/v$release_version^{}")
+if test "$cached_revision" != "$release_revision"; then
+  echo "cached v$release_version resolved to '$cached_revision', expected '$release_revision'" >&2
+  exit 1
+fi
+for relative_file in "${correspondence_files[@]}"; do
+  release_file="$source_tree/$relative_file"
+  if ! test -f "$release_file"; then
+    echo "release/Git correspondence file is missing: $relative_file" >&2
+    exit 1
+  fi
+  release_blob=$(git hash-object "$release_file")
+  upstream_blob=$(git --git-dir="$upstream_git" rev-parse --verify \
+    "$release_revision:$relative_file")
+  if test "$release_blob" != "$upstream_blob"; then
+    echo "release/Git blob mismatch for $relative_file: release $release_blob, upstream $upstream_blob" >&2
+    exit 1
+  fi
+done
+
+printf 'source_revision=%s\narchive_sha256=%s\narchive_sha1=%s\nsignature_status=%s\nsource_tree_sha256=%s\nrelease_git_correspondence=%s\nrelease_git_correspondence_files=%s\nsource_tree=%s\n' \
   "$release_revision" "$observed_archive_sha256" "$observed_archive_sha1" "$signature_status" \
-  "$observed_tree_sha256" "$source_tree"
+  "$observed_tree_sha256" verified "${correspondence_files[*]}" "$source_tree"
