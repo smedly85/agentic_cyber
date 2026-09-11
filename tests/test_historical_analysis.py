@@ -14,6 +14,7 @@ from security.historical.analysis import (
     map_record_to_graph,
     summarize_historical_analysis,
     validate_record,
+    validate_source_manifest,
     version_specific_hvc,
 )
 
@@ -117,6 +118,16 @@ class HistoricalSchemaTests(unittest.TestCase):
         self.assertEqual(len(grep_source["programs"]["grep"]["source_files"]), 43)
         self.assertIn(
             "src/kwset.c", grep_source["programs"]["grep"]["source_files"]
+        )
+        self.assertEqual(
+            grep_source["programs"]["grep"]["declared_indirect_dispatches"],
+            [{
+                "caller": {"source_file": "src/grep.c", "function": "grepbuf"},
+                "callee_text": "execute",
+                "possible_target": {
+                    "source_file": "src/kwsearch.c", "function": "Fexecute",
+                },
+            }],
         )
         try:
             import jsonschema
@@ -239,7 +250,7 @@ class MultiFunctionMappingTests(unittest.TestCase):
         self.assertEqual(result["mapping_status"], "partial_mapping")
         self.assertEqual(result["successfully_mapped_function_count"], 1)
 
-    def test_reachable_and_unreachable_functions_remain_distinguishable(self):
+    def test_resolved_and_missing_static_paths_remain_distinguishable(self):
         result = map_record_to_graph(
             sample_record(["reached", "orphan"]),
             graph("static void reached(void) {} static void orphan(void) {} "
@@ -248,8 +259,92 @@ class MultiFunctionMappingTests(unittest.TestCase):
         rows = {item["vulnerable_function"]: item for item in result["function_mappings"]}
         self.assertIs(rows["reached"]["reachable_from_entry"], True)
         self.assertIs(rows["orphan"]["reachable_from_entry"], False)
-        self.assertEqual(rows["orphan"]["mapping_status"], "mapped_but_unreachable")
-        self.assertEqual(result["mapping_status"], "mapped_with_mixed_reachability")
+        self.assertEqual(
+            rows["orphan"]["mapping_status"],
+            "mapped_without_resolved_static_path",
+        )
+        self.assertEqual(rows["orphan"]["call_depth_status"], "no_resolved_static_path")
+        self.assertEqual(result["mapping_status"], "mapped_with_mixed_path_resolution")
+
+    def test_unresolved_indirect_dispatch_is_explicit_without_inventing_depth(self):
+        analyzed = analyze_sources([
+            (
+                "grep.c",
+                b"static void (*execute)(void);\n"
+                b"static void grepbuf(void) { execute(); }\n"
+                b"int main(void) { grepbuf(); return 0; }\n",
+            ),
+            (
+                "kwsearch.c",
+                b"static void bmexec_trans(void) {}\n"
+                b"static void bmexec(void) { bmexec_trans(); }\n"
+                b"static void kwsexec(void) { bmexec(); }\n"
+                b"static void Fexecute(void) { kwsexec(); }\n",
+            ),
+        ], entry_points=("grep.c::main",), force_fallback=True)
+        result = map_record_to_graph(
+            sample_record(["bmexec_trans"]),
+            analyzed,
+            declared_indirect_dispatches=[{
+                "caller": {"source_file": "grep.c", "function": "grepbuf"},
+                "callee_text": "execute",
+                "possible_target": {
+                    "source_file": "kwsearch.c", "function": "Fexecute",
+                },
+            }],
+        )
+        row = result["function_mappings"][0]
+        self.assertEqual(
+            row["mapping_status"], "mapped_without_resolved_static_path"
+        )
+        self.assertEqual(row["call_depth_status"], "unresolved_indirect_dispatch")
+        self.assertIsNone(row["call_depth"])
+        self.assertIsNone(row["shortest_call_path"])
+        self.assertIsNone(row["normalized_depth"])
+        self.assertEqual(len(row["unresolved_indirect_dispatches"]), 1)
+        evidence = row["unresolved_indirect_dispatches"][0]
+        self.assertEqual(
+            evidence["resolved_path_to_dispatch_caller"], ["main", "grepbuf"]
+        )
+        self.assertEqual(evidence["callee_text"], "execute")
+        self.assertEqual(evidence["resolved_static_suffix"], [
+            "Fexecute", "kwsexec", "bmexec", "bmexec_trans",
+        ])
+        summary = summarize_historical_analysis(
+            result["function_mappings"], [result]
+        )
+        self.assertEqual(summary["function_call_depth_status_counts"], {
+            "unresolved_indirect_dispatch": 1,
+        })
+        unobserved = map_record_to_graph(
+            sample_record(["bmexec_trans"]),
+            analyzed,
+            declared_indirect_dispatches=[{
+                "caller": {"source_file": "grep.c", "function": "grepbuf"},
+                "callee_text": "not_the_observed_call",
+                "possible_target": {
+                    "source_file": "kwsearch.c", "function": "Fexecute",
+                },
+            }],
+        )["function_mappings"][0]
+        self.assertEqual(unobserved["call_depth_status"], "no_resolved_static_path")
+        self.assertEqual(unobserved["unresolved_indirect_dispatches"], [])
+
+    def test_indirect_dispatch_manifest_endpoints_must_be_in_exact_scope(self):
+        manifest = fixture_manifest()[0]
+        program = manifest["programs"]["sort"]
+        program["source_files"] = program.pop("source_globs")
+        program["declared_indirect_dispatches"] = [{
+            "caller": {"source_file": "outside.c", "function": "caller"},
+            "callee_text": "dispatch",
+            "possible_target": {
+                "source_file": "program.c", "function": "target",
+            },
+        }]
+        self.assertTrue(any(
+            "caller.source_file must be in source_files" in error
+            for error in validate_source_manifest([manifest])
+        ))
 
     def test_cve_minimum_and_maximum_reachable_depths(self):
         result = map_record_to_graph(
@@ -375,6 +470,7 @@ class MultiFunctionMappingTests(unittest.TestCase):
         result = map_record_to_graph(sample_record(["bmexec_trans"]), analyzed)
         row = result["function_mappings"][0]
         self.assertEqual(row["mapping_status"], "mapped_and_reachable")
+        self.assertEqual(row["call_depth_status"], "resolved_numeric_depth")
         self.assertEqual(row["mapped_source_file"], "grep.c")
         self.assertEqual(row["call_depth"], 5)
         self.assertEqual(row["shortest_call_path"], [

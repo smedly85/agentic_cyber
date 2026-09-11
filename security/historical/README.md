@@ -38,14 +38,16 @@ Analysis emits two levels:
 
 - `historical_function_mappings`: one row per vulnerable function location,
   retaining the CVE, utility, mapping state, resolved function ID,
-  reachability, raw shortest call depth and path, normalized depth, and
-  direct callers/callees.
+  raw graph reachability, `call_depth_status`, raw shortest call depth and
+  path, normalized depth, direct callers/callees, and any evidence-gated
+  unresolved indirect-dispatch boundary.
 - `historical_record_mappings`: one row per CVE, retaining every function row,
   declared/mapped/reachable counts, an explicit overall mapping status, and
   minimum/maximum reachable location depth.
 
 The summary exposes both the vulnerable-function-location depth distribution
-and the distribution of each CVE's shallowest reachable location. No fixed
+and the distribution of each CVE's shallowest reachable location, plus counts
+for nonnumeric depth states such as `unresolved_indirect_dispatch`. No fixed
 "shallow" cutoff is inferred, and call depth is descriptive rather than a
 claim that shallow functions are vulnerable.
 
@@ -204,10 +206,18 @@ The frozen 43-file analysis uses Tree-sitter, resolves the entry point as
 reachable depth 10, and three unresolved ambiguous direct calls.
 `bmexec_trans` resolves uniquely in `src/kwset.c`; its direct caller is
 `bmexec`, and its direct callees are `bm_delta2_search` and `memchr_kwset`.
-It is `mapped_but_unreachable`, so raw depth, shortest resolved path, and
-normalized depth are null. This is an explicit analyzer limitation: grep
-calls `Fexecute` through the `execute` function pointer selected from its
-matcher table. The upstream patch supplies the observed runtime stack
+It is mapped, but without a resolved static path from `src/grep.c::main` under
+the conservative call-graph model. Its `mapping_status` is
+`mapped_without_resolved_static_path`, and its `call_depth_status` is
+`unresolved_indirect_dispatch`; raw depth, shortest resolved path, and
+normalized depth remain null. This does not assert that the function is dead
+code. The frozen manifest predeclares the source-supported boundary where
+`grepbuf` calls through `execute` and `Fexecute` is a possible target. The
+analyzer verifies the resolved prefix `main -> grep_command_line_arg ->
+grepdesc -> grep -> grepbuf`, the unresolved `execute` call, and the resolved
+suffix `Fexecute -> kwsexec -> bmexec -> bmexec_trans`, but does not promote
+that declaration into a synthetic call-graph edge or numeric depth. The
+upstream patch supplies the observed runtime stack
 `main -> grep_command_line_arg -> grepdesc -> grep -> grepbuf -> Fexecute ->
 kwsexec -> bmexec -> bmexec_trans`, but the conservative graph does not turn
 that dynamic evidence into a guessed direct edge.
@@ -216,13 +226,15 @@ The scope-sensitivity check keeps that result stable:
 
 | Scope | C files | Functions | Reachable | Max depth | Ambiguous calls | `bmexec_trans` |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| Minimal known-path units (`grep.c`, `kwsearch.c`, `kwset.c`) | 3 | 74 | 44 | 7 | 0 | unique, unreachable |
-| Frozen linker-exact scope | 43 | 371 | 119 | 10 | 3 | unique, unreachable |
-| Configured archive-source superset | 74 | 479 | 120 | 10 | 6 | unique, unreachable |
-| Whole-release C diagnostic | 295 | 1025 | 230 | 11 | 32 | unique, unreachable |
+| Minimal known-path units (`grep.c`, `kwsearch.c`, `kwset.c`) | 3 | 74 | 44 | 7 | 0 | unique; unresolved indirect dispatch |
+| Frozen linker-exact scope | 43 | 371 | 119 | 10 | 3 | unique; unresolved indirect dispatch |
+| Configured archive-source superset | 74 | 479 | 120 | 10 | 6 | unique; unresolved indirect dispatch |
+| Whole-release C diagnostic | 295 | 1025 | 230 | 11 | 32 | unique; unresolved indirect dispatch |
 
 All four scopes retain the same null shortest depth/path and the same direct
-caller/callees for `bmexec_trans`. The larger scopes add resolved edges from
+caller/callees for `bmexec_trans`; the same declared indirect-dispatch boundary
+explains the missing numeric depth in each scope. The larger scopes add
+resolved edges from
 the known-path translation units (45 for the formal scope, 46 for the archive
 superset, and 60 for the whole release), but the broad scopes also introduce
 more duplicate definition names and ambiguous calls. The formal result
@@ -246,7 +258,7 @@ python3 security/historical/run_historical_analysis.py \
 
 Missing or mismatched source versions, fingerprint mismatches, invalid or empty
 scopes, unresolved entry points/functions, ambiguous names, and mapped but
-unreachable functions remain distinct fail-closed states.
+functions without a resolved static path remain distinct fail-closed states.
 
 The preserved comparison infrastructure is opt-in and is not part of the
 current call-depth smoke test. A later study can add `--coverage-study` plus

@@ -13,7 +13,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from security.common.callgraph import SELECTION_POLICIES, analyze_source_tree, select_functions
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 ALLOWED_UTILITIES = {"sort", "mkdir", "chmod", "grep"}
 ALLOWED_PROJECTS = {"gnu-coreutils", "gnu-grep"}
 REQUIRED_FIELDS = {
@@ -29,8 +29,12 @@ MANIFEST_FIELDS = {
 }
 PROGRAM_FIELDS = {
     "entry_point": dict, "source_globs": list, "source_files": list,
+    "declared_indirect_dispatches": list,
 }
 ENTRY_POINT_FIELDS = {"source_file": str, "function": str}
+INDIRECT_DISPATCH_FIELDS = {
+    "caller": dict, "callee_text": str, "possible_target": dict,
+}
 CENSUS_FIELDS = {
     "id": str, "package_project": str, "utility_component": str,
     "target_utility": bool, "provenance": str, "analysis_eligibility": str,
@@ -43,7 +47,7 @@ CENSUS_PROVENANCE = {
 }
 CENSUS_ELIGIBILITY = {"eligible", "excluded", "unresolved"}
 CENSUS_VERIFICATION = {"verified", "partially_verified", "unverified"}
-MAPPED_STATES = {"mapped_and_reachable", "mapped_but_unreachable"}
+MAPPED_STATES = {"mapped_and_reachable", "mapped_without_resolved_static_path"}
 HVC_ELIGIBLE_STATE = "mapped_and_reachable"
 COMMIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
@@ -271,6 +275,67 @@ def validate_manifest_entry(entry: Mapping[str, Any]) -> list[str]:
                         errors.append(
                             f"{prefix}.source_files entries must name C files: {path}"
                         )
+            dispatches = program.get("declared_indirect_dispatches")
+            if isinstance(dispatches, list):
+                if not dispatches:
+                    errors.append(
+                        f"{prefix}.declared_indirect_dispatches must not be empty"
+                    )
+                for index, dispatch in enumerate(dispatches):
+                    dispatch_prefix = (
+                        f"{prefix}.declared_indirect_dispatches[{index}]"
+                    )
+                    if not isinstance(dispatch, Mapping):
+                        errors.append(f"{dispatch_prefix}: must be an object")
+                        continue
+                    errors.extend(
+                        f"{dispatch_prefix}: {error}"
+                        for error in _validate_fields(
+                            dispatch, INDIRECT_DISPATCH_FIELDS
+                        )
+                    )
+                    for endpoint_name in ("caller", "possible_target"):
+                        endpoint = dispatch.get(endpoint_name)
+                        if not isinstance(endpoint, Mapping):
+                            continue
+                        errors.extend(
+                            f"{dispatch_prefix}.{endpoint_name}: {error}"
+                            for error in _validate_fields(
+                                endpoint, ENTRY_POINT_FIELDS
+                            )
+                        )
+                        endpoint_file = endpoint.get("source_file")
+                        endpoint_function = endpoint.get("function")
+                        if isinstance(endpoint_file, str):
+                            path_error = _relative_scope_path_error(
+                                endpoint_file, allow_glob=False
+                            )
+                            if path_error:
+                                errors.append(
+                                    f"{dispatch_prefix}.{endpoint_name}.source_file: "
+                                    f"{path_error}"
+                                )
+                            elif (
+                                isinstance(source_files, list)
+                                and endpoint_file not in source_files
+                            ):
+                                errors.append(
+                                    f"{dispatch_prefix}.{endpoint_name}.source_file "
+                                    "must be in source_files"
+                                )
+                        if (
+                            isinstance(endpoint_function, str)
+                            and not endpoint_function.strip()
+                        ):
+                            errors.append(
+                                f"{dispatch_prefix}.{endpoint_name}.function "
+                                "must not be empty"
+                            )
+                    callee_text = dispatch.get("callee_text")
+                    if isinstance(callee_text, str) and not callee_text.strip():
+                        errors.append(
+                            f"{dispatch_prefix}.callee_text must not be empty"
+                        )
     return errors
 
 
@@ -466,11 +531,107 @@ def _resolve_program_scope(
     return qualified_entry, resolved_files
 
 
+def _source_qualified_function(
+    analysis: Mapping[str, Any], endpoint: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    matches = [
+        item for item in analysis.get("function_reachability", [])
+        if item.get("source_file") == endpoint.get("source_file")
+        and item.get("function") == endpoint.get("function")
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _shortest_resolved_suffix(
+    analysis: Mapping[str, Any], start: str, target: str,
+) -> list[str] | None:
+    rows = {
+        str(item.get("function_id")): item
+        for item in analysis.get("function_reachability", [])
+    }
+    if start not in rows or target not in rows:
+        return None
+    pending: list[tuple[str, list[str]]] = [(start, [start])]
+    visited: set[str] = set()
+    while pending:
+        current, path = pending.pop(0)
+        if current == target:
+            return path
+        if current in visited:
+            continue
+        visited.add(current)
+        row = rows[current]
+        callees = sorted(set(row.get("direct_callees", [])) | set(
+            row.get("callback_callees", [])
+        ))
+        pending.extend(
+            (str(callee), [*path, str(callee)])
+            for callee in callees if str(callee) not in visited
+        )
+    return None
+
+
+def _unresolved_indirect_dispatch_evidence(
+    analysis: Mapping[str, Any], target_function_id: str,
+    dispatches: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Find predeclared indirect boundaries without converting them to edges."""
+    unresolved = analysis.get("unresolved_direct_calls", [])
+    evidence: list[dict[str, Any]] = []
+    for dispatch in dispatches:
+        caller_spec = dispatch.get("caller")
+        possible_target_spec = dispatch.get("possible_target")
+        if not isinstance(caller_spec, Mapping) or not isinstance(
+            possible_target_spec, Mapping
+        ):
+            continue
+        caller = _source_qualified_function(analysis, caller_spec)
+        possible_target = _source_qualified_function(analysis, possible_target_spec)
+        if caller is None or possible_target is None:
+            continue
+        caller_id = str(caller["function_id"])
+        callee_text = dispatch.get("callee_text")
+        unresolved_call = next((
+            item for item in unresolved
+            if item.get("caller") == caller_id
+            and item.get("callee_text") == callee_text
+        ), None)
+        suffix = _shortest_resolved_suffix(
+            analysis, str(possible_target["function_id"]), target_function_id
+        )
+        if (
+            caller.get("reachable_from_entry") is not True
+            or unresolved_call is None
+            or suffix is None
+        ):
+            continue
+        evidence.append({
+            "caller_function_id": caller_id,
+            "caller_source_file": caller.get("source_file"),
+            "callee_text": callee_text,
+            "unresolved_reason": unresolved_call.get("reason"),
+            "possible_target_function_id": possible_target.get("function_id"),
+            "possible_target_source_file": possible_target.get("source_file"),
+            "resolved_path_to_dispatch_caller": list(
+                caller.get("shortest_call_path", [])
+            ),
+            "resolved_static_suffix": suffix,
+        })
+    return sorted(
+        evidence,
+        key=lambda item: (
+            str(item["caller_source_file"]), str(item["caller_function_id"]),
+            str(item["callee_text"]), str(item["possible_target_function_id"]),
+        ),
+    )
+
+
 def map_record_to_graph(
     record: Mapping[str, Any], analysis: Mapping[str, Any], *,
     source_analysis_id: str | None = None,
     source_qualified_entry_point: str | None = None,
     resolved_source_files: Sequence[str] = (),
+    declared_indirect_dispatches: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     """Map every declared vulnerable function and retain a CVE-level aggregate."""
     function_mappings = [
@@ -479,6 +640,7 @@ def map_record_to_graph(
             source_analysis_id=source_analysis_id,
             source_qualified_entry_point=source_qualified_entry_point,
             resolved_source_files=resolved_source_files,
+            declared_indirect_dispatches=declared_indirect_dispatches,
         )
         for target in record["vulnerable_functions"]
     ]
@@ -490,6 +652,7 @@ def _map_function_to_graph(
     source_analysis_id: str | None = None,
     source_qualified_entry_point: str | None = None,
     resolved_source_files: Sequence[str] = (),
+    declared_indirect_dispatches: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     matches = [
         item for item in analysis.get("function_reachability", [])
@@ -505,9 +668,25 @@ def _map_function_to_graph(
         status = (
             "mapped_and_reachable"
             if matched.get("reachable_from_entry") is True
-            else "mapped_but_unreachable"
+            else "mapped_without_resolved_static_path"
         )
     depth = matched.get("call_depth") if matched else None
+    indirect_dispatch_evidence = (
+        _unresolved_indirect_dispatch_evidence(
+            analysis, str(matched["function_id"]), declared_indirect_dispatches
+        )
+        if matched and matched.get("reachable_from_entry") is not True
+        else []
+    )
+    call_depth_status = (
+        "resolved_numeric_depth"
+        if isinstance(depth, int)
+        else "unresolved_indirect_dispatch"
+        if indirect_dispatch_evidence
+        else "no_resolved_static_path"
+        if matched
+        else "mapping_unresolved"
+    )
     maximum = analysis.get("max_reachable_call_depth")
     normalized = (
         depth / maximum
@@ -529,6 +708,8 @@ def _map_function_to_graph(
         "resolved_source_files": list(resolved_source_files),
         "mapped_function_id": matched.get("function_id") if matched else None,
         "mapped_source_file": matched.get("source_file") if matched else None,
+        "call_depth_status": call_depth_status,
+        "unresolved_indirect_dispatches": indirect_dispatch_evidence,
         "call_depth": depth,
         "shortest_call_path": (
             list(matched.get("shortest_call_path", []))
@@ -552,7 +733,7 @@ def _overall_mapping_status(function_mappings: Sequence[Mapping[str, Any]]) -> s
         return next(iter(states))
     mapped = sum(item.get("mapping_status") in MAPPED_STATES for item in function_mappings)
     if mapped == len(function_mappings):
-        return "mapped_with_mixed_reachability"
+        return "mapped_with_mixed_path_resolution"
     if mapped:
         return "partial_mapping"
     return "unmapped_functions"
@@ -592,6 +773,9 @@ def _aggregate_record_mapping(
         "source_analysis_id": first.get("source_analysis_id"),
         "source_qualified_entry_point": first.get("source_qualified_entry_point"),
         "resolved_source_files": list(first.get("resolved_source_files", [])),
+        "call_depth_status_counts": dict(sorted(Counter(
+            str(item.get("call_depth_status")) for item in mappings
+        ).items())),
         "total_reachable_functions": first.get("total_reachable_functions"),
         "diversification_eligible_function_count": first.get(
             "diversification_eligible_function_count"
@@ -622,6 +806,8 @@ def _unevaluable_function_mapping(
         "source_qualified_entry_point": source_qualified_entry_point,
         "resolved_source_files": list(resolved_source_files),
         "mapped_function_id": None, "mapped_source_file": None, "call_depth": None,
+        "call_depth_status": "analysis_unavailable",
+        "unresolved_indirect_dispatches": [],
         "shortest_call_path": None,
         "direct_callers": [], "direct_callees": [],
         "reachable_from_entry": None,
@@ -709,6 +895,9 @@ def analyze_versioned_records(
                 "utility": record["utility"],
                 "source_qualified_entry_point": qualified_entry,
                 "resolved_source_files": resolved_files,
+                "declared_indirect_dispatches": program.get(
+                    "declared_indirect_dispatches", []
+                ),
             }, sort_keys=True).encode()).hexdigest()
             try:
                 graph = analyze_source_tree(
@@ -730,6 +919,9 @@ def analyze_versioned_records(
                 "utility": record["utility"],
                 "source_qualified_entry_point": qualified_entry,
                 "resolved_source_files": resolved_files,
+                "declared_indirect_dispatches": list(program.get(
+                    "declared_indirect_dispatches", []
+                )),
             }
             cache[cache_key] = (analysis_id, graph)
             graphs[analysis_id] = graph
@@ -753,6 +945,9 @@ def analyze_versioned_records(
                 record, graph, source_analysis_id=analysis_id,
                 source_qualified_entry_point=qualified_entry,
                 resolved_source_files=resolved_files,
+                declared_indirect_dispatches=program.get(
+                    "declared_indirect_dispatches", []
+                ),
             )
         record_mapping["source_tree"] = str(source_tree)
         record_mapping["source_tree_sha256"] = source["source_tree_sha256"]
@@ -919,6 +1114,9 @@ def summarize_historical_analysis(
     else:
         records = list(record_mappings)
     location_status_counts = Counter(str(item.get("mapping_status")) for item in mappings)
+    call_depth_status_counts = Counter(
+        str(item.get("call_depth_status")) for item in mappings
+    )
     record_status_counts = Counter(str(item.get("mapping_status")) for item in records)
     valid_locations = [item for item in mappings if item.get("eligible_for_hvc") is True]
     location_depths = [
@@ -935,6 +1133,9 @@ def summarize_historical_analysis(
         "historical_record_count": record_count,
         "historical_function_location_count": len(mappings),
         "function_mapping_status_counts": dict(sorted(location_status_counts.items())),
+        "function_call_depth_status_counts": dict(
+            sorted(call_depth_status_counts.items())
+        ),
         "cve_mapping_status_counts": dict(sorted(record_status_counts.items())),
         "valid_version_specific_mapping_count": sum(
             item.get("eligible_for_hvc") is True for item in records

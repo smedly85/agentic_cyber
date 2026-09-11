@@ -12,6 +12,7 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
 from security.historical.analysis import (  # noqa: E402
+    SCHEMA_VERSION,
     analyze_versioned_records,
     coverage_study,
     load_records,
@@ -71,7 +72,7 @@ def main(argv: list[str] | None = None) -> int:
         for identifier, graph in versioned["call_graphs"].items()
     }
     report = {
-        "schema_version": 3,
+        "schema_version": SCHEMA_VERSION,
         "dataset": str(args.records),
         "source_manifest": str(args.source_manifest),
         "call_graphs_constructed": versioned["call_graphs_constructed"],
