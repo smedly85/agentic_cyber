@@ -50,6 +50,35 @@ def _identifier(node: Any, data: bytes) -> str | None:
     return _identifier(child, data) if child is not None else None
 
 
+def _function_identifier(node: Any, data: bytes) -> str | None:
+    """Recover a function name when a GNU attribute macro precedes it.
+
+    Tree-sitter C treats constructs such as ``size_t _GL_ATTRIBUTE_PURE\nfn``
+    as a function declarator named ``_GL_ATTRIBUTE_PURE`` followed by an
+    ERROR node containing ``fn``.  Keep the normal declarator resolution, but
+    use that error-node identifier when the apparent name is macro-shaped.
+    """
+    name = _identifier(node, data)
+    if (
+        node is None or node.type != "function_declarator" or name is None
+        or re.fullmatch(r"_*[A-Z][A-Z0-9_]*", name) is None
+    ):
+        return name
+    for child in node.named_children:
+        if child.type != "ERROR":
+            continue
+        identifiers = [
+            nested for nested in child.named_children
+            if nested.type == "identifier"
+        ]
+        if identifiers:
+            candidate = identifiers[-1]
+            return data[candidate.start_byte:candidate.end_byte].decode(
+                "utf-8", "replace"
+            )
+    return name
+
+
 def _callback_identifier(node: Any, data: bytes) -> str | None:
     """Resolve only a bare identifier, optionally wrapped in parentheses/&."""
     if node.type == "identifier":
@@ -119,7 +148,7 @@ def _tree_sitter_definitions(data: bytes, source_file: str) -> list[dict[str, An
             continue
         declarator = node.child_by_field_name("declarator")
         body = node.child_by_field_name("body")
-        name = _identifier(declarator, parsed.data)
+        name = _function_identifier(declarator, parsed.data)
         if not name or body is None:
             continue
         body_text = parsed.data[body.start_byte:body.end_byte].decode("utf-8", "replace")

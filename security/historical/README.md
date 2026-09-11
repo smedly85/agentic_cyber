@@ -135,6 +135,99 @@ source-level approximation.
 The entry point is source-qualified as `src/sort.c::main`. The whole-tree C/H
 fingerprint is independent of program filtering.
 
+## Reproduce GNU grep 2.21 and its program scope
+
+The second frozen identity is GNU grep 2.21. GNU's annotated Savannah tag
+`v2.21` peels to:
+
+```text
+d930f765041bb2ad936056ddfdad60042d44bd9d
+```
+
+GNU's signed 2.21 release announcement identifies the official archive and
+detached signature. The archive was verified with that signature and GNU's
+official keyring (key `7FD9FCCB000BEEEE`), then frozen with the portable
+SHA-256 used by the preparation script:
+
+```text
+archive SHA-256:          5244a11c00dee8e7e5e714b9aaa053ac6cbfa27e104abee20d3c778e4bb0e5de
+whole-tree C/H SHA-256:   7118428355f3b5283654ea7c9c99e0b740a5aa7cd265114798204a6f488a7788
+```
+
+Prepare and authenticate the released source tree with:
+
+```bash
+bash security/historical/prepare_grep_2_21.sh
+```
+
+The script reads the affected version, source revision, source-tree location,
+and tree fingerprint from `source_manifest.json`; the revision is not copied
+into preparation or derivation code. It verifies the peeled Savannah tag,
+uses Python `hashlib.sha256` for the archive, verifies the detached signature
+against the GNU keyring when `gpgv` is available, extracts under the ignored
+`security/historical/sources/grep-2.21/`, and fails closed on every required
+identity or fingerprint mismatch.
+
+The released `src/Makefile.am` declares seven `grep_SOURCES` translation
+units, including `src/grep.c` (which contains `main`) and `src/kwset.c` (which
+contains `bmexec_trans`). The configured link also uses
+`lib/libgreputils.a`. For the frozen x86-64 GNU/Linux configuration,
+`CC='gcc -std=gnu17'`, `--disable-nls`, and no usable PCRE development
+library, that archive has 67 C-derived objects. The generated
+`lib/colorize.c` wrapper selects the distributed `lib/colorize-posix.c`.
+
+Unlike the Coreutils build, this historical grep build succeeds with the
+current GCC toolchain. A GNU ld link map proves that 36 `libgreputils.a`
+members are extracted. The formal manifest scope is therefore the
+linker-exact 43-file closure: those 36 distributed library sources plus the
+seven grep-owned translation units. The configured archive-source superset
+has 74 files and is retained only for sensitivity analysis. Rebuild the
+program, reproduce the link map, and verify the exact manifest list with:
+
+```bash
+bash security/historical/prepare_grep_2_21_scope.sh
+```
+
+On macOS the wrapper does not claim to reproduce a GNU/Linux/GNU-ld closure;
+it verifies the 43 frozen paths against the authenticated tree instead.
+
+The GNU bug report and upstream commit establish `src/kwset.c::bmexec_trans`
+before depth is measured. The fix says `memchr_kwset` could leave `tp` beyond
+`ep`, after which `bm_delta2_search` could read beyond the main input buffer;
+it changes only `bmexec_trans` in the vulnerable source file and adds
+`tests/kwset-abuse`. Savannah ancestry confirms that the fix commit
+`83a95bd8c8561875b948cadd417c653dbe7ef2e2` is after `v2.21` and before
+`v2.22`. NVD records versions 2.19 through 2.21 and CWE-119.
+
+The frozen 43-file analysis uses Tree-sitter, resolves the entry point as
+`src/grep.c::main`, and yields 371 functions, 119 reachable functions, maximum
+reachable depth 10, and three unresolved ambiguous direct calls.
+`bmexec_trans` resolves uniquely in `src/kwset.c`; its direct caller is
+`bmexec`, and its direct callees are `bm_delta2_search` and `memchr_kwset`.
+It is `mapped_but_unreachable`, so raw depth, shortest resolved path, and
+normalized depth are null. This is an explicit analyzer limitation: grep
+calls `Fexecute` through the `execute` function pointer selected from its
+matcher table. The upstream patch supplies the observed runtime stack
+`main -> grep_command_line_arg -> grepdesc -> grep -> grepbuf -> Fexecute ->
+kwsexec -> bmexec -> bmexec_trans`, but the conservative graph does not turn
+that dynamic evidence into a guessed direct edge.
+
+The scope-sensitivity check keeps that result stable:
+
+| Scope | C files | Functions | Reachable | Max depth | Ambiguous calls | `bmexec_trans` |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Minimal known-path units (`grep.c`, `kwsearch.c`, `kwset.c`) | 3 | 74 | 44 | 7 | 0 | unique, unreachable |
+| Frozen linker-exact scope | 43 | 371 | 119 | 10 | 3 | unique, unreachable |
+| Configured archive-source superset | 74 | 479 | 120 | 10 | 6 | unique, unreachable |
+| Whole-release C diagnostic | 295 | 1025 | 230 | 11 | 32 | unique, unreachable |
+
+All four scopes retain the same null shortest depth/path and the same direct
+caller/callees for `bmexec_trans`. The larger scopes add resolved edges from
+the known-path translation units (45 for the formal scope, 46 for the archive
+superset, and 60 for the whole release), but the broad scopes also introduce
+more duplicate definition names and ambiguous calls. The formal result
+remains the predeclared linker-exact scope, independent of those outcomes.
+
 The call-graph output includes `shortest_call_path` for every reachable
 function. Ambiguous direct-call targets are retained as unresolved calls with
 `reason = "ambiguous_target"`; extra translation units therefore cannot change

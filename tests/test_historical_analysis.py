@@ -21,6 +21,13 @@ from security.historical.analysis import (
 REPO = Path(__file__).resolve().parents[1]
 FIXTURES = REPO / "tests" / "fixtures" / "historical"
 SCHEMA = json.loads((REPO / "security" / "historical" / "schema.json").read_text())
+GREP_REVISION = next(
+    item["source_revision"]
+    for item in json.loads(
+        (REPO / "security" / "historical" / "source_manifest.json").read_text()
+    )
+    if item["upstream_project"] == "gnu-grep"
+)
 
 
 def fixture_records():
@@ -33,6 +40,19 @@ def fixture_manifest():
 
 def sample_record(functions):
     return {**fixture_records()[0], "id": "SYNTHETIC-MULTI", "vulnerable_functions": functions}
+
+
+def grep_fixture():
+    record = copy.deepcopy(fixture_records()[1])
+    record.update({
+        "id": "SYNTHETIC-GREP",
+        "utility": "grep",
+        "upstream_project": "gnu-grep",
+    })
+    manifest = copy.deepcopy(fixture_manifest()[1])
+    manifest["upstream_project"] = "gnu-grep"
+    manifest["programs"] = {"grep": manifest["programs"].pop("sort")}
+    return record, manifest
 
 
 def graph(source):
@@ -73,9 +93,31 @@ class HistoricalSchemaTests(unittest.TestCase):
         self.assertSchemaRejects(sample_record(["valid", " "]))
 
     def test_checked_in_records_and_census_validate(self):
-        self.assertEqual(len(load_records(REPO / "security/historical/records.json")), 1)
-        self.assertEqual(len(load_census(REPO / "security/historical/cve_census.json")), 1)
-        load_source_manifest(REPO / "security/historical/source_manifest.json")
+        records = load_records(REPO / "security/historical/records.json")
+        census = load_census(REPO / "security/historical/cve_census.json")
+        manifest = load_source_manifest(REPO / "security/historical/source_manifest.json")
+        self.assertEqual([item["id"] for item in records], [
+            "CVE-2025-5278", "CVE-2015-1345",
+        ])
+        self.assertEqual([item["id"] for item in census], [
+            "CVE-2025-5278", "CVE-2015-1345",
+        ])
+        self.assertEqual(
+            [(item["upstream_project"], item["affected_version"]) for item in manifest],
+            [("gnu-coreutils", "9.7"), ("gnu-grep", "2.21")],
+        )
+        grep_record = next(item for item in records if item["id"] == "CVE-2015-1345")
+        grep_source = next(
+            item for item in manifest if item["upstream_project"] == "gnu-grep"
+        )
+        self.assertEqual(grep_record["vulnerable_functions"], ["bmexec_trans"])
+        self.assertEqual(grep_source["programs"]["grep"]["entry_point"], {
+            "source_file": "src/grep.c", "function": "main",
+        })
+        self.assertEqual(len(grep_source["programs"]["grep"]["source_files"]), 43)
+        self.assertIn(
+            "src/kwset.c", grep_source["programs"]["grep"]["source_files"]
+        )
         try:
             import jsonschema
         except ImportError:
@@ -93,6 +135,60 @@ class HistoricalSchemaTests(unittest.TestCase):
 
 
 class MultiFunctionMappingTests(unittest.TestCase):
+    def test_coreutils_and_grep_identities_resolve_independently(self):
+        coreutils_record = fixture_records()[0]
+        coreutils_manifest = fixture_manifest()[0]
+        grep_record, grep_manifest = grep_fixture()
+        combined = analyze_versioned_records(
+            [coreutils_record, grep_record],
+            [coreutils_manifest, grep_manifest],
+            force_fallback=True,
+        )
+        rows = {
+            item["vulnerability_id"]: item
+            for item in combined["historical_function_mappings"]
+        }
+        self.assertEqual(combined["call_graphs_constructed"], 2)
+        self.assertEqual(rows["SYNTHETIC-A"]["call_depth"], 1)
+        self.assertEqual(rows["SYNTHETIC-GREP"]["call_depth"], 2)
+        self.assertEqual(rows["SYNTHETIC-GREP"]["mapped_source_file"], "program.c")
+
+    def test_source_identity_matching_uses_project_version_and_revision(self):
+        record, manifest = grep_fixture()
+        mutations = (
+            ("upstream_project", "gnu-coreutils", "source_version_unavailable"),
+            ("affected_version", "other-version", "source_version_unavailable"),
+            ("source_revision", "c" * 40, "source_version_mismatch"),
+        )
+        for field, value, expected in mutations:
+            with self.subTest(field=field):
+                changed = copy.deepcopy(record)
+                changed[field] = value
+                result = analyze_versioned_records(
+                    [changed], [manifest], force_fallback=True
+                )
+                row = result["historical_function_mappings"][0]
+                self.assertEqual(row["source_version_status"], expected)
+                self.assertEqual(result["call_graphs_constructed"], 0)
+
+    def test_grep_source_fingerprint_mismatch_fails_closed(self):
+        record, manifest = grep_fixture()
+        manifest["source_tree_sha256"] = "0" * 64
+        result = analyze_versioned_records([record], [manifest], force_fallback=True)
+        row = result["historical_function_mappings"][0]
+        self.assertEqual(row["source_version_status"], "source_version_mismatch")
+        self.assertEqual(row["mapping_status"], "source_version_mismatch")
+        self.assertEqual(result["call_graphs_constructed"], 0)
+
+    def test_missing_exact_grep_source_file_fails_closed(self):
+        record, manifest = grep_fixture()
+        program = manifest["programs"]["grep"]
+        program["source_files"] = [program.pop("source_globs")[0], "missing.c"]
+        result = analyze_versioned_records([record], [manifest], force_fallback=True)
+        row = result["historical_function_mappings"][0]
+        self.assertEqual(row["mapping_status"], "analysis_scope_invalid")
+        self.assertEqual(result["call_graphs_constructed"], 0)
+
     def test_exact_source_file_manifest_scope_is_supported_and_fail_closed(self):
         manifest = fixture_manifest()
         program = manifest[0]["programs"]["sort"]
@@ -254,6 +350,70 @@ class MultiFunctionMappingTests(unittest.TestCase):
         )
         self.assertEqual(main["direct_callees"], [])
 
+    def test_bmexec_trans_must_resolve_uniquely_before_mapping(self):
+        analyzed = analyze_sources([
+            ("first-kwset.c", b"static void bmexec_trans(void) {}"),
+            ("second-kwset.c", b"static void bmexec_trans(void) {}"),
+            ("grep.c", b"int main(void) { bmexec_trans(); return 0; }"),
+        ], force_fallback=True)
+        result = map_record_to_graph(sample_record(["bmexec_trans"]), analyzed)
+        row = result["function_mappings"][0]
+        self.assertEqual(row["mapping_status"], "ambiguous_function_name")
+        self.assertIsNone(row["mapped_function_id"])
+        self.assertIsNone(row["mapped_source_file"])
+
+    def test_shortest_call_path_reporting_works_for_grep_graph(self):
+        analyzed = analyze_sources([(
+            "grep.c",
+            b"static void bmexec_trans(void) {}\n"
+            b"static void bmexec(void) { bmexec_trans(); }\n"
+            b"static void kwsexec(void) { bmexec(); }\n"
+            b"static void Fexecute(void) { kwsexec(); }\n"
+            b"static void grepbuf(void) { Fexecute(); }\n"
+            b"int main(void) { grepbuf(); return 0; }\n",
+        )], entry_points=("grep.c::main",), force_fallback=True)
+        result = map_record_to_graph(sample_record(["bmexec_trans"]), analyzed)
+        row = result["function_mappings"][0]
+        self.assertEqual(row["mapping_status"], "mapped_and_reachable")
+        self.assertEqual(row["mapped_source_file"], "grep.c")
+        self.assertEqual(row["call_depth"], 5)
+        self.assertEqual(row["shortest_call_path"], [
+            "main", "grepbuf", "Fexecute", "kwsexec", "bmexec", "bmexec_trans",
+        ])
+
+    def test_gnu_attribute_macro_before_function_name_is_recovered(self):
+        analyzed = analyze_source_bytes(
+            b"static inline unsigned long _GL_ATTRIBUTE_PURE\n"
+            b"bmexec_trans(void) { return 0; }\n"
+            b"int main(void) { return (int) bmexec_trans(); }\n"
+        )
+        matches = [
+            item for item in analyzed["function_reachability"]
+            if item["function"] == "bmexec_trans"
+        ]
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["call_depth"], 1)
+
+    def test_second_project_record_does_not_change_coreutils_result(self):
+        coreutils_record = fixture_records()[0]
+        coreutils_manifest = fixture_manifest()[0]
+        baseline = analyze_versioned_records(
+            [coreutils_record], [coreutils_manifest], force_fallback=True
+        )["historical_function_mappings"][0]
+        grep_record, grep_manifest = grep_fixture()
+        combined = analyze_versioned_records(
+            [coreutils_record, grep_record], [coreutils_manifest, grep_manifest],
+            force_fallback=True,
+        )["historical_function_mappings"][0]
+        stable_fields = (
+            "mapping_status", "mapped_function_id", "mapped_source_file",
+            "call_depth", "shortest_call_path", "direct_callers", "direct_callees",
+        )
+        self.assertEqual(
+            {field: baseline[field] for field in stable_fields},
+            {field: combined[field] for field in stable_fields},
+        )
+
     def test_source_fingerprint_mismatch_still_fails_closed_for_every_location(self):
         manifest = fixture_manifest()
         manifest[0]["source_tree_sha256"] = "0" * 64
@@ -266,6 +426,27 @@ class MultiFunctionMappingTests(unittest.TestCase):
             item["source_version_status"] == "source_version_mismatch"
             for item in result["historical_function_mappings"]
         ))
+
+
+class HistoricalPreparationTests(unittest.TestCase):
+    def test_preparation_scripts_use_portable_python_sha256(self):
+        historical = REPO / "security" / "historical"
+        for name in ("prepare_coreutils_9_7.sh", "prepare_grep_2_21.sh"):
+            with self.subTest(script=name):
+                text = (historical / name).read_text()
+                self.assertIn("hashlib.sha256", text)
+                self.assertNotIn("sha256sum", text)
+                self.assertNotIn("shasum", text)
+
+    def test_grep_scripts_do_not_duplicate_frozen_revision(self):
+        historical = REPO / "security" / "historical"
+        for name in (
+            "prepare_grep_2_21.sh",
+            "prepare_grep_2_21_scope.sh",
+            "derive_grep_scope.py",
+        ):
+            with self.subTest(script=name):
+                self.assertNotIn(GREP_REVISION, (historical / name).read_text())
 
 
 if __name__ == "__main__":

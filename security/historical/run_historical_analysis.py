@@ -60,7 +60,14 @@ def main(argv: list[str] | None = None) -> int:
                 "unreachable_function_count", "max_reachable_call_depth",
                 "functions_by_call_depth",
             )
-        } | {"function_count": len(graph["function_reachability"])}
+        } | {
+            "function_count": len(graph["function_reachability"]),
+            "unresolved_direct_call_count": len(graph["unresolved_direct_calls"]),
+            "unresolved_ambiguous_call_count": sum(
+                item.get("reason") == "ambiguous_target"
+                for item in graph["unresolved_direct_calls"]
+            ),
+        }
         for identifier, graph in versioned["call_graphs"].items()
     }
     report = {

@@ -528,6 +528,7 @@ def _map_function_to_graph(
         "source_qualified_entry_point": source_qualified_entry_point,
         "resolved_source_files": list(resolved_source_files),
         "mapped_function_id": matched.get("function_id") if matched else None,
+        "mapped_source_file": matched.get("source_file") if matched else None,
         "call_depth": depth,
         "shortest_call_path": (
             list(matched.get("shortest_call_path", []))
@@ -620,7 +621,7 @@ def _unevaluable_function_mapping(
         "eligible_for_hvc": False, "source_analysis_id": source_analysis_id,
         "source_qualified_entry_point": source_qualified_entry_point,
         "resolved_source_files": list(resolved_source_files),
-        "mapped_function_id": None, "call_depth": None,
+        "mapped_function_id": None, "mapped_source_file": None, "call_depth": None,
         "shortest_call_path": None,
         "direct_callers": [], "direct_callees": [],
         "reachable_from_entry": None,
