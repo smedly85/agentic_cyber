@@ -4,9 +4,9 @@ set -euo pipefail
 script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/../.." && pwd)
 manifest="$script_dir/source_manifest.json"
-requested_version=2.21
+requested_version=2.10
 
-bash "$script_dir/prepare_grep_2_21.sh"
+bash "$script_dir/prepare_grep_2_10.sh"
 
 identity=$(
   PYTHONPATH="$repo_root" python3 -c \
@@ -19,7 +19,7 @@ matches = [entry for entry in entries
            and entry.get("affected_version") == sys.argv[2]
            and isinstance(entry.get("programs", {}).get("grep"), dict)]
 if len(matches) != 1:
-    raise SystemExit("manifest must contain exactly one GNU grep identity")
+    raise SystemExit("manifest must contain exactly one requested GNU grep identity")
 entry = matches[0]
 source_tree = Path(sys.argv[1]).parent / entry["source_tree"]
 print(entry["affected_version"], source_tree, sep="\t")' \
@@ -29,10 +29,7 @@ IFS=$'\t' read -r release_version source_tree <<< "$identity"
 build_dir="$repo_root/build/grep-$release_version-scope"
 
 if test "$(uname -s)" = Darwin; then
-  # The manifest freezes a GNU/Linux/GCC/GNU-ld link closure.  A Darwin
-  # configuration cannot re-establish that closure, so verify only the exact
-  # frozen paths against the already authenticated release tree.
-  PYTHONPATH="$repo_root" python3 "$script_dir/derive_grep_scope.py" \
+  PYTHONPATH="$repo_root" python3 "$script_dir/derive_grep_2_10_scope.py" \
     --source-tree "$source_tree" \
     --verify-manifest "$manifest" \
     --verify-frozen-files-only \
@@ -46,14 +43,13 @@ else
   )
   (
     cd "$build_dir"
-    # grep 2.21's configure rejects absolute srcdir values containing spaces.
     CC='gcc -std=gnu17' "$configure_script" --disable-nls
   )
   make -C "$build_dir" -j2
   touch "$build_dir/src/grep.o"
   make -C "$build_dir/src" grep LDFLAGS='-Wl,-Map=grep.map'
 
-  PYTHONPATH="$repo_root" python3 "$script_dir/derive_grep_scope.py" \
+  PYTHONPATH="$repo_root" python3 "$script_dir/derive_grep_2_10_scope.py" \
     --source-tree "$source_tree" \
     --src-makefile "$build_dir/src/Makefile" \
     --lib-makefile "$build_dir/lib/Makefile" \

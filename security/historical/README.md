@@ -373,6 +373,155 @@ present. Per-scope normalization is 1.0 in the minimal graph and 1/7 in the
 formal graph because each normalization uses that graph's maximum reachable
 depth; only the formal 1/7 value is reported as the historical result.
 
+## Reproduce GNU grep 2.10 and its program scope
+
+The fourth frozen identity is the released GNU grep 2.10 source. Savannah's
+annotated `v2.10` tag peels to:
+
+```text
+3a43c16a899c10ab6033b334ab6b727e09484ed5
+```
+
+The signed GNU 2.10 release announcement identifies the official
+`grep-2.10.tar.xz` archive and detached signature. The archive signature
+verifies with GNU's official keyring and Jim Meyering's key
+`7FD9FCCB000BEEEE`. No contemporary GNU-published checksum was located, so the
+preparation script freezes a portable SHA-256 calculated only after detached-
+signature authentication:
+
+```text
+archive SHA-256:          6c796773f23bcd9bb751165bb9ce13a04d678e6d426ca59843e386f99dc77ab3
+whole-tree C/H SHA-256:   8a6d9e7185ff75fd79419b01cee22f9b04f3f1347d054af16916da4dcc6c7273
+```
+
+Prepare, authenticate, build, reproduce the GNU ld map, and verify the frozen
+scope with:
+
+```bash
+bash security/historical/prepare_grep_2_10_scope.sh
+```
+
+`prepare_grep_2_10.sh` reads the version, peeled revision, source-tree path,
+and tree fingerprint from the manifest. It requires network access to
+Savannah for the tag and release/Git correspondence checks and to GNU
+infrastructure when the archive, signature, or keyring is absent. It verifies
+the annotated tag and peel, the mandatory frozen archive SHA-256, the
+conditional detached signature, and the whole-tree C/H fingerprint. It then
+compares release and frozen-revision Git blob identities for these nine files:
+
+- `src/main.c`, `src/dfa.c`, `src/dfa.h`, `src/dfasearch.c`;
+- `src/kwset.c`, `src/kwset.h`, `src/Makefile.am`;
+- `lib/Makefile.am`, `configure.ac`.
+
+`configure.ac` is checked because the generated release `configure` file is
+not tracked at the frozen Git revision. Any missing file, network/fetch
+failure, tag mismatch, archive mismatch, tree mismatch, or representative
+blob mismatch fails closed. Successful output lists all nine files and prints
+`release_git_correspondence=verified`.
+
+Both CVE-referenced fixes are dated 2012-03-01. Commit
+`cbbc1a45b9f843c811905c97c90a5d31f8e6c189` follows `v2.10` and repairs the
+DFA/search/kwset long-input size problems; its parent is
+`235aad711285fc6978f6ff26397743930b23f79a`. Commit
+`8fcf61523644df42e1905c81bed26838e0b04f91` follows the first and repairs the
+main program's count, context, argument, and pattern-size integer issues; its
+parent is `4572ea4649d025e51463d48c2d06a1c66134cdb8`. The peeled `v2.10`
+revision is an ancestor of both fixes, the first fix is an ancestor of the
+second, and both are ancestors of the peeled `v2.11` revision
+`f80de4cb768997b0dd947a7e775d1892105aae5f`. GNU's 2.11 release notes identify
+the long-line crash, oversized context counts, and widened match counts as
+fixed. Thus the formal vulnerable snapshot is the authenticated 2.10 release,
+and the fixed release is 2.11.
+
+The per-function evidence and A/B/C classification are frozen in
+`evidence/CVE-2012-5667.md`. Category A contains a direct unsafe arithmetic,
+narrowing, allocation/index, or count operation over attacker-controlled or
+input-derived data. Category B only propagates a corrected type/interface;
+category C is declaration, structure, cleanup, or support work. The resulting
+eight vulnerable locations are:
+
+```text
+src/dfa.c::lex
+src/dfasearch.c::EGexecute
+src/main.c::prtext
+src/main.c::grepbuf
+src/main.c::grep
+src/main.c::prepend_args
+src/main.c::prepend_default_options
+src/main.c::main
+```
+
+The last location is stored as `src/main.c::main` because the conservative
+parser also sees a test-only `main` in the exact linked scope; source
+qualification follows the predeclared evidence and entry point. The broad DFA
+type conversions, the kwset structure-field changes, `context_length_arg`,
+`grepfile`, and `get_nondigit_option` remain patch provenance rather than
+independently counted root sites. The intervening 2.11 `Pexecute` guard is
+useful robustness context but is not one of the two CVE-referenced commits.
+
+The 2.10 entry point is `src/main.c::main`. `src/Makefile.am` declares
+`grep_SOURCES = grep.c`, places seven sources (including `main.c`, `dfa.c`,
+`dfasearch.c`, and `kwset.c`) in `libgrep.a`, and links that archive together
+with `../lib/libgreputils.a`. For the frozen x86-64 GNU/Linux configuration,
+`CC='gcc -std=gnu17'`, `--disable-nls`, and no usable PCRE development library,
+the release builds with the current toolchain. A GNU ld map proves that all
+seven `libgrep.a` members and 25 of 44 configured `libgreputils.a` C members
+are extracted. The formal scope is therefore the linker-exact 33-file closure:
+`src/grep.c`, seven extracted `libgrep.a` sources, and 25 extracted
+`libgreputils.a` sources. The configured archive-source superset has 52 files
+and is diagnostic only. On macOS, the wrapper authenticates the same release
+and verifies all frozen paths without claiming to reproduce GNU-ld extraction.
+
+The formal Tree-sitter graph contains 255 functions, 73 reachable functions,
+maximum reachable depth 7, and five unresolved ambiguous direct calls. Its
+source-qualified entry point is `src/main.c::main`. The mapping result is:
+
+| Vulnerable location | Status | Raw depth | Shortest resolved static path | Normalized depth |
+| --- | --- | ---: | --- | ---: |
+| `src/dfa.c::lex` | mapped; unresolved indirect dispatch | null | null | null |
+| `src/dfasearch.c::EGexecute` | mapped; unresolved indirect dispatch | null | null | null |
+| `src/main.c::prtext` | mapped and reachable | 4 | `main -> grepfile -> grep -> grepbuf -> prtext` | 4/7 |
+| `src/main.c::grepbuf` | mapped and reachable | 3 | `main -> grepfile -> grep -> grepbuf` | 3/7 |
+| `src/main.c::grep` | mapped and reachable | 2 | `main -> grepfile -> grep` | 2/7 |
+| `src/main.c::prepend_args` | mapped and reachable | 2 | `main -> prepend_default_options -> prepend_args` | 2/7 |
+| `src/main.c::prepend_default_options` | mapped and reachable | 1 | `main -> prepend_default_options` | 1/7 |
+| `src/main.c::main` | mapped and reachable | 0 | `main` | 0 |
+
+`lex` is behind the unresolved `main` call through the selected matcher's
+`compile` pointer; `EGexecute` is behind reachable `do_execute` calling the
+selected matcher's `execute` pointer. Both have a resolved static suffix from
+the manifest-declared possible target to the vulnerable function. Those
+declarations remain evidence categories and are not promoted into graph
+edges. The precise result is mapped, but without a resolved static path from
+`src/main.c::main` under the conservative call-graph model; it does not imply
+dead code and no numeric depth is manufactured.
+
+At CVE level, all eight locations map, six are reachable through resolved
+static paths, the numeric minimum is 0, the maximum is 4, and the shallowest
+reachable location is `src/main.c::main`. The aggregation remains one CVE,
+not eight records.
+
+The reproducible diagnostic can be run against the scope wrapper's build
+outputs with `check_grep_2_10_scope_sensitivity.py`. Its result does not alter
+the manifest:
+
+| Scope | C files | Functions | Reachable | Max depth | Duplicate names | Ambiguous calls | Resolved path-unit edges |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Minimal vulnerability-path units plus `argmatch.c` disambiguator | 5 | 113 | 28 | 6 | 3 | 4 | 162 |
+| Frozen linker-exact scope | 33 | 255 | 73 | 7 | 5 | 5 | 194 |
+| Configured archive-source superset | 52 | 296 | 74 | 7 | 5 | 5 | 195 |
+| Whole-release C diagnostic | 236 | 831 | 99 | 9 | 31 | 21 | 227 |
+
+All eight mappings retain their unique intended locations in all four scopes.
+The six numeric depths and shortest paths remain unchanged; `lex` and
+`EGexecute` retain null depth and `unresolved_indirect_dispatch`. The larger
+scopes add resolved source-level edges and, especially in the whole release,
+many duplicate names and ambiguous calls. The minimal scope retains
+`lib/argmatch.c` solely because its preprocessor-guarded test `main`, also
+visible to the conservative parser in the formal graph, preserves the stable
+source-qualified ID `src/main.c::main`. The formal result remains the
+predeclared linker-exact scope regardless of these diagnostic outcomes.
+
 ## Run depth characterization
 
 After preparation:
@@ -388,9 +537,9 @@ Missing or mismatched source versions, fingerprint mismatches, invalid or empty
 scopes, unresolved entry points/functions, ambiguous names, and mapped but
 functions without a resolved static path remain distinct fail-closed states.
 
-Detached-signature verification is conditional for portability. The grep 2.21
-and Coreutils 5.2.1 preparation scripts verify with GNU's keyring when `gpgv`
-is available and always print either
+Detached-signature verification is conditional for portability. The grep
+2.10, grep 2.21, and Coreutils 5.2.1 preparation scripts verify with GNU's
+keyring when `gpgv` is available and always print either
 `signature_status=verified_with_gnu_keyring` or
 `signature_status=not_checked_gpgv_unavailable`. A successful run with the
 latter status does not claim that the signature was reverified on that host;

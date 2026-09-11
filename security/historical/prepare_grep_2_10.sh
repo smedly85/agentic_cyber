@@ -5,10 +5,10 @@ script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/../.." && pwd)
 sources_dir="$script_dir/sources"
 manifest="$script_dir/source_manifest.json"
-requested_version=2.21
+requested_version=2.10
 
-# Frozen after verifying grep-2.21.tar.xz against GNU's detached signature.
-archive_sha256=5244a11c00dee8e7e5e714b9aaa053ac6cbfa27e104abee20d3c778e4bb0e5de
+# Frozen after authenticating grep-2.10.tar.xz with GNU's detached signature.
+archive_sha256=6c796773f23bcd9bb751165bb9ce13a04d678e6d426ca59843e386f99dc77ab3
 
 identity=$(
   PYTHONPATH="$repo_root" python3 -c \
@@ -21,7 +21,7 @@ matches = [entry for entry in entries
            and entry.get("affected_version") == sys.argv[2]
            and isinstance(entry.get("programs", {}).get("grep"), dict)]
 if len(matches) != 1:
-    raise SystemExit("manifest must contain exactly one GNU grep identity")
+    raise SystemExit("manifest must contain exactly one requested GNU grep identity")
 entry = matches[0]
 source_tree = Path(sys.argv[1]).parent / entry["source_tree"]
 print(entry["affected_version"], entry["source_revision"],
@@ -32,12 +32,30 @@ IFS=$'\t' read -r release_version release_revision source_tree source_tree_sha25
   <<< "$identity"
 archive="$sources_dir/grep-$release_version.tar.xz"
 signature="$archive.sig"
-
-resolved_revision=$(
-  git ls-remote https://git.savannah.gnu.org/git/grep.git \
-    "refs/tags/v$release_version^{}" |
-    awk 'NR == 1 { print $1 }'
+upstream_git="$sources_dir/grep-upstream.git"
+correspondence_files=(
+  src/main.c
+  src/dfa.c
+  src/dfa.h
+  src/dfasearch.c
+  src/kwset.c
+  src/kwset.h
+  src/Makefile.am
+  lib/Makefile.am
+  configure.ac
 )
+
+printf 'upstream_git_network=required_for_tag_and_release_correspondence\n'
+tag_refs=$(
+  git ls-remote https://git.savannah.gnu.org/git/grep.git \
+    "refs/tags/v$release_version" "refs/tags/v$release_version^{}"
+)
+tag_object=$(printf '%s\n' "$tag_refs" | awk '$2 !~ /\^\{\}$/ { print $1 }')
+resolved_revision=$(printf '%s\n' "$tag_refs" | awk '$2 ~ /\^\{\}$/ { print $1 }')
+if ! printf '%s\n' "$tag_object" | grep -Eq '^[0-9a-f]{40}$'; then
+  echo "v$release_version is not exposed as an annotated upstream tag" >&2
+  exit 1
+fi
 if test "$resolved_revision" != "$release_revision"; then
   echo "v$release_version resolved to '$resolved_revision', expected '$release_revision'" >&2
   exit 1
@@ -84,14 +102,47 @@ fi
 
 observed_tree_sha256=$(
   PYTHONPATH="$repo_root" python3 -c \
-    'import sys; from pathlib import Path; from security.historical.analysis import source_tree_sha256; print(source_tree_sha256(Path(sys.argv[1])))' \
-    "$source_tree"
+    'import sys; from pathlib import Path; from security.historical.analysis import verify_source_tree_sha256; print(verify_source_tree_sha256(Path(sys.argv[1]), sys.argv[2]))' \
+    "$source_tree" "$source_tree_sha256"
 )
 if test "$observed_tree_sha256" != "$source_tree_sha256"; then
   echo "source-tree fingerprint mismatch: $observed_tree_sha256" >&2
   exit 1
 fi
 
-printf 'source_revision=%s\narchive_sha256=%s\nsignature_status=%s\nsource_tree_sha256=%s\nsource_tree=%s\n' \
+if ! test -d "$upstream_git"; then
+  git init --bare "$upstream_git"
+fi
+if git --git-dir="$upstream_git" config --get remote.origin.url >/dev/null 2>&1; then
+  git --git-dir="$upstream_git" remote set-url origin \
+    https://git.savannah.gnu.org/git/grep.git
+else
+  git --git-dir="$upstream_git" remote add origin \
+    https://git.savannah.gnu.org/git/grep.git
+fi
+git --git-dir="$upstream_git" fetch --force --no-tags origin \
+  "refs/tags/v$release_version:refs/tags/v$release_version"
+cached_revision=$(git --git-dir="$upstream_git" rev-parse --verify \
+  "refs/tags/v$release_version^{}")
+if test "$cached_revision" != "$release_revision"; then
+  echo "cached v$release_version resolved to '$cached_revision', expected '$release_revision'" >&2
+  exit 1
+fi
+for relative_file in "${correspondence_files[@]}"; do
+  release_file="$source_tree/$relative_file"
+  if ! test -f "$release_file"; then
+    echo "release/Git correspondence file is missing: $relative_file" >&2
+    exit 1
+  fi
+  release_blob=$(git hash-object "$release_file")
+  upstream_blob=$(git --git-dir="$upstream_git" rev-parse --verify \
+    "$release_revision:$relative_file")
+  if test "$release_blob" != "$upstream_blob"; then
+    echo "release/Git blob mismatch for $relative_file: release $release_blob, upstream $upstream_blob" >&2
+    exit 1
+  fi
+done
+
+printf 'source_revision=%s\narchive_sha256=%s\nsignature_status=%s\nsource_tree_sha256=%s\nrelease_git_correspondence=%s\nrelease_git_correspondence_files=%s\nsource_tree=%s\n' \
   "$release_revision" "$observed_archive_sha256" "$signature_status" \
-  "$observed_tree_sha256" "$source_tree"
+  "$observed_tree_sha256" verified "${correspondence_files[*]}" "$source_tree"
