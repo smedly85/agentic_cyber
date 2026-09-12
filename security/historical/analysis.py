@@ -13,19 +13,37 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from security.common.callgraph import SELECTION_POLICIES, analyze_source_tree, select_functions
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 ALLOWED_UTILITIES = {"sort", "mkdir", "chmod", "grep"}
 ALLOWED_PROJECTS = {"gnu-coreutils", "gnu-grep"}
-REQUIRED_FIELDS = {
+RECORD_FIELDS = {
     "id": str, "utility": str, "upstream_project": str,
     "affected_version": str, "fixed_version": str, "source_revision": str,
     "vulnerable_functions": list, "patched_functions": list, "cwe": str,
     "bug_type": str, "attacker_input": str, "source_reference": str,
     "patch_reference": str, "notes": str, "verified": bool,
+    "source_provenance": str, "upstream_base_version": str,
+    "downstream_revision": str,
+}
+REQUIRED_RECORD_FIELDS = set(RECORD_FIELDS) - {
+    "source_provenance", "upstream_base_version", "downstream_revision",
 }
 MANIFEST_FIELDS = {
     "upstream_project": str, "affected_version": str, "source_revision": str,
     "source_tree": str, "source_tree_sha256": str, "programs": dict,
+    "source_provenance": str, "upstream_base_version": str,
+    "downstream_revision": str, "downstream_source": dict,
+}
+REQUIRED_MANIFEST_FIELDS = set(MANIFEST_FIELDS) - {
+    "source_provenance", "upstream_base_version", "downstream_revision",
+    "downstream_source",
+}
+DOWNSTREAM_SOURCE_FIELDS = {
+    "distribution": str, "source_package": str,
+    "packaging_repository": str, "spec_file": str, "spec_sha256": str,
+    "security_patch_file": str, "security_patch_sha256": str,
+    "security_patch_git_blob": str,
+    "upstream_archive_sha256": str, "upstream_signature_sha256": str,
 }
 PROGRAM_FIELDS = {
     "entry_point": dict, "source_globs": list, "source_files": list,
@@ -36,11 +54,13 @@ INDIRECT_DISPATCH_FIELDS = {
     "caller": dict, "callee_text": str, "possible_target": dict,
 }
 CENSUS_FIELDS = {
-    "id": str, "package_project": str, "utility_component": str,
+    "id": str, "identifier_type": str,
+    "package_project": str, "utility_component": str,
     "target_utility": bool, "provenance": str, "analysis_eligibility": str,
     "disposition_reason": str, "source_patch_verification_status": str,
     "references": list,
 }
+CENSUS_IDENTIFIER_TYPES = {"cve", "temporary"}
 CENSUS_PROVENANCE = {
     "upstream_gnu", "downstream_patch", "predecessor_package",
     "unrelated_implementation",
@@ -93,13 +113,16 @@ def _validate_fields(
 
 
 def validate_record(record: Mapping[str, Any]) -> list[str]:
-    errors = _validate_fields(record, REQUIRED_FIELDS)
+    errors = _validate_fields(
+        record, RECORD_FIELDS, required_fields=REQUIRED_RECORD_FIELDS
+    )
     for field in ("id", "source_revision"):
         if isinstance(record.get(field), str) and not record[field].strip():
             errors.append(f"{field} must not be empty")
     revision = record.get("source_revision")
     if isinstance(revision, str) and not _is_commit_sha(revision):
         errors.append("source_revision must be a lowercase 40-character Git commit SHA")
+    errors.extend(_validate_downstream_identity(record))
     if record.get("utility") not in ALLOWED_UTILITIES:
         errors.append("utility must be sort, mkdir, chmod, or grep")
     if record.get("upstream_project") not in ALLOWED_PROJECTS:
@@ -152,6 +175,16 @@ def validate_census(records: Any) -> list[str]:
         for field in ("id", "package_project", "utility_component", "disposition_reason"):
             if isinstance(record.get(field), str) and not record[field].strip():
                 errors.append(prefix + f"{field} must not be empty")
+        if record.get("identifier_type") not in CENSUS_IDENTIFIER_TYPES:
+            errors.append(prefix + "invalid identifier_type")
+        identifier = record.get("id")
+        identifier_type = record.get("identifier_type")
+        if isinstance(identifier, str):
+            is_cve = re.fullmatch(r"CVE-\d{4}-\d{4,}", identifier) is not None
+            if identifier_type == "cve" and not is_cve:
+                errors.append(prefix + "cve identifier_type requires a CVE identifier")
+            if identifier_type == "temporary" and is_cve:
+                errors.append(prefix + "temporary identifier_type cannot use a CVE identifier")
         if record.get("provenance") not in CENSUS_PROVENANCE:
             errors.append(prefix + "invalid provenance")
         if record.get("analysis_eligibility") not in CENSUS_ELIGIBILITY:
@@ -167,11 +200,81 @@ def validate_census(records: Any) -> list[str]:
                 errors.append(prefix + "references entries must be non-empty strings")
             if len(set(strings)) != len(references):
                 errors.append(prefix + "references entries must be unique")
-        identifier = record.get("id")
         if isinstance(identifier, str):
             if identifier in identifiers:
                 errors.append(prefix + f"duplicate id: {identifier}")
             identifiers.add(identifier)
+    return errors
+
+
+def summarize_census(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Summarize discovery dispositions without treating temporary IDs as CVEs."""
+    return {
+        "discovery_entry_count": len(records),
+        "cve_identifier_count": sum(
+            item.get("identifier_type") == "cve" for item in records
+        ),
+        "temporary_identifier_count": sum(
+            item.get("identifier_type") == "temporary" for item in records
+        ),
+        "eligibility_counts": dict(sorted(Counter(
+            str(item.get("analysis_eligibility")) for item in records
+        ).items())),
+        "provenance_counts": dict(sorted(Counter(
+            str(item.get("provenance")) for item in records
+        ).items())),
+    }
+
+
+def _validate_downstream_identity(value: Mapping[str, Any]) -> list[str]:
+    errors: list[str] = []
+    provenance = value.get("source_provenance")
+    downstream_fields = (
+        "upstream_base_version", "downstream_revision",
+    )
+    if provenance is not None and provenance not in {"upstream_gnu", "downstream_patch"}:
+        errors.append("source_provenance must be upstream_gnu or downstream_patch")
+    if provenance == "downstream_patch":
+        for field in downstream_fields:
+            if not isinstance(value.get(field), str) or not value[field].strip():
+                errors.append(f"{field} is required for downstream_patch provenance")
+        revision = value.get("downstream_revision")
+        if isinstance(revision, str) and not _is_commit_sha(revision):
+            errors.append(
+                "downstream_revision must be a lowercase 40-character Git commit SHA"
+            )
+    elif any(field in value for field in downstream_fields):
+        errors.append(
+            "downstream identity fields require source_provenance=downstream_patch"
+        )
+    return errors
+
+
+def _validate_downstream_source(value: Any) -> list[str]:
+    if not isinstance(value, Mapping):
+        return ["downstream_source must be an object"]
+    errors = _validate_fields(value, DOWNSTREAM_SOURCE_FIELDS)
+    for field, item in value.items():
+        if isinstance(item, str) and not item.strip():
+            errors.append(f"downstream_source.{field} must not be empty")
+    for field in (
+        "spec_sha256", "security_patch_sha256", "upstream_archive_sha256",
+        "upstream_signature_sha256",
+    ):
+        digest = value.get(field)
+        if isinstance(digest, str) and not re.fullmatch(r"[0-9a-f]{64}", digest):
+            errors.append(f"downstream_source.{field} must be a lowercase SHA-256")
+    blob = value.get("security_patch_git_blob")
+    if isinstance(blob, str) and not _is_commit_sha(blob):
+        errors.append(
+            "downstream_source.security_patch_git_blob must be a lowercase Git object id"
+        )
+    for field in ("spec_file", "security_patch_file"):
+        item = value.get(field)
+        if isinstance(item, str):
+            path_error = _relative_scope_path_error(item, allow_glob=False)
+            if path_error:
+                errors.append(f"downstream_source.{field}: {path_error}")
     return errors
 
 
@@ -191,7 +294,9 @@ def _relative_scope_path_error(value: str, *, allow_glob: bool) -> str | None:
 
 
 def validate_manifest_entry(entry: Mapping[str, Any]) -> list[str]:
-    errors = _validate_fields(entry, MANIFEST_FIELDS)
+    errors = _validate_fields(
+        entry, MANIFEST_FIELDS, required_fields=REQUIRED_MANIFEST_FIELDS
+    )
     for field in ("affected_version", "source_revision", "source_tree"):
         if isinstance(entry.get(field), str) and not entry[field].strip():
             errors.append(f"{field} must not be empty")
@@ -200,6 +305,16 @@ def validate_manifest_entry(entry: Mapping[str, Any]) -> list[str]:
         errors.append("source_revision must be a lowercase 40-character Git commit SHA")
     if entry.get("upstream_project") not in ALLOWED_PROJECTS:
         errors.append("upstream_project must be gnu-coreutils or gnu-grep")
+    errors.extend(_validate_downstream_identity(entry))
+    if entry.get("source_provenance") == "downstream_patch":
+        if "downstream_source" not in entry:
+            errors.append("downstream_source is required for downstream_patch provenance")
+        else:
+            errors.extend(_validate_downstream_source(entry.get("downstream_source")))
+    elif "downstream_source" in entry:
+        errors.append(
+            "downstream_source requires source_provenance=downstream_patch"
+        )
     fingerprint = entry.get("source_tree_sha256")
     if isinstance(fingerprint, str) and not (
         len(fingerprint) == 64
@@ -414,11 +529,40 @@ def verify_source_tree_sha256(source_tree: Path, expected: str) -> str:
     return observed
 
 
-def _identity(record: Mapping[str, Any]) -> tuple[str, str, str]:
-    return (
+def _identity(record: Mapping[str, Any]) -> tuple[str, ...]:
+    identity = (
         str(record["upstream_project"]), str(record["affected_version"]),
         str(record["source_revision"]),
     )
+    if record.get("source_provenance") == "downstream_patch":
+        return (*identity, "downstream_patch", str(record["upstream_base_version"]),
+                str(record["downstream_revision"]))
+    return identity
+
+
+def _emitted_source_identity(
+    record: Mapping[str, Any], source: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Serialize provenance without conflating upstream and downstream revisions."""
+    manifest_source = source or {}
+    provenance = str(
+        manifest_source.get(
+            "source_provenance", record.get("source_provenance", "upstream_gnu")
+        )
+    )
+    identity: dict[str, Any] = {"source_provenance": provenance}
+    if provenance != "downstream_patch":
+        return identity
+    for field in ("upstream_base_version", "downstream_revision"):
+        value = manifest_source.get(field, record.get(field))
+        if value is not None:
+            identity[field] = value
+    downstream_source = manifest_source.get(
+        "downstream_source", record.get("downstream_source")
+    )
+    if isinstance(downstream_source, Mapping):
+        identity["downstream_source"] = dict(downstream_source)
+    return identity
 
 
 def _source_resolution(
@@ -440,6 +584,21 @@ def _source_resolution(
     if len(exact) != 1:
         return "source_version_mismatch", None, "source identity is not unique in the manifest"
     entry = exact[0]
+    record_downstream = record.get("source_provenance") == "downstream_patch"
+    entry_downstream = entry.get("source_provenance") == "downstream_patch"
+    if record_downstream != entry_downstream:
+        return (
+            "source_version_mismatch", entry,
+            "record and manifest disagree about downstream-patch provenance",
+        )
+    if record_downstream and any(
+        entry.get(field) != record.get(field)
+        for field in ("upstream_base_version", "downstream_revision")
+    ):
+        return (
+            "source_version_mismatch", entry,
+            "no manifest entry matches the record's exact downstream source identity",
+        )
     source_tree = Path(str(entry.get("resolved_source_tree", entry["source_tree"])))
     if not source_tree.is_dir():
         return "source_version_unavailable", entry, f"source tree is unavailable: {source_tree}"
@@ -708,6 +867,7 @@ def _map_function_to_graph(
         "upstream_project": record["upstream_project"],
         "affected_version": record["affected_version"],
         "source_revision": record["source_revision"],
+        **_emitted_source_identity(record),
         "vulnerable_function": target,
         "source_version_status": "source_version_matched",
         "source_version_error": None, "analysis_error": None,
@@ -767,6 +927,7 @@ def _aggregate_record_mapping(
         "upstream_project": record["upstream_project"],
         "affected_version": record["affected_version"],
         "source_revision": record["source_revision"],
+        **_emitted_source_identity(record),
         "vulnerable_functions": list(record["vulnerable_functions"]),
         "declared_vulnerable_function_count": len(mappings),
         "successfully_mapped_function_count": mapped_count,
@@ -807,6 +968,7 @@ def _unevaluable_function_mapping(
         "upstream_project": record["upstream_project"],
         "affected_version": record["affected_version"],
         "source_revision": record["source_revision"],
+        **_emitted_source_identity(record),
         "vulnerable_function": target,
         "source_version_status": source_version_status or status,
         "source_version_error": reason if source_error else None,
@@ -851,10 +1013,9 @@ def analyze_versioned_records(
     force_fallback: bool = False,
 ) -> dict[str, Any]:
     """Analyze every record against its exact vulnerable source identity."""
-    cache: dict[
-        tuple[str, str, str, str, str, str, tuple[str, ...]],
-        tuple[str, dict[str, Any]],
-    ] = {}
+    # Upstream identities have three components; authenticated downstream
+    # identities add provenance, base-version, and packaging-revision fields.
+    cache: dict[tuple[Any, ...], tuple[str, dict[str, Any]]] = {}
     function_mappings: list[dict[str, Any]] = []
     record_mappings: list[dict[str, Any]] = []
     graphs: dict[str, dict[str, Any]] = {}
@@ -927,6 +1088,12 @@ def analyze_versioned_records(
                 continue
             graph["historical_program_scope"] = {
                 "utility": record["utility"],
+                "upstream_project": record["upstream_project"],
+                "affected_version": record["affected_version"],
+                "source_revision": record["source_revision"],
+                **_emitted_source_identity(record, source),
+                "source_tree": str(source_tree),
+                "source_tree_sha256": source["source_tree_sha256"],
                 "source_qualified_entry_point": qualified_entry,
                 "resolved_source_files": resolved_files,
                 "declared_indirect_dispatches": list(program.get(
@@ -959,9 +1126,12 @@ def analyze_versioned_records(
                     "declared_indirect_dispatches", []
                 ),
             )
+        emitted_identity = _emitted_source_identity(record, source)
+        record_mapping.update(emitted_identity)
         record_mapping["source_tree"] = str(source_tree)
         record_mapping["source_tree_sha256"] = source["source_tree_sha256"]
         for mapping in record_mapping["function_mappings"]:
+            mapping.update(emitted_identity)
             mapping["source_tree"] = str(source_tree)
             mapping["source_tree_sha256"] = source["source_tree_sha256"]
         record_mappings.append(record_mapping)
@@ -1015,6 +1185,9 @@ def version_specific_hvc(
             "vulnerability_id": record["vulnerability_id"],
             "utility": record["utility"],
             "source_revision": record["source_revision"],
+            **_emitted_source_identity(record),
+            "source_tree": record.get("source_tree"),
+            "source_tree_sha256": record.get("source_tree_sha256"),
             "source_analysis_id": record["source_analysis_id"],
             "source_qualified_entry_point": record["source_qualified_entry_point"],
             "resolved_source_files": list(record["resolved_source_files"]),

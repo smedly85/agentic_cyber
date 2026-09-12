@@ -15,9 +15,14 @@ a downstream patch, a predecessor-package issue, or an unrelated
 implementation. Its schema is `cve_census.schema.json`.
 
 `records.json` is analysis-ready input. It must contain only source-mappable
-records tied to an immutable Git commit in `source_revision`; no `TBD` values,
-guessed functions, or speculative downstream mappings belong there.
-`schema.json` validates the complete array.
+records tied to an immutable upstream Git commit in `source_revision`. For an
+`upstream_gnu` record, that commit identifies the analyzed released source;
+for a `downstream_patch` record, it identifies the pristine upstream base and
+does not identify the final patched tree. A downstream record separately
+freezes its package name, packaging revision, patch blob/checksum, and final
+analyzed-tree fingerprint.
+No `TBD` values, guessed functions, or speculative downstream mappings belong
+there. `schema.json` validates the complete array.
 
 ## Data model and methodology
 
@@ -45,6 +50,13 @@ Analysis emits two levels:
   declared/mapped/reachable counts, an explicit overall mapping status, and
   minimum/maximum reachable location depth.
 
+Both row types retain `source_provenance`. Downstream rows also retain
+`upstream_base_version`, `downstream_revision`, the frozen `downstream_source`
+metadata, and `source_tree_sha256`. The same source identity is included in a
+call graph's `historical_program_scope` and version-specific HVC detail rows.
+Thus `source_revision` cannot be mistaken for the final Fedora-patched tree;
+the latter is anchored by the final C/H fingerprint.
+
 The summary exposes both the vulnerable-function-location depth distribution
 and the distribution of each CVE's shallowest reachable location, plus counts
 for nonnumeric depth states such as `unresolved_indirect_dispatch`. No fixed
@@ -67,6 +79,25 @@ per-location coverage remains in the output for future stricter definitions.
 
 Historical data never affects generation, functional validation, dynamic
 security findings, repair, or promotion.
+
+## Discovery census
+
+The discovery pass was frozen on 2026-09-11 before the two downstream sort
+graphs were measured. It searched by package, project, utility, and advisory
+identity across CVE/NVD, GNU/Savannah, oss-security, Red Hat, Debian,
+SUSE/openSUSE, Ubuntu, and Fedora sources. It did not use depth-related search
+terms or mapping convenience. The complete query boundary, sources, and
+candidate dispositions are preserved in
+`evidence/discovery-census-2026-09-11.md`.
+
+The ledger now has 12 entries: 11 CVE identifiers and one Debian temporary
+identifier. Six CVEs are eligible and analysis-ready; CVE-2013-0221 remains
+unresolved pending an exact downstream patch generation and function mapping;
+the temporary identifier and four independent uutils/Rust name collisions are
+excluded. Temporary identifiers remain visible for auditability but are not
+members of CVE-only denominators. No target GNU-lineage `chmod` CVE and no
+additional predecessor fileutils/textutils/sh-utils candidate was found by
+this pass.
 
 ## Reproduce the Coreutils 9.7 source tree
 
@@ -518,6 +549,133 @@ visible to the conservative parser in the formal graph, preserves the stable
 source-qualified ID `src/main.c::main`. The formal result remains the
 predeclared linker-exact scope regardless of these diagnostic outcomes.
 
+## Reproduce Fedora Coreutils 8.23-9 sort and its program scope
+
+CVE-2015-4041 and CVE-2015-4042 are not attributed to pristine GNU
+Coreutils. The primary disclosure, assignment reply, Debian non-affected
+status, and Fedora package history establish that both defects are in the
+downstream `coreutils-i18n.patch`. Their complete operation-level evidence and
+distinct fix hunks are preserved in
+`evidence/CVE-2015-4041-CVE-2015-4042.md`.
+
+Both vulnerable operations coexist in the reproducibly reconstructed Fedora
+22 `coreutils-8.23-9.fc22` source state. `coreutils-8.23-9.fc22.src.rpm` is the
+source-package identity represented by the frozen packaging state; the SRPM
+payload and its RPM signature were not independently downloaded or
+authenticated. The reconstruction instead has these independently frozen
+layers:
+
+- upstream GNU Coreutils 8.23, Savannah `v8.23` peeled to
+  `22c8c23f4090adf98f790f7dd6704c51415e475d`;
+- Fedora `f22` packaging revision
+  `79d651a2d90f80aed880ef226633cb2ec8afd081`, with
+  `coreutils-i18n.patch` Git blob
+  `e7005cf1af708949cf2c78a942408977e3b0b61a` and raw patch SHA-256
+  `cc1a106df77c4f5dd827b5431e81db0d0436390e3c29024b3a328a71fdc8f587`.
+
+The official GNU archive SHA-256 is
+`ec43ca5bcfc62242accb46b7f121f6b684ee21ecd7d075059bf650ff9e37b82d`;
+its detached-signature file SHA-256 is
+`5dbecc47e841a317caa1552de17e7f06f7c147184917c180402fd128a514bef5`.
+The authenticated archive verifies against GNU's keyring with key
+`DF6FD971306037D9`. The final Fedora-patched source has whole-tree C/H
+fingerprint:
+
+```text
+78b251dc01d31af8534ae56fb968498432ca1ffdfb7bfd9e0db22b590583118d
+```
+
+Prepare the exact patched tree with:
+
+```bash
+bash security/historical/prepare_coreutils_8_23_fedora.sh
+```
+
+This requires network access for Savannah tag verification and the Fedora
+packaging history, and for GNU artifacts when absent locally. The script reads
+all frozen identity values from `source_manifest.json`; verifies the annotated
+GNU tag, archive checksum, conditional detached signature, and representative
+release/Git blobs (`src/sort.c`, `src/local.mk`, `lib/local.mk`, `Makefile.am`,
+and `configure.ac`); verifies the immutable Fedora commit and security-patch blob;
+verifies the exported spec and patch checksums; derives the exact `%prep`
+patch order and strip levels from that spec; applies the complete stack; and
+finally checks the C/H fingerprint. The frozen spec has 15 explicit,
+unconditional `%patchN -p1` applications. The parser also supports bare
+`%patch` (Patch0) and `%patch -P N`, retains explicit `-p0`/`-p1`/`-p2`
+levels for application, and fails closed on conditional, macro-dependent,
+malformed, or otherwise unsupported sequencing rather than guessing RPM macro
+state. Missing or changed package components fail closed.
+
+For the frozen x86_64 GNU/Linux/GCC configuration, the historical source
+build succeeds with `--disable-nls --without-selinux --without-openssl
+--without-gmp --enable-largefile`; compatibility flags only accommodate the
+modern compiler and current glibc's hidden historical libio constants. They do
+not alter analyzed source. `HAVE_MBRTOWC=1` is frozen.
+A GNU ld map proves that `src/sort.c` plus 45 members of
+`lib/libcoreutils.a` enter the executable, so the formal scope contains 46 C
+files. The configured archive-source superset contains 236 C files and is not
+the formal graph. Reproduce and verify the build/map/scope with:
+
+```bash
+bash security/historical/prepare_coreutils_8_23_fedora_sort_scope.sh
+```
+
+The vulnerability path requires a multibyte locale; `LC_ALL=C` selects the
+byte comparator. Locale is trigger evidence and does not create a static edge.
+Both CVEs independently map to `src/sort.c::keycompare_mb`. In
+CVE-2015-4041, the `wcrtomb(... towupper(...))` case-folding/translation path
+can emit up to `MB_CUR_MAX` bytes per input byte, but the old allocation
+reserves only the input lengths; the ignore/filter branch copies bytes and is
+not an independent expansion source. Fedora commit `8d61fd49` reserves the
+expansion and advances the package to 8.23-10.fc22. In CVE-2015-4042,
+aggregate length arithmetic can wrap; Fedora commit `4989cfae` adds the
+`SIZE_MAX` guard and `xnmalloc`, advancing to 8.23-11.fc22. That two-step
+assignment is our source-level hunk reconstruction; Fedora's later changelog
+describes a newer sort/I18N fix for both CVEs and does not itself label those
+two package revisions separately. Pristine upstream 8.23 `keycompare` has a
+parallel unguarded aggregate expression, but the assigned disclosure context
+is downstream `keycompare_mb`, which pristine upstream lacks, and Debian says
+it is unaffected because it did not carry the patch. The upstream function is
+therefore not promoted to a vulnerable location. A shared source/function
+does not collapse these distinct CVE identities.
+
+The formal Tree-sitter graph has 292 functions, 162 reachable functions,
+maximum reachable depth 8, and two unresolved ambiguous direct calls. In each
+record, `keycompare_mb` maps uniquely in `src/sort.c`; it has no
+resolved direct caller because reachable `compare` invokes the `keycompare`
+function pointer. Its direct callees are `compare_random`, `filevercmp`,
+`general_numcompare`, `human_numcompare`, `ismbblank`, `xmalloc`, and
+`xmemcoll0`. Consequently both results are mapped, but without a resolved
+static path from `src/sort.c::main` under the conservative call-graph model.
+Their `call_depth_status` is `unresolved_indirect_dispatch`; raw depth,
+shortest path, and normalized depth are null.
+
+The reproducible diagnostic compares the one-file program-owned unit, formal
+linker closure, configured archive-source superset, and whole release without
+changing the manifest:
+
+```bash
+python3 security/historical/check_coreutils_8_23_sort_scope_sensitivity.py \
+  --source-manifest security/historical/source_manifest.json \
+  --records security/historical/records.json \
+  --makefile build/coreutils-8.23-fedora-sort-scope-portable/Makefile \
+  --link-map build/coreutils-8.23-fedora-sort-scope-portable/sort.map
+```
+
+| Scope | C files | Functions | Reachable | Max depth | Duplicate names | Ambiguous calls | Result for both CVEs |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Minimal `sort`-owned translation unit | 1 | 105 | 77 | 5 | 0 | 0 | unique; unresolved indirect dispatch |
+| Frozen linker-exact scope | 46 | 292 | 162 | 8 | 4 | 2 | unique; unresolved indirect dispatch |
+| Configured archive-source superset | 236 | 846 | 164 | 8 | 31 | 24 | unique; unresolved indirect dispatch |
+| Whole-release C diagnostic | 800 | 2936 | 206 | 8 | 113 | 173 | unique; unresolved indirect dispatch |
+
+All scopes retain the same null raw depth and path. The formal and archive
+scopes also retain the same seven direct callees; the minimal scope cannot
+resolve three library callees. Broader scopes increase duplicate names,
+ambiguous calls, and unrelated source-level edges without resolving the
+`keycompare` pointer call. The formal result remains the predeclared linker
+closure, not a scope chosen from these outcomes.
+
 ## Run depth characterization
 
 After preparation:
@@ -534,8 +692,8 @@ scopes, unresolved entry points/functions, ambiguous names, and mapped but
 functions without a resolved static path remain distinct fail-closed states.
 
 Detached-signature verification is conditional for portability. The grep
-2.10, grep 2.21, and Coreutils 5.2.1 preparation scripts verify with GNU's
-keyring when `gpgv` is available and always print either
+2.10, grep 2.21, Coreutils 5.2.1, and Fedora Coreutils 8.23 preparation scripts
+verify with GNU's keyring when `gpgv` is available and always print either
 `signature_status=verified_with_gnu_keyring` or
 `signature_status=not_checked_gpgv_unavailable`. A successful run with the
 latter status does not claim that the signature was reverified on that host;

@@ -17,12 +17,19 @@ from security.historical.analysis import (
     load_records,
     load_source_manifest,
     map_record_to_graph,
+    summarize_census,
     summarize_historical_analysis,
     source_tree_sha256,
     validate_record,
     validate_source_manifest,
     verify_source_tree_sha256,
     version_specific_hvc,
+)
+from security.historical.downstream import (
+    DownstreamSourceError,
+    file_sha256,
+    rpm_patch_sequence,
+    verify_packaging_components,
 )
 from security.historical.derive_coreutils_mkdir_scope import verify_frozen_source_files
 from security.historical.run_historical_analysis import parse_args
@@ -54,6 +61,13 @@ MKDIR_REVISION = next(
     )
     if item["upstream_project"] == "gnu-coreutils"
     and item["affected_version"] == "5.2.1"
+)
+FEDORA_REVISION = next(
+    item["downstream_revision"]
+    for item in json.loads(
+        (REPO / "security" / "historical" / "source_manifest.json").read_text()
+    )
+    if item.get("source_provenance") == "downstream_patch"
 )
 
 
@@ -120,6 +134,39 @@ def grep_210_fixture():
     return record, manifest
 
 
+def downstream_sort_fixture():
+    record = copy.deepcopy(fixture_records()[0])
+    record.update({
+        "id": "SYNTHETIC-DOWNSTREAM-A",
+        "affected_version": "fixture-1.fc",
+        "fixed_version": "fixture-2.fc",
+        "source_provenance": "downstream_patch",
+        "upstream_base_version": "fixture-upstream",
+        "downstream_revision": "f" * 40,
+    })
+    manifest = copy.deepcopy(fixture_manifest()[0])
+    manifest["source_tree"] = manifest.pop("resolved_source_tree")
+    manifest.update({
+        "affected_version": "fixture-1.fc",
+        "source_provenance": "downstream_patch",
+        "upstream_base_version": "fixture-upstream",
+        "downstream_revision": "f" * 40,
+        "downstream_source": {
+            "distribution": "Fixture Linux",
+            "source_package": "fixture.src.rpm",
+            "packaging_repository": "https://example.invalid/fixture.git",
+            "spec_file": "fixture.spec",
+            "spec_sha256": "1" * 64,
+            "security_patch_file": "security.patch",
+            "security_patch_sha256": "2" * 64,
+            "security_patch_git_blob": "3" * 40,
+            "upstream_archive_sha256": "4" * 64,
+            "upstream_signature_sha256": "5" * 64,
+        },
+    })
+    return record, manifest
+
+
 def cve_2012_graph_and_record():
     analyzed = analyze_sources([
         (
@@ -180,6 +227,15 @@ def graph(source):
     return analyze_source_bytes(source.replace("} ", "}\n"), force_fallback=True)
 
 
+def symlink_or_skip(test: unittest.TestCase, target: Path, link: Path) -> None:
+    try:
+        os.symlink(target, link)
+    except OSError as error:
+        if getattr(error, "winerror", None) == 1314:
+            test.skipTest("Windows symlink privilege is unavailable")
+        raise
+
+
 class HistoricalSchemaTests(unittest.TestCase):
     def assertSchemaAccepts(self, record):
         self.assertEqual(validate_record(record), [])
@@ -219,11 +275,13 @@ class HistoricalSchemaTests(unittest.TestCase):
         manifest = load_source_manifest(REPO / "security/historical/source_manifest.json")
         self.assertEqual([item["id"] for item in records], [
             "CVE-2025-5278", "CVE-2015-1345", "CVE-2005-1039",
-            "CVE-2012-5667",
+            "CVE-2012-5667", "CVE-2015-4041", "CVE-2015-4042",
         ])
         self.assertEqual([item["id"] for item in census], [
             "CVE-2025-5278", "CVE-2015-1345", "CVE-2005-1039",
-            "CVE-2012-5667",
+            "CVE-2012-5667", "CVE-2015-4041", "CVE-2015-4042",
+            "CVE-2013-0221", "TEMP-0306076-4B7D89", "CVE-2026-35338",
+            "CVE-2026-35339", "CVE-2026-35348", "CVE-2026-35353",
         ])
         self.assertEqual(
             [(item["upstream_project"], item["affected_version"]) for item in manifest],
@@ -232,6 +290,7 @@ class HistoricalSchemaTests(unittest.TestCase):
                 ("gnu-grep", "2.21"),
                 ("gnu-coreutils", "5.2.1"),
                 ("gnu-grep", "2.10"),
+                ("gnu-coreutils", "8.23-9.fc22"),
             ],
         )
         grep_record = next(item for item in records if item["id"] == "CVE-2015-1345")
@@ -300,6 +359,25 @@ class HistoricalSchemaTests(unittest.TestCase):
         self.assertEqual(
             grep_210_source["source_revision"], GREP_210_REVISION
         )
+        downstream_records = [
+            item for item in records
+            if item["id"] in {"CVE-2015-4041", "CVE-2015-4042"}
+        ]
+        self.assertEqual(
+            [item["vulnerable_functions"] for item in downstream_records],
+            [["keycompare_mb"], ["keycompare_mb"]],
+        )
+        downstream_source = next(
+            item for item in manifest
+            if item.get("source_provenance") == "downstream_patch"
+        )
+        self.assertEqual(downstream_source["downstream_revision"], FEDORA_REVISION)
+        self.assertEqual(
+            len(downstream_source["programs"]["sort"]["source_files"]), 46
+        )
+        self.assertEqual(downstream_source["programs"]["sort"]["entry_point"], {
+            "source_file": "src/sort.c", "function": "main",
+        })
         try:
             import jsonschema
         except ImportError:
@@ -324,6 +402,56 @@ class HistoricalSchemaTests(unittest.TestCase):
             f"{entry['source_revision']}"
         ])
 
+    def test_discovery_dispositions_do_not_leak_into_analysis_records(self):
+        census = load_census(REPO / "security/historical/cve_census.json")
+        records = load_records(REPO / "security/historical/records.json")
+        analysis_ids = {item["id"] for item in records}
+        noneligible = {
+            item["id"] for item in census
+            if item["analysis_eligibility"] != "eligible"
+        }
+        self.assertTrue(noneligible)
+        self.assertTrue(noneligible.isdisjoint(analysis_ids))
+        self.assertIn("CVE-2013-0221", noneligible)
+        self.assertIn("TEMP-0306076-4B7D89", noneligible)
+
+    def test_temporary_identifier_is_outside_cve_denominator(self):
+        summary = summarize_census(
+            load_census(REPO / "security/historical/cve_census.json")
+        )
+        self.assertEqual(summary["discovery_entry_count"], 12)
+        self.assertEqual(summary["cve_identifier_count"], 11)
+        self.assertEqual(summary["temporary_identifier_count"], 1)
+        self.assertEqual(summary["eligibility_counts"], {
+            "eligible": 6, "excluded": 5, "unresolved": 1,
+        })
+
+    def test_downstream_schema_requires_complete_separate_identity(self):
+        record, manifest = downstream_sort_fixture()
+        self.assertEqual(validate_record(record), [])
+        self.assertEqual(validate_source_manifest([manifest]), [])
+        del record["downstream_revision"]
+        self.assertIn(
+            "downstream_revision is required for downstream_patch provenance",
+            validate_record(record),
+        )
+
+    def test_checked_in_upstream_identities_declare_provenance_explicitly(self):
+        records = load_records(REPO / "security/historical/records.json")
+        manifest = load_source_manifest(
+            REPO / "security/historical/source_manifest.json"
+        )
+        for collection in (records, manifest):
+            upstream = [
+                item for item in collection
+                if item.get("source_provenance") != "downstream_patch"
+            ]
+            self.assertTrue(upstream)
+            self.assertTrue(all(
+                item.get("source_provenance") == "upstream_gnu"
+                for item in upstream
+            ))
+
 
 class MultiFunctionMappingTests(unittest.TestCase):
     def test_program_scope_rejects_parent_traversal_and_symlink_escape(self):
@@ -334,19 +462,25 @@ class MultiFunctionMappingTests(unittest.TestCase):
             (source_tree / "entry.c").write_text("int main(void) { return 0; }\n")
             outside = base / "outside.c"
             outside.write_text("void outside(void) {}\n")
-            escaped = source_tree / "escaped.c"
-            os.symlink(outside, escaped)
+            with self.assertRaises(ProgramAnalysisError) as raised:
+                _resolve_program_scope(source_tree, {
+                    "entry_point": {
+                        "source_file": "entry.c", "function": "main",
+                    },
+                    "source_files": ["../outside.c"],
+                })
+            self.assertEqual(raised.exception.status, "analysis_scope_invalid")
 
-            for source_files in (["../outside.c"], ["entry.c", "escaped.c"]):
-                with self.subTest(source_files=source_files):
-                    with self.assertRaises(ProgramAnalysisError) as raised:
-                        _resolve_program_scope(source_tree, {
-                            "entry_point": {
-                                "source_file": "entry.c", "function": "main",
-                            },
-                            "source_files": source_files,
-                        })
-                    self.assertEqual(raised.exception.status, "analysis_scope_invalid")
+            escaped = source_tree / "escaped.c"
+            symlink_or_skip(self, outside, escaped)
+            with self.assertRaises(ProgramAnalysisError) as raised:
+                _resolve_program_scope(source_tree, {
+                    "entry_point": {
+                        "source_file": "entry.c", "function": "main",
+                    },
+                    "source_files": ["entry.c", "escaped.c"],
+                })
+            self.assertEqual(raised.exception.status, "analysis_scope_invalid")
 
     def test_same_file_fallback_is_explicit_for_duplicate_function_names(self):
         analyzed = analyze_sources([
@@ -425,6 +559,113 @@ class MultiFunctionMappingTests(unittest.TestCase):
         )
         self.assertEqual(mismatch["call_graphs_constructed"], 0)
 
+    def test_downstream_and_upstream_source_identities_coexist(self):
+        upstream_record = fixture_records()[0]
+        upstream_manifest = fixture_manifest()[0]
+        downstream_record, downstream_manifest = downstream_sort_fixture()
+        result = analyze_versioned_records(
+            [upstream_record, downstream_record],
+            [upstream_manifest, downstream_manifest],
+            force_fallback=True,
+        )
+        self.assertEqual(result["call_graphs_constructed"], 2)
+        self.assertEqual(result["call_graph_cache_hits"], 0)
+        rows = result["historical_function_mappings"]
+        self.assertNotEqual(rows[0]["source_analysis_id"], rows[1]["source_analysis_id"])
+
+    def test_downstream_identity_matching_includes_packaging_revision(self):
+        record, manifest = downstream_sort_fixture()
+        changed = copy.deepcopy(record)
+        changed["downstream_revision"] = "a" * 40
+        result = analyze_versioned_records([changed], [manifest], force_fallback=True)
+        row = result["historical_function_mappings"][0]
+        self.assertEqual(row["source_version_status"], "source_version_mismatch")
+        self.assertEqual(result["call_graphs_constructed"], 0)
+
+    def test_distinct_downstream_revisions_do_not_share_graph_cache(self):
+        first_record, first_manifest = downstream_sort_fixture()
+        second_record = copy.deepcopy(first_record)
+        second_manifest = copy.deepcopy(first_manifest)
+        second_record.update({
+            "id": "SYNTHETIC-DOWNSTREAM-B",
+            "affected_version": "fixture-2.fc",
+            "downstream_revision": "a" * 40,
+        })
+        second_manifest.update({
+            "affected_version": "fixture-2.fc",
+            "downstream_revision": "a" * 40,
+        })
+        result = analyze_versioned_records(
+            [first_record, second_record], [first_manifest, second_manifest],
+            force_fallback=True,
+        )
+        self.assertEqual(result["call_graphs_constructed"], 2)
+        self.assertEqual(result["call_graph_cache_hits"], 0)
+
+    def test_two_cves_at_same_downstream_function_are_not_collapsed(self):
+        first, manifest = downstream_sort_fixture()
+        second = copy.deepcopy(first)
+        second["id"] = "SYNTHETIC-DOWNSTREAM-B"
+        result = analyze_versioned_records(
+            [first, second], [manifest], force_fallback=True
+        )
+        self.assertEqual(result["call_graphs_constructed"], 1)
+        self.assertEqual(result["call_graph_cache_hits"], 1)
+        rows = result["historical_function_mappings"]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(
+            [item["vulnerability_id"] for item in rows],
+            ["SYNTHETIC-DOWNSTREAM-A", "SYNTHETIC-DOWNSTREAM-B"],
+        )
+        self.assertEqual(len({item["mapped_function_id"] for item in rows}), 1)
+        self.assertEqual(len(result["historical_record_mappings"]), 2)
+        summary = summarize_historical_analysis(
+            rows, result["historical_record_mappings"]
+        )
+        self.assertEqual(summary["historical_record_count"], 2)
+        self.assertEqual(summary["historical_function_location_count"], 2)
+
+    def test_analyzer_serializes_complete_downstream_provenance(self):
+        record, manifest = downstream_sort_fixture()
+        result = analyze_versioned_records(
+            [record], [manifest], force_fallback=True
+        )
+        function_row = result["historical_function_mappings"][0]
+        record_row = result["historical_record_mappings"][0]
+        program_scope = next(iter(result["call_graphs"].values()))[
+            "historical_program_scope"
+        ]
+        for row in (function_row, record_row, program_scope):
+            with self.subTest(row_type=row.get("vulnerability_id", "scope")):
+                self.assertEqual(row["source_provenance"], "downstream_patch")
+                self.assertEqual(row["upstream_base_version"], "fixture-upstream")
+                self.assertEqual(row["downstream_revision"], "f" * 40)
+                self.assertEqual(
+                    row["downstream_source"], manifest["downstream_source"]
+                )
+                self.assertEqual(
+                    row["source_tree_sha256"], manifest["source_tree_sha256"]
+                )
+        self.assertEqual(function_row["source_revision"], record["source_revision"])
+        self.assertNotEqual(
+            function_row["source_revision"], function_row["downstream_revision"]
+        )
+
+    def test_hvc_detail_serializes_downstream_source_identity(self):
+        record, manifest = downstream_sort_fixture()
+        versioned = analyze_versioned_records(
+            [record], [manifest], force_fallback=True
+        )
+        hvc = version_specific_hvc(versioned, policy="SHALLOW", k=1)
+        detail = hvc["per_vulnerability_selections"][0]
+        self.assertEqual(detail["source_provenance"], "downstream_patch")
+        self.assertEqual(detail["upstream_base_version"], "fixture-upstream")
+        self.assertEqual(detail["downstream_revision"], "f" * 40)
+        self.assertEqual(detail["downstream_source"], manifest["downstream_source"])
+        self.assertEqual(
+            detail["source_tree_sha256"], manifest["source_tree_sha256"]
+        )
+
     def test_source_identity_matching_uses_project_version_and_revision(self):
         record, manifest = grep_fixture()
         mutations = (
@@ -445,6 +686,15 @@ class MultiFunctionMappingTests(unittest.TestCase):
 
     def test_grep_source_fingerprint_mismatch_fails_closed(self):
         record, manifest = grep_fixture()
+        manifest["source_tree_sha256"] = "0" * 64
+        result = analyze_versioned_records([record], [manifest], force_fallback=True)
+        row = result["historical_function_mappings"][0]
+        self.assertEqual(row["source_version_status"], "source_version_mismatch")
+        self.assertEqual(row["mapping_status"], "source_version_mismatch")
+        self.assertEqual(result["call_graphs_constructed"], 0)
+
+    def test_downstream_source_fingerprint_mismatch_fails_closed(self):
+        record, manifest = downstream_sort_fixture()
         manifest["source_tree_sha256"] = "0" * 64
         result = analyze_versioned_records([record], [manifest], force_fallback=True)
         row = result["historical_function_mappings"][0]
@@ -473,6 +723,15 @@ class MultiFunctionMappingTests(unittest.TestCase):
     def test_missing_exact_grep_source_file_fails_closed(self):
         record, manifest = grep_fixture()
         program = manifest["programs"]["grep"]
+        program["source_files"] = [program.pop("source_globs")[0], "missing.c"]
+        result = analyze_versioned_records([record], [manifest], force_fallback=True)
+        row = result["historical_function_mappings"][0]
+        self.assertEqual(row["mapping_status"], "analysis_scope_invalid")
+        self.assertEqual(result["call_graphs_constructed"], 0)
+
+    def test_missing_exact_downstream_source_file_fails_closed(self):
+        record, manifest = downstream_sort_fixture()
+        program = manifest["programs"]["sort"]
         program["source_files"] = [program.pop("source_globs")[0], "missing.c"]
         result = analyze_versioned_records([record], [manifest], force_fallback=True)
         row = result["historical_function_mappings"][0]
@@ -1020,13 +1279,13 @@ class HistoricalPreparationTests(unittest.TestCase):
             (source_tree / "entry.c").write_text("int main(void) { return 0; }\n")
             outside = base / "outside.c"
             outside.write_text("void outside(void) {}\n")
-            os.symlink(outside, source_tree / "escaped.c")
             manifest = base / "manifest.json"
 
             self._write_mkdir_manifest(manifest, source_tree, ["../outside.c"])
             with self.assertRaises(HistoricalDataError):
                 verify_frozen_source_files(source_tree, manifest)
 
+            symlink_or_skip(self, outside, source_tree / "escaped.c")
             self._write_mkdir_manifest(
                 manifest, source_tree, ["entry.c", "escaped.c"]
             )
@@ -1054,6 +1313,148 @@ class HistoricalPreparationTests(unittest.TestCase):
                 script,
             )
 
+    def test_downstream_packaging_components_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = Path(directory)
+            spec = checkout / "fixture.spec"
+            patch = checkout / "security.patch"
+            spec.write_text("Name: fixture\n")
+            patch.write_text("diff --git a/a b/a\n")
+            metadata = {
+                "spec_file": spec.name,
+                "spec_sha256": file_sha256(spec),
+                "security_patch_file": patch.name,
+                "security_patch_sha256": file_sha256(patch),
+            }
+            verified = verify_packaging_components(checkout, metadata)
+            self.assertEqual(set(verified), {"spec", "security_patch"})
+
+            patch.unlink()
+            with self.assertRaisesRegex(
+                DownstreamSourceError, "packaging component is missing"
+            ):
+                verify_packaging_components(checkout, metadata)
+
+            patch.write_text("corrupted\n")
+            with self.assertRaisesRegex(
+                DownstreamSourceError, "security_patch checksum mismatch"
+            ):
+                verify_packaging_components(checkout, metadata)
+
+    def test_downstream_packaging_component_rejects_symlink_escape(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            checkout = base / "checkout"
+            checkout.mkdir()
+            outside = base / "outside.patch"
+            outside.write_text("outside\n")
+            spec = checkout / "fixture.spec"
+            spec.write_text("Name: fixture\n")
+            symlink_or_skip(self, outside, checkout / "security.patch")
+            metadata = {
+                "spec_file": spec.name,
+                "spec_sha256": file_sha256(spec),
+                "security_patch_file": "security.patch",
+                "security_patch_sha256": file_sha256(outside),
+            }
+            with self.assertRaisesRegex(
+                DownstreamSourceError, "escapes checkout"
+            ):
+                verify_packaging_components(checkout, metadata)
+
+    def test_rpm_patch_parser_supports_bare_numbered_and_strip_levels(self):
+        bare = rpm_patch_sequence("Patch: zero.patch\n%prep\n%patch\n%build\n")
+        self.assertEqual(
+            [(item.number, item.path, item.strip_level) for item in bare],
+            [(0, "zero.patch", 0)],
+        )
+        numbered = rpm_patch_sequence(
+            "Patch7: seven.patch\nPatch8: eight.patch\n%prep\n"
+            "%patch7 -p1 -b .seven\n%patch -P 8 -p2\n%build\n"
+        )
+        self.assertEqual(
+            [(item.number, item.path, item.strip_level) for item in numbered],
+            [(7, "seven.patch", 1), (8, "eight.patch", 2)],
+        )
+
+    def test_rpm_patch_parser_rejects_conditionals_and_macro_sequences(self):
+        guarded = (
+            "Patch0: zero.patch\n%prep\n%if 0%{?fedora}\n"
+            "%patch0 -p1\n%endif\n%build\n"
+        )
+        with self.assertRaisesRegex(
+            DownstreamSourceError, "conditional %prep sequencing"
+        ):
+            rpm_patch_sequence(guarded)
+        macro_guarded = (
+            "Patch0: zero.patch\n%prep\n%{?apply_zero:%patch0 -p1}\n%build\n"
+        )
+        with self.assertRaisesRegex(
+            DownstreamSourceError, "macro-dependent RPM patch sequencing"
+        ):
+            rpm_patch_sequence(macro_guarded)
+        conditional_declaration = (
+            "%if 0%{?fedora}\nPatch0: zero.patch\n%endif\n"
+            "%prep\n%patch0 -p1\n%build\n"
+        )
+        with self.assertRaisesRegex(
+            DownstreamSourceError, "conditional Patch0 declaration"
+        ):
+            rpm_patch_sequence(conditional_declaration)
+
+    def test_rpm_patch_parser_rejects_malformed_conditionals(self):
+        with self.assertRaisesRegex(
+            DownstreamSourceError, "malformed RPM conditional %else"
+        ):
+            rpm_patch_sequence(
+                "Patch0: zero.patch\n%prep\n%else\n%patch0\n%build\n"
+            )
+        with self.assertRaisesRegex(
+            DownstreamSourceError, "unterminated RPM conditional structure"
+        ):
+            rpm_patch_sequence(
+                "Patch0: zero.patch\n%if 1\n%endif\n%prep\n%patch0\n"
+                "%build\n%if 1\n"
+            )
+
+    def test_fedora_8_23_9_patch_sequence_and_strip_levels_are_frozen(self):
+        names = [
+            "coreutils-8.23-chroot-chdir.patch",
+            "coreutils-6.10-configuration.patch",
+            "coreutils-6.10-manpages.patch",
+            "coreutils-7.4-sttytcsadrain.patch",
+            "coreutils-8.2-uname-processortype.patch",
+            "coreutils-df-direct.patch",
+            "coreutils-8.4-mkdir-modenote.patch",
+            "sh-utils-2.0.11-dateman.patch",
+            "coreutils-4.5.3-langinfo.patch",
+            "coreutils-i18n.patch",
+            "coreutils-getgrouplist.patch",
+            "coreutils-overflow.patch",
+            "coreutils-8.22-temporarytestoff.patch",
+            "coreutils-selinux.patch",
+            "coreutils-selinuxmanpages.patch",
+        ]
+        numbers = [1, 100, 101, 102, 103, 104, 107, 703, 713, 800,
+                   908, 912, 913, 950, 951]
+        spec = "\n".join(
+            [*(f"Patch{number}: {name}" for number, name in zip(numbers, names)),
+             "%prep", "%setup -q",
+             *(f"%patch{number} -p1 -b .fixture" for number in numbers),
+             "%build"]
+        )
+        sequence = rpm_patch_sequence(spec)
+        self.assertEqual(len(sequence), 15)
+        self.assertEqual([item.path for item in sequence], names)
+        self.assertEqual([item.strip_level for item in sequence], [1] * 15)
+
+        script = (
+            REPO / "security/historical/prepare_coreutils_8_23_fedora.sh"
+        ).read_text()
+        self.assertIn("application.strip_level", script)
+        self.assertIn('"-p$strip_level"', script)
+        self.assertNotIn('patch --directory "$working_tree" --batch --forward -p1', script)
+
     def test_preparation_scripts_use_portable_python_sha256(self):
         historical = REPO / "security" / "historical"
         for name in (
@@ -1061,6 +1462,7 @@ class HistoricalPreparationTests(unittest.TestCase):
             "prepare_grep_2_21.sh",
             "prepare_coreutils_5_2_1.sh",
             "prepare_grep_2_10.sh",
+            "prepare_coreutils_8_23_fedora.sh",
         ):
             with self.subTest(script=name):
                 text = (historical / name).read_text()
@@ -1136,6 +1538,46 @@ class HistoricalPreparationTests(unittest.TestCase):
         ):
             with self.subTest(script=name):
                 self.assertNotIn(MKDIR_REVISION, (historical / name).read_text())
+
+    def test_fedora_scripts_do_not_duplicate_frozen_revisions(self):
+        historical = REPO / "security" / "historical"
+        upstream_revision = next(
+            item["source_revision"]
+            for item in json.loads(
+                (historical / "source_manifest.json").read_text()
+            )
+            if item.get("source_provenance") == "downstream_patch"
+        )
+        for name in (
+            "prepare_coreutils_8_23_fedora.sh",
+            "prepare_coreutils_8_23_fedora_sort_scope.sh",
+            "derive_coreutils_8_23_sort_scope.py",
+            "check_coreutils_8_23_sort_scope_sensitivity.py",
+        ):
+            with self.subTest(script=name):
+                text = (historical / name).read_text()
+                self.assertNotIn(upstream_revision, text)
+                self.assertNotIn(FEDORA_REVISION, text)
+
+    def test_fedora_preparation_rechecks_full_downstream_identity(self):
+        script = (
+            REPO / "security/historical/prepare_coreutils_8_23_fedora.sh"
+        ).read_text()
+        self.assertIn("verify_packaging_components", script)
+        self.assertIn("rpm_patch_sequence", script)
+        self.assertIn("security patch Git blob mismatch", script)
+        self.assertIn("verify_source_tree_sha256", script)
+        self.assertIn("source_package_identity=%s", script)
+        self.assertIn(
+            "srpm_authentication_status=%s", script
+        )
+        self.assertIn("not_downloaded_or_authenticated", script)
+        for relative_file in (
+            "src/sort.c", "src/local.mk", "lib/local.mk", "Makefile.am",
+            "configure.ac",
+        ):
+            with self.subTest(relative_file=relative_file):
+                self.assertIn(relative_file, script)
 
     def test_mkdir_preparation_rechecks_release_git_blob_correspondence(self):
         script = (
