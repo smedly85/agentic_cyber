@@ -55,6 +55,94 @@ eligible set; percentage denominators likewise use eligible functions. Equal
 function count is not equal cost, so selected LOC and AST-node counts remain
 separate descriptive costs. The helpers do not regenerate or change code.
 
+These are two different, named universes:
+
+* The **security-depth measurement universe** contains all statically reachable
+  functions with numeric raw call depth, including configured entry points.
+  This is the descriptive universe used when security findings are eventually
+  related to depth. It is consistent with historical measurement, which can
+  contain a vulnerable `main` at depth zero.
+* The **diversification-priority universe** contains reachable numeric-depth
+  functions but excludes configured entry points by default. This remains the
+  universe used by `select_functions()` and its existing `SHALLOW`, `RANDOM`,
+  and `DEEP` helpers.
+
+The generated structural census freezes these definitions before inspecting or
+joining any security outcome. Historical resolved observations at depths 0, 1,
+and 3 motivate structural study but do not define a cutoff, and specifically do
+not establish `shallow = depth <= 3`. Structural depth describes exposure in a
+conservative graph; it is not a vulnerability probability. No top-k or
+percentage budget is selected by this census.
+
+## Frozen generated-candidate structural census
+
+`security/generated_candidate_population.json` is the deterministic source of
+candidate membership. It is derived from four explicitly supplied, checked-in
+formal lineage roots using the existing RQ2/RQ3 population machinery rather
+than by scanning whatever happens to be under `runs/`. Every successful
+checkpoint candidate is represented once; checkpoint 000 is valid, later
+failure preserves earlier successful checkpoints, and final-population
+membership follows the existing end-to-end functional-success rule. Stable
+identities combine formal run, lineage, and checkpoint. They never contain an
+absolute host path.
+
+Every manifest row records experiment/run, lineage, checkpoint, utility,
+attempt, repository-relative candidate source, source SHA-256, checkpoint
+population status, and final-population membership. Candidate bytes are the
+immutable committed Git blob after checking that the worktree has no
+substantive change. This avoids CRLF checkout conversion changing scientific
+identity across Windows, WSL, and Vessel. An untracked test fixture instead
+uses its literal bytes. A missing frozen source remains in the denominator and
+is marked unavailable; a source-hash mismatch is reported and is fatal to a
+formal run. Extra machine-local run directories are never discovered or added.
+
+`security/generated_structural_census.py` recomputes reachability directly from
+those frozen sources because the population lacks complete reusable standalone
+reachability metadata. It does not rerun generation, functional evaluation, or
+security evaluation and does not read security outcome fields. Candidate rows,
+function rows, depth distributions, and summaries are emitted in stable order.
+Summaries cover overall, utility, checkpoint, utility by checkpoint, and the
+existing final-lineage population. Depth output separately counts functions at
+each depth and candidates containing that depth, and separately totals physical
+LOC and AST nodes.
+
+The candidate-population fingerprint is SHA-256 over canonical, sorted-key JSON
+containing the schema version, population definition, formal run list, and
+candidate rows, excluding the fingerprint field itself. The structural-census
+fingerprint is SHA-256 over canonical, sorted-key JSON containing only the
+scientific result object. It excludes environment provenance and timestamps.
+Environment output separately records Python and platform versions, parser
+availability/method, call-graph schema, repository SHA, host role, host name,
+and working directory.
+
+Formal census execution is restricted to `--host-role vessel --formal` and
+fails closed if any candidate is missing, mismatched, or analyzed by anything
+other than Tree-sitter. Regex remains available for unit tests and diagnostic
+smoke runs, but its results cannot be mixed into the formal census. The compare
+command treats parser-method differences as scientific differences while
+reporting ordinary OS, Python, host-name, and working-directory differences
+separately:
+
+```bash
+# WSL development/smoke result
+python3 security/generated_structural_census.py census \
+  --manifest security/generated_candidate_population.json \
+  --output-dir build/generated-structural-census-wsl \
+  --host-role wsl
+
+# Vessel formal frozen result
+python3 security/generated_structural_census.py census \
+  --manifest security/generated_candidate_population.json \
+  --output-dir build/generated-structural-census-vessel \
+  --host-role vessel --formal
+
+# Scientific equality with environment differences shown separately
+python3 security/generated_structural_census.py compare \
+  --left-dir build/generated-structural-census-wsl \
+  --right-dir build/generated-structural-census-vessel \
+  --output build/generated-structural-census-comparison.json
+```
+
 The retrospective study has a separate, initially empty dataset under
 `security/historical/`. Its records must be manually curated from authoritative
 GNU Coreutils or GNU grep sources. Each record carries an exact source revision,

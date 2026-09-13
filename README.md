@@ -82,6 +82,14 @@ Direct calls and unambiguous callbacks for known APIs are typed separately;
 depth zero but are excluded from diversification selection and percentage
 denominators by default. Use `--include-entry-points` for sensitivity analysis.
 
+Two universes are therefore kept explicit. The **security-depth measurement
+universe** is every statically reachable function with a numeric raw call
+depth, including configured entry points. The **diversification-priority
+universe** is the same resolved reachable universe with configured entry
+points excluded by default. The latter preserves the existing selection-helper
+semantics; the former prevents descriptive security analysis from silently
+discarding depth-zero code.
+
 Reusable helpers select `SHALLOW`, deterministic-seeded `RANDOM`, and `DEEP`
 controls at an equal function-count budget, while also reporting the differing
 line and node costs. Equal function count is not equal cost. They prepare a
@@ -91,6 +99,51 @@ Inspect a source directly with:
 ```bash
 python3 security/analyze_reachability.py \
   --source src/new_sort/new_sort.c --k 3 --seed 1
+```
+
+### Blind generated structural census
+
+`security/generated_candidate_population.json` freezes the generated-candidate
+population independently of the directories present on a particular machine.
+It was derived from the four explicitly named checked-in formal lineage roots
+using the existing RQ2/RQ3 population rules: every successful checkpoint is a
+checkpoint-population member, checkpoint 000 is valid, a later failure does
+not erase an earlier success, and the final-population flag uses the existing
+end-to-end functional-success rule. Each stable candidate identity includes a
+repository-relative source path and SHA-256. Extra local runs cannot enter the
+census; missing or hash-mismatched frozen candidates remain in its denominator
+and are reported as unavailable.
+
+The census measures structure before security outcomes are joined. It neither
+reads security findings nor uses historical depths to choose a budget. In
+particular, the historical resolved depths 0, 1, and 3 do not define a
+`depth <= 3` shallow threshold. Structural depth is descriptive exposure, not
+vulnerability probability, and no primary top-k or percentage is frozen here.
+
+Tree-sitter is required for formal results. WSL is supported for development
+and smoke checks; Vessel is the designated formal host. Candidate and
+structural SHA-256 fingerprints exclude environment metadata, while Python,
+OS, parser method, call-graph schema, repository revision, and host role are
+written separately. Run the same frozen population with:
+
+```bash
+# WSL development/smoke census
+python3 security/generated_structural_census.py census \
+  --manifest security/generated_candidate_population.json \
+  --output-dir build/generated-structural-census-wsl \
+  --host-role wsl
+
+# Vessel formal census (fails closed unless every candidate uses Tree-sitter)
+python3 security/generated_structural_census.py census \
+  --manifest security/generated_candidate_population.json \
+  --output-dir build/generated-structural-census-vessel \
+  --host-role vessel --formal
+
+# Cross-host scientific comparison; environment differences are separate
+python3 security/generated_structural_census.py compare \
+  --left-dir build/generated-structural-census-wsl \
+  --right-dir build/generated-structural-census-vessel \
+  --output build/generated-structural-census-comparison.json
 ```
 
 The separate `security/historical/` area contains empty validated record and

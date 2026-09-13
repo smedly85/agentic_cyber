@@ -512,6 +512,38 @@ def selection_size(reachable_count: int, *, k: int | None = None, percent: float
     return min(reachable_count, math.ceil(reachable_count * percent / 100.0))
 
 
+def measurement_universe_functions(
+    analysis: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Resolved reachable functions, including configured entry points.
+
+    This is the descriptive security-depth measurement universe.  It is
+    intentionally distinct from the diversification-priority universe because
+    depth-zero entry-point code is a valid location to measure.
+    """
+    return [
+        dict(item) for item in analysis.get("function_reachability", [])
+        if item.get("reachable_from_entry") is True
+        and isinstance(item.get("call_depth"), int)
+    ]
+
+
+def diversification_priority_universe_functions(
+    analysis: Mapping[str, Any], *, include_entry_points: bool = False,
+) -> list[dict[str, Any]]:
+    """Resolved reachable functions eligible for structural selection.
+
+    Configured entry points are excluded by default, preserving the existing
+    SHALLOW/RANDOM/DEEP selection semantics.  The opt-in flag is a sensitivity
+    control and does not change that default.
+    """
+    entry_points = set(analysis.get("resolved_entry_points", []))
+    return [
+        item for item in measurement_universe_functions(analysis)
+        if include_entry_points or item.get("function_id") not in entry_points
+    ]
+
+
 def select_functions(
     analysis: Mapping[str, Any], *, policy: str, k: int | None = None,
     percent: float | None = None, seed: int = 1,
@@ -521,12 +553,9 @@ def select_functions(
     normalized_policy = policy.upper()
     if normalized_policy not in SELECTION_POLICIES:
         raise ValueError(f"unknown selection policy: {policy}")
-    entry_points = set(analysis.get("resolved_entry_points", []))
-    eligible = [
-        dict(item) for item in analysis.get("function_reachability", [])
-        if item.get("reachable_from_entry") is True and isinstance(item.get("call_depth"), int)
-        and (include_entry_points or item.get("function_id") not in entry_points)
-    ]
+    eligible = diversification_priority_universe_functions(
+        analysis, include_entry_points=include_entry_points
+    )
     count = selection_size(len(eligible), k=k, percent=percent)
     shallow = sorted(eligible, key=lambda item: (item["call_depth"], item["function_id"]))
     if normalized_policy == "SHALLOW":
