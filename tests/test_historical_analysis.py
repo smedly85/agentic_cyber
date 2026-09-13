@@ -288,9 +288,14 @@ class HistoricalSchemaTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in census], [
             "CVE-2025-5278", "CVE-2015-1345", "CVE-2005-1039",
             "CVE-2012-5667", "CVE-2015-4041", "CVE-2015-4042",
-            "CVE-2013-0221", "TEMP-0306076-4B7D89", "CVE-2026-35338",
-            "CVE-2026-35339", "CVE-2026-35348", "CVE-2026-35353",
+            "CVE-2013-0221", "CVE-2001-0310", "TEMP-0306076-4B7D89",
+            "CVE-2026-35338", "CVE-2026-35339", "CVE-2026-35348",
+            "CVE-2026-35353",
         ])
+        self.assertEqual(len(records), 7)
+        self.assertEqual(
+            sum(len(item["vulnerable_functions"]) for item in records), 9
+        )
         self.assertEqual(
             [(item["upstream_project"], item["affected_version"]) for item in manifest],
             [
@@ -444,12 +449,31 @@ class HistoricalSchemaTests(unittest.TestCase):
         summary = summarize_census(
             load_census(REPO / "security/historical/cve_census.json")
         )
-        self.assertEqual(summary["discovery_entry_count"], 12)
-        self.assertEqual(summary["cve_identifier_count"], 11)
+        self.assertEqual(summary["discovery_entry_count"], 13)
+        self.assertEqual(summary["cve_identifier_count"], 12)
         self.assertEqual(summary["temporary_identifier_count"], 1)
         self.assertEqual(summary["eligibility_counts"], {
-            "eligible": 7, "excluded": 5,
+            "eligible": 7, "excluded": 6,
         })
+
+    def test_population_finalization_excludes_freebsd_sort_and_has_no_unresolved(self):
+        census = load_census(REPO / "security/historical/cve_census.json")
+        records = load_records(REPO / "security/historical/records.json")
+        freebsd_sort = next(item for item in census if item["id"] == "CVE-2001-0310")
+        self.assertEqual(freebsd_sort["identifier_type"], "cve")
+        self.assertEqual(freebsd_sort["utility_component"], "sort")
+        self.assertIs(freebsd_sort["target_utility"], True)
+        self.assertEqual(freebsd_sort["provenance"], "unrelated_implementation")
+        self.assertEqual(freebsd_sort["analysis_eligibility"], "excluded")
+        self.assertEqual(
+            freebsd_sort["source_patch_verification_status"], "verified"
+        )
+        self.assertNotIn("CVE-2001-0310", {item["id"] for item in records})
+        self.assertEqual(
+            [item["id"] for item in census
+             if item["analysis_eligibility"] == "unresolved"],
+            [],
+        )
 
     def test_census_eligibility_exactly_matches_analysis_ready_records(self):
         census = load_census(REPO / "security/historical/cve_census.json")
@@ -1840,6 +1864,28 @@ class CheckedInHistoricalRegressionTests(unittest.TestCase):
         )
         self.assertEqual(summary["historical_record_count"], 7)
         self.assertEqual(summary["historical_function_location_count"], 9)
+        numeric_locations = summary["function_call_depth_status_counts"][
+            "resolved_numeric_depth"
+        ]
+        nonnumeric_locations = (
+            summary["historical_function_location_count"] - numeric_locations
+        )
+        numeric_cves = summary["reachable_mapped_vulnerability_count"]
+        nonnumeric_cves = summary["historical_record_count"] - numeric_cves
+        self.assertEqual((numeric_locations, nonnumeric_locations), (3, 6))
+        self.assertEqual((numeric_cves, nonnumeric_cves), (2, 5))
+        calculated_percentages = {
+            100 * numeric_locations / summary["historical_function_location_count"],
+            100 * nonnumeric_locations / summary["historical_function_location_count"],
+            100 * numeric_cves / summary["historical_record_count"],
+            100 * nonnumeric_cves / summary["historical_record_count"],
+        }
+        population_evidence = (
+            REPO / "security/historical/evidence/discovery-census-2026-09-11.md"
+        ).read_text()
+        for percentage in calculated_percentages:
+            with self.subTest(percentage=percentage):
+                self.assertIn(f"({percentage:.1f}%)", population_evidence)
 
 
 if __name__ == "__main__":

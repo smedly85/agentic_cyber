@@ -80,24 +80,49 @@ per-location coverage remains in the output for future stricter definitions.
 Historical data never affects generation, functional validation, dynamic
 security findings, repair, or promotion.
 
-## Discovery census
+## Discovery census and population freeze
 
-The discovery pass was frozen on 2026-09-11 before downstream sort graphs were
-measured. It searched by package, project, utility, and advisory
-identity across CVE/NVD, GNU/Savannah, oss-security, Red Hat, Debian,
-SUSE/openSUSE, Ubuntu, and Fedora sources. It did not use depth-related search
-terms or mapping convenience. The complete query boundary, sources, and
-candidate dispositions are preserved in
+The population cutoff remains 2026-09-11. A population-finalization audit on
+2026-09-13 reconciled issues published by that cutoff across utility-level,
+package-level, predecessor-package, and documented downstream security
+records. The Debian Coreutils source-package security ledger and Debian GNU
+grep source-package security ledger formed the package-level enumeration
+spine. They were supplemented by GNU predecessor-package composition and
+history; GNU/Savannah records; CVE/MITRE/NVD records; oss-security;
+Fedora/Red Hat; SUSE/openSUSE; Ubuntu; and relevant vendor records and
+documented downstream patch histories. Debian did not alone define the
+population. No call-depth outcome or mapping convenience influenced the
+screening. The matrix and candidate dispositions are preserved in
 `evidence/discovery-census-2026-09-11.md`.
 
-The ledger now has 12 entries: 11 CVE identifiers and one Debian temporary
-identifier. Seven CVEs are eligible and analysis-ready. CVE-2013-0221 is now
-verified against Fedora 18's exact vulnerable and fixed downstream patch
-states; the temporary identifier and four independent uutils/Rust name
-collisions are excluded. Temporary identifiers remain visible for auditability
-but are not members of CVE-only denominators. No target GNU-lineage `chmod` CVE
-and no additional predecessor fileutils/textutils/sh-utils candidate was found
-by this pass.
+The historical CVE population was established from utility-level,
+package-level, predecessor-package, and documented downstream security records
+without consulting call-depth outcomes. Candidate exclusions and non-CVE
+security issues were retained in the discovery audit where necessary. The
+population was reconciled against the identified authoritative sources for
+issues published by the 2026-09-11 cutoff before interpreting the call-depth
+distribution. It is systematically audited and complete under the stated
+population definition and 2026-09-11 cutoff; this is not a claim to
+mathematical exhaustiveness over every vulnerability that may ever have
+existed.
+
+The frozen ledger has 13 entries: 12 CVE identifiers and one Debian temporary
+identifier. Seven are eligible, none is unresolved, and six are excluded.
+CVE-2001-0310 is retained as an excluded FreeBSD `sort` hit because no primary
+evidence links it to GNU Textutils. The analysis-ready input remains seven CVEs
+and nine vulnerable-function observations. No target GNU-lineage `chmod` CVE
+was identified.
+
+The formal summary has three of nine locations with numeric raw depth (33.3%)
+and six mapped but nonnumeric (66.7%); numeric depths are 0, 1, and 3. At CVE
+level, two of seven have a numeric resolved location (28.6%) and five do not
+(71.4%); shallowest numeric CVE depths are 0 and 3. These percentages are
+calculated from the emitted summary counts. All numeric observations are at
+small raw depths, but the nonnumeric majority prevents an estimate of the
+overall historical depth distribution. This evidence is consistent with some
+vulnerabilities occurring in shallow reachable regions; it does not justify a
+post-hoc `depth <= 3` definition. SHALLOW remains ascending-depth
+prioritization.
 
 ## Reproduce the Coreutils 9.7 source tree
 
