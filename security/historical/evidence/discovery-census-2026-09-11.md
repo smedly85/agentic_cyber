@@ -30,7 +30,7 @@ no additional target candidate was found in the predecessor GNU packages.
 | CVE-2012-5667 | CVE | grep | upstream GNU | eligible | Existing verified record. |
 | CVE-2015-4041 | CVE | sort | downstream patch | eligible | The Fedora 22 source state is reproducibly reconstructed from authenticated GNU source plus frozen dist-git content; the multibyte-expansion defect is mapped. The SRPM itself was not authenticated. |
 | CVE-2015-4042 | CVE | sort | downstream patch | eligible | The distinct aggregate-size overflow is authenticated and mapped. |
-| CVE-2013-0221 | CVE | sort | downstream patch | unresolved | Downstream provenance is established, but an exact vulnerable patch generation and mapping have not yet been frozen. |
+| CVE-2013-0221 | CVE | sort | downstream patch | eligible | Follow-up verification froze Fedora 18 coreutils-8.17-7.fc18, both disclosure-supported sort locations (`keycompare_mb`, `getmonth_mb`), the complete RPM patch stack, and the linker-exact scope; see `CVE-2013-0221.md`. |
 | TEMP-0306076-4B7D89 | temporary | mkdir | upstream GNU | excluded | Debian says this automatically generated name is not for external reference; it is not a CVE denominator member. |
 | CVE-2026-35338 | CVE | chmod | unrelated implementation | excluded | uutils Rust implementation, outside the GNU lineage. |
 | CVE-2026-35339 | CVE | chmod | unrelated implementation | excluded | uutils Rust implementation, outside the GNU lineage. |

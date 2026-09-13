@@ -62,12 +62,19 @@ MKDIR_REVISION = next(
     if item["upstream_project"] == "gnu-coreutils"
     and item["affected_version"] == "5.2.1"
 )
+FEDORA_817_REVISION = next(
+    item["downstream_revision"]
+    for item in json.loads(
+        (REPO / "security" / "historical" / "source_manifest.json").read_text()
+    )
+    if item.get("affected_version") == "8.17-7.fc18"
+)
 FEDORA_REVISION = next(
     item["downstream_revision"]
     for item in json.loads(
         (REPO / "security" / "historical" / "source_manifest.json").read_text()
     )
-    if item.get("source_provenance") == "downstream_patch"
+    if item.get("affected_version") == "8.23-9.fc22"
 )
 
 
@@ -275,7 +282,8 @@ class HistoricalSchemaTests(unittest.TestCase):
         manifest = load_source_manifest(REPO / "security/historical/source_manifest.json")
         self.assertEqual([item["id"] for item in records], [
             "CVE-2025-5278", "CVE-2015-1345", "CVE-2005-1039",
-            "CVE-2012-5667", "CVE-2015-4041", "CVE-2015-4042",
+            "CVE-2012-5667", "CVE-2015-4041", "CVE-2013-0221",
+            "CVE-2015-4042",
         ])
         self.assertEqual([item["id"] for item in census], [
             "CVE-2025-5278", "CVE-2015-1345", "CVE-2005-1039",
@@ -290,6 +298,7 @@ class HistoricalSchemaTests(unittest.TestCase):
                 ("gnu-grep", "2.21"),
                 ("gnu-coreutils", "5.2.1"),
                 ("gnu-grep", "2.10"),
+                ("gnu-coreutils", "8.17-7.fc18"),
                 ("gnu-coreutils", "8.23-9.fc22"),
             ],
         )
@@ -369,7 +378,7 @@ class HistoricalSchemaTests(unittest.TestCase):
         )
         downstream_source = next(
             item for item in manifest
-            if item.get("source_provenance") == "downstream_patch"
+            if item.get("affected_version") == "8.23-9.fc22"
         )
         self.assertEqual(downstream_source["downstream_revision"], FEDORA_REVISION)
         self.assertEqual(
@@ -378,6 +387,21 @@ class HistoricalSchemaTests(unittest.TestCase):
         self.assertEqual(downstream_source["programs"]["sort"]["entry_point"], {
             "source_file": "src/sort.c", "function": "main",
         })
+        cve_2013 = next(item for item in records if item["id"] == "CVE-2013-0221")
+        fedora_18 = next(
+            item for item in manifest if item.get("affected_version") == "8.17-7.fc18"
+        )
+        self.assertEqual(cve_2013["vulnerable_functions"], [
+            "keycompare_mb", "getmonth_mb",
+        ])
+        self.assertEqual(cve_2013["patched_functions"], [
+            "keycompare_mb", "getmonth_mb",
+        ])
+        self.assertEqual(fedora_18["downstream_revision"], FEDORA_817_REVISION)
+        self.assertEqual(len(fedora_18["programs"]["sort"]["source_files"]), 45)
+        self.assertNotEqual(
+            fedora_18["source_tree_sha256"], downstream_source["source_tree_sha256"]
+        )
         try:
             import jsonschema
         except ImportError:
@@ -412,7 +436,8 @@ class HistoricalSchemaTests(unittest.TestCase):
         }
         self.assertTrue(noneligible)
         self.assertTrue(noneligible.isdisjoint(analysis_ids))
-        self.assertIn("CVE-2013-0221", noneligible)
+        self.assertIn("CVE-2013-0221", analysis_ids)
+        self.assertNotIn("CVE-2013-0221", noneligible)
         self.assertIn("TEMP-0306076-4B7D89", noneligible)
 
     def test_temporary_identifier_is_outside_cve_denominator(self):
@@ -423,8 +448,16 @@ class HistoricalSchemaTests(unittest.TestCase):
         self.assertEqual(summary["cve_identifier_count"], 11)
         self.assertEqual(summary["temporary_identifier_count"], 1)
         self.assertEqual(summary["eligibility_counts"], {
-            "eligible": 6, "excluded": 5, "unresolved": 1,
+            "eligible": 7, "excluded": 5,
         })
+
+    def test_census_eligibility_exactly_matches_analysis_ready_records(self):
+        census = load_census(REPO / "security/historical/cve_census.json")
+        records = load_records(REPO / "security/historical/records.json")
+        eligible = {item["id"] for item in census if item["analysis_eligibility"] == "eligible"}
+        self.assertEqual(eligible, {item["id"] for item in records})
+        cve = next(item for item in census if item["id"] == "CVE-2013-0221")
+        self.assertEqual(cve["source_patch_verification_status"], "verified")
 
     def test_downstream_schema_requires_complete_separate_identity(self):
         record, manifest = downstream_sort_fixture()
@@ -684,6 +717,24 @@ class MultiFunctionMappingTests(unittest.TestCase):
                 self.assertEqual(row["source_version_status"], expected)
                 self.assertEqual(result["call_graphs_constructed"], 0)
 
+    def test_fedora_2013_downstream_identity_cannot_resolve_as_pristine_gnu(self):
+        records = load_records(REPO / "security/historical/records.json")
+        manifest = load_source_manifest(REPO / "security/historical/source_manifest.json")
+        record = copy.deepcopy(next(item for item in records if item["id"] == "CVE-2013-0221"))
+        downstream = copy.deepcopy(next(
+            item for item in manifest if item.get("affected_version") == "8.17-7.fc18"
+        ))
+        pristine = copy.deepcopy(downstream)
+        pristine["source_provenance"] = "upstream_gnu"
+        for field in ("upstream_base_version", "downstream_revision", "downstream_source"):
+            pristine.pop(field)
+        result = analyze_versioned_records([record], [pristine], force_fallback=True)
+        self.assertEqual(result["call_graphs_constructed"], 0)
+        self.assertTrue(all(
+            row["source_version_status"] == "source_version_mismatch"
+            for row in result["historical_function_mappings"]
+        ))
+
     def test_grep_source_fingerprint_mismatch_fails_closed(self):
         record, manifest = grep_fixture()
         manifest["source_tree_sha256"] = "0" * 64
@@ -889,6 +940,42 @@ class MultiFunctionMappingTests(unittest.TestCase):
         })
         self.assertEqual(result["mapping_status"], "partial_mapping")
         self.assertEqual(result["successfully_mapped_function_count"], 1)
+
+    def test_cve_2013_sibling_degradation_preserves_independent_mapping(self):
+        record = copy.deepcopy(next(
+            item for item in load_records(REPO / "security/historical/records.json")
+            if item["id"] == "CVE-2013-0221"
+        ))
+        cases = {
+            "missing": analyze_sources([
+                ("sort.c", b"static void keycompare_mb(void) {}\n"
+                           b"int main(void) { keycompare_mb(); return 0; }\n"),
+            ], force_fallback=True),
+            "ambiguous": analyze_sources([
+                ("sort.c", b"static void keycompare_mb(void) {}\n"
+                           b"static void getmonth_mb(void) {}\n"
+                           b"int main(void) { keycompare_mb(); return 0; }\n"),
+                ("other.c", b"static void getmonth_mb(void) {}\n"),
+            ], force_fallback=True),
+        }
+        expected_sibling_status = {
+            "missing": "function_not_found",
+            "ambiguous": "ambiguous_function_name",
+        }
+        for case, analyzed in cases.items():
+            with self.subTest(case=case):
+                result = map_record_to_graph(record, analyzed)
+                rows = {
+                    item["vulnerable_function"]: item
+                    for item in result["function_mappings"]
+                }
+                self.assertEqual(set(rows), {"keycompare_mb", "getmonth_mb"})
+                self.assertEqual(rows["keycompare_mb"]["mapping_status"],
+                                 "mapped_and_reachable")
+                self.assertEqual(rows["getmonth_mb"]["mapping_status"],
+                                 expected_sibling_status[case])
+                self.assertEqual(result["successfully_mapped_function_count"], 1)
+                self.assertEqual(result["mapping_status"], "partial_mapping")
 
     def test_resolved_and_missing_static_paths_remain_distinguishable(self):
         result = map_record_to_graph(
@@ -1377,6 +1464,16 @@ class HistoricalPreparationTests(unittest.TestCase):
             [(7, "seven.patch", 1), (8, "eight.patch", 2)],
         )
 
+    def test_rpm_patch_parser_propagates_p0_p1_and_p2(self):
+        sequence = rpm_patch_sequence(
+            "Patch: zero.patch\nPatch1: one.patch\nPatch2: two.patch\n%prep\n"
+            "%patch -p0\n%patch1 -p1\n%patch -P 2 -p2\n%build\n"
+        )
+        self.assertEqual(
+            [(item.number, item.path, item.strip_level) for item in sequence],
+            [(0, "zero.patch", 0), (1, "one.patch", 1), (2, "two.patch", 2)],
+        )
+
     def test_rpm_patch_parser_rejects_conditionals_and_macro_sequences(self):
         guarded = (
             "Patch0: zero.patch\n%prep\n%if 0%{?fedora}\n"
@@ -1417,6 +1514,21 @@ class HistoricalPreparationTests(unittest.TestCase):
                 "%build\n%if 1\n"
             )
 
+    def test_rpm_patch_parser_rejects_unknown_and_conflicting_arguments(self):
+        declarations = "Patch7: seven.patch\nPatch8: eight.patch\n%prep\n"
+        with self.assertRaisesRegex(
+            DownstreamSourceError, "unsupported RPM patch argument"
+        ):
+            rpm_patch_sequence(declarations + "%patch7 --fuzz 0\n%build\n")
+        with self.assertRaisesRegex(
+            DownstreamSourceError, "conflicting RPM patch numbers"
+        ):
+            rpm_patch_sequence(declarations + "%patch7 -P 8\n%build\n")
+        with self.assertRaisesRegex(
+            DownstreamSourceError, "strip level is specified more than once"
+        ):
+            rpm_patch_sequence(declarations + "%patch7 -p1 -p2\n%build\n")
+
     def test_fedora_8_23_9_patch_sequence_and_strip_levels_are_frozen(self):
         names = [
             "coreutils-8.23-chroot-chdir.patch",
@@ -1455,6 +1567,74 @@ class HistoricalPreparationTests(unittest.TestCase):
         self.assertIn('"-p$strip_level"', script)
         self.assertNotIn('patch --directory "$working_tree" --batch --forward -p1', script)
 
+    def test_fedora_8_17_7_patch_sequence_and_source_identities_are_frozen(self):
+        historical = REPO / "security/historical"
+        manifest = load_source_manifest(historical / "source_manifest.json")
+        old = next(item for item in manifest if item.get("affected_version") == "8.17-7.fc18")
+        recent = next(item for item in manifest if item.get("affected_version") == "8.23-9.fc22")
+        self.assertEqual(old["source_revision"],
+                         "e9024b7d89b6aec4c6fae02a25e06747bb9d0eeb")
+        self.assertEqual(old["downstream_revision"], FEDORA_817_REVISION)
+        self.assertNotEqual(old["downstream_revision"], recent["downstream_revision"])
+        self.assertNotEqual(old["source_tree_sha256"], recent["source_tree_sha256"])
+        self.assertNotEqual(old["downstream_source"]["security_patch_git_blob"],
+                            recent["downstream_source"]["security_patch_git_blob"])
+        self.assertEqual(old["downstream_source"]["spec_sha256"],
+                         "027f2c12b5ec052da77c3811ab4b52dc11e77e1e495a6664b290b308ee5f0639")
+        self.assertEqual(old["downstream_source"]["security_patch_sha256"],
+                         "e10991e81cfda71eeb7c87f016e92439141bb6fbe2f2ee4ca8bc7e81c7ddf6e2")
+
+        frozen = []
+        for line in (historical / "coreutils_8_17_fedora_patch_sequence.tsv").read_text().splitlines():
+            number, strip, name = line.split("\t")
+            frozen.append((int(number), int(strip), name))
+        self.assertEqual(len(frozen), 23)
+        self.assertEqual(frozen[14], (800, 1, "coreutils-i18n.patch"))
+        declarations = [f"Patch{number}: {name}" for number, _, name in frozen]
+        applications = [f"%patch{number} -p{strip}" for number, strip, _ in frozen]
+        parsed = rpm_patch_sequence("\n".join([
+            *declarations, "%prep", "%setup -q", *applications, "%build",
+        ]))
+        self.assertEqual(
+            [(item.number, item.strip_level, item.path) for item in parsed], frozen
+        )
+        script = (historical / "prepare_coreutils_8_17_fedora.sh").read_text()
+        self.assertIn('cmp "$expected_sequence" "$sequence"', script)
+        self.assertIn("fixed_patch_blob=704941fd665209cff14143dae6b98d442a2cd9bc", script)
+        self.assertIn("fixed_patch_sha256=8e5e7759e1e175d9befa3d60916bbc5cf51fd4efb384a6929c28d739e1c85f5a", script)
+        self.assertIn("verify_source_tree_sha256", script)
+
+    def test_fedora_8_17_patch_hash_mismatch_fails_closed(self):
+        manifest = load_source_manifest(
+            REPO / "security/historical/source_manifest.json"
+        )
+        source = next(item for item in manifest if item.get("affected_version") == "8.17-7.fc18")
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = Path(directory)
+            spec = checkout / "coreutils.spec"
+            patch = checkout / "coreutils-i18n.patch"
+            spec.write_text("Name: coreutils\n")
+            patch.write_text("corrupted downstream patch\n")
+            metadata = copy.deepcopy(source["downstream_source"])
+            metadata["spec_sha256"] = file_sha256(spec)
+            with self.assertRaisesRegex(
+                DownstreamSourceError, "security_patch checksum mismatch"
+            ):
+                verify_packaging_components(checkout, metadata)
+
+    def test_fedora_8_17_final_tree_fingerprint_mismatch_fails_closed(self):
+        manifest = load_source_manifest(
+            REPO / "security/historical/source_manifest.json"
+        )
+        source = next(item for item in manifest if item.get("affected_version") == "8.17-7.fc18")
+        with tempfile.TemporaryDirectory() as directory:
+            tree = Path(directory)
+            (tree / "sort.c").write_text("int main(void) { return 0; }\n")
+            with self.assertRaisesRegex(
+                HistoricalDataError, "source-tree fingerprint mismatch"
+            ):
+                verify_source_tree_sha256(tree, source["source_tree_sha256"])
+
     def test_preparation_scripts_use_portable_python_sha256(self):
         historical = REPO / "security" / "historical"
         for name in (
@@ -1463,6 +1643,7 @@ class HistoricalPreparationTests(unittest.TestCase):
             "prepare_coreutils_5_2_1.sh",
             "prepare_grep_2_10.sh",
             "prepare_coreutils_8_23_fedora.sh",
+            "prepare_coreutils_8_17_fedora.sh",
         ):
             with self.subTest(script=name):
                 text = (historical / name).read_text()
@@ -1600,6 +1781,65 @@ class HistoricalPreparationTests(unittest.TestCase):
             "--output", str(REPO / "build/unused-historical-test-output.json"),
         ])
         self.assertIs(arguments.coverage_study, False)
+
+
+class CheckedInHistoricalRegressionTests(unittest.TestCase):
+    def test_seven_record_formal_analysis_preserves_prior_six_and_new_multilocation(self):
+        records = load_records(REPO / "security/historical/records.json")
+        manifest = load_source_manifest(REPO / "security/historical/source_manifest.json")
+        if any(not Path(item["resolved_source_tree"]).is_dir() for item in manifest):
+            self.skipTest("prepared historical source trees are not present")
+        result = analyze_versioned_records(records, manifest)
+        analysis_methods = {
+            graph.get("analysis_method")
+            for graph in result["call_graphs"].values()
+        }
+        if analysis_methods != {"tree_sitter"}:
+            methods = ", ".join(sorted(str(item) for item in analysis_methods))
+            self.skipTest(
+                "formal frozen historical results require Tree-sitter; "
+                f"analyzer used: {methods or 'unknown'}"
+            )
+        self.assertEqual(analysis_methods, {"tree_sitter"})
+        rows = {
+            (item["vulnerability_id"], item["vulnerable_function"]): item
+            for item in result["historical_function_mappings"]
+        }
+        expected = {
+            ("CVE-2025-5278", "begfield"): ("resolved_numeric_depth", 3),
+            ("CVE-2015-1345", "bmexec_trans"): ("unresolved_indirect_dispatch", None),
+            ("CVE-2005-1039", "main"): ("resolved_numeric_depth", 0),
+            ("CVE-2005-1039", "make_path"): ("resolved_numeric_depth", 1),
+            ("CVE-2012-5667", "EGexecute"): ("unresolved_indirect_dispatch", None),
+            ("CVE-2015-4041", "keycompare_mb"): ("unresolved_indirect_dispatch", None),
+            ("CVE-2015-4042", "keycompare_mb"): ("unresolved_indirect_dispatch", None),
+            ("CVE-2013-0221", "keycompare_mb"): ("unresolved_indirect_dispatch", None),
+            ("CVE-2013-0221", "getmonth_mb"): ("no_resolved_static_path", None),
+        }
+        self.assertEqual(set(rows), set(expected))
+        for key, value in expected.items():
+            with self.subTest(location=key):
+                self.assertEqual((rows[key]["call_depth_status"], rows[key]["call_depth"]), value)
+
+        cve = next(
+            item for item in result["historical_record_mappings"]
+            if item["vulnerability_id"] == "CVE-2013-0221"
+        )
+        self.assertEqual(cve["declared_vulnerable_function_count"], 2)
+        self.assertEqual(cve["successfully_mapped_function_count"], 2)
+        self.assertEqual(cve["reachable_vulnerable_function_count"], 0)
+        self.assertIsNone(cve["minimum_reachable_call_depth"])
+        self.assertIsNone(cve["maximum_reachable_call_depth"])
+        self.assertEqual(cve["mapping_status"], "mapped_without_resolved_static_path")
+        self.assertEqual(cve["source_provenance"], "downstream_patch")
+        self.assertEqual(cve["downstream_revision"], FEDORA_817_REVISION)
+        self.assertEqual(cve["downstream_source"]["source_package"],
+                         "coreutils-8.17-7.fc18.src.rpm")
+        summary = summarize_historical_analysis(
+            result["historical_function_mappings"], result["historical_record_mappings"]
+        )
+        self.assertEqual(summary["historical_record_count"], 7)
+        self.assertEqual(summary["historical_function_location_count"], 9)
 
 
 if __name__ == "__main__":

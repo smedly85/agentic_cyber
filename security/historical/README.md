@@ -82,8 +82,8 @@ security findings, repair, or promotion.
 
 ## Discovery census
 
-The discovery pass was frozen on 2026-09-11 before the two downstream sort
-graphs were measured. It searched by package, project, utility, and advisory
+The discovery pass was frozen on 2026-09-11 before downstream sort graphs were
+measured. It searched by package, project, utility, and advisory
 identity across CVE/NVD, GNU/Savannah, oss-security, Red Hat, Debian,
 SUSE/openSUSE, Ubuntu, and Fedora sources. It did not use depth-related search
 terms or mapping convenience. The complete query boundary, sources, and
@@ -91,13 +91,13 @@ candidate dispositions are preserved in
 `evidence/discovery-census-2026-09-11.md`.
 
 The ledger now has 12 entries: 11 CVE identifiers and one Debian temporary
-identifier. Six CVEs are eligible and analysis-ready; CVE-2013-0221 remains
-unresolved pending an exact downstream patch generation and function mapping;
-the temporary identifier and four independent uutils/Rust name collisions are
-excluded. Temporary identifiers remain visible for auditability but are not
-members of CVE-only denominators. No target GNU-lineage `chmod` CVE and no
-additional predecessor fileutils/textutils/sh-utils candidate was found by
-this pass.
+identifier. Seven CVEs are eligible and analysis-ready. CVE-2013-0221 is now
+verified against Fedora 18's exact vulnerable and fixed downstream patch
+states; the temporary identifier and four independent uutils/Rust name
+collisions are excluded. Temporary identifiers remain visible for auditability
+but are not members of CVE-only denominators. No target GNU-lineage `chmod` CVE
+and no additional predecessor fileutils/textutils/sh-utils candidate was found
+by this pass.
 
 ## Reproduce the Coreutils 9.7 source tree
 
@@ -549,6 +549,66 @@ visible to the conservative parser in the formal graph, preserves the stable
 source-qualified ID `src/main.c::main`. The formal result remains the
 predeclared linker-exact scope regardless of these diagnostic outcomes.
 
+## Reproduce Fedora Coreutils 8.17-7 sort and its program scope
+
+CVE-2013-0221 is frozen to Fedora 18 `coreutils-8.17-7.fc18`, dist-git
+revision `1b40d50d5e34ef5a47fcee49d6df689a458a2251`, over pristine GNU 8.17
+revision `e9024b7d89b6aec4c6fae02a25e06747bb9d0eeb`. Its immediate fixed state
+is `coreutils-8.17-8.fc18` at Fedora revision
+`8def2175102337e5c315fa9c0dbe265a76358dda`. Preparation authenticates the
+official GNU archive, verifies representative archive/Git correspondence,
+parses and applies the complete 23-patch RPM sequence, checks both i18n patch
+blobs, reconstructs both package states, and verifies both final C/H tree
+fingerprints:
+
+`coreutils-8.17-7.fc18.src.rpm` is the source-package identity represented by
+the frozen packaging state; the SRPM payload and its RPM signature were not
+independently downloaded or authenticated. The source state is reproducibly
+reconstructed from authenticated GNU Coreutils 8.17 plus immutable Fedora
+dist-git packaging metadata and frozen patch blobs. This does not weaken the
+independently verified dist-git revisions, blob identities, patch sequence, or
+final source-tree fingerprints.
+
+```bash
+bash security/historical/prepare_coreutils_8_17_fedora_sort_scope.sh
+```
+
+The clean compatible build confirms `HAVE_MBRTOWC=1`. Its GNU-ld map extracts
+44 members from the configured 220-source `libcoreutils.a`; with `src/sort.c`,
+the formal linker-exact scope contains 45 C files. The archive-source superset
+contains 221 files.
+
+Both disclosed triggers are independent locations. `-d` sets
+`key->ignore = nondictionary` and reaches the combined `lena`/`lenb` stack
+allocation in `keycompare_mb`. `-M` sets `key->month = true` and dispatches to
+the three simultaneous `len`-derived stack allocations in `getmonth_mb`. The
+fixed patch replaces all four `alloca()` operations with `xmalloc()` and adds
+matching `free()` calls. Therefore the record freezes both functions.
+
+The formal graph has 287 functions, 158 reachable functions, and maximum depth
+8. Both locations map uniquely but have null numeric depths: `keycompare_mb`
+is `unresolved_indirect_dispatch` at the reachable `compare → keycompare`
+pointer call, while `getmonth_mb` is `no_resolved_static_path` because the
+analyzer does not chain a second pointer declaration through an unresolved
+possible target. It does not manufacture either graph edge.
+
+The sensitivity command compares the minimal unit, 45-file formal scope,
+221-file archive superset, and 804-file whole-release diagnostic:
+
+```bash
+PYTHONPATH=. python3 security/historical/check_coreutils_8_17_sort_scope_sensitivity.py \
+  --source-manifest security/historical/source_manifest.json \
+  --records security/historical/records.json \
+  --src-makefile build/coreutils-8.17-fedora-sort-scope-portable/src/Makefile \
+  --lib-makefile build/coreutils-8.17-fedora-sort-scope-portable/lib/Makefile \
+  --link-map build/coreutils-8.17-fedora-sort-scope-portable/sort.map
+```
+
+Every scope preserves both unique mappings, null depths, paths, and dispatch
+statuses. The complete primary/vendor evidence, function-by-function audit,
+exact hashes and fix hunks, source-scope derivation, emitted provenance, graph
+results, and limitations are in `evidence/CVE-2013-0221.md`.
+
 ## Reproduce Fedora Coreutils 8.23-9 sort and its program scope
 
 CVE-2015-4041 and CVE-2015-4042 are not attributed to pristine GNU
@@ -681,7 +741,7 @@ closure, not a scope chosen from these outcomes.
 After preparation:
 
 ```bash
-python3 security/historical/run_historical_analysis.py \
+PYTHONPATH=. python3 security/historical/run_historical_analysis.py \
   --source-manifest security/historical/source_manifest.json \
   --records security/historical/records.json \
   --output build/historical-analysis.json
