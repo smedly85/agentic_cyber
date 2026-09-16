@@ -188,7 +188,23 @@ def source_physical_line_count(path: Path) -> int:
 def security_profile(
     source: bytes, configuration: Mapping[str, Any] | None = None
 ) -> dict[str, int]:
-    """Count descriptors; none is interpreted as a confirmed vulnerability."""
+    """Aggregate the occurrence extraction used for descriptor localization."""
+    occurrences = security_descriptor_occurrences(source, configuration)
+    counts = Counter(str(row["descriptor"]) for row in occurrences)
+    return {field: counts[field] for field in CONSTRUCT_FIELDS}
+
+
+def security_descriptor_occurrences(
+    source: bytes, configuration: Mapping[str, Any] | None = None
+) -> list[dict[str, Any]]:
+    """Return one row per existing security-sensitive descriptor occurrence.
+
+    Lines and columns are one-based.  The column is Tree-sitter's zero-based
+    UTF-8 byte column plus one; no descriptor is interpreted as a confirmed
+    vulnerability.  This function intentionally owns the classifications
+    aggregated by :func:`security_profile` so the two representations cannot
+    drift.
+    """
     resolved = validate_security_configuration(
         configuration or default_security_configuration()
     )
@@ -196,27 +212,36 @@ def security_profile(
     bounded_calls = set(resolved["bounded_risky_calls"])
     heap_calls = set(resolved["heap_calls"])
     parsed = parse_source(source)
-    counts = {field: 0 for field in CONSTRUCT_FIELDS}
+    occurrences: list[dict[str, Any]] = []
     stack = [(parsed.root, False)]
     while stack:
         node, inside_function = stack.pop()
         inside_function = inside_function or node.type == "function_definition"
+        descriptor = None
+        call_name = None
         if node.type == "call_expression":
-            name = _call_name(node, parsed.data)
-            if name in unsafe_calls:
-                counts["unsafe_call_count"] += 1
-            elif name in bounded_calls:
-                counts["bounded_risky_call_count"] += 1
-            elif name in heap_calls:
-                counts["heap_allocation_deallocation_call_count"] += 1
+            call_name = _call_name(node, parsed.data)
+            if call_name in unsafe_calls:
+                descriptor = "unsafe_call_count"
+            elif call_name in bounded_calls:
+                descriptor = "bounded_risky_call_count"
+            elif call_name in heap_calls:
+                descriptor = "heap_allocation_deallocation_call_count"
         elif inside_function and node.type == "array_declarator":
             size = node.child_by_field_name("size")
             if size is not None and size.type in {"number_literal", "identifier"}:
-                counts["fixed_size_stack_buffer_count"] += 1
+                descriptor = "fixed_size_stack_buffer_count"
         elif node.type == "subscript_expression":
-            counts["indexing_operation_count"] += 1
+            descriptor = "indexing_operation_count"
+        if descriptor is not None:
+            occurrences.append({
+                "descriptor": descriptor,
+                "call_name": call_name,
+                "line": node.start_point[0] + 1,
+                "column": node.start_point[1] + 1,
+            })
         stack.extend((child, inside_function) for child in reversed(node.children))
-    return counts
+    return occurrences
 
 
 def resolve_flawfinder_executable(explicit: str | Path | None = None) -> Path | None:
@@ -239,9 +264,13 @@ def resolve_flawfinder_executable(explicit: str | Path | None = None) -> Path | 
 
 
 def flawfinder_version(executable: Path) -> tuple[str | None, str | None]:
+    prefix = (
+        [sys.executable, str(executable)]
+        if executable.suffix == ".py" else [str(executable)]
+    )
     try:
         completed = subprocess.run(
-            [str(executable), "--version"],
+            [*prefix, "--version"],
             capture_output=True,
             text=True,
             timeout=30,
@@ -384,9 +413,14 @@ def flawfinder_crosscheck(
             "command": command,
         }
     executable = scanner.get("executable_path")
+    executable_path = Path(str(executable))
+    prefix = (
+        [sys.executable, str(executable_path)]
+        if executable_path.suffix == ".py" else [str(executable_path)]
+    )
     try:
         completed = subprocess.run(
-            [str(executable), *scanner["options"], path.name],
+            [*prefix, *scanner["options"], path.name],
             cwd=path.parent,
             capture_output=True,
             text=True,

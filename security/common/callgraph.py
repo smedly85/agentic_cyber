@@ -1,4 +1,8 @@
-"""Conservative C call-graph reachability and structural selection helpers.
+"""Superseded syntax-only C call-graph and structural selection helpers.
+
+This module remains available for frozen prototype provenance and syntax-level
+selection experiments. It is not the scientific call-depth backend; official
+depth uses the Clang/LLVM/SVF semantic may-call graph.
 
 The graph records directly named calls and explicitly supported, statically
 identifiable callback arguments. A directly called name with multiple global
@@ -178,7 +182,9 @@ def _tree_sitter_definitions(data: bytes, source_file: str) -> list[dict[str, An
             "function": name,
             "source_file": source_file,
             "start_line": node.start_point[0] + 1,
+            "start_column": node.start_point[1],
             "end_line": node.end_point[0] + 1,
+            "end_column": node.end_point[1],
             "lines_of_code": node.end_point[0] - node.start_point[0] + 1,
             "ast_node_count": sum(1 for child in iter_nodes(node) if child.is_named),
             "body": body_text,
@@ -204,7 +210,9 @@ def _regex_definitions(data: bytes, source_file: str) -> list[dict[str, Any]]:
             "function": match.group(1),
             "source_file": source_file,
             "start_line": start_line,
+            "start_column": None,
             "end_line": end_line,
+            "end_column": None,
             "lines_of_code": end_line - start_line + 1,
             "ast_node_count": None,
             "body": body,
@@ -225,7 +233,7 @@ def _definitions(data: bytes, source_file: str, force_fallback: bool) -> tuple[l
 
 def analyze_sources(
     sources: Iterable[tuple[str, bytes]], *, entry_points: Iterable[str] = ("main",),
-    force_fallback: bool = False,
+    force_fallback: bool = False, include_source_columns: bool = False,
 ) -> dict[str, Any]:
     """Analyze one or more C translation units without inventing indirect edges."""
     source_items = [(str(source_file), data) for source_file, data in sources]
@@ -379,7 +387,7 @@ def analyze_sources(
     ranks = {identifier: index + 1 for index, identifier in enumerate(ordered_eligible)}
     functions: list[dict[str, Any]] = []
     for identifier, item in sorted(by_id.items(), key=lambda pair: pair[0]):
-        functions.append({
+        function_row = {
             "function": item["function"],
             "function_id": identifier,
             "source_file": item["source_file"],
@@ -403,7 +411,13 @@ def analyze_sources(
             ],
             "analysis_method": method,
             "diversification_rank": ranks.get(identifier),
-        })
+        }
+        if include_source_columns:
+            function_row.update({
+                "start_column": item["start_column"],
+                "end_column": item["end_column"],
+            })
+        functions.append(function_row)
 
     by_depth: dict[str, list[str]] = {}
     for identifier in ordered_reachable:
@@ -451,9 +465,14 @@ def analyze_sources(
 def analyze_source_bytes(
     source: bytes | str, *, source_file: str = "candidate.c",
     entry_points: Iterable[str] = ("main",), force_fallback: bool = False,
+    include_source_columns: bool = False,
 ) -> dict[str, Any]:
     data = source.encode() if isinstance(source, str) else source
-    return analyze_sources([(source_file, data)], entry_points=entry_points, force_fallback=force_fallback)
+    return analyze_sources(
+        [(source_file, data)], entry_points=entry_points,
+        force_fallback=force_fallback,
+        include_source_columns=include_source_columns,
+    )
 
 
 def analyze_source_file(

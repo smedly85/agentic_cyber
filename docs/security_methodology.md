@@ -23,9 +23,38 @@ The seeded programs in `security/calibration/fixtures/` exist solely to validate
 the evaluator. They never enter lineage generation, prompts, repair, functional
 corpora, or formal candidate populations.
 
-## Structural reachability study
+## Official scientific raw call depth
 
-The repository also records a deliberately simple, descriptive call-graph
+Scientific raw call depth is now defined as the shortest path from the
+configured entry point in the Clang/LLVM/SVF static semantic may-call graph:
+
+```text
+d_call(f) = minimum number of semantic may-call edges from entry to f
+```
+
+The primary configuration is Clang/LLVM 21.1.8, SVF 3.4 at commit
+`67efb7745ce47b2b6853fd5696fc22c83d701e6c`, AndersenWaveDiff,
+`-stat=false`, and `-ff-eq-base`. The entry point has depth zero. Direct calls
+and SVF-resolved indirect calls each contribute one edge. Every member of a
+multi-target indirect callsite remains in the graph; an indirect edge is a
+possible static call target, not proof that the target executes at runtime.
+Consequently, the metric is the shortest path in a static may-call graph.
+
+Unreachable functions, unresolved indirect callsites, external or unavailable
+definitions, unavailable builds/IR, and analysis failures remain explicit.
+No missing depth is imputed and raw depth is not normalized. Source-qualified
+function identities and edge-level source/backend/target-set provenance make
+each reported shortest path auditable. The complete instrument definition is
+in `docs/semantic_callgraph_methodology.md`.
+
+## Tree-sitter structural reachability prototype (superseded measurement)
+
+The following Tree-sitter study and its frozen outputs are retained for
+historical comparison and reproducibility. Their call-depth classification is
+**prototype / superseded semantic measurement**. Tree-sitter-derived call
+relationships are no longer the scientific source of call depth.
+
+The repository records the former deliberately simple, descriptive call-graph
 measurement. For a function `f`, `d_call(f)` is the minimum number of resolved
 call-graph edges from `main` to `f`. Edges include direct identifier calls and
 explicitly supported, statically identifiable callback arguments. The initial
@@ -70,11 +99,11 @@ These are two different, named universes:
 The generated structural census freezes these definitions before inspecting or
 joining any security outcome. Historical resolved observations at depths 0, 1,
 and 3 motivate structural study but do not define a cutoff, and specifically do
-not establish `shallow = depth <= 3`. Structural depth describes exposure in a
-conservative graph; it is not a vulnerability probability. No top-k or
+not establish any binary depth category. Structural depth describes exposure
+in a conservative graph; it is not a vulnerability probability. No top-k or
 percentage budget is selected by this census.
 
-## Frozen generated-candidate structural census
+## Frozen generated-candidate structural census (prototype provenance)
 
 `security/generated_candidate_population.json` is the deterministic source of
 candidate membership. It is derived from four explicitly supplied, checked-in
@@ -142,6 +171,128 @@ python3 security/generated_structural_census.py compare \
   --right-dir build/generated-structural-census-vessel \
   --output build/generated-structural-census-comparison.json
 ```
+
+## Generated static-security localization by prototype depth (superseded)
+
+This frozen prototype RQ3 measurement asked where the already-defined
+security-relevant static findings and source descriptors occur in generated
+implementations. Exact raw call depth is the primary category: 0, 1, 2, 3, and
+any future numeric depths remain separate. No binary depth threshold is
+inferred from either the historical observations or the generated range. This
+localization dataset precedes, and does not execute or choose parameters for,
+any later structural prioritization experiment.
+
+Its Tree-sitter depths and Flawfinder-by-depth joins are preserved as
+**prototype / superseded semantic measurement** provenance. They are not the
+official scientific semantic depths and must not be used as such. The 140
+generated candidates and their findings have not yet been remeasured with the
+official semantic backend.
+
+`security/generated_security_depth_localization.py` reads only
+`security/generated_candidate_population.json`. Before any measurement it
+retrieves the same committed candidate bytes used by the structural census,
+verifies the manifest identity and candidate SHA-256, and reconstructs the
+Tree-sitter call graph. Function identity, source span, reachability, shortest
+path, and raw depth must agree with the structural census. A missing or
+hash-mismatched frozen candidate remains in all eligible denominators as an
+explicit unavailable measurement; extra local runs are never discovered.
+Formal localization requires Tree-sitter and the frozen Flawfinder 2.0.20
+configuration. Parser fallback, scanner absence, version mismatch, malformed
+CSV, and other failures are unavailable states and never zero findings.
+
+Each Flawfinder finding retains every existing scientific field unchanged and
+is joined by source position to the unique containing Tree-sitter function.
+Flawfinder 2.0.20 numbers both lines and columns from one. Its column is a
+Python decoded-string character position; Tree-sitter numbers rows from zero
+and columns as zero-based UTF-8 byte offsets. Line containment is the primary
+mapping rule. Only when more than one function span contains the reported line
+is the Flawfinder character column explicitly converted to a Tree-sitter byte
+column to disambiguate the spans. Tree-sitter function start points are
+inclusive and end points are exclusive. Tests cover the conversion, including
+a multibyte UTF-8 prefix. A valid location outside every function is not
+assigned to the nearest function.
+
+Mapping states are preserved exactly as `mapped`, `outside_function`,
+`ambiguous_function`, `invalid_source_location`, and
+`mapped_without_numeric_depth`. Numeric mapped rows retain their exact raw
+depth; nonnumeric states are never collapsed into depth zero. Configured entry
+points remain in the measurement universe, so a finding in `main` maps to raw
+depth 0.
+
+Tree-sitter descriptor output uses one-based lines and one-based UTF-8 byte
+columns. `security_descriptor_occurrences()` is the sole classification path:
+it emits one row per unsafe call, bounded-risky call, heap
+allocation/deallocation call, fixed-size stack buffer, and indexing expression,
+and `security_profile()` aggregates those rows. Thus localization does not add
+or reinterpret any descriptor class. Fixed-size stack buffers remain
+function-context-only; indexing expressions keep their prior unrestricted
+source-context semantics, and an outside-function occurrence remains visible.
+These are security-sensitive constructs, not findings or vulnerabilities.
+
+Depth summaries keep finding-level, candidate-level, and code-opportunity
+denominators distinct. At each exact numeric depth they report function count,
+candidate count with that depth, physical LOC, and AST-node count alongside
+finding or descriptor counts. Candidate prevalence uses the complete eligible
+candidate group only when coverage is complete. Descriptive counts per 100
+functions and per KLOC are likewise null if required scanner, descriptor, or
+structural coverage is incomplete. Results are emitted overall, by utility, by
+checkpoint, and by utility and checkpoint; pooled counts must be interpreted
+alongside these strata and their code mass.
+
+Scientific output and environment provenance are separate. The scientific
+fingerprint includes the candidate-population and structural fingerprints,
+candidate source hashes, frozen security-configuration fingerprint,
+Flawfinder version, Tree-sitter package versions, call-graph schema, localized
+rows, and exact-depth aggregates. Host name, absolute paths, working directory,
+and platform strings occur only in environment metadata. Analyzer-version or
+finding/depth differences remain scientific differences rather than being
+normalized away.
+
+The localization outputs are:
+
+```text
+generated_security_depth_summary.json
+generated_security_depth_environment.json
+generated_security_depth_candidates.csv
+generated_flawfinder_findings_by_depth.csv
+generated_security_descriptor_occurrences_by_depth.csv
+generated_security_depth_function_opportunity.csv
+generated_flawfinder_depth_summary.csv
+generated_security_descriptor_depth_summary.csv
+```
+
+Reproduction commands are:
+
+```bash
+# WSL development/reproducibility run; this is not the designated formal result
+python3 security/generated_security_depth_localization.py localize \
+  --manifest security/generated_candidate_population.json \
+  --security-config scripts/security-analysis-config-v1.json \
+  --output-dir build/generated-security-depth-wsl \
+  --host-role wsl \
+  --flawfinder-executable ac_venv/bin/flawfinder
+
+# Vessel-designated formal run
+python3 security/generated_security_depth_localization.py localize \
+  --manifest security/generated_candidate_population.json \
+  --security-config scripts/security-analysis-config-v1.json \
+  --output-dir build/generated-security-depth-vessel \
+  --host-role vessel --formal
+
+# Compare scientific localization separately from environment differences
+python3 security/generated_security_depth_localization.py compare \
+  --left-dir build/generated-security-depth-wsl \
+  --right-dir build/generated-security-depth-vessel \
+  --output build/generated-security-depth-comparison.json
+```
+
+If a complete provenance-valid prior localization exists, its raw Flawfinder
+rows can be reused with `--reuse-localization-dir <directory>`. The analyzer
+validates population, source hashes, structural census, security configuration,
+Flawfinder version, candidate coverage, and finding counts before reuse. In the
+absence of such an artifact, findings are deterministically reproduced with
+the pinned scanner and marked accordingly. Descriptor occurrences are always
+reconstructed from the frozen source and verified against `security_profile()`.
 
 The retrospective study has a separate, initially empty dataset under
 `security/historical/`. Its records must be manually curated from authoritative
