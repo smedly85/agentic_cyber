@@ -15,6 +15,7 @@ from security.historical.analysis import load_source_manifest
 entries = load_source_manifest(Path(sys.argv[1]))
 matches = [entry for entry in entries
            if entry.get("upstream_project") == "gnu-coreutils"
+           and entry.get("affected_version") == "9.7"
            and isinstance(entry.get("programs", {}).get("sort"), dict)]
 if len(matches) != 1:
     raise SystemExit("manifest must contain exactly one GNU Coreutils sort identity")

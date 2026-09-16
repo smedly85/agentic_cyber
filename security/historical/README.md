@@ -24,7 +24,28 @@ analyzed-tree fingerprint.
 No `TBD` values, guessed functions, or speculative downstream mappings belong
 there. `schema.json` validates the complete array.
 
-## Data model and methodology
+## Official depth definition and frozen historical-v1 provenance
+
+Scientific raw call depth is now the shortest number of edges from the
+configured entry point in the Clang/LLVM/SVF static semantic may-call graph.
+The primary configuration is Clang/LLVM 21.1.8, SVF 3.4 commit
+`67efb7745ce47b2b6853fd5696fc22c83d701e6c`, AndersenWaveDiff,
+`-stat=false`, and `-ff-eq-base`. Direct and SVF-resolved indirect may-call
+edges each count once; all valid targets of a multi-target callsite are kept.
+A resolved indirect edge is a possible static target, not proof of runtime
+execution. Unavailable and unresolved states remain explicit, and no depth is
+imputed.
+
+`records.json` and `cve_census.json` remain the frozen historical-v1 pilot.
+Their Tree-sitter call-depth fields and the Tree-sitter results described below
+are retained as **prototype / superseded semantic measurement** provenance;
+they are not the official scientific call-depth result. Tree-sitter remains in
+use for syntax parsing, source spans, descriptors, AST measurements, and other
+syntax-level work. The separate `semantic_validation.json` and
+`evidence/semantic-callgraph-validation.md` compare all nine verified
+vulnerable-function observations without rewriting those frozen files.
+
+## Frozen historical-v1 prototype data model
 
 CVEs are discovered without reference to call depth. The historical vulnerable
 source revision and all verified vulnerable functions are frozen before a call
@@ -63,7 +84,8 @@ for nonnumeric depth states such as `unresolved_indirect_dispatch`. No fixed
 "shallow" cutoff is inferred, and call depth is descriptive rather than a
 claim that shallow functions are vulnerable.
 
-Raw shortest call depth is the primary metric. Normalized depth is retained as
+Within the frozen prototype, raw shortest call depth was the primary metric.
+Normalized depth is retained as
 a secondary descriptive quantity, calculated as
 `raw_depth / maximum_reachable_depth` within one graph. It is not directly
 comparable across historical programs: their frozen scopes and deepest
@@ -113,7 +135,7 @@ evidence links it to GNU Textutils. The analysis-ready input remains seven CVEs
 and nine vulnerable-function observations. No target GNU-lineage `chmod` CVE
 was identified.
 
-The formal summary has three of nine locations with numeric raw depth (33.3%)
+The frozen Tree-sitter prototype summary has three of nine locations with numeric raw depth (33.3%)
 and six mapped but nonnumeric (66.7%); numeric depths are 0, 1, and 3. At CVE
 level, two of seven have a numeric resolved location (28.6%) and five do not
 (71.4%); shallowest numeric CVE depths are 0 and 3. These percentages are
@@ -185,11 +207,27 @@ using another target/toolchain must freeze and report that scope separately.
 
 This is an archive-source superset, not a claim that all 328 members are
 extracted into the executable. Static archive member extraction depends on the
-symbols required at the successful final link. Obtaining the linker-exact
-member set therefore requires a compatible historical build and link map. In
-the current environment, GCC 15 and Clang 21 fail while compiling bundled
-Coreutils 9.7/gnulib code (before the link), including incompatibilities around
-`mbszero`, `wint_t`, and `c32tolower`; no linker-member set is fabricated.
+symbols required at the final native link; the semantic validation deliberately
+uses the frozen 329-file conservative scope rather than fabricating a
+linker-member set.
+
+The first Clang IR attempt failed at `lib/aszprintf.c` because the semantic
+driver requested per-object dry-run recipes without first realizing Automake
+`BUILT_SOURCES`. As a result, configured `lib/stdio.h` and `lib/stddef.h` were
+absent, Clang fell through to the system `<stdio.h>`, and `ptrdiff_t` and
+`vaszprintf` were undeclared. The later apparent `mbszero`, `wint_t`, and
+`c32tolower` failures had the same missing-wrapper cause. They were not
+intrinsic source incompatibilities.
+
+The corrected reconstruction expands the configured `BUILT_SOURCES` variable
+through GNU Make and generates its build-directory prerequisites from the
+frozen GCC-derived Makefile before producing LLVM IR. It rechecks the
+authenticated source fingerprint afterward and never changes a historical C/H
+file. A Clang-native configure was not substituted: it legitimately selects a
+different conditional source set (including `lib/float.c`) and therefore is
+not the frozen 329-file configuration. With the historically justified
+generated inputs present, Clang 21 compiles all 329 translation units,
+`llvm-link` succeeds, and both SVF configurations complete.
 
 The former 532-file scope contained 203 release-tree C files that are not even
 inputs to this configured `libcoreutils.a` (38.2% of that scope; 532 is 61.7%
@@ -761,7 +799,7 @@ ambiguous calls, and unrelated source-level edges without resolving the
 `keycompare` pointer call. The formal result remains the predeclared linker
 closure, not a scope chosen from these outcomes.
 
-## Run depth characterization
+## Reproduce the superseded Tree-sitter characterization
 
 After preparation:
 
@@ -775,6 +813,9 @@ PYTHONPATH=. python3 security/historical/run_historical_analysis.py \
 Missing or mismatched source versions, fingerprint mismatches, invalid or empty
 scopes, unresolved entry points/functions, ambiguous names, and mapped but
 functions without a resolved static path remain distinct fail-closed states.
+
+This command reproduces prototype provenance only. It is not the scientific
+semantic call-depth backend.
 
 Detached-signature verification is conditional for portability. The grep
 2.10, grep 2.21, Coreutils 5.2.1, and Fedora Coreutils 8.23 preparation scripts
