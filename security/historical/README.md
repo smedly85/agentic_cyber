@@ -45,6 +45,28 @@ syntax-level work. The separate `semantic_validation.json` and
 `evidence/semantic-callgraph-validation.md` compare all nine verified
 vulnerable-function observations without rewriting those frozen files.
 
+The pre-v2 scope checkpoint makes linker-exact scope primary whenever it is
+faithfully recoverable. `source_scope_kind` distinguishes `linker_exact`,
+`reconstructed_program_scope`, and `archive_superset`; see the central
+[scope policy](../../docs/semantic_callgraph_methodology.md#program-scope-is-part-of-the-measurement).
+The retained milestone `semantic_validation.json` labels its original scopes;
+its Coreutils 9.7 archive-superset result is superseded for primary use by
+`semantic_scope_validation.json`'s `linker_exact` result. The frozen 329-file
+manifest remains unchanged as archive-superset provenance. The scope audit
+and comparison do not expand the pilot population or calculate statistics.
+
+The subsequent Fedora sort scope completion is stored separately in
+`fedora_sort_scope_validation.json` and
+`evidence/fedora-sort-scope-completion.md`. It uses complete configured native
+link maps, object/source dependency evidence, and legitimate generated
+`src/version.c` modules to validate the 8.17/8.23 primary scopes. The original
+45/46-file measurements remain labeled reconstructed scope; successful
+generated-module-inclusive measurements supersede them without rewriting the
+frozen source manifest. Reproduce with
+`bash scripts/run_fedora_sort_scope_checkpoint.sh` using the existing prepared
+historical builds. `historical_linker_scope.schema.json` defines the separate
+authenticated-tree and configured-build-generated TU provenance model.
+
 ## Frozen historical-v1 prototype data model
 
 CVEs are discovered without reference to call depth. The historical vulnerable
@@ -638,8 +660,12 @@ bash security/historical/prepare_coreutils_8_17_fedora_sort_scope.sh
 
 The clean compatible build confirms `HAVE_MBRTOWC=1`. Its GNU-ld map extracts
 44 members from the configured 220-source `libcoreutils.a`; with `src/sort.c`,
-the formal linker-exact scope contains 45 C files. The archive-source superset
-contains 221 files.
+the retained release-only scope contains 45 C files. That list omitted the
+linked build-generated `libver.a(version.o)` and is now explicitly classified
+as `reconstructed_program_scope`, not linker-exact. The separate
+[semantic scope completion](evidence/fedora-sort-scope-completion.md) includes
+that generated TU and verifies the complete 46-object closure. The old
+archive-source superset contains 221 files.
 
 Both disclosed triggers are independent locations. `-d` sets
 `key->ignore = nondictionary` and reaches the combined `lena`/`lenb` stack
@@ -648,7 +674,7 @@ the three simultaneous `len`-derived stack allocations in `getmonth_mb`. The
 fixed patch replaces all four `alloca()` operations with `xmalloc()` and adds
 matching `free()` calls. Therefore the record freezes both functions.
 
-The formal graph has 287 functions, 158 reachable functions, and maximum depth
+The retained Tree-sitter prototype graph has 287 functions, 158 reachable functions, and maximum depth
 8. Both locations map uniquely but have null numeric depths: `keycompare_mb`
 is `unresolved_indirect_dispatch` at the reachable `compare → keycompare`
 pointer call, while `getmonth_mb` is `no_resolved_static_path` because the
@@ -735,9 +761,13 @@ build succeeds with `--disable-nls --without-selinux --without-openssl
 modern compiler and current glibc's hidden historical libio constants. They do
 not alter analyzed source. `HAVE_MBRTOWC=1` is frozen.
 A GNU ld map proves that `src/sort.c` plus 45 members of
-`lib/libcoreutils.a` enter the executable, so the formal scope contains 46 C
-files. The configured archive-source superset contains 236 C files and is not
-the formal graph. Reproduce and verify the build/map/scope with:
+`lib/libcoreutils.a` enter the executable, so the retained release-only scope
+contains 46 C files. It omitted linked build-generated `libver.a(version.o)`:
+the list is `reconstructed_program_scope`, not a complete linker-exact scope.
+The separate [semantic scope completion](evidence/fedora-sort-scope-completion.md)
+includes that generated TU and verifies the complete 47-object closure. The
+old configured archive-source superset contains 236 C files. Reproduce the
+retained release-only build/map/scope with:
 
 ```bash
 bash security/historical/prepare_coreutils_8_23_fedora_sort_scope.sh
@@ -788,16 +818,17 @@ python3 security/historical/check_coreutils_8_23_sort_scope_sensitivity.py \
 | Scope | C files | Functions | Reachable | Max depth | Duplicate names | Ambiguous calls | Result for both CVEs |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 | Minimal `sort`-owned translation unit | 1 | 105 | 77 | 5 | 0 | 0 | unique; unresolved indirect dispatch |
-| Frozen linker-exact scope | 46 | 292 | 162 | 8 | 4 | 2 | unique; unresolved indirect dispatch |
+| Retained reconstructed scope | 46 | 292 | 162 | 8 | 4 | 2 | unique; unresolved indirect dispatch |
 | Configured archive-source superset | 236 | 846 | 164 | 8 | 31 | 24 | unique; unresolved indirect dispatch |
 | Whole-release C diagnostic | 800 | 2936 | 206 | 8 | 113 | 173 | unique; unresolved indirect dispatch |
 
-All scopes retain the same null raw depth and path. The formal and archive
+These retained Tree-sitter prototype scopes have the same null raw depth and path. The formal and archive
 scopes also retain the same seven direct callees; the minimal scope cannot
 resolve three library callees. Broader scopes increase duplicate names,
 ambiguous calls, and unrelated source-level edges without resolving the
-`keycompare` pointer call. The formal result remains the predeclared linker
-closure, not a scope chosen from these outcomes.
+`keycompare` pointer call. The retained result uses its predeclared
+reconstructed scope, not a scope chosen from these outcomes. The semantic
+scope completion is a separate measurement and preserves this provenance.
 
 ## Reproduce the superseded Tree-sitter characterization
 

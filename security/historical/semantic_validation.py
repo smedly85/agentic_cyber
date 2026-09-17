@@ -39,6 +39,64 @@ REPO = Path(__file__).resolve().parents[2]
 HISTORICAL = Path(__file__).resolve().parent
 PRIMARY_OPTIONS = ("-stat=false", "-ff-eq-base")
 SENSITIVITY_OPTIONS = ("-stat=false",)
+COREUTILS_LINKER_SCOPES = {
+    "9.7": "coreutils_9_7_linker_scope.json",
+    "8.17-7.fc18": "coreutils_8_17_linker_scope.json",
+    "8.23-9.fc22": "coreutils_8_23_linker_scope.json",
+}
+
+
+def verify_frozen_queries(records: Sequence[Mapping[str, Any]],
+                          observations: Sequence[Mapping[str, Any]] | None = None) -> None:
+    """Records select queries only; this guard never constructs graph edges.
+
+    records.json stores function names, not structured source locations. The
+    companion location ledger preserves the independently verified milestone
+    source mappings; both must agree exactly with the query declarations.
+    """
+    declarations = OBSERVATIONS if observations is None else observations
+    ledger = json.loads((HISTORICAL / "semantic_query_locations.json").read_text())
+    expected = {}
+    for row in ledger["locations"]:
+        expected.setdefault(row["cve"], set()).add((row["source_file"], row["function"]))
+    actual = {}
+    for row in declarations:
+        pair = (row["source_file"], row["function"])
+        values = actual.setdefault(row["cve"], set())
+        if pair in values:
+            raise RuntimeError("duplicate historical semantic query")
+        values.add(pair)
+    if actual != expected or {r["id"] for r in records} != set(expected):
+        raise RuntimeError("historical query/location ledger mismatch")
+    for record in records:
+        if set(record["vulnerable_functions"]) != {f for _, f in expected[record["id"]]}:
+            raise RuntimeError(f"frozen vulnerable-function query mismatch: {record['id']}")
+        for row in declarations:
+            if row["cve"] == record["id"] and (
+                row["project"], row["version"], row["program"]
+            ) != (record["upstream_project"], record["affected_version"], record["utility"]):
+                raise RuntimeError("historical query specimen mismatch")
+
+
+def map_source_identity(result: Mapping[str, Any], source_file: str,
+                        function: str) -> dict[str, Any]:
+    """Expose all matches. LLVM suffix ordering must never resolve ambiguity."""
+    candidates = sorted((dict(row) for row in result.get("functions", [])
+                         if row.get("source_file") == source_file
+                         and row.get("name") == function),
+                        key=lambda row: row["identity"])
+    status = result.get("analysis_status")
+    if status == "success":
+        status = ("source_identity_not_found" if not candidates else
+                  "source_identity_ambiguous" if len(candidates) > 1 else
+                  candidates[0]["semantic_status"])
+    return {
+        "semantic_mapping_status": status,
+        "requested_source_identity": f"{source_file}::{function}",
+        "candidate_count": len(candidates),
+        "candidate_identities": [row["identity"] for row in candidates],
+        "candidates": candidates,
+    }
 
 
 @dataclass(frozen=True)
@@ -341,11 +399,22 @@ def _configured_recipe(
     source_file: str, *, source_root: Path, build_root: Path,
     spec: HistoricalBuildSpec, makefile_text: str | None = None,
     recipe_cache: dict[tuple[str, str], list[str]] | None = None,
+    configured_object_target: str | None = None,
 ) -> tuple[Path, str, list[str], list[str]]:
-    cwd, target = _dependency_target(
-        source_file, source_root=source_root, build_root=build_root, spec=spec,
-        makefile_text=makefile_text,
-    )
+    if configured_object_target is None:
+        cwd, target = _dependency_target(
+            source_file, source_root=source_root, build_root=build_root, spec=spec,
+            makefile_text=makefile_text,
+        )
+    else:
+        # A source may have several configured compile instances (e.g. sort.o
+        # versus the single-binary archive variant). Use the object established
+        # by the native link closure, not the first source-name rule in Makefile.
+        obj = Path(configured_object_target)
+        if obj.is_absolute() or ".." in obj.parts or obj.suffix != ".o":
+            raise RuntimeError("invalid configured scope object target")
+        cwd, target = ((build_root / obj.parent, obj.name) if spec.layout == "recursive"
+                       else (build_root, obj.as_posix()))
     makefile = cwd / "Makefile"
     if not makefile.is_file():
         raise RuntimeError(f"configured Makefile unavailable: {makefile}")
@@ -397,6 +466,7 @@ def _configured_recipe(
 def _clang_command(
     recipe: Sequence[str], *, cwd: Path, output: Path, source_root: Path,
     build_root: Path, clang: str, manifest_source: str,
+    compile_input_override: Path | None = None,
 ) -> tuple[list[str], Path]:
     args: list[str] = []
     skip_next = False
@@ -426,7 +496,7 @@ def _clang_command(
             include = (cwd / token[2:]).resolve()
             token = f"-I{include}"
         args.append(token)
-    compile_input = (source_root / manifest_source).resolve()
+    compile_input = (compile_input_override or (source_root / manifest_source)).resolve()
     if not compile_input.is_file():
         raise RuntimeError(f"configured compile input unavailable: {compile_input}")
     command = [
@@ -442,16 +512,37 @@ def _clang_command(
 
 def build_historical_bitcode(
     manifest_entry: Mapping[str, Any], program: str, output_root: Path,
-    *, inventory: Mapping[str, Any],
+    *, inventory: Mapping[str, Any], scope: Mapping[str, Any] | None = None,
 ) -> BuildResult:
     key = _program_key(manifest_entry, program)
     spec = BUILD_SPECS[key]
     source_root = (HISTORICAL / str(manifest_entry["source_tree"])).resolve()
     build_root = (REPO / spec.build_dir).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
-    source_files = tuple(manifest_entry["programs"][program]["source_files"])
+    if scope is None and key[0] == "gnu-coreutils" and key[1] in COREUTILS_LINKER_SCOPES and program == "sort":
+        exact_path = HISTORICAL / COREUTILS_LINKER_SCOPES[key[1]]
+        if not exact_path.is_file():
+            raise RuntimeError(f"reconstruct {key[1]} linker scope before primary validation")
+        scope = json.loads(exact_path.read_text(encoding="utf-8"))
+        if scope["source_tree_sha256"] != manifest_entry["source_tree_sha256"]:
+            raise RuntimeError("linker scope source fingerprint mismatch")
+    source_files = tuple(scope["source_files"] if scope else manifest_entry["programs"][program]["source_files"])
+    allowed_sources = set(manifest_entry["programs"][program]["source_files"])
+    if key[0] == "gnu-coreutils" and key[1] in COREUTILS_LINKER_SCOPES and program == "sort":
+        allowed_sources.add("generated-config/src/version.c")
+    if not source_files or len(set(source_files)) != len(source_files) or not set(source_files) <= allowed_sources:
+        raise RuntimeError("scope contains duplicate, empty, or unauthenticated source inputs")
+    if scope and scope["source_scope_kind"] not in {"linker_exact", "reconstructed_program_scope", "archive_superset"}:
+        raise RuntimeError("unknown historical source_scope_kind")
+    def source_path(value: str) -> Path:
+        if value.startswith("generated-config/"):
+            return build_root / value.removeprefix("generated-config/")
+        return source_root / value
     configuration = {
-        "source_scope_kind": "frozen_manifest_program_scope",
+        "source_scope_kind": scope["source_scope_kind"] if scope else (
+            "reconstructed_program_scope" if key[1] in ("8.17-7.fc18", "8.23-9.fc22") else "linker_exact"
+        ),
+        "scope_evidence": scope.get("evidence") if scope else "security/historical/source_scope_audit.json",
         "source_file_count": len(source_files),
         "configured_build": spec.build_dir,
         "configure_options": list(spec.configure_options),
@@ -473,7 +564,8 @@ def build_historical_bitcode(
     }
     source_rows = tuple({
         "path": value,
-        "sha256": _sha256(source_root / value),
+        **({"sha256": _sha256(source_path(value))} if source_path(value).is_file()
+           else {"hash_status": "input_not_yet_available"}),
     } for value in source_files)
     tools = inventory.get("tools", {})
     clang = tools.get("clang", {}).get("path")
@@ -507,6 +599,23 @@ def build_historical_bitcode(
         if spec.layout == "nonrecursive" else None
     )
     recipe_cache: dict[tuple[str, str], list[str]] = {}
+    if not spec.prepare_built_sources and any(s.startswith("generated-config/") for s in source_files):
+        # The Fedora builds generate version.c from PACKAGE_VERSION in their
+        # configured Makefile. Do not synthesize it or place it in the source tree.
+        cwd = build_root / "src" if spec.layout == "recursive" else build_root
+        target = "version.c" if spec.layout == "recursive" else "src/version.c"
+        preparation_command = ["make", "-C", str(cwd), "-f", "Makefile",
+                               "-o", "../config.status" if spec.layout == "recursive" else "config.status",
+                               "-o", "Makefile", target,
+                               *(f"{k}={v}" for k, v in spec.make_variables)]
+        prepared = _run(preparation_command)
+        commands.append(_normalize_command(preparation_command, source_root=source_root,
+                                           build_root=build_root, output_root=output_root))
+        if prepared.returncode:
+            return BuildResult("build_or_ir_unavailable", None, source_rows, tuple(commands), (),
+                               ({"stage": "configured_generated_source", "stderr": prepared.stderr},),
+                               None, configuration)
+        configuration["configured_generated_inputs"] = "configured_Makefile_version_c_rule"
     if spec.prepare_built_sources:
         try:
             preparation_command, preparation = _prepare_configured_built_sources(
@@ -540,17 +649,41 @@ def build_historical_bitcode(
                 "build_or_ir_unavailable", None, source_rows, tuple(commands),
                 tuple(bitcode_rows), tuple(diagnostics), None, configuration,
             )
+    # Required generated TUs (e.g. version.c) may not exist until BUILT_SOURCES
+    # has run. Fingerprint the realized input, never an absent-file placeholder.
+    try:
+        source_rows = tuple({"path": value, "sha256": _sha256(source_path(value))}
+                            for value in source_files)
+    except OSError as error:
+        return BuildResult(
+            "build_or_ir_unavailable", None, source_rows, tuple(commands), (),
+            ({"stage": "source_input", "message": str(error)},), None, configuration,
+        )
+    configuration["translation_units"] = []
+    scope_objects = {u["source_file"]: u["configured_object_target"]
+                     for u in (scope or {}).get("translation_units", [])}
+    if scope and "translation_units" in scope and (
+        set(scope_objects) != set(source_files)
+        or len(scope_objects) != len(scope["translation_units"])
+        or len(set(scope_objects.values())) != len(scope_objects)
+    ):
+        raise RuntimeError("scope source/object compile-instance mapping is incomplete or duplicated")
     for index, source_file in enumerate(source_files):
         module = output_root / f"tu-{index:04d}.bc"
         try:
+            generated = source_file.startswith("generated-config/")
             cwd, target, recipe, make_command = _configured_recipe(
-                source_file, source_root=source_root, build_root=build_root, spec=spec,
+                source_file.removeprefix("generated-config/"),
+                source_root=build_root if generated else source_root,
+                build_root=build_root, spec=spec,
                 makefile_text=makefile_text, recipe_cache=recipe_cache,
+                configured_object_target=scope_objects.get(source_file),
             )
             command, compile_input = _clang_command(
                 recipe, cwd=cwd, output=module, source_root=source_root,
                 build_root=build_root, clang=str(clang),
                 manifest_source=source_file,
+                compile_input_override=source_path(source_file) if generated else None,
             )
         except Exception as error:
             diagnostics.append({
@@ -565,6 +698,19 @@ def build_historical_bitcode(
             command, source_root=source_root, build_root=build_root,
             output_root=output_root,
         ))
+        configuration["translation_units"].append({
+            "source_file": source_file,
+            "source_provenance_kind": "configured_build_generated" if generated else "authenticated_historical_tree",
+            "source_sha256": _sha256(compile_input),
+            "configured_object_target": str((cwd / target).relative_to(build_root)),
+            "compile_recipe_provenance": {
+                "kind": "configured_automake_dry_run",
+                "working_directory": str(cwd.relative_to(build_root)),
+                "make_command": list(_normalize_command(make_command, source_root=source_root, build_root=build_root, output_root=output_root)),
+                "configured_compiler_recipe": list(_normalize_command(recipe, source_root=source_root, build_root=build_root, output_root=output_root)),
+                "clang_command": list(commands[-1]),
+            },
+        })
         result = _run(command, cwd=cwd)
         if result.returncode != 0:
             diagnostics.append({
@@ -640,22 +786,11 @@ def _extract_observation(
 ) -> dict[str, Any]:
     identity = f"{observation['source_file']}::{observation['function']}"
 
-    def mapped(result: Mapping[str, Any]) -> dict[str, Any] | None:
-        matches = [
-            row for row in result.get("functions", [])
-            if row.get("source_file") == observation["source_file"]
-            and row.get("name") == observation["function"]
-        ]
-        return matches[0] if len(matches) == 1 else None
-
-    primary_row = mapped(primary)
-    sensitivity_row = mapped(sensitivity)
-    if primary.get("analysis_status") != "success":
-        mapping_status = primary.get("analysis_status")
-    elif primary_row is None:
-        mapping_status = "source_identity_not_found"
-    else:
-        mapping_status = primary_row["semantic_status"]
+    primary_mapping = map_source_identity(primary, observation["source_file"], observation["function"])
+    sensitivity_mapping = map_source_identity(sensitivity, observation["source_file"], observation["function"])
+    primary_row = primary_mapping["candidates"][0] if primary_mapping["candidate_count"] == 1 and primary.get("analysis_status") == "success" else None
+    sensitivity_row = sensitivity_mapping["candidates"][0] if sensitivity_mapping["candidate_count"] == 1 and sensitivity.get("analysis_status") == "success" else None
+    mapping_status = primary_mapping["semantic_mapping_status"]
     path = _path_signature(primary_row)
     direct_count = sum(edge["edge_type"] == "direct" for edge in path or [])
     indirect_count = sum(edge["edge_type"] == "indirect_resolved" for edge in path or [])
@@ -684,6 +819,8 @@ def _extract_observation(
         "llvm_ir_status": "success" if build.linked_bitcode else "build_or_ir_unavailable",
         "svf_analysis_status": primary.get("analysis_status"),
         "semantic_mapping_status": mapping_status,
+        "source_identity_mapping": primary_mapping,
+        "source_scope_kind": (build.configuration or {}).get("source_scope_kind"),
         "semantic_raw_call_depth": new_depth,
         "shortest_semantic_path": (
             primary_row["shortest_call_path"] if primary_row else None
@@ -696,10 +833,8 @@ def _extract_observation(
         "ff_eq_base_sensitivity": {
             "configuration": ["-stat=false"],
             "analysis_status": sensitivity.get("analysis_status"),
-            "semantic_mapping_status": (
-                sensitivity_row["semantic_status"] if sensitivity_row
-                else sensitivity.get("analysis_status")
-            ),
+            "semantic_mapping_status": sensitivity_mapping["semantic_mapping_status"],
+            "source_identity_mapping": sensitivity_mapping,
             "raw_call_depth": (
                 sensitivity_row.get("raw_call_depth") if sensitivity_row else None
             ),
@@ -728,6 +863,7 @@ def _program_summary(
     key = _program_key(entry, program)
     return {
         "program_key": list(key),
+        "source_scope_kind": (build.configuration or {})["source_scope_kind"],
         "source_tree": entry["source_tree"],
         "source_revision": entry["source_revision"],
         "source_tree_sha256": entry["source_tree_sha256"],
@@ -763,9 +899,7 @@ def _program_summary(
 def run_validation(*, helper: Path, build_root: Path) -> dict[str, Any]:
     records = load_records(HISTORICAL / "records.json")
     manifest = load_source_manifest(HISTORICAL / "source_manifest.json")
-    record_ids = {record["id"] for record in records}
-    if {row["cve"] for row in OBSERVATIONS} != record_ids:
-        raise RuntimeError("nine-observation declaration no longer matches frozen records")
+    verify_frozen_queries(records)
     inventory = inventory_toolchain(helper=helper)
     by_key: dict[tuple[str, str, str], Mapping[str, Any]] = {}
     for entry in manifest:
@@ -1032,6 +1166,7 @@ def main() -> int:
         help="refresh aggregates and Markdown without rerunning Clang or SVF",
     )
     args = parser.parse_args()
+    verify_frozen_queries(load_records(HISTORICAL / "records.json"))
     if args.refresh_existing:
         result = refresh_result(json.loads(args.output.read_text(encoding="utf-8")))
     else:
