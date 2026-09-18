@@ -201,5 +201,5 @@ if __name__ == "__main__":
     require(first == render(*data), "nondeterministic rendering")
     output = ROOT / "evidence/v2/progress.md"
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(first)
+    output.write_text(first, encoding="utf-8")
     print("Validated 24-member accounting, schemas, mapping/graph fingerprints, semantic paths/target sets, frozen-v1 integrity, deterministic progress rendering.")

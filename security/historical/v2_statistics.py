@@ -193,7 +193,7 @@ def render(artifact):
     lines += ["", "## Coverage and limitations", "",
               "Every numeric result uses the frozen Clang/LLVM/SVF may-call backend and linker-exact executable scope. Static may-call reachability over-approximates possible runtime calls and does not prove execution. Resolved indirect callsites retain every may-target; unresolved indirect calls and external definitions remain graph-quality diagnostics in the source manifest. Historical compiler/configuration reconstruction and heterogeneous implementation families remain limitations.", "",
               "The fail-closed executable-coverage gate passed: every program explicitly enumerated by authoritative CVE evidence has a measured vulnerable context or an evidence-backed disposition. Executable membership is disclosure-governed; linked but unenumerated aliases such as `dir` and `vdir` are not added to `ls` CVEs.", "",
-              "For CVE-2007-4998, the numeric observation is the actually affected FreeBSD 5.0 `cp` implementation. GNU Fileutils 4.1 `copy_internal=3` is retained only as descriptive defect-class proxy evidence and is excluded from every CVE denominator and statistic.", "",
+              "For CVE-2007-4998, the numeric observation is the selected historically affected FreeBSD 5.0 `cp` implementation. GNU Fileutils 4.1 contains a related weaker overwrite-existing-files form of the defect; its `copy_internal=3` specimen is retained only as descriptive defect-class proxy evidence and is excluded from every CVE denominator and statistic.", "",
               "CVE-2009-4135 is a build-machinery vulnerability and CVE-2008-1946 is a PAM-configuration vulnerability; both remain in the 24-CVE population but have no legitimate runtime C-function depth. No value is imputed. Tree-sitter prototype depths do not enter these statistics. The distribution is reported without choosing a shallow-depth cutoff or inferring that depth causes vulnerability.", "",
               f"Population fingerprint: `{artifact['population_fingerprint']}`. Mapping fingerprint: `{artifact['mapping_artifact_fingerprint']}`. Statistics fingerprint: `{artifact['statistics_artifact_fingerprint']}`. Instrument commit: `{artifact['instrument_commit']}`.", ""]
     return "\n".join(lines)
@@ -207,7 +207,7 @@ def main():
     report = render(artifact)
     if report != render(artifact):
         raise RuntimeError("nondeterministic statistics rendering")
-    (ROOT / "evidence/v2/final-report.md").write_text(report)
+    (ROOT / "evidence/v2/final-report.md").write_text(report, encoding="utf-8")
     gate.update(statistics_reportable=True, statistics_computed=True,
                 statistics_artifact="security/historical/v2_statistics.json",
                 statistics_artifact_fingerprint=artifact["statistics_artifact_fingerprint"])

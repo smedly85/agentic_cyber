@@ -21,7 +21,7 @@ The two non-applicable cases remain population members:
 
 The util-linux and FreeBSD cases retain their actual implementation families. FreeBSD sort is not relabeled GNU Coreutils.
 
-CVE-2005-1039 covers `mkdir`, `mkfifo`, and `mknod` under `-m`. Its four frozen functions are `mkdir::main=0`, `mkdir::make_path=1`, `mkfifo::main=0`, and `mknod::main=0`; `make_path` belongs only to the `mkdir` executable context. CVE-2007-4998 uses the disclosure-demonstrated FreeBSD 5.0 `cp` and independently maps `bin/cp/cp.c::copy=1`. The former GNU Fileutils `copy_internal=3` result is retained only as non-CVE proxy provenance and is excluded from every denominator and statistic.
+CVE-2005-1039 covers `mkdir`, `mkfifo`, and `mknod` under `-m`. Its four frozen functions are `mkdir::main=0`, `mkdir::make_path=1`, `mkfifo::main=0`, and `mknod::main=0`; `make_path` belongs only to the `mkdir` executable context. CVE-2007-4998 uses the disclosure-demonstrated FreeBSD 5.0 `cp` and independently maps `bin/cp/cp.c::copy=1`. GNU Fileutils 4.1 contains a related weaker overwrite-existing-files form of the defect; its `copy_internal=3` result is retained only as non-CVE proxy provenance and is excluded from every denominator and statistic.
 
 ## Reproduction and build provenance
 

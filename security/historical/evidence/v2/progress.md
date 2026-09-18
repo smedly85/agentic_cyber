@@ -2,8 +2,8 @@
 
 Population: exactly 24 CVEs. Completed measurement dispositions: 24/24. No member remains pending.
 
-Population fingerprint: `d6912254ad268ada415e588002c91e47719bd7d5e384f7451b462f488d9b6748`.
-Current frozen mapping artifact fingerprint: `fe1626425904001a7ec43d4b59ecdad37612b1525580e0478ad9a0acb316876e`.
+Population fingerprint: `62745447ca2a53781c18f22d884fd7344a76cccaa46434d212ef3d2e252e1a3b`.
+Current frozen mapping artifact fingerprint: `bdb0d2bed1ea41f55987381b86685a0819dd74ae7caf50d37ddac13def98ecb4`.
 
 Final statistics use the approved (CVE, vulnerable function) unit with within-function averaging across affected executables; see `final-report.md`.
 

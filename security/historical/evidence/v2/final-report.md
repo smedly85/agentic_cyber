@@ -76,8 +76,8 @@ Every numeric result uses the frozen Clang/LLVM/SVF may-call backend and linker-
 
 The fail-closed executable-coverage gate passed: every program explicitly enumerated by authoritative CVE evidence has a measured vulnerable context or an evidence-backed disposition. Executable membership is disclosure-governed; linked but unenumerated aliases such as `dir` and `vdir` are not added to `ls` CVEs.
 
-For CVE-2007-4998, the numeric observation is the actually affected FreeBSD 5.0 `cp` implementation. GNU Fileutils 4.1 `copy_internal=3` is retained only as descriptive defect-class proxy evidence and is excluded from every CVE denominator and statistic.
+For CVE-2007-4998, the numeric observation is the selected historically affected FreeBSD 5.0 `cp` implementation. GNU Fileutils 4.1 contains a related weaker overwrite-existing-files form of the defect; its `copy_internal=3` specimen is retained only as descriptive defect-class proxy evidence and is excluded from every CVE denominator and statistic.
 
 CVE-2009-4135 is a build-machinery vulnerability and CVE-2008-1946 is a PAM-configuration vulnerability; both remain in the 24-CVE population but have no legitimate runtime C-function depth. No value is imputed. Tree-sitter prototype depths do not enter these statistics. The distribution is reported without choosing a shallow-depth cutoff or inferring that depth causes vulnerability.
 
-Population fingerprint: `d6912254ad268ada415e588002c91e47719bd7d5e384f7451b462f488d9b6748`. Mapping fingerprint: `fe1626425904001a7ec43d4b59ecdad37612b1525580e0478ad9a0acb316876e`. Statistics fingerprint: `73cca07b3c5f7ef35576eb966b9eb37a7dba1011f28150d87090799f645df369`. Instrument commit: `e73c3a98ea3b4f5b8957674b9a05d182ced4558b`.
+Population fingerprint: `62745447ca2a53781c18f22d884fd7344a76cccaa46434d212ef3d2e252e1a3b`. Mapping fingerprint: `bdb0d2bed1ea41f55987381b86685a0819dd74ae7caf50d37ddac13def98ecb4`. Statistics fingerprint: `840734ea19aca43900d885b74e0485e7b83a2f56409eebe542f2eb935b98ff05`. Instrument commit: `e73c3a98ea3b4f5b8957674b9a05d182ced4558b`.

@@ -10,6 +10,21 @@ from security.historical.v2_study import ROOT, fingerprint, read, write
 from security.historical import semantic_validation as v
 
 
+PRIOR_4998_REVIEW_REASON = (
+    "The package ledger includes the cp symlink-preservation vulnerability; cp is not a target utility.")
+CURRENT_4998_CORRECTION_RATIONALE = (
+    "The study selects the disclosure-demonstrated FreeBSD 5.0 implementation for the single "
+    "CVE-2007-4998 measurement. GNU Fileutils 4.1 predates the later destination-history guard "
+    "and contains a related weaker overwrite-existing-files form of the defect, but is retained "
+    "only as descriptive defect-class proxy evidence and is excluded from every CVE denominator "
+    "and statistic.")
+PROXY_4998_REASON = (
+    "GNU Fileutils 4.1 contains a related weaker overwrite-existing-files form of the defect. "
+    "The study uses FreeBSD 5.0 as the single selected historically affected implementation for "
+    "CVE-2007-4998; the GNU specimen is descriptive defect-class proxy evidence only and does not "
+    "enter any CVE denominator or statistic.")
+
+
 def sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -41,8 +56,7 @@ def freeze():
     pop_4998.update(affected_project_package="FreeBSD base system and other affected cp implementations",
                     implementation_family="FreeBSD base-system cp",
                     gnu_lineage_relationship="non_gnu_affected_implementation_in_fixed_population")
-    pop_4998["prior_review_provenance"]["reason"] = (
-        "Corrected by independent primary-evidence audit: the vendor disclosure demonstrates FreeBSD 5.0/6.1 and other implementations as affected, while GNU cp had been protected since Fileutils 4.1.2.")
+    pop_4998["prior_review_provenance"]["reason"] = PRIOR_4998_REVIEW_REASON
     population["population_fingerprint"] = fingerprint({k: value for k, value in population.items()
                                                           if k != "population_fingerprint"})
     population_fp = population["population_fingerprint"]
@@ -80,6 +94,7 @@ def freeze():
              "sha256": sha(ROOT / "v2_freebsd_cp_acquisition.json")}],
         "mapping_reason": (
             "The vendor disclosure gives an executable FreeBSD 5.0 reproducer: under cp -R, a first source symlink and later regular source with the same basename are copied to one destination. Independently reading the pinned release source identifies bin/cp/cp.c::copy as the vulnerable orchestration point: it reuses the destination pathname across source roots, follows the just-created destination link with stat, and dispatches the later regular source without rejecting a destination created earlier in the invocation. copy_link implements the requested preservation operation; copy_file performs ordinary single-destination open/truncate behavior and is reached only after copy has lost the security-relevant destination history, so neither is promoted as a separate vulnerable function."),
+        "correction_rationale": CURRENT_4998_CORRECTION_RATIONALE,
         "specimen_selection_reason": (
             "The disclosure explicitly demonstrates FreeBSD 5.0 as affected. The source is pinned by the annotated release/5.0.0 tag and Git blob identities; selection was completed before semantic depth measurement."),
         "nearby_function_exclusions": [
@@ -92,7 +107,7 @@ def freeze():
             "excluded_from": ["verified_CVE_function_observations", "numeric_CVE_denominator",
                               "primary_function_statistics", "CVE_weighted_statistics",
                               "executable_context_sensitivity_statistics"],
-            "reason": "The primary disclosure says GNU cp had been protected since Fileutils 4.1.2; this historical GNU location is not a CVE-2007-4998 measurement."}}
+            "reason": PROXY_4998_REASON}}
 
     old_1039 = by_mapping["CVE-2005-1039"]
     source_1039 = ROOT / "sources/coreutils-5.2.1"
@@ -204,7 +219,66 @@ def finalize():
     write("v2_semantic_results.json", results)
 
 
+def refresh_provenance():
+    """Refresh descriptive provenance and dependent hashes without touching science."""
+    population = read("v2_population.json")
+    mappings = read("v2_vulnerable_function_mappings.json")
+    results = read("v2_semantic_results.json")
+    manifest = read("v2_source_manifest.json")
+    protocol = read("v2_protocol.json")
+    statistics = read("v2_statistics.json")
+    gate = read("v2_reporting_gate.json")
+    integrity = read("v2_source_integrity.json")
+    checks = read("v2_validation_checks.json")
+
+    population_4998 = next(row for row in population["members"] if row["cve_id"] == "CVE-2007-4998")
+    population_4998["prior_review_provenance"]["reason"] = PRIOR_4998_REVIEW_REASON
+    population.pop("population_fingerprint", None)
+    population["population_fingerprint"] = fingerprint(population)
+
+    mapping_4998 = next(row for row in mappings["members"] if row["cve_id"] == "CVE-2007-4998")
+    mapping_4998["correction_rationale"] = CURRENT_4998_CORRECTION_RATIONALE
+    mapping_4998["non_cve_proxy_evidence"]["reason"] = PROXY_4998_REASON
+    mapping_4998.pop("mapping_fingerprint", None)
+    mapping_4998["mapping_fingerprint"] = fingerprint(mapping_4998)
+    mappings["population_fingerprint"] = population["population_fingerprint"]
+    mappings.pop("mapping_artifact_fingerprint", None)
+    mappings["mapping_artifact_fingerprint"] = fingerprint(mappings)
+
+    results["population_fingerprint"] = population["population_fingerprint"]
+    result_4998 = next(row for row in results["members"] if row["cve_id"] == "CVE-2007-4998")
+    result_4998["mapping_fingerprint"] = mapping_4998["mapping_fingerprint"]
+    manifest["population_fingerprint"] = population["population_fingerprint"]
+    protocol["population_fingerprint"] = population["population_fingerprint"]
+
+    statistics["population_fingerprint"] = population["population_fingerprint"]
+    statistics["mapping_artifact_fingerprint"] = mappings["mapping_artifact_fingerprint"]
+    statistics.pop("statistics_artifact_fingerprint", None)
+    statistics["statistics_artifact_fingerprint"] = fingerprint(statistics)
+    gate["population_fingerprint"] = population["population_fingerprint"]
+    gate["mapping_artifact_fingerprint"] = mappings["mapping_artifact_fingerprint"]
+    gate["statistics_artifact_fingerprint"] = statistics["statistics_artifact_fingerprint"]
+    integrity["population_fingerprint"] = population["population_fingerprint"]
+    integrity["mapping_artifact_fingerprint"] = mappings["mapping_artifact_fingerprint"]
+    checks["population_fingerprint"] = population["population_fingerprint"]
+    checks["mapping_artifact_fingerprint"] = mappings["mapping_artifact_fingerprint"]
+    checks["statistics_artifact_fingerprint"] = statistics["statistics_artifact_fingerprint"]
+
+    write("v2_population.json", population)
+    write("v2_vulnerable_function_mappings.json", mappings)
+    write("v2_semantic_results.json", results)
+    write("v2_source_manifest.json", manifest)
+    write("v2_protocol.json", protocol)
+    write("v2_statistics.json", statistics)
+    write("v2_reporting_gate.json", gate)
+    write("v2_source_integrity.json", integrity)
+    write("v2_validation_checks.json", checks)
+    print("population fingerprint:", population["population_fingerprint"])
+    print("mapping fingerprint:", mappings["mapping_artifact_fingerprint"])
+    print("statistics fingerprint:", statistics["statistics_artifact_fingerprint"])
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("stage", choices=("freeze", "finalize"))
+    parser.add_argument("stage", choices=("freeze", "finalize", "refresh_provenance"))
     globals()[parser.parse_args().stage]()
