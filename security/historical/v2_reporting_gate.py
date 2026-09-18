@@ -1,6 +1,6 @@
 """Enforce the approved statistical unit and complete-disposition gate."""
 from collections import defaultdict
-from security.historical.v2_study import read, write, IDS
+from security.historical.v2_study import ROOT, read, write, IDS
 
 
 def assess(population, mappings, results):
@@ -21,6 +21,17 @@ def assess(population, mappings, results):
                                "executable_specific_depths": [{"specimen_id": v["specimen_id"], "raw_call_depth": v["raw_call_depth"]}
                                                               for v in sorted(values, key=lambda v: v["specimen_id"])]})
     pending = [r["cve_id"] for r in results["members"] if not r["completed"]]
+    coverage_pending = [{"cve_id": row["cve_id"], "executable": item["executable"]}
+                        for row in results["members"] for item in row.get("executable_coverage", [])
+                        if item["status"] == "pending"]
+    coverage_complete = not coverage_pending
+    numeric_context_count = sum(obs["raw_call_depth"] is not None
+                                for row in results["members"] for obs in row["observations"])
+    numeric_group_count = sum(any(obs["raw_call_depth"] is not None for obs in values)
+                              for values in groups.values())
+    unavailable = sum(row["depth_applicability"] == "applicable_in_principle" or
+                      row["disposition"] == "affected_specimen_unavailable" for row in results["members"])
+    reportable = not pending and coverage_complete
     return {"schema_version": 1, "population_fingerprint": population["population_fingerprint"],
             "mapping_artifact_fingerprint": mappings["mapping_artifact_fingerprint"],
             "population_count": 24, "completed_disposition_count": 24 - len(pending),
@@ -28,16 +39,21 @@ def assess(population, mappings, results):
             "depth_applicable_cve_count": sum(r["depth_applicability"] == "applicable" for r in results["members"]),
             "numeric_cve_count": sum(any(o["raw_call_depth"] is not None for o in r["observations"]) for r in results["members"]),
             "not_applicable_cve_count": sum(r["depth_applicability"] == "not_applicable" for r in results["members"]),
+            "measurement_unavailable_cve_count": unavailable,
             "verified_cve_function_count": sum(len(m["functions"]) for m in mappings["members"]),
-            "numeric_executable_function_measurement_count": sum(o["raw_call_depth"] is not None for values in groups.values() for o in values),
-            "cve_function_groups_with_numeric_measurements": sum(any(o["raw_call_depth"] is not None for o in values) for values in groups.values()),
+            "numeric_executable_function_measurement_count": numeric_context_count,
+            "cve_function_groups_with_numeric_measurements": numeric_group_count,
             "multiple_executable_function_groups": collisions,
+            "dependent_call_depth_locations": read("v2_protocol.json")["dependence_disclosure"],
             "approved_primary_observation_unit": "CVE_vulnerable_function",
             "approved_multi_executable_rule": "arithmetic_mean_within_CVE_vulnerable_function",
-            "sensitivity_context_count": sum(len(values) for values in groups.values()),
+            "sensitivity_context_count": numeric_context_count,
             "sensitivity_contexts_are_independent_observations": False,
-            "statistics_reportable": not pending,
-            "gate_reason": "Passed: all 24 dispositions complete; approved function-level averaging rule preserves raw contexts and treats the 28-context analysis only as sensitivity." if not pending else "Pending member dispositions",
+            "executable_coverage_gate_passed": coverage_complete,
+            "pending_executable_coverage": coverage_pending,
+            "statistics_reportable": reportable,
+            "gate_reason": (f"Passed: all 24 dispositions and enumerated-executable coverage are complete; the approved function-level averaging rule preserves {numeric_context_count} raw contexts as sensitivity only."
+                            if reportable else "Pending member dispositions or enumerated-executable coverage"),
             "statistics_computed": False}
 
 

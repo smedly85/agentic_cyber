@@ -6,7 +6,9 @@ import statistics
 from pathlib import Path
 import subprocess
 import jsonschema
-from security.historical.v2_study import ROOT, IDS, INSTRUMENT, read, fingerprint, validate_population
+from security.historical.v2_study import (ROOT, IDS, INSTRUMENT, read, fingerprint,
+                                          validate_population, function_executables,
+                                          expected_executable_function_pairs)
 from security.historical import semantic_validation as v
 from security.historical.v2_seed import graph_quality
 
@@ -33,6 +35,7 @@ def validate():
         require(ledger["population_fingerprint"] == population["population_fingerprint"], "population fingerprint mismatch")
         require(ledger["instrument_commit"] == INSTRUMENT, "instrument mismatch")
     graphs = {}
+    specimens = {specimen["specimen_id"]: specimen for specimen in manifest["specimens"]}
     for specimen in manifest["specimens"]:
         graph_path = v.REPO / specimen["retained_graph_path"]
         require(v._sha256(graph_path) == specimen["retained_graph_sha256"], "retained graph changed")
@@ -49,16 +52,36 @@ def validate():
             require(set(scope["source_files"]) == {s["path"] for s in graph["source_files"]}, "LLVM scope differs from linked scope")
         graphs[specimen["specimen_id"]] = graph
     by_cve = {m["cve_id"]: m for m in mappings["members"]}
+    for mapping in mappings["members"]:
+        require((mapping.get("mapping_reason") or "").strip(), "missing self-contained mapping rationale: " + mapping["cve_id"])
+        programs = mapping.get("programs", [])
+        expected = mapping.get("expected_affected_executables", [])
+        if programs:
+            require(expected and len(expected) == len(set(expected)), "missing/duplicate frozen executable set: " + mapping["cve_id"])
+            require(set(expected) == set(programs), "program list differs from authoritative executable set: " + mapping["cve_id"])
+            associated = {program for function in mapping["functions"] for program in function_executables(mapping, function)}
+            require(associated == set(expected), "vulnerable functions do not cover frozen executable set: " + mapping["cve_id"])
+        else:
+            require(not expected, "non-runtime mapping unexpectedly enumerates executables: " + mapping["cve_id"])
+        if mapping.get("mapping_status") == "verified_pilot_reuse":
+            require("authoritative_sources" not in mapping, "reused-v1 evidence still mixes bare URLs with field names")
+            require(all(set(item) >= {"role", "url"} for item in mapping.get("authoritative_evidence", [])),
+                    "reused-v1 authoritative evidence is not machine-readable")
     for row in results["members"]:
         mapping = by_cve[row["cve_id"]]
         require(mapping["mapping_fingerprint"] == fingerprint({k: val for k, val in mapping.items() if k != "mapping_fingerprint"}), "member mapping fingerprint mismatch")
         require(row["mapping_fingerprint"] == mapping["mapping_fingerprint"], "result queried a different mapping")
         for obs in row["observations"]:
             require(obs["source_identity"] in {f["source_identity"] for f in mapping["functions"]}, "depth query outside frozen mapping")
+            program = obs["specimen_id"].rsplit("/", 1)[-1]
+            function = next(f for f in mapping["functions"] if f["source_identity"] == obs["source_identity"])
+            require(program in function_executables(mapping, function), "observation uses a non-CVE-enumerated executable context")
             graph = graphs[obs["specimen_id"]]
             file, name = obs["source_identity"].split("::")
             require(obs["mapping"] == v.map_source_identity(graph, file, name), "source-identity mapping changed")
             if obs["raw_call_depth"] is not None:
+                require(obs["source_scope_kind"] == "linker_exact" and specimens[obs["specimen_id"]]["source_scope_kind"] == "linker_exact",
+                        "numeric observation is not linker-exact")
                 require(obs["mapping"]["candidate_count"] == 1, "numeric result from ambiguous or absent identity")
                 candidate = obs["mapping"]["candidates"][0]
                 require(candidate["raw_call_depth"] == obs["raw_call_depth"], "numeric depth mismatch")
@@ -69,12 +92,50 @@ def validate():
                     require(edge in graph["call_edges"], "synthetic or altered path edge")
                     if edge["edge_type"] == "indirect_resolved":
                         require(edge["indirect_target_count"] == len(edge["indirect_target_set"]), "incomplete indirect target set")
+        expected_executables = set(mapping.get("expected_affected_executables", []))
+        coverage = row.get("executable_coverage")
+        require(isinstance(coverage, list), "missing executable-coverage disposition: " + row["cve_id"])
+        require({item["executable"] for item in coverage} == expected_executables and
+                len(coverage) == len(expected_executables), "executable-coverage set mismatch: " + row["cve_id"])
+        observed_pairs = {(obs["specimen_id"].rsplit("/", 1)[-1], obs["source_identity"])
+                          for obs in row["observations"] if obs["raw_call_depth"] is not None}
+        for item in coverage:
+            identities = {function["source_identity"] for function in mapping["functions"]
+                          if item["executable"] in function_executables(mapping, function)}
+            require(set(item["required_source_identities"]) == identities,
+                    "coverage/function association mismatch: " + row["cve_id"] + "/" + item["executable"])
+            if item["status"] == "measured_vulnerable_context":
+                require(identities and all((item["executable"], identity) in observed_pairs for identity in identities),
+                        "coverage claims an unmeasured executable: " + row["cve_id"] + "/" + item["executable"])
+            elif item["status"] == "evidence_backed_exclusion":
+                require(item.get("reason", "").strip() and item.get("evidence"),
+                        "executable exclusion lacks reason/evidence: " + row["cve_id"] + "/" + item["executable"])
+            else:
+                require(item["status"] == "pending" and not row["completed"],
+                        "completed result has pending/unknown executable coverage: " + row["cve_id"])
         require(not row["completed"] or row["disposition"] != "pending", "unfinished work mislabeled completed")
         if row["completed"] and row["disposition"] == "depth_applicable":
             require({o["source_identity"] for o in row["observations"]} == {f["source_identity"] for f in mapping["functions"]}, "completed result omits verified vulnerable functions")
             require(len({(o["specimen_id"], o["source_identity"]) for o in row["observations"]}) == len(row["observations"]), "duplicate executable/function measurement")
+            require(observed_pairs == expected_executable_function_pairs(mapping), "completed result omits or adds executable/function contexts")
         require(row["reason"].strip(), "missing disposition justification")
-    frozen = ["records.json", "cve_census.json", "source_manifest.json", "v2_population_reconnaissance.json"]
+    require({item["executable"] for item in next(r for r in results["members"] if r["cve_id"] == "CVE-2005-1039")["executable_coverage"]} == {"mkdir", "mkfifo", "mknod"}, "CVE-2005-1039 executable set regressed")
+    for cve, expected in (("CVE-2014-9471", {"date", "touch"}), ("CVE-2017-18018", {"chown", "chgrp"}),
+                          ("CVE-2002-0435", {"rm", "mv"})):
+        require(set(by_cve[cve]["expected_affected_executables"]) == expected, cve + " executable set regressed")
+    for cve in ("CVE-2003-0853", "CVE-2003-0854"):
+        require(set(by_cve[cve]["expected_affected_executables"]) == {"ls"}, cve + " must not infer dir/vdir membership")
+    proxy = by_cve["CVE-2007-4998"].get("non_cve_proxy_evidence", {})
+    require(proxy.get("semantic_depth") == 3 and proxy.get("status") == "descriptive_defect_class_proxy_only",
+            "GNU Fileutils proxy provenance missing")
+    require(not any(obs["specimen_id"] == proxy.get("specimen_id")
+                    for row in results["members"] for obs in row["observations"]), "GNU proxy counted as a CVE observation")
+    proxy_specimen = specimens[proxy["specimen_id"]]
+    require(proxy_specimen.get("evidence_role") == "non_CVE_proxy_only" and
+            proxy_specimen.get("excluded_from_CVE_2007_4998_statistics") is True, "GNU proxy manifest exclusion missing")
+    frozen = ["records.json", "cve_census.json", "source_manifest.json", "semantic_query_locations.json",
+              "semantic_scope_validation.json", "semantic_validation.json", "semantic_validation_pending.json",
+              "source_scope_audit.json", "v2_population_reconnaissance.json"]
     for name in frozen:
         original = subprocess.run(["git", "show", INSTRUMENT + ":security/historical/" + name], cwd=v.REPO, capture_output=True, check=True).stdout
         require(original == (ROOT / name).read_bytes(), "frozen historical artifact changed: " + name)
@@ -88,14 +149,14 @@ def validate():
                     for row in results["members"] for obs in row["observations"] if obs["raw_call_depth"] is not None}
         retained = {(row["cve_id"], row["source_identity"], row["specimen_id"]): row["raw_semantic_depth"]
                     for row in statistics_artifact["executable_context_sensitivity"]["contexts"]}
-        require(contexts == retained and len(contexts) == 28, "statistics lost or altered raw executable contexts")
+        require(contexts == retained, "statistics lost or altered raw executable contexts")
         grouped = {}
         for (cve, identity, _), depth in contexts.items():
             grouped.setdefault((cve, identity), []).append(depth)
         primary = {(row["cve_id"], row["source_identity"]): row["function_level_depth"]
                    for row in statistics_artifact["primary_function_observations"]}
         expected_primary = {key: statistics.fmean(depths) for key, depths in grouped.items()}
-        require(primary == expected_primary and len(primary) == 25, "primary observation averaging rule mismatch")
+        require(primary == expected_primary, "primary observation averaging rule mismatch")
         values = statistics_artifact["primary_function_observation_statistics"]["values"]
         require(values == sorted(expected_primary.values()), "primary depth list mismatch")
         require(math.isclose(statistics_artifact["primary_function_observation_statistics"]["mean"], statistics.fmean(expected_primary.values())), "primary mean mismatch")

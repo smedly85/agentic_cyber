@@ -92,29 +92,50 @@ def build_statistics(population, mappings, results):
                         "scope_kinds": scopes,
                         "analysis_status": result.get("analysis_status", result["disposition"]),
                         "disposition": result["disposition"], "reason": result["reason"]})
-    if len(primary_observations) != 25 or len(context_observations) != 28 or len(numeric_cve_means) != 22:
-        raise RuntimeError("unexpected v2 statistical denominators")
+    expected_numeric_groups = sum(
+        any(observation["source_identity"] == function["source_identity"] and
+            observation["raw_call_depth"] is not None for observation in result["observations"])
+        for result in results["members"] for function in by_mapping[result["cve_id"]]["functions"])
+    if len(primary_observations) != expected_numeric_groups:
+        raise RuntimeError("primary denominator was not derived from numeric (CVE,function) groups")
+    numeric_cve_count = sum(any(observation["raw_call_depth"] is not None
+                                for observation in result["observations"])
+                            for result in results["members"])
+    if len(numeric_cve_means) != numeric_cve_count:
+        raise RuntimeError("CVE-weighted denominator was not derived from numeric CVEs")
+    verified_function_count = sum(len(mapping["functions"]) for mapping in mappings["members"])
+    unavailable_count = sum(result["depth_applicability"] == "applicable_in_principle" or
+                            result["disposition"] == "affected_specimen_unavailable" for result in results["members"])
+    not_applicable_count = sum(result["depth_applicability"] == "not_applicable" for result in results["members"])
+    depth_applicable_count = sum(result["depth_applicability"] == "applicable" for result in results["members"])
     artifact = {"schema_version": 1, "population_fingerprint": population["population_fingerprint"],
                 "mapping_artifact_fingerprint": mappings["mapping_artifact_fingerprint"],
                 "instrument_commit": INSTRUMENT,
                 "observation_rule": {"primary_unit": "CVE_vulnerable_function",
                     "shared_function_rule": "arithmetic_mean_of_executable_specific_semantic_depths",
                     "raw_contexts_preserved": True,
-                    "sensitivity_contexts_are_independent_vulnerability_observations": False},
-                "population_accounting": {"population_cves": 24, "depth_applicable_cves": 22,
-                    "cves_with_numeric_semantic_depth": 22, "non_depth_applicable_cves": 2,
-                    "unavailable_or_unresolved_cves": 0, "all_final_dispositions": True,
-                    "verified_vulnerable_function_observations": 25,
-                    "numeric_vulnerable_function_observations": 25,
-                    "nonnumeric_vulnerable_function_observations": 0},
+                    "sensitivity_contexts_are_independent_vulnerability_observations": False,
+                    "executable_coverage_gate_passed": gate["executable_coverage_gate_passed"]},
+                "population_accounting": {"population_cves": len(results["members"]),
+                    "depth_applicable_cves": depth_applicable_count,
+                    "cves_with_numeric_semantic_depth": numeric_cve_count,
+                    "non_depth_applicable_cves": not_applicable_count,
+                    "measurement_unavailable_cves": unavailable_count,
+                    "unavailable_or_unresolved_cves": unavailable_count, "all_final_dispositions": True,
+                    "verified_vulnerable_function_observations": verified_function_count,
+                    "numeric_vulnerable_function_observations": len(primary_observations),
+                    "nonnumeric_vulnerable_function_observations": verified_function_count - len(primary_observations),
+                    "raw_executable_contexts": len(context_observations)},
                 "primary_function_observations": primary_observations,
                 "primary_function_observation_statistics": summary([row["function_level_depth"] for row in primary_observations]),
                 "cve_weighted_statistics": summary(numeric_cve_means),
-                "executable_context_sensitivity": {"context_count": 28,
+                "executable_context_sensitivity": {"context_count": len(context_observations),
                     "independent_vulnerability_observations": False,
-                    "interpretation": "Descriptive sensitivity only; three CVE/function groups contribute multiple dependent executable contexts.",
+                    "interpretation": f"Descriptive sensitivity only; {len(gate['multiple_executable_function_groups'])} CVE/function groups contribute multiple dependent executable contexts.",
                     "contexts": context_observations,
                     "statistics": summary([row["raw_semantic_depth"] for row in context_observations])},
+                "dependence_disclosure": read("v2_protocol.json")["dependence_disclosure"],
+                "dependence_interpretation": read("v2_protocol.json")["dependence_interpretation"],
                 "per_cve": per_cve,
                 "statistical_conventions": read("v2_protocol.json")["statistics_conventions"]}
     artifact["statistics_artifact_fingerprint"] = fingerprint(artifact)
@@ -140,17 +161,17 @@ def render(artifact):
     sensitivity = artifact["executable_context_sensitivity"]["statistics"]
     lines = ["# Historical population v2 semantic call-depth report", "",
              "## Population accounting", "",
-             f"Population CVEs: **{accounting['population_cves']}**. Depth-applicable: **{accounting['depth_applicable_cves']}**; with at least one numeric semantic depth: **{accounting['cves_with_numeric_semantic_depth']}**; non-depth-applicable: **{accounting['non_depth_applicable_cves']}**; unavailable/unresolved: **{accounting['unavailable_or_unresolved_cves']}**.", "",
-             f"Verified vulnerable-function observations: **{accounting['verified_vulnerable_function_observations']}**; numeric: **{accounting['numeric_vulnerable_function_observations']}**; nonnumeric: **{accounting['nonnumeric_vulnerable_function_observations']}**.", "",
-             "The primary unit is `(CVE, vulnerable function)`. When the same vulnerable function is shared by multiple affected executables, its primary depth is the arithmetic mean of the preserved executable-specific semantic depths. The 28-context analysis below is sensitivity only and does not treat those contexts as independent vulnerabilities.", "",
+             f"Population CVEs: **{accounting['population_cves']}**. Depth-applicable: **{accounting['depth_applicable_cves']}**; with at least one numeric semantic depth: **{accounting['cves_with_numeric_semantic_depth']}**; non-depth-applicable: **{accounting['non_depth_applicable_cves']}**; applicable in principle but measurement-unavailable: **{accounting['measurement_unavailable_cves']}**.", "",
+             f"Verified `(CVE,function)` observations: **{accounting['verified_vulnerable_function_observations']}**; numeric: **{accounting['numeric_vulnerable_function_observations']}**; nonnumeric: **{accounting['nonnumeric_vulnerable_function_observations']}**. Raw executable contexts: **{accounting['raw_executable_contexts']}**.", "",
+             f"The primary unit is `(CVE, vulnerable function)`. When the same vulnerable function is shared by multiple affected executables, its primary depth is the arithmetic mean of the preserved executable-specific semantic depths. The {accounting['raw_executable_contexts']}-context analysis below is sensitivity only and does not treat those contexts as independent vulnerabilities.", "",
              "## Function-observation statistics", "", format_summary(primary), "",
              "Exact-depth histogram: " + ", ".join(f"depth {depth}: {count}" for depth, count in primary["exact_depth_histogram"].items()) + ".", "",
              "Complete primary depth list (sorted): `" + ", ".join(number(value) for value in primary["values"]) + "`.", "",
              "## CVE-weighted statistics", "",
-             "For each of the 22 CVEs with numeric depths, vulnerable-function depths were averaged within that CVE; the following describes those 22 per-CVE means.", "", format_summary(weighted), "",
+             f"For each of the {accounting['cves_with_numeric_semantic_depth']} CVEs with numeric depths, vulnerable-function depths were averaged within that CVE; the following describes those {accounting['cves_with_numeric_semantic_depth']} per-CVE means.", "", format_summary(weighted), "",
              "Per-CVE mean-depth list (sorted): `" + ", ".join(number(value) for value in weighted["values"]) + "`.", "",
              "## Executable-context sensitivity analysis", "",
-             "This descriptive analysis retains all 28 raw executable contexts. Three vulnerable functions occur in multiple executables, so these 28 values are dependent contexts—not 28 independent vulnerability observations.", "", format_summary(sensitivity), "",
+             f"This descriptive analysis retains all {accounting['raw_executable_contexts']} raw executable contexts. {artifact['executable_context_sensitivity']['interpretation']} These values are dependent contexts—not independent vulnerability observations.", "", format_summary(sensitivity), "",
              "Context-depth histogram: " + ", ".join(f"depth {depth}: {count}" for depth, count in sensitivity["exact_depth_histogram"].items()) + ".", "",
              "Complete context-depth list (sorted): `" + ", ".join(number(value) for value in sensitivity["values"]) + "`.", "",
              "## Complete 24-CVE accounting", "",
@@ -165,8 +186,14 @@ def render(artifact):
             row["depth_applicability"], str(row["verified_vulnerable_function_count"]), str(row["numeric_vulnerable_function_count"]),
             "; ".join(values) or "—", "/".join(number(row[key]) for key in ("per_cve_mean_depth", "per_cve_minimum_depth", "per_cve_maximum_depth")),
             ", ".join(row["scope_kinds"]) or "not applicable", row["disposition"] + ": " + row["reason"]]) + " |")
+    lines += ["", "## Dependence disclosure", "",
+              "Distinct CVEs may legitimately contribute the same function/depth under the chosen `(CVE,function)` estimand. They remain distinct vulnerability IDs/defects, but are not independent call-depth locations.", ""]
+    for item in artifact["dependence_disclosure"]:
+        lines.append(f"- `{item['specimen']}::{item['source_identity']}` at depth {item['depth']} is counted for " + ", ".join(item["counted_for"]) + ".")
     lines += ["", "## Coverage and limitations", "",
               "Every numeric result uses the frozen Clang/LLVM/SVF may-call backend and linker-exact executable scope. Static may-call reachability over-approximates possible runtime calls and does not prove execution. Resolved indirect callsites retain every may-target; unresolved indirect calls and external definitions remain graph-quality diagnostics in the source manifest. Historical compiler/configuration reconstruction and heterogeneous implementation families remain limitations.", "",
+              "The fail-closed executable-coverage gate passed: every program explicitly enumerated by authoritative CVE evidence has a measured vulnerable context or an evidence-backed disposition. Executable membership is disclosure-governed; linked but unenumerated aliases such as `dir` and `vdir` are not added to `ls` CVEs.", "",
+              "For CVE-2007-4998, the numeric observation is the actually affected FreeBSD 5.0 `cp` implementation. GNU Fileutils 4.1 `copy_internal=3` is retained only as descriptive defect-class proxy evidence and is excluded from every CVE denominator and statistic.", "",
               "CVE-2009-4135 is a build-machinery vulnerability and CVE-2008-1946 is a PAM-configuration vulnerability; both remain in the 24-CVE population but have no legitimate runtime C-function depth. No value is imputed. Tree-sitter prototype depths do not enter these statistics. The distribution is reported without choosing a shallow-depth cutoff or inferring that depth causes vulnerability.", "",
               f"Population fingerprint: `{artifact['population_fingerprint']}`. Mapping fingerprint: `{artifact['mapping_artifact_fingerprint']}`. Statistics fingerprint: `{artifact['statistics_artifact_fingerprint']}`. Instrument commit: `{artifact['instrument_commit']}`.", ""]
     return "\n".join(lines)

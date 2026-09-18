@@ -12,7 +12,9 @@ from pathlib import Path
 
 from security.historical import semantic_validation as v
 from security.historical.analysis import verify_source_tree_sha256
-from security.historical.v2_study import ROOT, read, write, fingerprint, validate_population, ledger_transaction
+from security.historical.v2_study import (ROOT, read, write, fingerprint,
+    validate_population, ledger_transaction, function_executables,
+    expected_executable_function_pairs)
 from security.historical.v2_seed import graph_quality
 from security.semantic_callgraph import BuildResult, inventory_toolchain, analyze_build, stable_json
 
@@ -246,20 +248,37 @@ def run(program, release=None, configured_build=None):
         slug = "fedora-8.17-" + program
         specimen_id = "gnu-coreutils/8.17-7.fc18/" + program
     else:
-        selected = [m for m in mappings["members"] if m.get("affected_version") == release and program in m.get("programs", [])]
+        selected = [m for m in mappings["members"]
+                    if (m.get("affected_version") == release
+                        or m.get("source_tree", "").rstrip("/").endswith("/" + release))
+                    and program in m.get("programs", [])]
         native = v.REPO / (configured_build or ("build/historical-v2/native/" + release))
-        if not native.resolve().is_relative_to((v.REPO / "build/historical-v2/native").resolve()):
-            raise RuntimeError("configured v2 build directory outside isolated native-build root")
-        configured = json.loads((native / "v2-configure-status.json").read_text())
-        if configured["returncode"]:
-            raise RuntimeError("release configure unsuccessful; preserve diagnostics for review")
-        spec = v.HistoricalBuildSpec(native.relative_to(v.REPO).as_posix(),
-                                     "recursive" if (native / "src/Makefile").exists() else "nonrecursive",
-                                     tuple(configured["configure_options"]), configured["configured_cc"],
-                                     ((("CPPFLAGS", "-D_IO_ftrylockfile=1 -D_IO_IN_BACKUP=0x100"),) if release in ("coreutils-8.22", "coreutils-8.25", "coreutils-8.29") else ())
-                                     + ((("CFLAGS", "-g -O2 -Wno-error=implicit-function-declaration -Wno-error=incompatible-pointer-types -Wno-error=int-conversion"),) if release == "coreutils-8.25" else ()))
-        slug = release + "-" + program
-        specimen_id = release + "/" + program
+        allowed_roots = ((v.REPO / "build/historical-v2/native").resolve(),
+                         (v.REPO / "build").resolve())
+        if not any(native.resolve().is_relative_to(root) for root in allowed_roots):
+            raise RuntimeError("configured build directory outside build roots")
+        if release in ("coreutils-5.2.1", "5.2.1"):
+            # Reuse the already authenticated/configured v1 historical build;
+            # no v1 ledger or result is modified.  The new executables get
+            # independent linker maps, LLVM modules, graphs and v2 specimens.
+            configured = {"returncode": 0, "configure_options": ["--disable-nls"],
+                          "configured_cc": "gcc -std=gnu89 -fcommon",
+                          "source_tree": "sources/coreutils-5.2.1",
+                          "source_tree_sha256": selected[0]["source_tree_sha256"]}
+            spec = v.HistoricalBuildSpec(native.relative_to(v.REPO).as_posix(), "recursive",
+                                         ("--disable-nls",), "gcc -std=gnu89 -fcommon")
+        else:
+            configured = json.loads((native / "v2-configure-status.json").read_text())
+            if configured["returncode"]:
+                raise RuntimeError("release configure unsuccessful; preserve diagnostics for review")
+            spec = v.HistoricalBuildSpec(native.relative_to(v.REPO).as_posix(),
+                                         "recursive" if (native / "src/Makefile").exists() else "nonrecursive",
+                                         tuple(configured["configure_options"]), configured["configured_cc"],
+                                         ((("CPPFLAGS", "-D_IO_ftrylockfile=1 -D_IO_IN_BACKUP=0x100"),) if release in ("coreutils-8.22", "coreutils-8.25", "coreutils-8.29") else ())
+                                         + ((("CFLAGS", "-g -O2 -Wno-error=implicit-function-declaration -Wno-error=incompatible-pointer-types -Wno-error=int-conversion"),) if release == "coreutils-8.25" else ()))
+        release_slug = "coreutils-5.2.1" if release == "5.2.1" else release
+        slug = release_slug + "-" + program
+        specimen_id = release_slug + "/" + program
     if not selected:
         raise RuntimeError("no independently frozen mapping for this executable")
     for mapping in selected:
@@ -316,7 +335,10 @@ def persist(specimen, selected, graph):
         row = next(r for r in results["members"] if r["cve_id"] == mapping["cve_id"])
         observations = [o for o in row["observations"] if o["specimen_id"] != specimen_id]
         if graph["analysis_status"] == "success":
+            program = specimen_id.rsplit("/", 1)[1]
             for query in mapping["functions"]:
+                if program not in function_executables(mapping, query):
+                    continue
                 matched = v.map_source_identity(graph, query["source_file"], query["function"])
                 candidate = matched["candidates"][0] if matched["candidate_count"] == 1 else None
                 observations.append({"source_identity": query["source_identity"], "specimen_id": specimen_id,
@@ -325,7 +347,9 @@ def persist(specimen, selected, graph):
                                      "shortest_semantic_path": candidate["shortest_call_path"] if candidate else None})
         observations.sort(key=lambda o: (o["specimen_id"], o["source_identity"]))
         row.update(observations=observations, analysis_status=graph["analysis_status"])
-        if (len(observations) == len(mapping["programs"]) * len(mapping["functions"])
+        observed_pairs = {(o["specimen_id"].rsplit("/", 1)[1], o["source_identity"])
+                          for o in observations}
+        if (observed_pairs == expected_executable_function_pairs(mapping)
             and all(o["raw_call_depth"] is not None for o in observations)):
             row.update(completed=True, disposition="depth_applicable", reason="Independently frozen vulnerable functions measured using configured linker-exact LLVM/SVF scope.")
         else:

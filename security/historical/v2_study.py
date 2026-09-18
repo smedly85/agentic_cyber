@@ -42,6 +42,23 @@ DISPOSITIONS = {
 }
 
 
+def function_executables(mapping: dict, function: dict) -> tuple[str, ...]:
+    """Return the disclosure-governed executable contexts for one function.
+
+    Older mappings implicitly applied every mapped function to every program.
+    New multi-program mappings must serialize the narrower association when a
+    function is executable-specific (for example, each of the three distinct
+    Coreutils 5.2.1 entry points for CVE-2005-1039).
+    """
+    return tuple(function.get("executables", mapping.get("programs", ())))
+
+
+def expected_executable_function_pairs(mapping: dict) -> set[tuple[str, str]]:
+    return {(program, function["source_identity"])
+            for function in mapping["functions"]
+            for program in function_executables(mapping, function)}
+
+
 def canonical(value: object) -> str:
     return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
 
