@@ -20,6 +20,7 @@ DIVIDER = "======="
 REPLACE = ">>>>>>> REPLACE"
 
 EXPLICIT_INVALID_EDIT_PATTERNS = (
+    re.compile(r"\bSEARCH/REPLACE blocks? failed to match\b", re.IGNORECASE),
     re.compile(r"\bInvalidEditBlock\b", re.IGNORECASE),
     re.compile(
         r"\b(?:invalid|malformed)\s+"
@@ -32,6 +33,7 @@ EXPLICIT_INVALID_EDIT_PATTERNS = (
         re.IGNORECASE,
     ),
 )
+APPLIED_EDIT = re.compile(r"^Applied edit to .+\s*$", re.MULTILINE)
 
 
 def malformed_editor_diff(text: str) -> bool:
@@ -60,7 +62,19 @@ def malformed_editor_diff(text: str) -> bool:
     return saw_marker and state != "outside"
 
 
-def has_invalid_editor_output(text: str, editor_edit_format: str) -> bool:
+def has_invalid_editor_output(
+    text: str, editor_edit_format: str, *,
+    agent_exit_code: int | None = None, candidate_available: bool = False,
+) -> bool:
+    # Aider can reject one response and apply its own retry in the SAME
+    # invocation. Only a successful process with a non-empty candidate can
+    # discharge earlier protocol errors. Errors after the final applied edit
+    # remain terminal. Compilation is deliberately not part of this decision:
+    # a compiler error belongs to controller validation and repair feedback.
+    if agent_exit_code == 0 and candidate_available:
+        applied = list(APPLIED_EDIT.finditer(text))
+        if applied:
+            text = text[applied[-1].end():]
     if any(pattern.search(text) for pattern in EXPLICIT_INVALID_EDIT_PATTERNS):
         return True
     return editor_edit_format == "editor-diff" and malformed_editor_diff(text)
@@ -69,6 +83,8 @@ def has_invalid_editor_output(text: str, editor_edit_format: str) -> bool:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--log", required=True, type=Path)
+    parser.add_argument("--agent-exit-code", type=int)
+    parser.add_argument("--candidate", type=Path)
     parser.add_argument(
         "--editor-edit-format", choices=EDITOR_EDIT_FORMATS, required=True
     )
@@ -78,7 +94,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     text = args.log.read_text(encoding="utf-8", errors="replace")
-    return 0 if has_invalid_editor_output(text, args.editor_edit_format) else 1
+    candidate_available = bool(
+        args.candidate and args.candidate.is_file() and args.candidate.stat().st_size
+    )
+    return 0 if has_invalid_editor_output(
+        text, args.editor_edit_format, agent_exit_code=args.agent_exit_code,
+        candidate_available=candidate_available,
+    ) else 1
 
 
 if __name__ == "__main__":

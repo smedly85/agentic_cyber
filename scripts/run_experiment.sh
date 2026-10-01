@@ -493,6 +493,8 @@ run_aider() {
         invalid_editor_output=false
         if "$PYTHON_BIN" "$AIDER_OUTPUT_TOOL" \
                 --log "$current_log" \
+                --agent-exit-code "$status" \
+                --candidate "$workdir/$SOURCE_PATH" \
                 --editor-edit-format "$EDITOR_EDIT_FORMAT"; then
             invalid_editor_output=true
         fi
