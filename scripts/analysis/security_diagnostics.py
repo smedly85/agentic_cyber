@@ -456,6 +456,8 @@ def measure_security_candidate(
     configuration: Mapping[str, Any],
     provenance: Mapping[str, Any],
 ) -> dict[str, Any]:
+    if source is not None and source.suffix.lower() == ".rs":
+        raise ValueError("Rust security diagnostics require a Rust backend")
     row: dict[str, Any] = {
         "run_id": run_id,
         "source_identifier": source_identifier,

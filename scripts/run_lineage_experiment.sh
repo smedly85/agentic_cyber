@@ -913,6 +913,7 @@ record.update(
         "repository_commit": commit,
         "utility": plan["utility"],
         "program": plan["program"],
+        **{key: plan[key] for key in ("functional_oracle", "historical_vulnerability_source") if key in plan},
         "agent_backend": plan["agent_backend"],
         "aider_version": plan["aider_version"],
         "architect_model": plan["architect_model"],

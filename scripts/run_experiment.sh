@@ -1130,7 +1130,7 @@ if [[ "$SOURCE_MODE" == "new" && -n "$SEED_SOURCE" ]]; then
 fi
 
 if [[ ${#KEEP_GLOBS[@]} -eq 0 ]]; then
-    KEEP_GLOBS=("*.c" "*.h")
+    KEEP_GLOBS=("*.c" "*.h" "$(basename "$SOURCE_PATH")")
 fi
 
 if [[ -n "$ANALYSIS_ARCHITECTURE_THRESHOLD" ]]; then
@@ -1156,6 +1156,10 @@ if [[ -n "$ANALYSIS_DIVERSITY_K_MAX" &&
 fi
 
 ANALYZER_PATH="$REPO/scripts/analyze_experiment.py"
+if [[ "$SOURCE_PATH" == *.rs ]]; then
+    warn "Rust functional validation is supported; C-only structural analysis is skipped"
+    NO_ANALYSIS=1
+fi
 if [[ "$NO_ANALYSIS" -eq 0 ]]; then
     [[ -f "$ANALYZER_PATH" ]] || die "analyzer not found: $ANALYZER_PATH"
 fi
@@ -1508,11 +1512,9 @@ PY
             cp -p "$(resolve_repo_path "$seed_src")" "$workdir/$seed_dest"
         done
 
-        # Aider must receive an editable file even for a new-source checkpoint.
-        # The empty file is still the same empty analysis baseline, and a
-        # successful invocation must replace it with a non-empty implementation.
+        # A new-source checkpoint starts without a candidate. The experiment
+        # agent creates the named editable file; the controller supplies no seed.
         mkdir -p "$(dirname "$workdir/$SOURCE_PATH")"
-        [[ -e "$workdir/$SOURCE_PATH" ]] || : >"$workdir/$SOURCE_PATH"
 
         # Reject config-shaped files at the workspace root. Aider searches CWD
         # during early startup, before all command-line options are applied.
@@ -1558,7 +1560,7 @@ PY
             # task in both models' contexts.
             [[ "$visible_file" == "$WORKDIR_PROMPT_PATH" ]] && continue
             case "$visible_file" in
-                *.c|*.h|*.py|*.sh|*.json|*.md|*.txt|*.toml|*.yaml|*.yml)
+                *.c|*.h|*.rs|*.py|*.sh|*.json|*.md|*.txt|*.toml|*.yaml|*.yml)
                     AIDER_READ_ARGS+=(--read "$visible_file") ;;
             esac
         done < <(cd "$workdir" && find . -type f -print | sed 's#^./##' | LC_ALL=C sort)

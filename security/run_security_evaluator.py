@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -15,7 +16,7 @@ from security.common.evaluator import evaluate  # noqa: E402
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--utility", required=True, choices=("grep", "sort", "mkdir", "chmod"))
+    parser.add_argument("--utility", required=True, choices=("grep", "sort", "mkdir", "chmod", "cp", "mv"))
     parser.add_argument("--source", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--artifacts", type=Path)
@@ -36,6 +37,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.source.suffix.lower() == ".rs":
+        result = {
+            "schema_version": 1,
+            "utility": args.utility,
+            "security_evaluation_completed": False,
+            "security_clean": None,
+            "security_evaluator_exit_code": 2,
+            "unsupported_reason": "Rust requires an explicit security backend; C parsers, sanitizers and call graphs are not applicable",
+        }
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+        print(result["unsupported_reason"], file=sys.stderr)
+        return 2
     result = evaluate(
         utility=args.utility, source=args.source, output=args.output,
         artifacts=args.artifacts, seed=args.security_seed,

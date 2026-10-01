@@ -97,9 +97,13 @@ def scan_utility(repo: Path, utility: str) -> tuple[list[str], int, int]:
         raise NoCorpus(str(corpus_file))
 
     corpus = heldout_contract.load(root)
+    aliases = plan.get("flag_aliases", {})
+    public_options = frozenset(aliases) | frozenset(
+        alias for spellings in aliases.values() for alias in spellings
+    )
     needles: list[tuple[str, str]] = []
     for case in heldout_contract.cases(corpus):
-        for value in heldout_contract.scannable_values(case):
+        for value in heldout_contract.scannable_values(case, public_options=public_options):
             needles.append((case["name"], value))
 
     leaks: list[str] = []

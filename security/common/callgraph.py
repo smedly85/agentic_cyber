@@ -237,6 +237,8 @@ def analyze_sources(
 ) -> dict[str, Any]:
     """Analyze one or more C translation units without inventing indirect edges."""
     source_items = [(str(source_file), data) for source_file, data in sources]
+    if any(Path(name).suffix.lower() == ".rs" for name, _ in source_items):
+        raise ValueError("Rust semantic call graphs are unsupported by the C backend")
     definitions: list[dict[str, Any]] = []
     methods: set[str] = set()
     for source_file, data in source_items:

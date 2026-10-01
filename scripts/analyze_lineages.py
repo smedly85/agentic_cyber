@@ -2051,6 +2051,8 @@ def main(argv: list[str] | None = None) -> int:
     output_dir = (args.output_dir or root / "analysis").resolve()
     run_metadata, lineages, never_started = load_run(root)
     run_metadata = dict(run_metadata)
+    if Path(str(run_metadata.get("source_path", ""))).suffix.lower() == ".rs":
+        raise LineageError("Rust downstream analysis unsupported: use functional lineage records; C structural/security backends cannot analyze Rust")
     if args.analysis_config is not None:
         run_metadata["frozen_analysis_configuration"] = read_json(
             args.analysis_config.resolve()

@@ -2314,6 +2314,8 @@ def parse_clang_ast(
     output_path: Path | None,
     extra_args: Sequence[str],
 ) -> tuple[Counter[str], int | None, str | None]:
+    if source.suffix.lower() == ".rs":
+        raise ValueError("Rust is unsupported by the C Clang AST backend")
     executable = shutil.which("clang")
     if executable is None:
         return Counter(), None, "clang not found"
@@ -2398,6 +2400,8 @@ def parse_tree_sitter(
     dict[str, FunctionInfo] | None,
     str | None,
 ]:
+    if source.suffix.lower() == ".rs":
+        raise ValueError("Rust is unsupported by the C Tree-sitter grammar")
     try:
         from tree_sitter import Language, Parser
         import tree_sitter_c
@@ -2516,6 +2520,8 @@ def run_gumtree(
     baseline_nodes: int | None,
     candidate_nodes: int | None,
 ) -> tuple[Counter[str], float | None, str | None]:
+    if any(path.suffix.lower() == ".rs" for path in (baseline, candidate)):
+        raise ValueError("Rust GumTree analysis requires an explicit Rust backend")
     executable = shutil.which("gumtree")
     if executable is None:
         return Counter(), None, "gumtree not found"
@@ -2575,6 +2581,8 @@ def analyze_source(
     output_dir: Path | None,
     clang_extra_args: Sequence[str],
 ) -> ParsedSource:
+    if source.suffix.lower() == ".rs":
+        raise ValueError("Rust structural analysis unsupported: an explicit Rust backend is required")
     clang_counts, clang_nodes, clang_error = parse_clang_ast(
         source,
         output_dir / "clang-ast.json" if output_dir is not None else None,

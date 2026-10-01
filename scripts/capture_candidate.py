@@ -328,7 +328,7 @@ def main() -> int:
     if not args.workdir.is_dir():
         raise SystemExit(f"working directory not found: {args.workdir}")
 
-    keep_globs = args.keep_glob or ["*.c", "*.h"]
+    keep_globs = args.keep_glob or ["*.c", "*.h", "*.rs"]
     result = capture(
         args.workdir,
         args.attempt_dir,

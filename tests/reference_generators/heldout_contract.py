@@ -256,7 +256,7 @@ def corpus_invariants(payload: dict[str, Any],
     return problems
 
 
-def scannable_values(case: dict[str, Any]) -> list[str]:
+def scannable_values(case: dict[str, Any], *, public_options: frozenset[str] = frozenset()) -> list[str]:
     """The strings a leak scan should look for in bundle bytes.
 
     The case name always, plus every string anywhere in the case long enough
@@ -295,7 +295,18 @@ def scannable_values(case: dict[str, Any]) -> list[str]:
         # alongside a case -- sort's fuzz regressions carry `_reason` ("exit 1
         # vs GNU 0"), which the visible suite carries verbatim too.
         if key not in NON_IDENTIFYING_KEYS and not key.startswith("_"):
-            walk(value)
+            if key == "args" and isinstance(value, list):
+                # Declared option tokens are public vocabulary, not identifying
+                # case data. Never exempt operands after '--', or the same
+                # spelling in fixtures, stdin, expected output, or other fields.
+                after = False
+                for arg in value:
+                    if arg == "--":
+                        after = True
+                    if after or not isinstance(arg, str) or arg not in public_options:
+                        walk(arg)
+            else:
+                walk(value)
 
     # Base64 payloads are searched decoded as well as encoded: a suite file
     # carries them in encoded form, but a fixture or a stray comment would

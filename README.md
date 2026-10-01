@@ -5,8 +5,8 @@ across maintenance checkpoints. Each checkpoint preserves the prompt, baseline
 repository state, generated candidates, validation results, and metadata needed
 to reproduce and compare independent repository histories.
 
-The experiment generates C reimplementations of four standard utilities one
-feature at a time. The primary paper analysis separates RQ1 correctness and
+The experiment generates C reimplementations of four standard utilities and
+Rust cp/mv implementations one feature at a time. The primary paper analysis separates RQ1 correctness and
 lineage completion, RQ2 implementation diversity and maintenance variation,
 and RQ3 security. No composite score combines them.
 `docs/diversity_methodology.md` defines the structural and maintenance
@@ -15,6 +15,13 @@ optional post-hoc diagnostic and documented separately in
 `docs/execution_consistency_methodology.md`.
 
 ## Independent functional and security evaluation
+
+The Rust cp/mv experiments have no seed source: checkpoint 000 creates one Rust
+file from scratch; later checkpoints inherit only their own lineage's preceding
+candidate. Their GNU Coreutils 9.11 functional oracle is deliberately separate
+from the planned uutils/coreutils historical Rust vulnerability source. Rust
+functional evaluation is supported; the C scientific/security backends are not
+Rust backends. See [Rust lineage contracts and limitations](docs/rust_lineages.md).
 
 Every new candidate has two independent dimensions:
 
@@ -236,6 +243,8 @@ Coreutils or another implementation supports a flag.
 | `sort`  | `000` → `-r` → `-f` → `-u` → `-c` |
 | `grep`  | `000` → `-H` → `-h` → `-r` → `-i` |
 | `chmod` | `000` → `-R` → `-c` → `-v` → `-f` |
+| `cp` (Rust) | `000` → `-f` → `-i` → `-r` |
+| `mv` (Rust) | `000` → `-i` → `-f` |
 
 Each ladder is declared in `experiments/utilities/<name>.json` and nowhere else;
 the table above is that file's `checkpoints[].implemented_flags`, which is

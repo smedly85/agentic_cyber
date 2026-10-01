@@ -383,7 +383,15 @@ def resolve_plan(
     if parsed_num_ctx is not None and parsed_num_ctx < 1:
         raise ManifestError("num_ctx must be a positive integer")
 
+    reference_provenance = {}
+    for field in ("functional_oracle", "historical_vulnerability_source"):
+        if field in manifest:
+            if not isinstance(manifest[field], dict):
+                raise ManifestError(f"{field} must be an object")
+            reference_provenance[field] = manifest[field]
+
     plan = {
+        **reference_provenance,
         "schema_version": SCHEMA_VERSION,
         "manifest": str(manifest_path.relative_to(repo).as_posix()),
         "utility": utility,

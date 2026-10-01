@@ -190,7 +190,15 @@ def _chmod_probe(option: str, flag: str, fixture: Path) -> dict[str, Any]:
     return {"argv": [option, "644", str(target)], "stdin": b""}
 
 
+def _transfer_probe(option: str, flag: str, fixture: Path) -> dict[str, Any]:
+    source = fixture / "input"
+    source.write_bytes(b"payload\n")
+    return {"argv": [option, "input", "output"], "stdin": b"y\n"}
+
+
 PROBES = {
+    "cp": {"build": _transfer_probe, "requires_diagnostic": True},
+    "mv": {"build": _transfer_probe, "requires_diagnostic": True},
     "sort": {"build": _sort_probe, "requires_diagnostic": True},
     "mkdir": {"build": _mkdir_probe, "requires_diagnostic": True},
     "grep": {"build": _grep_probe, "requires_diagnostic": True},

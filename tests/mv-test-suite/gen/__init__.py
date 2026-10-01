@@ -1,0 +1,2 @@
+"""Offline golden generation."""
+

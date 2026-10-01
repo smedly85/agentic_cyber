@@ -12,7 +12,7 @@ detail is hardcoded in the controller.
   "schema_version": 1,
   "utility": "<manifest name, matches the file basename>",
   "program": "<executable basename>",
-  "source_path": "<working-directory-relative primary C source>",
+  "source_path": "<working-directory-relative primary source>",
   "executable_path": "<working-directory-relative built executable>",
   "build_command": "<shell command run from the working directory>",
   "test_dir": "<repo-relative visible test suite copied into the sandbox>",
@@ -47,6 +47,15 @@ detail is hardcoded in the controller.
 * `base_test_command` and `extra_test_command` default to empty, which
   `run_experiment.sh` treats as "not run" (exit 0). The cumulative judge already
   covers regression, so `base_test_command` is normally unnecessary.
+* Optional `functional_oracle` and `historical_vulnerability_source` objects
+  record separate reference roles. They are carried into the resolved plan and
+  lineage provenance; neither is staged into the agent's checkpoint bundle.
+
+The Rust cp/mv manifests use direct rustc builds and declare future .rs paths.
+No source exists before checkpoint 000. Their ladders are cp: base, force,
+interactive, recursive; mv: base, interactive, force. GNU Coreutils 9.11 provides
+functional goldens; uutils/coreutils is the separate planned historical Rust
+vulnerability source. See [Rust lineage design](../../docs/rust_lineages.md).
 
 `scripts/run_lineage_experiment.sh --list-utilities` prints the manifests it can
 see; `--print-plan` renders a manifest's resolved stage plan without running
