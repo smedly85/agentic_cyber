@@ -432,6 +432,20 @@ def analyze_build(
             "analysis_failure", entry_point, provenance,
             [{"stage": "svf", "reason": "invalid_helper_json", "message": str(error), "stdout": result.stdout}],
         )
+    disassembler = info.get("tools", {}).get("llvm-dis", {}).get("path")
+    if not disassembler:
+        return _failure_result("analysis_failure", entry_point, provenance,
+            [{"stage": "definition_inventory", "reason": "llvm_dis_unavailable"}])
+    disassembled = _run((disassembler, str(build.linked_bitcode), "-o", "-"))
+    try:
+        if disassembled.returncode:
+            raise SemanticCallgraphError(disassembled.stderr)
+        inventory = validate_definition_inventory(disassembled.stdout, raw)
+    except SemanticCallgraphError as error:
+        return _failure_result("analysis_failure", entry_point, provenance,
+            [{"stage": "definition_inventory", "reason": "dropped_or_unreadable_definitions",
+              "message": str(error)}])
+    provenance["definition_inventory"] = inventory
     return finalize_semantic_graph(raw, entry_point=entry_point, provenance=provenance)
 
 

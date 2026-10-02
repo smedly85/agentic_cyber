@@ -1,5 +1,12 @@
 # Rust semantic instrument: stopped before historical measurement
 
+> Revision note: this document and its JSON companions describe the original
+> v1 instrument, whose provenance remains unchanged. The correction audit and
+> current STOP gate are in
+> [rust_audit_v2](../../semantic_callgraph/rust_audit_v2/README.md).
+> Use that revision's runner and tests with the patched helper; the v1 runner
+> requires its original instrument and is not the current validation command.
+
 The frozen population, mappings, source manifest, mapping evidence and C historical
 study are unchanged. Their three canonical JSON fingerprints are checked before
 toolchain preparation, controlled execution, or publication. The canonical
