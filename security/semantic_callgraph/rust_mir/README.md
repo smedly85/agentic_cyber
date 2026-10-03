@@ -1,4 +1,20 @@
-# Controlled MIR feasibility spike — MIR-STOP
+# Controlled MIR backend — MIR-STOP-INCOMPLETE
+
+The current core milestone is in [CORE_REPORT.md](CORE_REPORT.md): allocation-site
+Box propagation, receiver-refined dyn dispatch, closures/RustCall, local unsafe
+collapse, typed static decoding, and a successful isolated build-std experiment.
+Thirty focused core checks and twelve memory checks pass. All 31 original cases
+pass explicit node/edge/target assertions, but required-body/operation gates and
+independent traces still prevent complete semantic acceptance. Calibration and
+historical Rust measurements remain unexecuted.
+
+The prior controlled continuation is documented in [CONTINUATION.md](CONTINUATION.md).
+It adds stage negative controls, typed aggregates, explicit missing-body handling,
+root-scoped inclusion, two fresh 31-case extractions, 12 memory adversaries, and
+a four-crate Cargo compilation wrapper. Nine memory target checks pass; heap,
+dyn, unsafe, complete std/closure semantics, traces, and calibration remain open.
+No full semantic acceptance or historical authorization follows from these checks.
+The record below describes the **archived initial spike**, not the current code.
 
 This is a **partial feasibility implementation**, not an accepted Rust semantic
 backend and not evidence that MIR is unsuitable. The exact compiler API works,

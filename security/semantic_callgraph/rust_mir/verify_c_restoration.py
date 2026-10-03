@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 import shutil
 import sys
+import argparse
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
@@ -20,8 +21,24 @@ def sha(path):
 
 def main():
     verify_frozen()
-    out = ROOT / "build/rust-mir/c-restoration/regression"
-    out.mkdir(parents=True, exist_ok=True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--output-label')
+    args = parser.parse_args()
+    if args.output_label and not args.output_label.replace('-', '').isalnum():
+        raise ValueError('Invalid output label')
+    out = (ROOT / 'build/rust-mir/c-validation' / args.output_label if args.output_label else
+           ROOT / "build/rust-mir/c-restoration/regression")
+    out.mkdir(parents=True, exist_ok=not bool(args.output_label))
+    protected = json.loads((ROOT / 'security/historical/rust/protected_c_artifacts.json').read_text())['files']
+    def check_frozen():
+        verify_frozen()
+        for name, checksum in protected.items():
+            if hashlib.sha256((ROOT / name).read_bytes().replace(b'\r\n', b'\n')).hexdigest() != checksum:
+                raise ValueError('STOP: protected C artifact changed: ' + name)
+        helper_path = ROOT / 'build/semantic-toolchain/SVF/Release-build/bin/semantic-callgraph-svf'
+        if sha(helper_path) != 'ca8ce8cd9e7e264dd8db7e8e8d656765af876db3fbec878da4de0edcc882a7d2':
+            raise ValueError('STOP: canonical C helper changed')
+    check_frozen()
     # Preserve failed restoration diagnostics rather than overwriting them.
     prior=out/'results.json'
     archive=out.parent/'initial-rust-guard-failure.json'
@@ -94,9 +111,13 @@ def main():
     result = {"controlled": rows, "historical_programs": replay, "observations": observations,
               "baseline_sha256": sha(baseline_path), "method": "replay_of_frozen_hash_authenticated_LLVM_modules",
               "historical_rust_measurements": False,
-              "passed": all(r["passed"] for r in rows + observations)}
+              "passed": len(rows) == 11 and len(observations) == 9 and all(r["passed"] for r in rows + observations),
+              "protected_c_files_unchanged": len(protected)}
+    check_frozen()
     (out / "results.json").write_text(json.dumps(result, indent=2) + "\n")
     print("C regression overall", result["passed"], flush=True)
+    if not result['passed']:
+        raise SystemExit('STOP: C regression changed')
 
 
 if __name__ == "__main__":

@@ -12,6 +12,8 @@ def sha(path):return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def main():
+    if (HERE/'continuation_results.json').exists():
+        raise RuntimeError('Archived spike publisher cannot overwrite continuation evidence; use publish_continuation.py')
     require_c()
     feasibility=read(HERE/'feasibility.json')
     inclusion=read(HERE/'inclusion_probe.json')
