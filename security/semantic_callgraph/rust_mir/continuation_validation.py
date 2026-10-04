@@ -8,9 +8,11 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 from prepare import ROOT, HERE, require_c
 from probe import BASE, SYSROOT, command
 from inclusion import analyze
+from std_config import rebuilt_std_flags
 
 
 def write(path, value):
@@ -26,6 +28,8 @@ def main():
     require_c()
     out = BASE / 'continuation' / options.label
     out.mkdir(parents=True, exist_ok=False)
+    for name in ('driver.rs','inclusion.py','body_ledger.py','std_config.py'):
+        shutil.copy2(HERE / name, out / name)
     env = os.environ.copy()
     env.update(RUSTC_BOOTSTRAP='1', MIR_PROBE_TRANSITIVE='1',
                LD_LIBRARY_PATH=str(SYSROOT / 'lib') + ':' + str(SYSROOT / 'lib/rustlib/x86_64-unknown-linux-gnu/lib'))
@@ -37,6 +41,7 @@ def main():
     flags = ['--sysroot', SYSROOT, '-C', 'opt-level=0', '-C', 'codegen-units=1',
              '-Z', 'mir-opt-level=0', '-Z', 'inline-mir=no', '-Z', 'always-encode-mir',
              '--remap-path-prefix', str(ROOT) + '=.', '--target=x86_64-unknown-linux-gnu']
+    flags.extend(rebuilt_std_flags(out))
     fixtures = ROOT / 'tests/fixtures/rust_semantic'
     cases = [r['case'] for r in json.loads((HERE / 'controlled_results.json').read_text())['cases']]
     all_runs = []
@@ -44,7 +49,7 @@ def main():
         directory = out / run
         directory.mkdir()
         command([rustc, fixtures / 'dependency.rs', '--edition=2021', '--crate-type=rlib',
-                 '--crate-name=semantic_dependency', '-C', 'panic=abort', *flags, '--out-dir', directory], directory, env)
+                 '--crate-name=semantic_dependency', '-C', 'panic=unwind', *flags, '--out-dir', directory], directory, env)
         acquisition = ROOT / 'build/rust-instrument-v2/acquisition'
         archive = acquisition / 'scopeguard-1.2.0.crate'
         assert hashlib.sha256(archive.read_bytes()).hexdigest() == '94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49'
@@ -55,7 +60,7 @@ def main():
             case_dir = directory / case
             case_dir.mkdir()
             source = fixtures / ('instrument.rs' if index < 13 else 'expanded.rs')
-            extra = (['--crate-type=rlib', '--crate-name=semantic_instrument', '-C', 'panic=abort', '--extern',
+            extra = (['--crate-type=rlib', '--crate-name=semantic_instrument', '-C', 'panic=unwind', '--extern',
                       'semantic_dependency=' + str(directory / 'libsemantic_dependency.rlib')] if index < 13 else
                      ['--crate-name=expanded', '-C', 'panic=unwind', '--cfg=audit_case="' + case + '"', '--extern',
                       'scopeguard=' + str(directory / 'libscopeguard.rlib')])
@@ -83,6 +88,7 @@ def main():
                                 'validation_status': 'not_adjudicated'})
                 write(case_dir / 'api.json', raw)
                 write(case_dir / 'inclusion.json', result)
+                write(case_dir / 'required_body_ledger.json', result['required_body_ledger'])
                 record = {'case': case, 'instances': len(raw['instances']), 'root': roots[0],
                           'expected_semantic_result': 'Configured entry reaches the designated target; full case-specific paths and target sets also require validation.',
                           'actual_semantic_result': 'target_reachable' if actual else 'target_not_reached',
@@ -103,8 +109,8 @@ def main():
     write(out / 'result.json', {'accepted_backend': False, 'cases': all_runs[0],
                               'determinism': determinism, 'all_identical': all(r['identical'] for r in determinism),
                               'status': 'MIR-STOP-INCOMPLETE',
-                              'driver_sha256': hashlib.sha256((HERE / 'driver.rs').read_bytes()).hexdigest(),
-                              'inclusion_sha256': hashlib.sha256((HERE / 'inclusion.py').read_bytes()).hexdigest()})
+                              'driver_sha256': hashlib.sha256((out / 'driver.rs').read_bytes()).hexdigest(),
+                              'inclusion_sha256': hashlib.sha256((out / 'inclusion.py').read_bytes()).hexdigest()})
     require_c()
 
 

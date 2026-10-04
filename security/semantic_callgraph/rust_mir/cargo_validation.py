@@ -8,6 +8,7 @@ import tarfile
 from prepare import ROOT, HERE, require_c
 from probe import BASE, SYSROOT, command
 from inclusion import analyze
+from std_config import rebuilt_std_flags
 
 
 def main():
@@ -49,6 +50,7 @@ def main():
     flags = ['--sysroot', str(SYSROOT), '-C', 'opt-level=0', '-C', 'panic=unwind', '-C', 'codegen-units=1',
              '-Z', 'mir-opt-level=0', '-Z', 'inline-mir=no', '-Z', 'always-encode-mir',
              '--remap-path-prefix', str(ROOT) + '=.']
+    flags.extend(rebuilt_std_flags(out))
     env['CARGO_ENCODED_RUSTFLAGS'] = '\x1f'.join(flags)
     manifest = ROOT / 'tests/fixtures/rust_mir/cargo/Cargo.toml'
     cargo = SYSROOT / 'bin/cargo'
@@ -88,12 +90,12 @@ def main():
     result = {'scope': 'controlled_cargo_program_closure', 'accepted_backend': False,
               'status': 'MIR-STOP-INCOMPLETE', 'compiler': version, 'runs': runs,
               'scientific_rerun_identical': runs[0]['scientific_sha256'] == runs[1]['scientific_sha256'],
-              'std_stage_verified': False, 'build_std_used': False,
+              'std_stage_verified': all(not r.get('inlined_scopes',0) for r in binary['instances']), 'build_std_used': True,
               'crates_io_input': {'package': 'scopeguard', 'version': '1.2.0', 'sha256': checksum,
                                   'transport': 'offline vendor of authenticated crates.io archive'},
               'dependency_edges': metadata['resolve']['nodes'],
               'packages': metadata['packages'],
-              'blockers': ['sysroot stage unauthenticated', 'incomplete value analysis', 'no dynamic trace validation']}
+              'blockers': ['remaining unsupported pointer/integer operations', 'Cargo runtime tracing not yet validated']}
     (out / 'result.json').write_text(json.dumps(result, sort_keys=True, indent=2) + '\n')
     require_c()
 

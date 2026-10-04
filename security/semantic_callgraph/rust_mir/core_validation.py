@@ -7,6 +7,7 @@ import shutil
 from prepare import ROOT,HERE,require_c
 from probe import BASE,SYSROOT,command
 from inclusion import analyze
+from std_config import rebuilt_std_flags
 
 
 def write(path,value):
@@ -37,6 +38,7 @@ def main():
     assert '254b59607d4417e9dffbc307138ae5c86280fe4c' in command([rustc,'-vV'],out,env)
     driver=out/'driver'
     command([rustc,HERE/'driver.rs','--edition=2021','-C','prefer-dynamic','-L',SYSROOT/'lib','-o',driver],out,env)
+    std_flags=rebuilt_std_flags(out)
     rows=[]
     for case in expected:
         fingerprints=[]
@@ -48,7 +50,7 @@ def main():
                 '-C','opt-level=0','-C','panic=unwind','-C','codegen-units=1',
                 '-Z','mir-opt-level=0','-Z','inline-mir=no','-Z','always-encode-mir',
                 '--remap-path-prefix',str(ROOT)+'=.','--cfg=core_case="'+case['case']+'"',
-                '-A','warnings','--emit=link','--out-dir',directory],directory,env))
+                *std_flags,'-A','warnings','--emit=link','--out-dir',directory],directory,env))
             roots=[r['instance_identity'] for r in raw['instances'] if r['instance_identity'].endswith('::crate::main')]
             assert len(roots)==1
             result=analyze(raw,roots=roots)

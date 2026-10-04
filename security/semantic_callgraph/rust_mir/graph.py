@@ -7,8 +7,9 @@ import json
 def export_partial(probe,inclusion):
     by_id={r['instance_identity']:r for r in probe['instances']}
     functions=[{'identity':identity,'name':identity,'instance_identity':identity,
-                'source_identity':row['source_identity'],'definition':{'source_span':row['source']},
-                'mir_phase':row['phase']} for identity,row in sorted(by_id.items())
+                'source_identity':row.get('source_identity',row.get('def_path',identity)),
+                'definition':{'source_span':row.get('source')},
+                'mir_phase':row.get('phase'),'disposition':row.get('disposition')} for identity,row in sorted(by_id.items())
                if row.get('body_availability') not in ('missing MIR','external body')]
     targets={(s['owner'],s['block']):s['targets'] for s in inclusion['sites']}
     edges=[]; calls=[]; unresolved=[]; external=[]
@@ -37,6 +38,7 @@ def export_partial(probe,inclusion):
             'unsupported_operations':inclusion['unsupported_operations'],
             'allocations':inclusion.get('allocations',[]),
             'body_inventory':inclusion.get('body_inventory',[]),
+            'required_body_ledger':inclusion.get('required_body_ledger',[]),
             'provenance':{'backend':'rustc_mir_probe','scientific_use_permitted':False}}
 
 

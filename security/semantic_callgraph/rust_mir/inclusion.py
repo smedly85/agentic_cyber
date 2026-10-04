@@ -6,11 +6,22 @@ operations prohibit acceptance; no type-only or dynamic-trace fallback exists.
 from collections import defaultdict
 import hashlib
 import json
+try:
+    from .body_ledger import ledger
+except ImportError:
+    from body_ledger import ledger
 
 
-def analyze(probe, *, roots=None):
+def analyze(probe, *, roots=None, cast_audit=None):
     functions={row['instance_identity']:row for row in probe['instances']}
-    values=defaultdict(set)
+    cells_by_local=defaultdict(set)
+    class Cells(defaultdict):
+        def __missing__(self,key):
+            # Reads create typed cells too; preserve these in precision-loss
+            # evidence even when their current points-to set is empty.
+            cells_by_local[key[:2]].add(key)
+            return super().__missing__(key)
+    values=Cells(set)
     losses=set()
     sites={}
     allocations={}
@@ -33,14 +44,13 @@ def analyze(probe, *, roots=None):
             record['source_spans'].add(current_span)
             record['reasons'].add(reason)
             incoming=set()
-            for key,value in list(values.items()):
-                if key[:2]==base[:2]:
-                    incoming.update(value)
-                    if key[2]:record['affected_fields'].add('/'.join(key[2]))
+            for key in list(cells_by_local[base[:2]]):
+                incoming.update(values[key])
+                if key[2]:record['affected_fields'].add('/'.join(key[2]))
             store({base},incoming)
     active=set(functions) if roots is None else set(roots)
-    for root in active - functions.keys():
-        losses.add((root, 'required_root_unavailable'))
+    for absent_root in active - functions.keys():
+        losses.add((absent_root, 'required_root_unavailable'))
     if not functions:
         losses.add(('<program>', 'empty_instance_inventory'))
 
@@ -63,6 +73,8 @@ def analyze(probe, *, roots=None):
         return current
 
     def operand(owner,source):
+        if 'unsupported_constant' in source:
+            losses.add((owner,'constant_payload_unmodeled'))
         if 'function' in source:return {('function',source['function'])}
         if 'reference' in source:return {('address',p) for p in locations(owner,source['reference'])}
         if 'place' in source:
@@ -85,6 +97,7 @@ def analyze(probe, *, roots=None):
         nonlocal changed
         for cell in cells:
             cell=canonical(cell)
+            cells_by_local[cell[:2]].add(cell)
             old=len(values[cell]); values[cell].update(incoming)
             changed |= old!=len(values[cell])
 
@@ -92,15 +105,17 @@ def analyze(probe, *, roots=None):
         source_owner=source_owner or owner
         cells=locations(owner,destination)
         store(cells,operand(source_owner,source))
+        for field in source.get('constant_fields',[]):
+            store({(i,l,p+tuple(field['path'])) for i,l,p in cells},{('function',field['function'])})
         if 'place' in source:
             # Whole-value copies preserve each typed subfield, not their union.
             for src in locations(source_owner,source['place']):
                 if root(src) in collapsed:
                     collapse(cells,'copy_of_collapsed_object')
-                for key,incoming in list(values.items()):
-                    if key[:2]==src[:2] and key[2][:len(src[2])]==src[2]:
+                for key in list(cells_by_local[src[:2]]):
+                    if key[2][:len(src[2])]==src[2]:
                         suffix=key[2][len(src[2]):]
-                        store({(i,l,p+suffix) for i,l,p in cells},incoming)
+                        store({(i,l,p+suffix) for i,l,p in cells},values[key])
 
     def allocate(owner, site):
         model=site['semantic_operation']
@@ -109,7 +124,7 @@ def analyze(probe, *, roots=None):
                   'type_key':model['type_key'],'source_def_path':model['source_def_path']}
         allocation='heap:'+hashlib.sha256(json.dumps(evidence,sort_keys=True).encode()).hexdigest()
         allocations[allocation]={'abstract_object_id':allocation,**evidence,
-                                 'established_by':'rustc diagnostic item box_new'}
+                                 'established_by':model['kind']}
         address={('address',(allocation,0,()))}
         # Seed prefixes through the compiler-exported Box/Unique/NonNull
         # representation. Object payload fields are stored separately.
@@ -118,7 +133,7 @@ def analyze(probe, *, roots=None):
         for path in model['pointer_paths']:
             for length in range(1,len(path)+1):
                 store(locations(owner,[destination[0],destination[1]+path[:length]]),address)
-        copy(allocation,[0,[]],site['arguments'][0],owner)
+        if model['kind']=='box_new':copy(allocation,[0,[]],site['arguments'][0],owner)
         store({(allocation,0,())},{('type',model['type_key'])})
 
     converged=False
@@ -136,7 +151,27 @@ def analyze(probe, *, roots=None):
                 current_span=constraint.get('source_span','unknown MIR source')
                 if constraint.get('union_write'):
                     collapse(locations(owner,dst),'union_access')
-                if kind=='copy':copy(owner,dst,src)
+                if kind=='scalar_operation':pass  # Cannot carry pointers or callable values.
+                elif kind=='pointer_free_scalar_extract':pass  # Compiler layout/field proof; no pointer payload.
+                elif kind=='pointer_address_bits':
+                    # This is not provenance exposure and cannot feed a dereference
+                    # or indirect call. Reconstruction has its own fail-closed gate.
+                    store(locations(owner,dst),{('address_bits',v[1]) for v in operand(owner,src)
+                                               if v[0] in ('address','erased_address')})
+                elif kind=='provenance_free_pointer':
+                    # Integer transmute does not recover an allocation's provenance.
+                    # This is distinct from PointerWithExposedProvenance (unsupported).
+                    store(locations(owner,dst),{('provenance_free_pointer',owner)})
+                elif kind=='copy':copy(owner,dst,src)
+                elif kind=='pointer_metadata':
+                    incoming=operand(owner,src)
+                    objects={v[1] for v in incoming if v[0] in ('address','erased_address')}
+                    metadata={v for v in incoming if v[0]=='type'}
+                    metadata.update(v for p in objects for v in values[canonical(p)] if v[0]=='type')
+                    store(locations(owner,dst),metadata)
+                elif kind=='raw_pointer_aggregate':
+                    copy(owner,dst,src[0])
+                    store(locations(owner,dst),{v for v in operand(owner,src[1]) if v[0]=='type'})
                 elif kind=='byte_copy':
                     source_cells={v[1] for v in operand(owner,src[0]) if v[0]=='address'}
                     dest_cells={v[1] for v in operand(owner,src[1]) if v[0]=='address'}
@@ -148,8 +183,11 @@ def analyze(probe, *, roots=None):
                     collapse({v[1] for v in incoming if v[0]=='address'},'unknown_index_or_offset')
                     store(locations(owner,dst),incoming)
                 elif kind=='pointer_cast':
-                    incoming=operand(owner,src)
-                    incoming |= {('erased_address',v[1]) for v in incoming if v[0]=='address'}
+                    incoming=operand(owner,src.get('operand',src))
+                    restored={v[1] for v in incoming if v[0]=='address' and
+                              ('type',src.get('pointee_key')) in values[canonical(v[1])]}
+                    incoming={v for v in incoming if not (v[0]=='erased_address' and v[1] in restored)}
+                    incoming |= {('erased_address',v[1]) for v in incoming if v[0]=='address' and v[1] not in restored}
                     store(locations(owner,dst),incoming)
                 elif kind=='reinterpret':
                     cells=locations(owner,dst)
@@ -168,13 +206,16 @@ def analyze(probe, *, roots=None):
                 elif kind=='typed_aggregate':
                     for index,field in enumerate(src['fields']):
                         copy(owner,[dst[0],dst[1]+src['prefix']+['field:'+str(index)]],field)
+                elif kind=='repeat_aggregate':
+                    for index in range(src['count']):
+                        copy(owner,[dst[0],dst[1]+['field:'+str(index)]],src['operand'])
                 elif kind=='union_aggregate':
                     collapse(locations(owner,dst),'union_access')
                     for field in src:copy(owner,dst,field)
                 else:losses.add((owner,kind))
             for site in row['calls']:
                 current_span=site.get('source','unknown MIR source')
-                is_box=(site.get('semantic_operation') or {}).get('kind')=='box_new'
+                is_box=(site.get('semantic_operation') or {}).get('kind') in ('box_new','box_storage_allocation')
                 if is_box: allocate(owner,site)
                 key=(owner,site['block'])
                 if site['status'] in ('resolved_instance','drop_instance'):
@@ -204,6 +245,33 @@ def analyze(probe, *, roots=None):
                         active.add(target); changed=True
                     if target not in functions or functions[target].get('body_availability') == 'missing MIR':
                         losses.add((owner,'external_or_unexported_body')); continue
+                    contract=functions[target].get('intrinsic_contract')
+                    if contract:
+                        if contract=='identity':
+                            copy(owner,site['destination'],site['arguments'][0])
+                        elif contract=='select_value_union':
+                            for arg in site['arguments'][1:3]:copy(owner,site['destination'],arg)
+                        elif contract=='offset_pointer_union':
+                            incoming=operand(owner,site['arguments'][0])
+                            collapse({v[1] for v in incoming if v[0]=='address'},'unknown_index_or_offset')
+                            store(locations(owner,site['destination']),incoming)
+                        elif contract=='typed_pointee_swap':
+                            left={v[1] for v in operand(owner,site['arguments'][0]) if v[0]=='address'}
+                            right={v[1] for v in operand(owner,site['arguments'][1]) if v[0]=='address'}
+                            # Flow-insensitive swap is the bidirectional union of
+                            # corresponding typed fields, retaining each object.
+                            for sources,destinations in ((left,right),(right,left)):
+                                for src_cell in sources:
+                                    for cell in list(cells_by_local[src_cell[:2]]):
+                                        if cell[2][:len(src_cell[2])]==src_cell[2]:
+                                            suffix=cell[2][len(src_cell[2]):]
+                                            store({(i,l,p+suffix) for i,l,p in destinations},values[cell])
+                        elif contract not in ('population_count_scalar','inhabited_type_assertion',
+                                              'abort_nonreturning','immutable_caller_location','dynamic_layout_scalar',
+                                              'saturating_sub_scalar','leading_zero_count_scalar',
+                                              'pointer_distance_scalar','cold_path_leaf'):
+                            losses.add((target,'unknown_intrinsic_contract'))
+                        continue
                     if 'arguments' not in site:continue
                     for index,arg in enumerate(site['arguments'],1):
                         if site.get('rust_call') and functions[target].get('closure_body') and index==len(site['arguments']):
@@ -223,9 +291,22 @@ def analyze(probe, *, roots=None):
                         copy(owner,site['destination'],{'place':[0,[]]},target)
         if not changed:
             converged=True;break
+    if cast_audit is not None:
+        for owner in sorted(active):
+            for constraint in functions.get(owner,{}).get('constraints',[]):
+                if constraint['kind']=='unsupported_cast':
+                    cast_audit.append({'calling_instance':owner,**constraint,
+                                       'current_abstract_value':sorted(operand(owner,constraint['source']))})
     return {'accepted_backend':False,'converged':converged,
+            'required_body_ledger':ledger(functions,active),
+            'unsupported_operation_inventory':[
+                {'instance':owner,'kind':c['kind'],'operation':c.get('operation_detail'),
+                 'source_span':c.get('source_span'),'classification':'D'}
+                for owner,row in sorted(functions.items()) if owner in active
+                for c in row['constraints'] if c['kind'].startswith('unsupported')],
             'active_instances':sorted(active),
-            'allocations':[allocations[key] for key in sorted(allocations)],
+            'allocations':[allocations[key] for key in sorted(allocations) if allocations[key]['established_by']=='box_new'],
+            'constructor_storage_summaries':[allocations[key] for key in sorted(allocations) if allocations[key]['established_by']=='box_storage_allocation'],
             'body_inventory':[{'instance':i,'classification':functions[i].get('body_classification','unclassified')}
                               for i in sorted(active) if i in functions],
             'precision_losses':[{'kind':'byte_level_alias',

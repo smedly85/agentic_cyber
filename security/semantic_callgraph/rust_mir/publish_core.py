@@ -14,6 +14,8 @@ def write(name,value):(HERE/name).write_text(json.dumps(value,sort_keys=True,ind
 
 
 def main():
+    if (HERE/'body_controlled_results.json').exists():
+        raise SystemExit('Refusing to overwrite the newer controlled body/trace milestone')
     parser=argparse.ArgumentParser()
     parser.add_argument('--focused',required=True)
     parser.add_argument('--memory',required=True)
