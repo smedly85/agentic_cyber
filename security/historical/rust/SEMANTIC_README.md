@@ -66,5 +66,9 @@ guide. The population, mappings, evidence dossiers and freeze/validation scripts
 remain unchanged. Historical statements in immutable provenance describe the time
 of publication; they are not instructions to rerun removed experiments.
 
-The cleanup audit, exhaustive deletion manifest, dependency check, preservation
-hashes and fresh validation evidence are under `build/rust-depth-cleanup/`.
+The build-only cleanup inventory is at repository-root
+`build_cve_cleanup_inventory.tsv`; dependency checks, preservation hashes and fresh
+validation evidence are under `cve_build_cleanup_evidence/`. Cleanup scratch and
+superseded graph copies are not retained in `build/`. The legacy `method-v1` input
+path is preserved because frozen provenance names it; its abandoned solver state,
+timeout logs and Cargo compilation caches are not part of the active method.

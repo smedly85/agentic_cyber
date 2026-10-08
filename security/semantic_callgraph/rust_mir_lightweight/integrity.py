@@ -38,8 +38,7 @@ def main(output):
     from study import verify
     from security.historical.rust.validate import validate_directory
     fingerprint=verify();population=validate_directory()
-    failures=[];cleanup=ROOT/'build/rust-depth-cleanup/rust_audit_preserve_manifest.json'
-    if not cleanup.exists():cleanup=ROOT/'build/rust-depth-cleanup/preserve_manifest.json'
+    failures=[];cleanup=ROOT/'cve_build_cleanup_evidence/preserved_scientific_files.json'
     baseline=read(cleanup)['files'] if cleanup.exists() else {
         (RESULTS/name).relative_to(ROOT).as_posix():h for name,h in read(RESULTS/'artifact_hashes.json')['files'].items()}
     for i,(name,expected) in enumerate(baseline.items(),1):
