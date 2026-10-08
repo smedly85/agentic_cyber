@@ -1,6 +1,6 @@
 """Read-only integrity checks using the frozen post-calibration preservation policy."""
 import argparse, datetime, hashlib, pathlib, sys
-from common import ROOT,HERE,OUT,REFERENCE,REFERENCE_SHA,read,sha,write
+from common import ROOT,HERE,OUT,RESULTS,REFERENCE,REFERENCE_SHA,read,sha,write
 sys.path[:0]=[str(ROOT),str(ROOT/'security/semantic_callgraph/cross_language_calibration'),str(ROOT/'security/historical/rust')]
 from runtime_provenance import verify_all_runtimes
 from corpus_integrity import verify_std,C_HELPER,RUST_START
@@ -34,11 +34,13 @@ def instruments():
             'calibration_guard':'Frozen Phase-A post-publication inventory; historical null-result placeholders are not used as current measured-output identities.',
             'timestamp_utc':datetime.datetime.now(datetime.timezone.utc).isoformat()}
 
-def main(after=False):
-    if not after:
-        target=OUT/'instrument_before_performance.json';assert not target.exists()
-        write(target,instruments());print('Before-performance instrument/C integrity PASS',flush=True);return
-    failures=[];baseline=read(OUT/'preservation_before.json')['files']
+def main(output):
+    from study import verify
+    from security.historical.rust.validate import validate_directory
+    fingerprint=verify();population=validate_directory()
+    failures=[];cleanup=ROOT/'build/rust-depth-cleanup/preserve_manifest.json'
+    baseline=read(cleanup)['files'] if cleanup.exists() else {
+        (RESULTS/name).relative_to(ROOT).as_posix():h for name,h in read(RESULTS/'artifact_hashes.json')['files'].items()}
     for i,(name,expected) in enumerate(baseline.items(),1):
         p=ROOT/name
         if not p.is_file() or sha(p)!=expected:failures.append(name)
@@ -47,11 +49,11 @@ def main(after=False):
         if sha(ROOT/row['input_path'])!=row['input_sha256']:failures.append(row['input_path'])
     current=instruments();before=read(OUT/'instrument_before_performance.json')
     assert current['protected_c_byte_hashes']==before['protected_c_byte_hashes']
-    write(OUT/'integrity_after.json',{'status':'FAIL' if failures else 'PASS','protected_files_verified':len(baseline),
-          'changed_or_missing':failures,'instruments':current,'preserved_method_v1_accepted_depths':0,
-          'new_method_results_namespace':'security/historical/rust/results/rust-only-lightweight-v1'})
+    write(output,{'status':'FAIL' if failures else 'PASS','protected_files_verified':len(baseline),
+          'changed_or_missing':failures,'instruments':current,'population_validation':population,
+          'method_fingerprint':fingerprint,'cleanup_preservation_manifest':str(cleanup) if cleanup.exists() else None})
     assert not failures,failures
     print('Final integrity PASS',len(baseline),'protected files',flush=True)
 
 if __name__=='__main__':
-    p=argparse.ArgumentParser();p.add_argument('--after',action='store_true');a=p.parse_args();main(a.after)
+    p=argparse.ArgumentParser();p.add_argument('--output',type=pathlib.Path,required=True);a=p.parse_args();main(a.output)

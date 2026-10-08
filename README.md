@@ -19,9 +19,18 @@ optional post-hoc diagnostic and documented separately in
 The Rust cp/mv experiments have no seed source: checkpoint 000 creates one Rust
 file from scratch; later checkpoints inherit only their own lineage's preceding
 candidate. Their GNU Coreutils 9.11 functional oracle is deliberately separate
-from the planned uutils/coreutils historical Rust vulnerability source. Rust
+from the uutils/coreutils historical Rust vulnerability source. Rust
 functional evaluation is supported; the C scientific/security backends are not
 Rust backends. See [Rust lineage contracts and limitations](docs/rust_lineages.md).
+
+The sole active historical Rust CVE depth analysis is
+[`rust-only-lightweight-v1`](security/historical/rust/results/rust-only-lightweight-v1/HISTORICAL_RUST_RESULTS.md).
+Its compiler-resolved MIR retained-call graph leaves unresolved indirect calls
+explicit and uses BFS for vulnerability depths and maximum finite shortest depths.
+It uses no points-to solver and makes no direct C/Rust comparability claim.
+See the [current historical Rust method guide](security/historical/rust/SEMANTIC_README.md)
+for results, validation and reproducibility. The prior historical inclusion-solver
+approach is abandoned and is no longer an active pipeline.
 
 Every new candidate has two independent dimensions:
 

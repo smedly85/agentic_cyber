@@ -2,6 +2,11 @@
 from collections import deque
 from common import ROOT,OUT,OLD,RESULTS,read,write,sha
 from study import verify
+import argparse,pathlib
+
+parser=argparse.ArgumentParser();parser.add_argument('--output',type=pathlib.Path,required=True)
+output=parser.parse_args().output
+assert not output.exists(),'Choose a fresh verification output path'
 
 fingerprint=verify()
 result=read(RESULTS/'semantic_results.json')
@@ -47,7 +52,7 @@ for row in verified:
     assert len(selected['path']['edges'])==distance
     if distance==0:assert row['entry']==selected['instance']
 for name,expected in read(RESULTS/'artifact_hashes.json')['files'].items():assert sha(RESULTS/name)==expected
-write(OUT/'published_results_verification.json',{'status':'PASS','population_CVEs':45,'verified_function_contexts':51,
+write(output,{'status':'PASS','population_CVEs':45,'verified_function_contexts':51,
     'graphs_independently_BFS_checked':len(graphs),'passing_historical_gates':gates,
     'method_fingerprint':fingerprint,'published_artifact_hashes_verified':True})
 print('RESULT VERIFICATION PASS',len(graphs),'graphs;',gates,'gates; 51 function contexts; 45 CVEs')

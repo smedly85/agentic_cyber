@@ -6,8 +6,9 @@ from security.semantic_callgraph.rust_mir_lightweight.graph import build
 REQUIRED={'direct','recursion','generic','static_trait','closure','cross_crate_direct','multiple_instances',
     'option_map','result_or_else','iterator_flat_map','entry_wrappers','unwind','crates_io','platform','same_method'}
 
-def worker(run):
-    base=OUT/'validation-v2'/run;base.mkdir(parents=True,exist_ok=False);results=[]
+def worker(run,output):
+    base=output/run;base.mkdir(parents=True,exist_ok=False);results=[]
+    frozen={r['id']:r for r in read(OUT/'validation_summary.json')['results']}
     for case in read(OUT/'input_inventory.json'):
         p=ROOT/case['input_path'];assert sha(p)==case['input_sha256'];data=read(p);raw=data['api'] if case['wrapped'] else data
         folder=base/case['id'];folder.mkdir(parents=True)
@@ -39,10 +40,7 @@ def worker(run):
                     'mir_status':got['mir_status']})
         expected_target_depths={};actual_target_depths={}
         if case['group']=='controlled':
-            old=read(ROOT/'build/rust-mir/solver-v2-performance/equality-v1/reference'/case['id']/'normalized_graph.json')
-            target_name='cross_target' if case['name'] in ('cross_crate_direct','cross_crate_indirect') else 'target'
-            targets={r['instance_identity'] for r in raw['instances'] if r.get('def_path','').split('::')[-1]==target_name}
-            expected_target_depths={r['identity']:r['raw_call_depth'] for r in old['functions'] if r['identity'] in targets and r['reachable_from_entry']}
+            expected_target_depths=frozen[case['id']]['controlled_full_method_target_depths']
             actual_target_depths={i:nodes[i]['raw_call_depth'] for i in expected_target_depths}
             if case['name'] in REQUIRED:
                 assert expected_target_depths,(case['name'],'missing controlled target oracle')
@@ -53,17 +51,21 @@ def worker(run):
             'reachable_body_boundaries':len(graph['reachable_body_boundaries']),
             'target_set_comparison':comparison,'controlled_full_method_target_depths':expected_target_depths,
             'lightweight_target_depths':actual_target_depths,'coverage':graph['coverage']}
+        assert result==frozen[case['id']],('Canonical lightweight result changed',case['id'])
         results.append(result);write(base/'results.json',results);print(run,case['id'],'PASS',result['reachable_unresolved_sites'],'unresolved',flush=True)
     write(base/'complete.json',{'status':'PASS','cases':len(results)})
 
-def main():
-    assert (OUT/'preservation_before.json').exists()
+def main(output):
+    from study import verify
+    verify()
+    output=output.resolve();assert output.is_relative_to(ROOT) and not output.exists()
+    output.mkdir(parents=True)
     manifest=read(ROOT/'security/semantic_callgraph/cross_language_calibration/fixture_manifest.json')
     env=dict(os.environ);env.update({k:expand(v) for k,v in manifest['semantic_extraction_configuration']['Rust']['driver']['environment'].items()})
-    write(OUT/'validation_protocol_v2.json',{'required_controlled_cases':sorted(REQUIRED),'acceptance':'All retained targets compiler-evidenced; all required concrete paths match frozen controls; unresolved indirect coverage reported; deterministic replicas.',
-        'harness_correction':'Cross-crate fixture designated target is cross_target in dependency.rs, as declared by the existing run_rust.evaluate oracle. Initial validator assumed target for every case. Preserved initial validation directory. Graph implementation unchanged.',
+    write(output/'validation_protocol.json',{'required_controlled_cases':sorted(REQUIRED),'acceptance':'Exact equality to frozen lightweight validation, including concrete-path oracles; compiler evidence and deterministic replicas.',
+        'oracle':'Canonical lightweight validation_summary.json, retaining the original controlled reference expectations without a failed-solver directory dependency.',
         'implementation_sha256':sha(HERE/'graph.py'),'policy_sha256':sha(HERE/'POLICY.md'),'timestamp_utc':datetime.datetime.now(datetime.timezone.utc).isoformat()})
-    workers=[subprocess.Popen([sys.executable,str(HERE/'validate.py'),'--run',run],cwd=ROOT,env=env) for run in ('run-1','run-2')]
+    workers=[subprocess.Popen([sys.executable,str(HERE/'validate.py'),'--run',run,'--output',str(output)],cwd=ROOT,env=env) for run in ('run-1','run-2')]
     try:
         while any(p.poll() is None for p in workers):
             assert all(p.poll() in (None,0) for p in workers),'Validation failed; stop before history'
@@ -72,10 +74,11 @@ def main():
     finally:
         for p in workers:
             if p.poll() is None:p.terminate();p.wait()
-    a=read(OUT/'validation-v2/run-1/results.json');b=read(OUT/'validation-v2/run-2/results.json');assert a==b
-    write(OUT/'validation_summary.json',{'status':'PASS','cases':len(a),'deterministic':True,
+    a=read(output/'run-1/results.json');b=read(output/'run-2/results.json');assert a==b
+    write(output/'validation_summary.json',{'status':'PASS','cases':len(a),'deterministic':True,
         'required_cases':sorted(REQUIRED),'implementation_sha256':sha(HERE/'graph.py'),'results':a})
     print('LIGHTWEIGHT VALIDATION PASS',len(a),flush=True)
 
 if __name__=='__main__':
-    p=argparse.ArgumentParser();p.add_argument('--run');args=p.parse_args();worker(args.run) if args.run else main()
+    p=argparse.ArgumentParser();p.add_argument('--run');p.add_argument('--output',type=pathlib.Path,required=True)
+    args=p.parse_args();worker(args.run,args.output) if args.run else main(args.output)
