@@ -8,10 +8,12 @@ import tarfile
 from prepare import ROOT, HERE, require_c
 from probe import BASE, SYSROOT, command
 from inclusion import analyze
+from dependency_inputs import scopeguard as verified_scopeguard
 from std_config import rebuilt_std_flags
 
 
 def main():
+    verified_scopeguard()
     parser = argparse.ArgumentParser()
     parser.add_argument('--label', required=True)
     args = parser.parse_args()
@@ -20,7 +22,7 @@ def main():
     require_c()
     out = BASE / 'cargo-validation' / args.label
     out.mkdir(parents=True, exist_ok=False)
-    archive = ROOT / 'build/rust-instrument-v2/acquisition/scopeguard-1.2.0.crate'
+    archive = ROOT / 'build/rust-mir/dependencies/scopeguard-1.2.0.crate'
     checksum = '94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49'
     assert hashlib.sha256(archive.read_bytes()).hexdigest() == checksum
     vendor = out / 'vendor'

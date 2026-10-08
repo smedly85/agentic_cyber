@@ -9,9 +9,11 @@ import hashlib
 from prepare import ROOT,HERE,require_c
 from probe import BASE,SYSROOT,command
 from inclusion import analyze
+from dependency_inputs import scopeguard as verified_scopeguard
 
 
 def main():
+    verified_scopeguard()
     require_c()
     out=BASE/'controlled-probe'
     if out.exists():raise ValueError('Fresh controlled output directory required')
@@ -29,13 +31,13 @@ def main():
              '-C','panic=abort',*flags,'--out-dir',out],out,env)
     command([driver,fixtures/'dependency.rs','--edition=2021','--crate-type=rlib','--crate-name=semantic_dependency',
              '-C','panic=abort',*flags,'--emit=metadata','--out-dir',out],out,env)
-    acquisition=ROOT/'build/rust-instrument-v2/acquisition'
+    acquisition=ROOT/'build/rust-mir/dependencies'
     archive=acquisition/'scopeguard-1.2.0.crate'
     if hashlib.sha256(archive.read_bytes()).hexdigest()!='94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49':
         raise ValueError('Dependency archive fingerprint mismatch')
     command([rustc,acquisition/'scopeguard-1.2.0/src/lib.rs','--edition=2015','--crate-type=rlib',
              '--crate-name=scopeguard','--cfg=feature="use_std"',*flags,'--out-dir',out],out,env)
-    baseline=json.loads((HERE.parent/'rust_audit_v2/results.json').read_text())['rust_controlled']['cases']
+    baseline=json.loads((HERE/'controlled_results.json').read_text())['cases']
     rows=[]
     for index,old in enumerate(baseline):
         case=old['case']; directory=out/case; directory.mkdir()

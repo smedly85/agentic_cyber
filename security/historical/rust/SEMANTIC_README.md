@@ -9,6 +9,7 @@ Method fingerprint:
 `456d46f1d50601b3928de37b8445a734dd345b1772131087b077bb503d8b394c`.
 
 The compiler-resolved MIR retained-call graph uses no inclusion/points-to solver.
+The active path is: Rust source / historical specimen → rustc → MIR → compiler-resolved call targets → retained MIR call graph → BFS from `uumain` → vulnerability depth and retained-graph maximum depth.
 Unresolved indirect calls remain explicit; targets are not invented. Vulnerability
 depth is the shortest BFS distance from the frozen utility entry to a legitimate
 Instance of the mapped source function. Program maximum depth is the maximum

@@ -12,6 +12,7 @@ import shutil
 from prepare import ROOT, HERE, require_c
 from probe import BASE, SYSROOT, command
 from inclusion import analyze
+from dependency_inputs import scopeguard as verified_scopeguard
 from std_config import rebuilt_std_flags
 
 
@@ -20,6 +21,7 @@ def write(path, value):
 
 
 def main():
+    verified_scopeguard()
     parser = argparse.ArgumentParser()
     parser.add_argument('--label', required=True)
     options = parser.parse_args()
@@ -50,7 +52,7 @@ def main():
         directory.mkdir()
         command([rustc, fixtures / 'dependency.rs', '--edition=2021', '--crate-type=rlib',
                  '--crate-name=semantic_dependency', '-C', 'panic=unwind', *flags, '--out-dir', directory], directory, env)
-        acquisition = ROOT / 'build/rust-instrument-v2/acquisition'
+        acquisition = ROOT / 'build/rust-mir/dependencies'
         archive = acquisition / 'scopeguard-1.2.0.crate'
         assert hashlib.sha256(archive.read_bytes()).hexdigest() == '94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49'
         command([rustc, acquisition / 'scopeguard-1.2.0/src/lib.rs', '--edition=2015', '--crate-type=rlib',

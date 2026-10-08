@@ -7,9 +7,11 @@ from prepare import ROOT,HERE,require_c
 from probe import BASE,SYSROOT,command
 from std_config import rebuilt_std_flags
 from inclusion import analyze
+from dependency_inputs import scopeguard as verified_scopeguard
 
 
 def main():
+    verified_scopeguard()
     parser=argparse.ArgumentParser();parser.add_argument('--label',required=True)
     args=parser.parse_args()
     if not args.label.replace('-','').isalnum():raise ValueError('Invalid label')
@@ -27,7 +29,7 @@ def main():
         command([rustc,fixture/'transitive_dependency.rs','--crate-type=rlib',*flags,'--out-dir',directory],directory,env)
         dependency=['--extern','transitive_dependency='+str(directory/'libtransitive_dependency.rlib')]
         command([rustc,fixture/'transitive_bridge.rs','--crate-type=rlib',*flags,*dependency,'--out-dir',directory],directory,env)
-        scopeguard=ROOT/'build/rust-instrument-v2/acquisition/scopeguard-1.2.0/src/lib.rs'
+        scopeguard=ROOT/'build/rust-mir/dependencies/scopeguard-1.2.0/src/lib.rs'
         command([rustc,scopeguard,'--crate-name=scopeguard','--crate-type=rlib','--cfg=feature="use_std"',*flags,'--out-dir',directory],directory,env)
         raw=json.loads(command([driver,fixture/'transitive_main.rs',*flags,*dependency,
              '--extern','transitive_bridge='+str(directory/'libtransitive_bridge.rlib'),
