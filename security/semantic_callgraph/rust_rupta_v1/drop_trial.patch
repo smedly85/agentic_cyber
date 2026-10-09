@@ -1,0 +1,245 @@
+--- a/src/mir/analysis_context.rs
++++ b/src/mir/analysis_context.rs
+@@ -249,6 +249,20 @@
+         }
+     }
+ 
++    /// Select compiler-generated drop glue instead of the generic intrinsic body.
++    pub fn function_mir(&self, func_id: FuncId) -> Option<&'tcx rustc_middle::mir::Body<'tcx>> {
++        let f = self.get_function_reference(func_id);
++        if self.tcx.lang_items().drop_in_place_fn() == Some(f.def_id) {
++            let dropped_ty = match f.generic_args.first() {
++                Some(GenericArgE::Type(t)) => *t,
++                _ => panic!("drop_in_place without type argument"),
++            };
++            let instance = rustc_middle::ty::Instance::resolve_drop_in_place(self.tcx, dropped_ty);
++            return Some(self.tcx.instance_mir(instance.def));
++        }
++        self.tcx.is_mir_available(f.def_id).then(|| self.tcx.optimized_mir(f.def_id))
++    }
++
+     pub fn get_function_reference(&self, func_id: FuncId) -> Rc<FunctionReference<'tcx>> {
+         self.functions.get(func_id).unwrap().clone()
+     }
+--- a/src/graph/pag.rs
++++ b/src/graph/pag.rs
+@@ -469,10 +469,10 @@
+             return false;
+         }
+         let def_id = acx.get_function_reference(func_id).def_id;
+-        if !acx.tcx.is_mir_available(def_id) {
++        let Some(mir) = acx.function_mir(func_id) else {
+             warn!("Unavailable mir for def_id: {:?}", def_id);
+             return false;
+-        }
++        };
+ 
+         if self.func_pags.contains_key(&func_id) {
+             return true;
+@@ -480,13 +480,14 @@
+ 
+         let gen_args = &acx.get_function_reference(func_id).generic_args;
+         // Build function pags for promoted functions
+-        if let Some(promoted_funcs) = self.promote_constants(acx, def_id, gen_args) {
+-            self.promoted_funcs_map.insert(func_id, promoted_funcs);
++        if acx.tcx.lang_items().drop_in_place_fn() != Some(def_id) {
++            if let Some(promoted_funcs) = self.promote_constants(acx, def_id, gen_args) {
++                self.promoted_funcs_map.insert(func_id, promoted_funcs);
++            }
+         }
+ 
+         // Build pag for this function.
+         let mut fpag = FuncPAG::new(func_id);
+-        let mir = acx.tcx.optimized_mir(def_id);
+         let mut builder = fpag_builder::FuncPAGBuilder::new(acx, func_id, mir, &mut fpag);
+         builder.build();
+ 
+--- a/src/util/type_util.rs
++++ b/src/util/type_util.rs
+@@ -1301,8 +1301,7 @@
+     func_id: FuncId,
+     ordinal: usize,
+ ) -> Ty<'tcx> {
+-    let def_id = acx.get_function_reference(func_id).def_id;
+-    let mir = acx.tcx.optimized_mir(def_id);
++    let mir = acx.function_mir(func_id).expect("local declaration without MIR");
+     let substs_specializer =
+         SubstsSpecializer::new(acx.tcx, acx.get_function_reference(func_id).generic_args.clone());
+     substs_specializer.specialize_generic_argument_type(mir.local_decls[ordinal.into()].ty)
+--- a/src/builder/fpag_builder.rs
++++ b/src/builder/fpag_builder.rs
+@@ -318,6 +318,27 @@
+                 call_source: _,
+                 fn_span: _,
+             } => self.visit_call(func, args, destination, location),
++            mir::TerminatorKind::Drop { place, .. } => {
++                let (_, dropped_ty) = self.get_path_and_type_for_place(place);
++                let instance = ty::Instance::resolve_drop_in_place(self.tcx(), dropped_ty);
++                // Empty glue has no destructor/callback to traverse.
++                if !matches!(instance.def, ty::InstanceDef::DropGlue(_, None)) {
++                    let callee = self.acx.get_func_id(instance.def.def_id(), instance.args);
++                    let pointer = self.create_aux_local(Ty::new_mut_ptr(self.tcx(), dropped_ty));
++                    self.visit_ref_or_address_of(pointer.clone(), place);
++                    let destination = self.create_aux_local(self.tcx().types.unit);
++                    let site = self.new_callsite(self.func_id, location, vec![pointer.clone()], destination);
++                    if matches!(dropped_ty.kind(), TyKind::Dynamic(..)) {
++                        // The concrete pointee selects the vtable's drop glue.
++                        // Reuse existing dynamic-receiver propagation, not a
++                        // recursive static edge to drop_in_place<dyn Trait>.
++                        self.acx.add_dyn_callsite(site.clone().into(), instance.def.def_id(), instance.args);
++                        self.fpag.add_dynamic_dispatch_callsite(pointer, site);
++                    } else {
++                        self.fpag.add_static_dispatch_callsite(site, callee);
++                    }
++                }
++            }
+             mir::TerminatorKind::InlineAsm {
+                 template: _,
+                 operands: _,
+--- a/src/util/results_dumper.rs
++++ b/src/util/results_dumper.rs
+@@ -32,6 +32,7 @@
+     S: CGCallSite + Into<BaseCallSite>,
+     <P as PAGPath>::FuncTy: Ord + std::fmt::Debug + Into<FuncId> + Copy
+ {
++    crate::util::depth_export::dump(acx, call_graph);
+     // dump points-to results
+     if let Some(pts_output) = &acx.analysis_options.pts_output {
+         info!("Dumping points-to results...");
+@@ -194,7 +195,9 @@
+         mir_writer
+             .write_all(format!("[{:?} - {:?}]\n", func_id, func_name).as_bytes())
+             .expect("Unable to write data");
+-        if !acx.tcx.is_mir_available(def_id) {
++        if acx.tcx.lang_items().drop_in_place_fn() == Some(def_id) {
++            writeln!(mir_writer, "Generated drop glue: {:#?}", acx.function_mir(func_id).unwrap()).unwrap();
++        } else if !acx.tcx.is_mir_available(def_id) {
+             mir_writer.write_all(("Mir is unavailable\n").as_bytes()).expect("Unable to write data");
+         } else {
+             rustc_middle::mir::write_mir_pretty(acx.tcx, Some(def_id), mir_writer.as_mut()).unwrap();
+--- a/src/util/mod.rs
++++ b/src/util/mod.rs
+@@ -174,3 +174,5 @@
+         path
+     }
+ }
++
++pub mod depth_export;
+--- a/src/pta/context_sensitive.rs
++++ b/src/pta/context_sensitive.rs
+@@ -430,6 +430,15 @@
+         // dump call graph, points-to results
+         results_dumper::dump_results(self.acx, &self.call_graph, &self.pt_data, &self.pag);
+       
++        if let Some(path) = &self.acx.analysis_options.call_graph_output {
++            let mut contexts = std::collections::BTreeMap::new();
++            for f in self.call_graph.reach_funcs_iter() {
++                contexts.insert(format!("{:?}",f.cid),
++                    format!("{:?}",self.ctx_strategy.get_context_by_id(f.cid)));
++            }
++            std::fs::write(format!("{}.contexts.json",path),
++                serde_json::to_vec_pretty(&contexts).unwrap()).unwrap();
++        }
+         // dump pta statistics
+         let pta_stat = ContextSensitiveStat::new(self);
+         pta_stat.dump_stats();
+--- /dev/null
++++ b/src/util/depth_export.rs
+@@ -0,0 +1,80 @@
++// Experimental depth-study sidecar for the pinned RUPTA checkout.
++// Does not change analysis, target sets, or contexts.
++use crate::graph::call_graph::{CallGraph, CGFunction, CGCallSite};
++use crate::mir::analysis_context::AnalysisContext;
++use crate::mir::call_site::BaseCallSite;
++use crate::mir::function::FuncId;
++use petgraph::visit::EdgeRef;
++use serde_json::{json, Value};
++
++fn source(acx: &AnalysisContext, span: rustc_span::Span) -> Value {
++    if span.is_dummy() { return Value::Null; }
++    let sm = acx.tcx.sess.source_map();
++    let lo = sm.lookup_char_pos(span.lo());
++    let hi = sm.lookup_char_pos(span.hi());
++    json!({"file":lo.file.name.prefer_local().to_string(), "line":lo.line,
++           "column":lo.col.0+1, "end_line":hi.line, "end_column":hi.col.0+1})
++}
++
++pub fn dump<F, S>(acx: &AnalysisContext, cg: &CallGraph<F,S>)
++where F: CGFunction + Into<FuncId>, S: CGCallSite + Into<BaseCallSite> {
++    let Some(path) = &acx.analysis_options.call_graph_output else { return; };
++    let mut nodes = Vec::new();
++    let mut functions = Vec::new();
++    let mut visited = std::collections::HashSet::new();
++    let mut entries = Vec::new();
++    for f in cg.reach_funcs_iter() {
++        let id: FuncId = f.into();
++        let fr = acx.get_function_reference(id);
++        let node = format!("{:?}", f);
++        if fr.def_id == acx.entry_point { entries.push(node.clone()); }
++        nodes.push(json!({"id":node, "function":format!("{:?}",id)}));
++        if visited.insert(id) {
++            functions.push(json!({"id":format!("{:?}",id), "name":fr.to_string(),
++                "def_id":format!("{:?}",fr.def_id),
++                "def_path_hash":format!("{:?}",acx.tcx.def_path_hash(fr.def_id)),
++                "generic_args":format!("{:?}",fr.generic_args),
++                "promoted":format!("{:?}",fr.promoted),
++                "source":source(acx, acx.tcx.def_span(fr.def_id)),
++                "body_available":acx.function_mir(id).is_some(),
++                "special_model":acx.special_functions.contains(&id),
++                "drop_glue":acx.tcx.lang_items().drop_in_place_fn()==Some(fr.def_id)}));
++        }
++    }
++    let mut edges = Vec::new();
++    for e in cg.graph.edge_references() {
++        let base: BaseCallSite = e.weight().callsite.into();
++        edges.push(json!({"caller":format!("{:?}",cg.graph[e.source()].func),
++            "callee":format!("{:?}",cg.graph[e.target()].func),
++            "location":format!("{:?}",base.location)}));
++    }
++    // A recognized site exists even when no points-to target was found.
++    // Each reachable context processes the same function-PAG site inventory.
++    let mut sites = Vec::new();
++    for f in cg.reach_funcs_iter() {
++        let id: FuncId = f.into();
++        for (base, kind) in &cg.callsite_to_type {
++            if base.func != id { continue; }
++            let caller = format!("{:?}",f);
++            let loc = format!("{:?}",base.location);
++            let span = acx.function_mir(id).map(|body| {
++                let block = &body.basic_blocks[base.location.block];
++                if base.location.statement_index < block.statements.len() {
++                    block.statements[base.location.statement_index].source_info.span
++                } else { block.terminator().source_info.span }
++            });
++            let targets: Vec<_> = edges.iter().filter(|e| e["caller"]==caller && e["location"]==loc)
++                .map(|e| e["callee"].clone()).collect();
++            sites.push(json!({"caller":caller,"location":loc,"kind":format!("{:?}",kind),
++                "source":span.map(|s|source(acx,s)),"targets":targets}));
++        }
++    }
++    // FuncId(0) is not assumed: use the actual first reachable node as root,
++    // and verify its DefId is the configured compiler entry.
++    let root = nodes.first().expect("analysis without reachable entry")["id"].clone();
++    assert!(entries.iter().any(|s| *s == root.as_str().unwrap()));
++    let value = json!({"schema":1,"entry":root,"entry_def_id":format!("{:?}",acx.entry_point),
++        "functions":functions,"nodes":nodes,"edges":edges,"callsites":sites,
++        "unresolved_scope":"recognized indirect callsites only; not a soundness certificate"});
++    std::fs::write(format!("{}.depth.json",path),serde_json::to_vec_pretty(&value).unwrap()).unwrap();
++}
+--- a/src/builder/call_graph_builder.rs
++++ b/src/builder/call_graph_builder.rs
+@@ -42,6 +42,14 @@
+     def_id: DefId,
+     gen_args: GenericArgsRef<'tcx>,
+ ) -> Option<(DefId, GenericArgsRef<'tcx>)> {
++    // Dynamic Drop is selected by the pointee's concrete type, using the
++    // compiler's drop-glue resolver. The existing propagator substitutes Self.
++    if tcx.lang_items().drop_in_place_fn() == Some(def_id) {
++        let dropped_ty = gen_args.types().next()?;
++        if matches!(dropped_ty.kind(), TyKind::Dynamic(..)) { return None; }
++        let instance = rustc_middle::ty::Instance::resolve_drop_in_place(tcx, dropped_ty);
++        return Some((instance.def.def_id(), instance.args));
++    }
+     if !util::is_trait_method(tcx, def_id) {
+         return None;
+     }
