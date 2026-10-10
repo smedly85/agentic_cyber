@@ -1158,7 +1158,10 @@ if [[ -n "$ANALYSIS_DIVERSITY_K_MAX" &&
 fi
 
 ANALYZER_PATH="$REPO/scripts/analyze_experiment.py"
+RUST_TOOLCHAIN_JSON=null
 if [[ "$SOURCE_PATH" == *.rs ]]; then
+    source "$REPO/scripts/rust_toolchain.sh"
+    rust_toolchain_preflight || exit 4
     warn "Rust functional validation is supported; C-only structural analysis is skipped"
     NO_ANALYSIS=1
 fi
@@ -1232,6 +1235,7 @@ write_metadata "$OUTPUT_DIR/sweep.json" \
     architect_mode true \
     model "$MODEL" \
     model_provenance "__JSON__:${MODEL_PROVENANCE_JSON:-null}" \
+    rust_toolchain "__JSON__:$RUST_TOOLCHAIN_JSON" \
     editor_temperature 0 \
     editor_sampling_seed 0 \
     editor_edit_format "$EDITOR_EDIT_FORMAT" \
@@ -1431,6 +1435,7 @@ PY
         architect_mode true \
         model "$MODEL" \
         model_provenance "__JSON__:${MODEL_PROVENANCE_JSON:-null}" \
+        rust_toolchain "__JSON__:$RUST_TOOLCHAIN_JSON" \
         temperature "$temperature" \
         top_p "$(optional_number "$TOP_P")" \
         sampling_seed "$(optional_number "$SAMPLING_SEED")" \
@@ -2037,6 +2042,7 @@ PY
             architect_mode true \
             model "$MODEL" \
             model_provenance "__JSON__:${MODEL_PROVENANCE_JSON:-null}" \
+            rust_toolchain "__JSON__:$RUST_TOOLCHAIN_JSON" \
             temperature "$temperature" \
             top_p "$(optional_number "$TOP_P")" \
             sampling_seed "$(optional_number "$SAMPLING_SEED")" \

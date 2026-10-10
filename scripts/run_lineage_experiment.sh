@@ -652,6 +652,13 @@ if [[ "$PRINT_PLAN" -eq 1 ]]; then
     exit 0
 fi
 
+# Toolchain eligibility is infrastructure, not an attempted lineage.
+RUST_TOOLCHAIN_JSON=null
+if [[ "$DRY_RUN" -eq 0 && "$SOURCE_PATH" == *.rs ]]; then
+    source "$REPO/scripts/rust_toolchain.sh"
+    rust_toolchain_preflight || exit 4
+fi
+
 # A dry run must not touch the filesystem, so the output directory is only
 # created when something is actually going to be written into it. OUTPUT_DIR is
 # already absolute either way; the cd/pwd pass only resolves symlinks.
@@ -864,7 +871,7 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
     "$PYTHON_BIN" - "$RUN_METADATA" "$PLAN_JSON" "$REPO" "$REPO_COMMIT" \
         "$LINEAGE_START" "$LINEAGES" "$(timestamp)" "$OLLAMA_TRACE" \
         "$SECURITY_EVALUATION" "$SECURITY_FUZZ_SECONDS" "$SECURITY_SEED" \
-        "$SECURITY_TIMEOUT" "$SECURITY_MAX_INPUTS" <<'PY'
+        "$SECURITY_TIMEOUT" "$SECURITY_MAX_INPUTS" "$RUST_TOOLCHAIN_JSON" <<'PY'
 import hashlib
 import json
 import sys
@@ -872,7 +879,7 @@ from pathlib import Path
 
 (path, plan_json, repository, commit, start, count, created, ollama_trace,
  security_enabled, security_seconds, security_seed, security_timeout,
- security_max_inputs) = sys.argv[1:]
+ security_max_inputs, rust_toolchain_json) = sys.argv[1:]
 plan = json.loads(plan_json)
 target = Path(path)
 security_configuration = {
@@ -941,6 +948,7 @@ record.update(
         "max_loops": plan["max_loops"],
         "timeout_seconds": plan["timeout_seconds"],
         "source_path": plan["source_path"],
+        "rust_toolchain": json.loads(rust_toolchain_json),
         "source_basename": plan["source_basename"],
         "executable_path": plan["executable_path"],
         "test_dir": plan["test_dir"],

@@ -16,6 +16,21 @@ direct rustc command. Capture retains the source basename, including .rs; the
 existing per-lineage seed checks and SHA-256 provenance remain in force. Empty
 archival analysis baselines are controller metadata, not agent-visible seeds.
 
+Both runner entry points preflight Rust before creating experiment output or
+starting an attempt. They preserve an existing `rustc` selection on `PATH`, or
+fall back to `$HOME/.cargo/bin` for non-interactive shells. The corrected `PATH`
+is inherited by stage runners and boundary recompilation. Preflight checks the
+compiler version, then compiles and executes a temporary Rust 2021 program;
+temporary files are removed on success or failure. An unavailable compiler,
+broken linker/toolchain, or failed probe exits with status 4 and an explicit
+`infrastructure_error: rust_toolchain_unavailable` diagnostic, without recording
+an LLM functional failure. Plan and dry-run modes do not execute the probe.
+
+The `rust_toolchain` provenance object records `compiler_path`, `version`,
+`edition`, and `compile_execute_verified` in `lineages.json`, `sweep.json`,
+`experiment.json`, and attempt `metadata.json`. C runs do not probe Rust and
+record this object as null.
+
 Every prompt requires its anchor on the actual operation path from main. Later
 prompts prohibit renaming/removing it. No helper count or artificial depth is
 prescribed. Prompt requirements do not claim semantic reachability verification.
