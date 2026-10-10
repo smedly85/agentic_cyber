@@ -19,7 +19,18 @@ EDITOR_TEMPERATURE = 0.0
 EDITOR_SEED = 0
 EDITOR_EDIT_FORMAT = "editor-diff"
 EDITOR_EDIT_FORMATS = ("whole", "editor-diff")
-ARCHITECT_THINK_VALUES = ("low", "medium", "high")
+ARCHITECT_THINK_VALUES = ("false", "low", "medium", "high")
+
+
+def normalize_architect_think(value: Any) -> bool | str | None:
+    """Keep omission distinct from native Ollama boolean false."""
+    if value is None or value == "":
+        return None
+    if value is False or value == "false":
+        return False
+    if isinstance(value, str) and value in ARCHITECT_THINK_VALUES:
+        return value
+    raise ValueError("architect think must be one of " + ", ".join(ARCHITECT_THINK_VALUES))
 
 
 def optional_float(value: Any) -> float | None:
@@ -66,16 +77,12 @@ def build_model_settings(
             "editor edit format must be one of " + ", ".join(EDITOR_EDIT_FORMATS)
         )
 
-    architect_params: dict[str, int | float | str] = {
+    architect_params: dict[str, bool | int | float | str] = {
         "temperature": float(temperature),
     }
-    if architect_think not in (None, ""):
-        if architect_think not in ARCHITECT_THINK_VALUES:
-            raise ValueError(
-                "architect think must be one of "
-                + ", ".join(ARCHITECT_THINK_VALUES)
-            )
-        # LiteLLM preserves the native string-valued `think` parameter and its
+    architect_think = normalize_architect_think(architect_think)
+    if architect_think is not None:
+        # LiteLLM preserves the native boolean/string `think` parameter and its
         # Ollama adapter promotes it to the top-level request. Do not substitute
         # reasoning_effort: for this model that collapses low/medium/high to the
         # same boolean `think=true` condition.

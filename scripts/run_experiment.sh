@@ -71,9 +71,9 @@ Temperature:
 Other sampling parameters (each optional; unset means the flag is absent from
 the request and the server's own default applies, which is the behavior before
 these flags existed):
-  --architect-think LEVEL   Native architect thinking level: low, medium, or
-                             high. Sent directly as the string-valued `think`
-                             parameter; never translated to reasoning_effort.
+  --architect-think LEVEL   Native architect thinking: false, low, medium, or
+                             high. false is sent as a JSON boolean; levels as
+                             strings in `think`, never reasoning_effort.
   --editor-edit-format FMT  Editor output protocol: whole or editor-diff
                              (default: editor-diff).
   --top-p P                  Nucleus sampling mass, 0 <= P <= 1. Sent as
@@ -232,6 +232,14 @@ optional_string() {
         printf '__STR__:%s' "$1"
     else
         printf '__JSON__:null'
+    fi
+}
+
+optional_think() {
+    if [[ "$1" == false ]]; then
+        printf '__JSON__:false'
+    else
+        optional_string "$1"
     fi
 }
 
@@ -868,10 +876,11 @@ if [[ -n "$NUM_CTX" ]]; then
         die "--num-ctx must be a positive integer"
 fi
 if [[ -n "$ARCHITECT_THINK" &&
+      "$ARCHITECT_THINK" != false &&
       "$ARCHITECT_THINK" != low &&
       "$ARCHITECT_THINK" != medium &&
       "$ARCHITECT_THINK" != high ]]; then
-    die "--architect-think must be low, medium, or high"
+    die "--architect-think must be false, low, medium, or high"
 fi
 if [[ "$EDITOR_EDIT_FORMAT" != whole &&
       "$EDITOR_EDIT_FORMAT" != editor-diff ]]; then
@@ -1256,7 +1265,7 @@ write_metadata "$OUTPUT_DIR/sweep.json" \
     sampling_seed "$(optional_number "$SAMPLING_SEED")" \
     max_tokens "$(optional_number "$MAX_TOKENS")" \
     num_ctx "$(optional_number "$NUM_CTX")" \
-    architect_think "$(optional_string "$ARCHITECT_THINK")" \
+    architect_think "$(optional_think "$ARCHITECT_THINK")" \
     runs_per_temperature "$RUNS" \
     max_loops "$MAX_LOOPS" \
     test_dirs "$TEST_DIRS_JOINED" \
@@ -1377,7 +1386,8 @@ expected = {
     "max_tokens": None if max_tokens == "__NONE__" else int(max_tokens),
     "num_ctx": None if num_ctx == "__NONE__" else int(num_ctx),
     "architect_think": (
-        None if architect_think == "__NONE__" else architect_think
+        None if architect_think == "__NONE__" else
+        False if architect_think == "false" else architect_think
     ),
     "editor_temperature": 0,
     "editor_sampling_seed": 0,
@@ -1441,7 +1451,7 @@ PY
         sampling_seed "$(optional_number "$SAMPLING_SEED")" \
         max_tokens "$(optional_number "$MAX_TOKENS")" \
         num_ctx "$(optional_number "$NUM_CTX")" \
-        architect_think "$(optional_string "$ARCHITECT_THINK")" \
+        architect_think "$(optional_think "$ARCHITECT_THINK")" \
         editor_temperature 0 \
         editor_sampling_seed 0 \
         editor_edit_format "$EDITOR_EDIT_FORMAT" \
@@ -2048,7 +2058,7 @@ PY
             sampling_seed "$(optional_number "$SAMPLING_SEED")" \
             max_tokens "$(optional_number "$MAX_TOKENS")" \
             num_ctx "$(optional_number "$NUM_CTX")" \
-            architect_think "$(optional_string "$ARCHITECT_THINK")" \
+            architect_think "$(optional_think "$ARCHITECT_THINK")" \
             architect_sampling "__JSON__:$("$PYTHON_BIN" -c 'import json,sys; s=json.loads(sys.argv[1]); print(json.dumps(s[0]["extra_params"],separators=(",",":")))' "$AIDER_MODEL_SETTINGS_JSON")" \
             editor_sampling "__JSON__:$("$PYTHON_BIN" -c 'import json,sys; s=json.loads(sys.argv[1]); print(json.dumps(s[1]["extra_params"],separators=(",",":")))' "$AIDER_MODEL_SETTINGS_JSON")" \
             editor_edit_format "$EDITOR_EDIT_FORMAT" \

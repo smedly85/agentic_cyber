@@ -418,6 +418,18 @@ omitting the key. Every sampling value is part of the lineage configuration
 fingerprint, so changing one refuses to resume an existing `--output-dir` rather
 than mixing conditions.
 
+`--architect-think false` explicitly disables architect thinking using native
+Ollama JSON `"think": false`. Omitting the option still omits `think` from the
+request and records null in provenance; `low`, `medium`, and `high` retain their
+string values. This control changes only the architect, is fingerprinted, and
+is preserved in lineage, experiment, and attempt metadata. Use a fresh output
+directory when changing it. `--ollama-trace` captures the outgoing request under
+`ollama-trace/requests/`; inspect the architect request's top-level `think`, not
+the editor request or `options`. The offline installed-package check is
+`python -m pytest -q tests/test_architect_thinking.py -k installed` in the Aider
+environment; it skips when Aider/LiteLLM are not installed and makes no model
+calls.
+
 Two spellings are refused outright rather than accepted and quietly ignored:
 
 * **`--top-k`** — native `ollama_chat` can carry it, but transport support alone

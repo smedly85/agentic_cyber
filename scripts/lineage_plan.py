@@ -164,13 +164,10 @@ def resolve_plan(
     del agent
     architect_model = model
     temperature = temperature_value.canonicalize(temperature)
-    if architect_think in (None, ""):
-        architect_think = None
-    elif architect_think not in aider_settings.ARCHITECT_THINK_VALUES:
-        raise ManifestError(
-            "architect_think must be one of "
-            + ", ".join(aider_settings.ARCHITECT_THINK_VALUES)
-        )
+    try:
+        architect_think = aider_settings.normalize_architect_think(architect_think)
+    except ValueError as error:
+        raise ManifestError(str(error)) from error
     if editor_edit_format not in aider_settings.EDITOR_EDIT_FORMATS:
         raise ManifestError(
             "editor_edit_format must be one of "
@@ -505,7 +502,7 @@ def fingerprint(plan: dict[str, Any]) -> str:
     material = {key: value for key, value in plan.items() if key != "config_fingerprint"}
     # Historical plans predate this optional key. Omitting the new control is
     # the same request condition as those plans, so preserve their fingerprint;
-    # explicit low/medium/high values remain covered both here and in the
+    # explicit false/low/medium/high values remain covered both here and in the
     # generated Aider settings.
     if material.get("architect_think") is None:
         material.pop("architect_think", None)

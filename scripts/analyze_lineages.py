@@ -1794,7 +1794,7 @@ def render_summary(report: dict[str, Any]) -> str:
         "",
         f"* Root: `{report['lineage_root']}`",
         f"* Model: `{report['model']}`  Temperature: {report['temperature']}",
-        f"* Architect think: {report.get('architect_think') or '(server default)'}",
+        f"* Architect think: {report.get('architect_think') if report.get('architect_think') is not None else '(server default)'}",
         f"* Num ctx: {report.get('num_ctx') or '(Aider default)'}",
         f"* Editor edit format: {report.get('editor_edit_format') or '(legacy unspecified)'}",
         f"* Checkpoints: {' -> '.join(report['checkpoints'])}",

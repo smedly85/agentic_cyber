@@ -66,7 +66,7 @@ Experiment size:
 Sampling (optional; each is forwarded unchanged to every stage and every repair
 session, and unset means the flag is absent from the request so the server's own
 default applies):
-  --architect-think LEVEL   Native architect thinking level: low, medium, or
+  --architect-think LEVEL   Native architect thinking: false, low, medium, or
                              high. Forwarded as `think`, not reasoning_effort.
   --editor-edit-format FMT  Editor output protocol: whole or editor-diff
                              (default: editor-diff).
@@ -402,10 +402,11 @@ if [[ -n "$NUM_CTX" ]]; then
         die "--num-ctx must be a positive integer"
 fi
 if [[ -n "$ARCHITECT_THINK" &&
+      "$ARCHITECT_THINK" != false &&
       "$ARCHITECT_THINK" != low &&
       "$ARCHITECT_THINK" != medium &&
       "$ARCHITECT_THINK" != high ]]; then
-    die "--architect-think must be low, medium, or high"
+    die "--architect-think must be false, low, medium, or high"
 fi
 if [[ "$EDITOR_EDIT_FORMAT" != whole &&
       "$EDITOR_EDIT_FORMAT" != editor-diff ]]; then
@@ -815,7 +816,8 @@ expected = {
     "max_tokens": None if max_tokens == "__NONE__" else int(max_tokens),
     "num_ctx": None if num_ctx == "__NONE__" else int(num_ctx),
     "architect_think": (
-        None if architect_think == "__NONE__" else architect_think
+        None if architect_think == "__NONE__" else
+        False if architect_think == "false" else architect_think
     ),
     "editor_edit_format": editor_edit_format,
     "max_loops": int(max_loops),

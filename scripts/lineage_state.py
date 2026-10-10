@@ -116,8 +116,12 @@ def optional_int(value: str | None) -> int | None:
 
 
 def init_record(args: argparse.Namespace) -> dict[str, Any]:
-    if args.architect_think not in ("", "low", "medium", "high"):
-        raise StateError("architect think must be low, medium, or high")
+    from aider_settings import normalize_architect_think
+
+    try:
+        architect_think = normalize_architect_think(args.architect_think)
+    except ValueError as error:
+        raise StateError(str(error)) from error
     if args.editor_edit_format not in ("whole", "editor-diff"):
         raise StateError("editor edit format must be whole or editor-diff")
     return {
@@ -142,7 +146,7 @@ def init_record(args: argparse.Namespace) -> dict[str, Any]:
         "sampling_seed": optional_int(args.sampling_seed),
         "max_tokens": optional_int(args.max_tokens),
         "num_ctx": optional_int(args.num_ctx),
-        "architect_think": args.architect_think or None,
+        "architect_think": architect_think,
         "editor_temperature": 0.0,
         "editor_sampling_seed": 0,
         "editor_edit_format": args.editor_edit_format,
