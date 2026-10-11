@@ -27,9 +27,18 @@ Your implementation so far:
 This file is your own previous work, already on disk in this directory. It is
 not a baseline and not a reference solution.
 
-Read it before changing it.
+Read its contents supplied through Aider before changing it.
 
-Make only the changes needed to fix the failures listed below.
+Treat the supplied validation feedback as actionable implementation requirements
+under the original task's bounded contract. Address every reported failing case
+and compiler diagnostic, not just the first. Use both the structured failures
+and raw output to identify underlying defects and make actual source edits in
+this invocation. Restating the problem or proposing future fixes is insufficient.
+
+Make the changes needed to fix those defects while preserving already passing
+behavior and all original requirements. Do not return an unchanged candidate
+while known failures remain unless repair is genuinely impossible under the
+task's constraints; in that case, state the specific constraint and blocker.
 
 ## Original task
 
@@ -76,9 +85,10 @@ The failures above come from the following visible tests:
 
     [TEST_DIR_PATHS]
 
-You may inspect these visible tests while repairing the task.
+Use any visible test contents supplied as read-only context through Aider while
+repairing the task. Do not assume the listed paths provide independent tool access.
 
-Do not modify, replace, weaken, disable, bypass, or delete any visible test.
+Do not modify, replace, weaken, disable, bypass, or delete any test.
 
 Do not special-case individual test inputs. Fix the underlying behavior.
 
@@ -92,7 +102,7 @@ Do not create or modify any other file.
 
 ## Build
 
-Run:
+The controller runs:
 
     [BUILD_COMMAND]
 
@@ -118,5 +128,6 @@ Report:
 
 1. What was failing and why.
 2. What you changed.
-3. Build command run.
-4. Which failing tests you expect to pass now.
+3. Compiler diagnostics addressed; compilation is performed by the controller.
+4. How the edits address every reported failure, and any unresolved blocker.
+   Expected outcomes must not be reported as verified passes.

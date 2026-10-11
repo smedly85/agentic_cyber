@@ -12,6 +12,32 @@ The executable must remain:
 
 Implement only the bounded behavior described here.
 
+## Checkpoint scope
+
+Complete functionality required now: the entire baseline below, force,
+interactive confirmation, and recursive copying. New in checkpoint 003:
+`-r` / `--recursive` and the recursive semantics in New behavior, including
+the change to source symlink handling when recursion is active.
+Reserved for later: no further checkpoint is defined in this ladder. Implement
+no options or aliases beyond the three pairs listed in Arguments. Without
+recursion, preserve the full earlier contract, including directory-source errors.
+
+Force remains mandatory: repeated `-f` / `--force` is idempotent. Try
+normal destination opening first; only if it fails for an existing nondirectory
+destination, remove it and retry creation if directory permissions allow.
+Do not bypass source/parent permissions, suppress unrelated errors, or replace
+a directory with a file. Normal in-place overwrites retain destination rwx bits.
+
+Interactive remains mandatory: repeated `-i` / `--interactive` is
+idempotent. Prompt on stderr naming the effective destination and consume one
+complete stdin line. Only a first byte of ASCII y/Y approves in the C locale;
+leading whitespace, empty input, EOF and all other first bytes decline. Do not
+prompt for nonexistent destinations. A decline leaves the entry unchanged,
+contributes status 1, and does not add an error beyond the prompt. Force and
+interactive remain independent in either order and with long aliases: ask
+before normal opening or any force fallback.
+
+
 ## Current program
 
 Preserve the base contract below and the already implemented options `-f`, `-i` unless explicitly changed.
@@ -93,6 +119,24 @@ options, or multiple sources without a directory target must fail before
 mutating anything, with stderr diagnostic, empty stdout and status 1.
 Combined short option spellings are outside the contract.
 
+Read arguments with `std::env::args_os()`. Retain operands as OsString/PathBuf
+(or borrowed OsStr/Path) through parsing, basename selection and filesystem
+operations; never require UTF-8 or use lossy conversion to construct paths.
+Parse the entire argument list and validate invocation-wide errors before any
+mutation. Recognize only the options allowed here anywhere before the first
+`--`, even after operands. Consume that terminator; all later arguments are
+literal operands, including a later `--`. A bare `-` remains a filename.
+
+For one source, select DEST itself unless it is an existing directory, in which
+case select DEST/source-basename. For multiple sources, require an existing
+directory as the final operand before processing any source, and select a
+separate effective destination for each source. Apply the utility-specific
+symlink and object-type rules above to these effective destinations. Check
+self-operation safeguards before destructive changes. Process sources in order,
+diagnose each per-source failure and continue later sources, accumulating
+status 1 for any failure; return 0 only on complete success. Preserve completed
+operations after later errors, with stdout/stderr behavior as specified above.
+
 ## Reference
 
 GNU Coreutils 9.11 cp is the functional behavioral reference only within this
@@ -126,6 +170,8 @@ prompts, controller files, or other repository files.
 
 ## Build
 
+The controller compiles the candidate with:
+
     mkdir -p build && rustc --edition=2021 -C opt-level=2 -D warnings src/new_cp/new_cp.rs -o build/new_cp
 
 Fix compiler errors and warnings.
@@ -133,7 +179,8 @@ Fix compiler errors and warnings.
 ## Visible tests
 
 The controller stages the checkpoint-visible bundle at `tests/cp-test-suite/`.
-You may read it. The controller will judge this checkpoint with exactly:
+Use selected read-only contents supplied through Aider; the path alone does not
+provide tool access. The controller will judge this checkpoint with exactly:
 
     tests/cp-test-suite/judge_candidate.sh build/new_cp -f -i -r
 
@@ -149,4 +196,5 @@ bypass or delete any test file.
 ## Final response
 
 Report files changed, behavior implemented, error/status rules,
-and build and other commands run.
+and any unresolved constraints. Compilation and validation are controller-owned;
+do not claim unperformed commands or unverified results.

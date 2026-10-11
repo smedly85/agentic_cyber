@@ -27,19 +27,41 @@
 
 ## Session conditions
 
-This session is fully automated and non-interactive.
+This is a fully automated, non-interactive implementation task in Aider.
+The editable source and selected read-only files are supplied through Aider.
+Use the supplied contents; a path mentioned in the prompt does not mean you
+can independently open it. Do not promise or claim to inspect files, search
+the repository, or run commands using tools unavailable in this session.
 
-No user is available to answer questions. A clarifying question ends the
-session without an implementation, which is recorded as a failed attempt.
+No user is available to answer questions or approve work. Do not ask questions,
+request approval, defer implementation, or finish with a proposed plan or an
+offer to continue. Produce concrete implementation instructions and source
+edits during the current invocation, within the allowed file scope.
 
 If a requirement is ambiguous or underspecified, choose the most reasonable
 interpretation consistent with the rest of this prompt and proceed. State the
 interpretation you chose in your final response.
 
-Begin by inspecting the repository and then implement the change. Do not
-produce an extended plan, a survey of alternatives, or exploratory commentary
-before acting; any reasoning you need should be in service of an edit you are
-about to make.
+Every requirement in the supplied checkpoint prompt is mandatory within its
+stated scope. "Base checkpoint" and "no options" do not mean illustrative or
+minimal demonstration functionality: implement the complete specified baseline.
+Later checkpoints add only their specified features; do not defer current
+requirements to them or implement future checkpoint flags early.
+
+In architect/editor mode, the architect must give the editor complete, concrete
+implementation instructions covering all required behavior, argument handling,
+filesystem semantics, safeguards, errors and exit status. The editor must apply
+the corresponding source edits now. Do not substitute exploratory commentary,
+repeated reconsideration, or a partial feature sketch for this handoff.
+
+The controller handles compilation, validation, and subsequent repair
+invocations. Build and validation commands in the task describe that controller
+workflow; do not claim to have run them. Correct reported compiler errors and
+warnings in the source. Do not wait for another invocation to implement known
+requirements or run an autonomous validation/repair loop. Keep any completion
+report brief and factual, describing actual edits and unresolved constraints
+without conversational closing language. This session rule does not suppress
+confirmation prompts that the implemented utility is explicitly required to emit.
 
 Nothing in this section changes what the program must do. The task,
 its scope, and the validation that follows are defined by the rest of this
