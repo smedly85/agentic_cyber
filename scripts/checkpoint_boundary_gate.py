@@ -197,6 +197,11 @@ def _transfer_probe(option: str, flag: str, fixture: Path) -> dict[str, Any]:
 
 
 PROBES = {
+    "python-cp": {"build": _transfer_probe, "requires_diagnostic": True},
+    "python-mv": {"build": _transfer_probe, "requires_diagnostic": True},
+    "python-mkdir": {"build": _mkdir_probe, "requires_diagnostic": True},
+    "python-ls": {"build": lambda option, flag, fixture: {
+        "argv": [option, "."], "stdin": b""}, "requires_diagnostic": True},
     "cp": {"build": _transfer_probe, "requires_diagnostic": True},
     "mv": {"build": _transfer_probe, "requires_diagnostic": True},
     "sort": {"build": _sort_probe, "requires_diagnostic": True},

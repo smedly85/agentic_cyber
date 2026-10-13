@@ -148,6 +148,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="the built executable, relative to the workdir")
     parser.add_argument("--workdir", type=Path, default=Path.cwd())
     parser.add_argument("--repo", type=Path, default=REPO)
+    parser.add_argument("--json-report", type=Path,
+                        help="controller-owned durable result path, outside the agent workdir")
     args = parser.parse_args(argv)
 
     repo = args.repo.resolve()
@@ -176,8 +178,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         command = [
             sys.executable, str(suite_root / "runner.py"), str(corpus),
-            "--config", str(config), "--", str(args.candidate),
+            "--config", str(config),
         ]
+        if args.json_report is not None:
+            command.extend(["--json-report", str(args.json_report.resolve())])
+        command.extend(["--", str(args.candidate)])
         print(f"held-out pass: {args.utility}, implemented={flags or '[]'}")
         completed = subprocess.run(command, cwd=str(args.workdir))
         return completed.returncode

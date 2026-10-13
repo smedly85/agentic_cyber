@@ -7,6 +7,11 @@ detail is hardcoded in the controller.
 
 ## Schema
 
+The `python-cp`, `python-mv`, `python-ls` and `python-mkdir` manifests use the same
+schema and checkpoint controller. Their build step validates syntax and creates
+an interpreter-pinned launcher, with no candidate implementation supplied. See
+[Python lineage setup and platform contracts](../../docs/python_lineages.md).
+
 ```json
 {
   "schema_version": 1,

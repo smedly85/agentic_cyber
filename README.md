@@ -6,7 +6,10 @@ repository state, generated candidates, validation results, and metadata needed
 to reproduce and compare independent repository histories.
 
 The experiment generates C reimplementations of four standard utilities and
-Rust cp/mv implementations one feature at a time. The primary paper analysis separates RQ1 correctness and
+Rust cp/mv implementations one feature at a time. Python cp, mv, ls and mkdir
+also use this pipeline for functional-only lineages; see
+[Python setup, checks and diagnostic commands](docs/python_lineages.md).
+The primary paper analysis separates RQ1 correctness and
 lineage completion, RQ2 implementation diversity and maintenance variation,
 and RQ3 security. No composite score combines them.
 `docs/diversity_methodology.md` defines the structural and maintenance

@@ -501,6 +501,9 @@ TEST_DIR="$(plan_field test_dir)"
 BASE_TEST_CMD="$(plan_field base_test_command)"
 EXTRA_TEST_CMD="$(plan_field extra_test_command)"
 SECURITY_CMD='"$SECURITY_PYTHON" "$SECURITY_ROOT/security/run_security_evaluator.py" --utility '"$UTILITY"' --source '"$SOURCE_PATH"' --output "$SECURITY_OUTPUT" --artifacts "$SECURITY_ARTIFACTS" --security-fuzz-seconds "$SECURITY_FUZZ_SECONDS" --security-seed "$SECURITY_SEED" --security-timeout "$SECURITY_TIMEOUT" --security-max-inputs "$SECURITY_MAX_INPUTS"'
+if [[ "$SOURCE_PATH" == *.py ]]; then
+    SECURITY_EVALUATION=0
+fi
 if [[ "$SECURITY_EVALUATION" -eq 0 ]]; then
     SECURITY_CMD=""
 fi
@@ -654,6 +657,11 @@ if [[ "$PRINT_PLAN" -eq 1 ]]; then
 fi
 
 # Toolchain eligibility is infrastructure, not an attempted lineage.
+if [[ "$SOURCE_PATH" == *.py ]]; then
+    PYTHON_BIN="$("$PYTHON_BIN" -c 'import sys; print(sys.executable)')"
+    export PYTHON_BIN
+    export PYTHON_CONTROLLER_ROOT="$REPO"
+fi
 RUST_TOOLCHAIN_JSON=null
 if [[ "$DRY_RUN" -eq 0 && "$SOURCE_PATH" == *.rs ]]; then
     source "$REPO/scripts/rust_toolchain.sh"

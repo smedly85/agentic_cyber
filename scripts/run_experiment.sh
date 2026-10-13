@@ -1167,6 +1167,13 @@ if [[ -n "$ANALYSIS_DIVERSITY_K_MAX" &&
 fi
 
 ANALYZER_PATH="$REPO/scripts/analyze_experiment.py"
+if [[ "$SOURCE_PATH" == *.py ]]; then
+    PYTHON_BIN="$("$PYTHON_BIN" -c 'import sys; print(sys.executable)')"
+    export PYTHON_BIN
+    export PYTHON_CONTROLLER_ROOT="$REPO"
+    # The existing structural/security backends target C/Rust, not Python.
+    NO_ANALYSIS=1
+fi
 RUST_TOOLCHAIN_JSON=null
 if [[ "$SOURCE_PATH" == *.rs ]]; then
     source "$REPO/scripts/rust_toolchain.sh"
@@ -1635,6 +1642,12 @@ PY
         # Loop 0 is the initial generation; loops 1..MAX_LOOPS are repairs, so
         # the budget bounds the iteration count directly.
         for (( validation_loop = 0; validation_loop <= MAX_LOOPS; validation_loop++ )); do
+            if [[ "$SOURCE_PATH" == *.py ]]; then
+                # Durable reports stay outside both the agent worktree and the
+                # immutable test bundle. The Aider environment is allowlisted.
+                export VALIDATION_JSON_REPORT="$attempt_dir/public-validation-$validation_loop.json"
+                export HELDOUT_JSON_REPORT="$attempt_dir/heldout-validation.json"
+            fi
             if [[ "$validation_loop" -eq 0 ]]; then
                 invocation_kind="INITIAL"
                 loop_kind="initial"
