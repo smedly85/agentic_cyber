@@ -1,9 +1,10 @@
 """Darwin-only GNU 9.11 SORT freezing; pending recipes are never judgeable.
 
-The four stdin-interface rejection cases are specification assertions, explicitly
-not GNU goldens. Full GNU accepts operands/-- whereas this bounded ladder does
-not. The offline selfcheck adapter enforces only that interface and delegates all
-supported behavior to the verified GNU binary. It is never a candidate or seed.
+The five interface rejection cases are specification assertions, explicitly not
+GNU goldens. Full GNU accepts operands/-- and has a --check value parser whose
+invalid-argument status is 1; this bounded ladder rejects operands/-- and all
+attached values with status 2. The offline selfcheck adapter enforces that
+interface and delegates supported behavior to GNU. It is never a candidate/seed.
 """
 import argparse
 import gzip
@@ -22,6 +23,14 @@ from reference_generators.python_sort_heldout import heldout_cases
 from reference_generators.transfer_oracle import frozen, load_engine, oracle, render
 
 
+def freeze_case(case, engine, binary):
+    """Keep explicit scope assertions separate from unmodified GNU outcomes."""
+    if case.get('scope_error'):
+        return dict(case, exit_code=2, stdout_b64='',
+                    stderr_class='nonempty', expected_tree={})
+    return frozen(case, engine, binary)
+
+
 def artifacts(suite, binary=None, version=None):
     ready = binary is not None
     if ready and platform.system() != 'Darwin':
@@ -35,11 +44,8 @@ def artifacts(suite, binary=None, version=None):
             if not ready:
                 # Null is an explicit unknown, never an expected GNU result.
                 cases[index] = dict(case, exit_code=None, oracle_pending=True)
-            elif case.get('scope_error'):
-                cases[index] = dict(case, exit_code=2, stdout_b64='',
-                                    stderr_class='nonempty', expected_tree={})
             else:
-                cases[index] = frozen(case, engine, binary)
+                cases[index] = freeze_case(case, engine, binary)
     provenance = dict(project='GNU Coreutils', version='9.11',
                       role='functional_behavioral_oracle',
                       status='validated' if ready else 'pending-darwin-generation')
@@ -63,13 +69,11 @@ def artifacts(suite, binary=None, version=None):
     return files
 
 
-def selfcheck(suite, binary):
-    # This temporary controller-only adapter handles the narrower argv contract,
-    # never sorting data itself. All supported calls reach the pinned GNU oracle.
-    with tempfile.TemporaryDirectory(prefix='sort-oracle-interface-') as temp:
-        adapter = Path(temp)/'oracle-interface'
-        source = Path(temp)/'interface.py'
-        source.write_text('''import os, sys
+def write_oracle_adapter(directory, binary):
+    """Write the controller-only bounded interface; never translate GNU statuses."""
+    adapter = Path(directory)/'oracle-interface'
+    source = Path(directory)/'interface.py'
+    source.write_text('''import os, sys
 args = sys.argv[1:]
 aliases = {'--reverse', '--ignore-case', '--unique', '--check'}
 if any(a not in aliases and not (a.startswith('-') and not a.startswith('--') and len(a) > 1 and set(a[1:]) <= set('rfuc')) for a in args):
@@ -77,8 +81,16 @@ if any(a not in aliases and not (a.startswith('-') and not a.startswith('--') an
     sys.exit(2)
 os.execv('''+repr(binary)+''', ['''+repr(binary)+''', *args])
 ''')
-        adapter.write_text('#!/bin/sh\nexec '+shlex.quote(sys.executable)+' -B '+shlex.quote(str(source))+' "$@"\n')
-        adapter.chmod(0o755)
+    adapter.write_text('#!/bin/sh\nexec '+shlex.quote(sys.executable)+' -B '+shlex.quote(str(source))+' "$@"\n')
+    adapter.chmod(0o755)
+    return adapter
+
+
+def selfcheck(suite, binary):
+    # This temporary controller-only adapter handles the narrower argv contract,
+    # never sorting data itself. All supported calls reach the pinned GNU oracle.
+    with tempfile.TemporaryDirectory(prefix='sort-oracle-interface-') as temp:
+        adapter = write_oracle_adapter(temp, binary)
         python_oracle.selfcheck(suite, 'sort', str(adapter))
 
 

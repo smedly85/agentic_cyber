@@ -34,7 +34,10 @@ def heldout_cases():
         for suffix, args in [('short', [flag]), ('long', [alias]),
                              ('repeat', [alias, flag, alias]), ('cluster', ['-'+flag[1]*3])]:
             add(flag[1]+'-'+suffix, b'quince\nPLUM\nplum\nQuince\nplum', args, [flag])
-        add(flag[1]+'-value', b'private invalid value\n', [alias+'=private-invalid'], [flag])
+        # Match the bounded attached-value rejection contract, not GNU's
+        # argument-matcher exit status for an invalid --check value.
+        add(flag[1]+'-value', b'private invalid value\n', [alias+'=private-invalid'], [flag],
+            scope_error=(flag == '-c'))
     for n in (2,3,4):
         for flags in combinations(aliases, n):
             label = ''.join(f[1] for f in flags)

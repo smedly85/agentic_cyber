@@ -37,7 +37,11 @@ def public_cases():
         for suffix, args in [('short', [flag]), ('long', [alias]),
                              ('repeat', [flag, flag]), ('cluster', ['-'+flag[1]*2])]:
             cases.append(case(flag[1]+'-'+suffix, b'b\nA\na\nB\na\n', args, [flag]))
-        cases.append(case(flag[1]+'-value', b'b\na\n', [alias+'=invalid'], [flag]))
+        # GNU's --check value parser exits 1 on an invalid value. The bounded
+        # Python interface rejects ALL attached values with status 2 instead;
+        # this is a scope assertion, not an unsorted-input GNU golden.
+        cases.append(case(flag[1]+'-value', b'b\na\n', [alias+'=invalid'], [flag],
+                          scope_error=(flag == '-c')))
     for n in (2,3,4):
         for flags in combinations(aliases, n):
             label = ''.join(f[1] for f in flags)

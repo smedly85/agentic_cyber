@@ -23,8 +23,12 @@ The contract is stdin-only binary pipe I/O in LC_ALL=C. Tests cover empty and
 unterminated records, NUL/non-UTF-8 bytes, long lines, folded tie-breaks, stable
 unique representatives, strict unique checks, combined/repeated options and
 invalid arguments. Status and stdout are exact; stderr presence/class is checked.
-The four `scope_error` cases assert rejection of operands, a bare dash and `--`;
-these are explicit bounded-interface assertions, not GNU outcomes. Offline
+The five `scope_error` cases assert rejection of operands, a bare dash, `--`, and
+an attached `--check` value; these are explicit bounded-interface assertions,
+not GNU outcomes. GNU 9.11 itself exits 1 for an invalid `--check` value through
+its argument parser (not its disorder check); the Python prompt requires 2 for
+all attached values. Both public `c-value` and its held-out dual assert that
+existing status-2 contract. Genuine check-mode disorder remains status 1. Offline
 selfcheck uses a temporary adapter solely for those restrictions; supported
 invocations always reach the verified GNU oracle. No adapter enters agent bundles.
 
@@ -43,7 +47,16 @@ test "$(uname -s)" = Darwin
 "$PYTHON_BIN" -B tests/python-sort-test-suite/gen/generate.py
 bash tests/python-sort-test-suite/selfcheck.sh
 "$PYTHON_BIN" -B scripts/check_heldout_isolation.py --utility python-sort
+test -f tests/test_python_infrastructure.py
+"$PYTHON_BIN" -B -m unittest discover -s tests -p 'test_python_infrastructure.py' -v
 ```
+
+The integration command must discover 15 tests. With `SORT_ORACLE_BIN` set, all
+15 should execute without skips. The test file is a repository-root `tests/`
+file, not inside this suite; include it when transferring the changes to vessel.
+The file-presence check prevents a missing file from looking like a successful
+zero-test run. Live oracle/adapter comparisons on Linux are diagnostic only;
+they do not replace Darwin generation or the complete five-checkpoint selfcheck.
 
 The generator enforces the exact GNU program/version and refuses BSD sort.
 `--audit` checks hashes/filtering/isolation without an oracle and reports status;

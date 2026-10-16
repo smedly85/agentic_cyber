@@ -96,8 +96,11 @@ is checked by controller-only probes, not future-feature public cases.
 * SORT follows the C stdin-only ladder: bytewise records, ASCII folding with
   original-byte tie-breaks, first-input unique representatives, and check mode.
   It accepts combined/repeated options, but rejects operands, a bare dash and
-  the option terminator. These four interface rejection cases are explicitly
-  specification assertions, since full GNU accepts those arguments. Offline
+  the option terminator. Five interface rejection cases are explicitly
+  specification assertions: GNU accepts operands/the terminator, and GNU's
+  invalid `--check` value parser exits 1 whereas the bounded prompt requires 2
+  for every attached value. This is distinct from check-mode disorder, whose
+  status remains 1. Offline
   self-check uses a temporary interface adapter for these rejections; every
   supported invocation executes the independently verified GNU binary.
   The formal contract is **Darwin-pinned** like C SORT. The C corpus documents
@@ -149,8 +152,13 @@ test "$(uname -s)" = Darwin
 "$PYTHON_BIN" -B tests/python-sort-test-suite/gen/generate.py
 bash tests/python-sort-test-suite/selfcheck.sh
 "$PYTHON_BIN" -B scripts/check_heldout_isolation.py --utility python-sort
+test -f tests/test_python_infrastructure.py
 "$PYTHON_BIN" -B -m unittest discover -s tests -p 'test_python_infrastructure.py' -v
 ```
+
+Expect **15 integration tests**, with no skips when `SORT_ORACLE_BIN` is set.
+The test file must be included in the checkout transferred to vessel; unittest
+discovery alone otherwise reports success with zero tests when it is absent.
 
 Generation runs twice and replaces the pending public/held-out artifacts and
 their SHA-256 manifest. Self-check then compares regeneration byte-for-byte and
