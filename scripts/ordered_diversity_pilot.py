@@ -12,7 +12,7 @@ from pathlib import Path
 import sys
 
 from .analysis.ordered_callgraph import analyze_source_bytes, stable_json
-from .analysis.ordered_distances import compare, coverage, provenance
+from .analysis.ordered_distances import compare, coverage, provenance, reference_sensitivity
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests/fixtures/ordered_callgraph"
 
@@ -71,18 +71,23 @@ def run_pilot(fixture_dir=FIXTURES):
         row = {
             **group, "extractions": {n: {**coverage(r), "source_sha256": digest, "diagnostics": r["diagnostics"]} for n, (r, digest) in extractions.items()},
             "architecture_distances": [], "strategy_distances": [], "raw_count_cosine_distances": [],
+            "strategy_alignment_ranges": [], "alignment_sensitive_pairs": [],
             "comparisons": [], "count_status": {n: error for n, (_, error) in counts.items()},
         }
         for a in names:
-            ad, sd, cd = [], [], []
+            ad, sd, cd, intervals = [], [], [], []
             for b in names:
                 measurement = compare(extractions[a][0], extractions[b][0], scope_reference=reference)
                 ad.append(measurement["architecture"]["distance"])
                 sd.append(measurement["strategy"]["distance"])
+                intervals.append(measurement["strategy"].get("alignment_range"))
+                if a < b and measurement["strategy"].get("reporting_status") == "alignment_sensitive":
+                    row["alignment_sensitive_pairs"].append({"left": a, "right": b, "range": measurement["strategy"]["alignment_range"]})
                 cd.append(_cosine(counts[a][0], counts[b][0]))
                 row["comparisons"].append({"left": a, "right": b, **measurement})
             row["architecture_distances"].append(ad)
             row["strategy_distances"].append(sd)
+            row["strategy_alignment_ranges"].append(intervals)
             row["raw_count_cosine_distances"].append(cd)
         row["coverage"] = {
             "extraction_successes": sum(r[0]["status"] == "success" for r in extractions.values()),
@@ -91,6 +96,9 @@ def run_pilot(fixture_dir=FIXTURES):
             "architecture_available": sum(c["architecture"]["status"] == "success" for c in row["comparisons"]),
             "strategy_available": sum(c["strategy"]["status"] == "success" for c in row["comparisons"]),
         }
+        if group.get("scope_reference_alternatives"):
+            refs = {name: load(name)[0] for name in group["scope_reference_alternatives"]}
+            row["reference_sensitivity"] = reference_sensitivity(extractions[names[0]][0], extractions[names[1]][0], refs)
         output["groups"].append(row)
     for name in manifest["negative_extraction_cases"]:
         result, digest = load(name)

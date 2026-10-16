@@ -222,6 +222,11 @@ The working-tree diff check also passed. No full experiments were run.
 
 ## Phase 2: exploratory pairwise distances
 
+**Historical Phase-2 policy/results:** the Phase-2.5 section below supersedes
+the argument/initializer permutation invariance and automatic unmatched-helper
+inclusion described here. `ordered_diversity_pilot_results.json` remains the
+original Phase-2 artifact; new results have separate Phase-2.5 filenames.
+
 Phase 2 adds `scripts/analysis/ordered_distances.py` and the controlled runner
 `scripts/ordered_diversity_pilot.py`. It leaves the Phase-1 extractor/schema and
 all primary analysis code unchanged. The comparison representation is versioned
@@ -521,3 +526,299 @@ whether scalable matching can preserve explicit uncertainty and reproducibility.
 Only after those checks should an independently calibrated, frozen clustering
 policy and complete-population missingness rules be proposed. Keep this work
 separate from primary RQ2 and the semantic vulnerability-depth backend.
+
+## Phase 2.5: feasibility, data positions, and uncertainty
+
+The comparison version is now `ordered-diversity-experimental-v2.5`. The
+Phase-1 extractor and schema, primary diversity metrics, frozen configurations,
+historical results, semantic depth backend, and lineage infrastructure are
+unchanged. Changes are confined to experimental comparison/pilot modules,
+controlled fixtures/tests, and new documentation artifacts. No weights were
+tuned. No compiler, SVF, LLM, experiment, or lineage-generation workload was run.
+
+### Real-source selection and provenance
+
+`scripts/ordered_diversity_feasibility.py` reads the existing
+`security/generated_candidate_population.json` manifest. The main group is all
+seven recorded successful C `mkdir` candidates at checkpoint `002` (mode), from
+`mkdir-qwen38-t1-seed42-low-ctx64k-max64k-n10`. A separate stress group is all ten
+successful C `grep` checkpoint `004` candidates from
+`grep-qwen38-t1-seed42-low-ctx64k-max64k-n10`. There are no cross-group comparisons
+or pooled experimental population statistics. Membership is the manifest's
+`public_checkpoint_stage_success` evidence, not a newly inferred success label.
+We did not rebuild or rerun functional validation.
+
+Candidate bytes are checked against their recorded SHA-256 before extraction.
+This Windows checkout has CRLF differences: the script permits only a verified
+CRLF-to-LF hash match, records both hashes and the exact verification status,
+and analyzes the **original bytes without rewriting files**. Any other mismatch
+aborts the audit. The manifest, audit runner, extractor, schema, comparator,
+Python and dependency provenance are recorded in
+`docs/ordered_diversity_phase25_feasibility.json`.
+
+The script also makes an explicitly diagnostic census of visible, unpreprocessed
+Tree-sitter syntax. On failed extraction this census can count function-definition
+nodes, call-expression nodes, and non-comment named function nodes. It does not
+recover a successful graph, identify targets, or authorize a distance. Failed
+measurements have null function/event/unresolved counts in the measurement
+columns; census counts live in a separately labeled object. All 17 census parses
+were error-free, but that does not establish type correctness or expanded syntax.
+
+### Real-source coverage and A/S availability
+
+Pairs below are unordered distinct candidate pairs (no diagonals). Function,
+event, and unresolved ranges describe **successful extractions only**.
+
+| Population | Candidates | Extracted | Preprocessing failures | Functions | Events | Unresolved occurrences | A available | S available | Capacity over 20,000 injections |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| mkdir / 002 | 7 | 4 | 3 | 5–7 | 1,224–1,599 | 25–44 | 0/21 | 0/21 | 0/21 |
+| grep / 004 | 10 | 2 | 8 | 11–13 | 2,156–2,215 | 75–80 | 0/45 | 0/45 | 45/45 |
+
+Every extraction failure is `unsupported_input`, with the diagnostic
+`Macro definitions/conditional preprocessing require a future policy`. There
+are six mkdir pairs and one grep pair with two successful extractions, but none
+has complete resolved targets. Both successful grep extractions also exceed the
+2,000-event comparison limit. The JSON records actual first-reported comparison
+failures **and** all known candidate blockers; first-failure counts depend on
+validation order and must not conceal coexisting unresolved-target/event limits.
+
+Per-source audit, using lineage suffixes within each population:
+
+| Utility | Lineage | Extraction | Functions / events | Unresolved | Diagnostic census functions / events |
+| --- | --- | --- | --- | ---: | --- |
+| mkdir | 001 | success | 6 / 1224 | 25 | 6 / 1224 |
+| mkdir | 003 | success | 7 / 1599 | 42 | 7 / 1599 |
+| mkdir | 004 | unsupported preprocessing | NA | NA | 3 / 1413 |
+| mkdir | 005 | unsupported preprocessing | NA | NA | 3 / 1280 |
+| mkdir | 006 | unsupported preprocessing | NA | NA | 3 / 1360 |
+| mkdir | 009 | success | 6 / 1566 | 37 | 6 / 1566 |
+| mkdir | 010 | success | 5 / 1390 | 44 | 5 / 1390 |
+| grep | 001 | success | 11 / 2215 | 75 | 11 / 2215 |
+| grep | 002 | unsupported preprocessing | NA | NA | 16 / 2152 |
+| grep | 003 | unsupported preprocessing | NA | NA | 11 / 2460 |
+| grep | 004 | unsupported preprocessing | NA | NA | 8 / 1981 |
+| grep | 005 | unsupported preprocessing | NA | NA | 12 / 2330 |
+| grep | 006 | unsupported preprocessing | NA | NA | 10 / 1814 |
+| grep | 007 | success | 13 / 2156 | 80 | 13 / 2156 |
+| grep | 008 | unsupported preprocessing | NA | NA | 11 / 2130 |
+| grep | 009 | unsupported preprocessing | NA | NA | 10 / 1943 |
+| grep | 010 | unsupported preprocessing | NA | NA | 10 / 2292 |
+
+Includes are accepted syntactically but not expanded. The mkdir candidates
+include standard/POSIX headers, yet occurrences such as `fprintf`, `mkdir`,
+`strerror`, `strcmp`, and `free` remain `unresolved_name` because their declarations
+are not present in the parsed translation unit. `S_ISDIR` also appears among
+unresolved call-like syntax. There is no whitelist, fabricated external target,
+inserted declaration, stripped preprocessor directive, or relaxed missingness.
+
+A further type-awareness issue appears in mkdir lineage-009: the unresolved-name
+inventory contains three `mode_t` occurrences. Inspection finds cast syntax such
+as `(mode_t)(rwx & 7u)`, which Tree-sitter can interpret as a call when header
+typedef information is absent. Merely declaring every unknown identifier an
+external API would therefore introduce false edges. The controlled
+`header_call.c`/`declared_call.c` probes demonstrate that an included-header call
+remains unresolved while an explicitly declared call resolves. The latter is a
+separate synthetic input, never a repair applied to real candidates.
+
+**Feasibility conclusion:** the current representation cannot support either
+audited experimental population under its current completeness rules. This is
+observed zero distance availability, not evidence of zero diversity. Coverage
+on other utilities/checkpoints remains unmeasured.
+
+### Argument and initializer data slots
+
+The normalized strategy tree now appends an explicit data-slot label to each
+argument and initializer-list element: `(argument_list, ordinal)` or
+`(initializer_list, ordinal)`. These labels are derived from non-comment AST
+children, never raw source coordinates. The parent remains an explicitly
+unordered evaluation group. Assignment matching may not match children across
+different slots; it still makes no assertion that slot 0 evaluates first.
+
+Thus `combine(first(), second())` and `combine(second(), first())` both have
+the same A topology but now differ in S (**0.125**): the association between
+operand computation and parameter slot differs. Neither representation claims
+a runtime order between `first` and `second`. This replaces Phase 2's lossy
+argument-permutation invariance.
+
+Positional initializer swaps likewise differ (**S=0.0625**) while retaining the
+`indeterminately_sequenced_initializers` annotation. Nested initializer lists
+carry slots at each level. Explicit field/index designator syntax and its tokens
+are retained, so `.x` versus `.y` and `[1]` versus `[2]` remain distinguishable.
+This is syntactic position, not type-resolved subobject identity: brace elision,
+mixed designated/positional lists, duplicate designators, and equivalent reorderings
+can still differ. No unspecified/indeterminate evaluation order is inferred from
+these slots. Source-slot association and execution sequencing remain separate.
+
+### Alignment feasibility and alternatives
+
+The exact oracle is unchanged. For n and m non-entry functions, it enumerates
+
+```text
+P(n,m) = sum_{k=0..min(n,m)} C(n,k) C(m,k) k!
+```
+
+partial injections. Each graph comparison constructs node/edge sets; retaining
+all optimum maps also costs memory proportional to the number and size of tied
+maps. Strategy and scope require additional comparisons over these maps, so
+architecture-only search time is not an end-to-end timing estimate.
+
+The new public `alignment_search_size` exposes this exact preflight calculation.
+For the real visible-syntax inventories, mkdir pairs require **7–4,051** mappings,
+whereas grep pairs require **1,047,376–2,148,321,709,561**. All grep pairs exceed
+the unchanged 20,000 limit. These are capacity diagnostics on visible source
+functions, not graph comparisons of failed extractions. No real full alignment
+timing can be reported: completeness validation rejects these candidates first.
+
+The audit separately benchmarks the exact matcher on synthetic symmetric star
+graphs, with no approximate results substituted for real candidates:
+
+| Helpers on each side | Partial injections | Observed A-oracle seconds | Optimum maps |
+| ---: | ---: | ---: | ---: |
+| 4 | 209 | about 0.0011 | 24 |
+| 5 | 1,546 | about 0.0085 | 120 |
+| 6 | 13,327 | about 0.0777 | 720 |
+| 7 | 130,922 | not run: search limit | not enumerated |
+
+Exact observed timings are in the JSON and are diagnostic, machine-dependent,
+and excluded from distance features. Even six symmetric helpers leave 720
+architecture-optimal maps to consider for S. Raising the search cap alone does
+not address real graph size or alignment uncertainty.
+
+Alternatives evaluated at the algorithm-design level (none replaces the oracle):
+
+| Candidate approach | Accuracy and uncertainty requirements | Determinism and applicability |
+| --- | --- | --- |
+| Exact branch-and-bound over partial injections | Preserve the current objective using admissible lower bounds; report certified lower/upper bounds or unavailable if incomplete. A zero optimality gap is needed for an exact scalar. | Canonical structural traversal and deterministic resource budget; potentially prunes sparse asymmetric graphs, but no improvement is assumed on symmetric worst cases. Not benchmarked here. |
+| Exact isomorphism fast path for A=0 | A verified entry/API-preserving isomorphism certifies zero A. One isomorphism does not establish S extrema or scope consensus; automorphism ambiguity remains. | Structural refinement may accelerate equality, but refinement colors alone are not proof of isomorphism. Do not restrict positive-distance alignments by heuristic colors. Not benchmarked here. |
+| Assignment relaxation plus feasible graph mappings | Unary vertex assignment omits pairwise edge dependencies and therefore is not the same objective. Use a proven lower bound plus a feasible upper bound; label any gap, never silently return the heuristic mapping as exact. | A defined objective, canonical tie policy, oracle-based accuracy study, and uncertainty protocol are prerequisites. No approximate matcher was introduced. |
+
+Any future scalable implementation must agree with the retained small-graph
+oracle on exact results, retain all relevant scope/strategy uncertainty, and
+report incomplete optimization explicitly. Timing and bound quality must then
+be measured on complete real-source graphs, which are currently unavailable.
+
+### Empty-reference scope and reference sensitivity
+
+The Phase-2 rule “include unmatched functions” has been removed. Main and
+designated entry functions remain included by explicit policy. Every other
+unmatched helper now has **unknown** scope. An unknown-only result raises
+`scope_unmatched_functions`; conflicting matched classifications (or matched
+versus unknown possibilities) raise `scope_alignment_ambiguous`. Diagnostics
+list known decisions, per-function possibilities, and what the candidate-name
+regex would have done **for audit only**. Neither candidate naming nor an empty
+reference silently supplies a missing classification. Explicit forced includes
+continue to apply to matched reference functions.
+
+For a new-source lineage population, the common comparison baseline is empty;
+individual trajectories' preceding checkpoint sources are not a shared reference.
+An empty reference consequently cannot assign parser/usage roles to new helpers.
+The real audit uses an explicitly empty shared scope reference and selects no
+arbitrary candidate as authoritative. Since A is unavailable for every real pair,
+real reference sensitivity and real alignment-induced S ranges are not estimable.
+
+The controlled `reference_sensitivity` audit compares exactly the same pair using
+all specified references, without choosing a favorable one:
+
+| Reference for worker-body repetition pair | Worker included? | S |
+| --- | --- | ---: |
+| `scope_worker.c` | yes | 0.130435 |
+| Structurally equivalent `scope_parser.c` | no | 0 |
+| `empty.c` | unknown | unavailable |
+
+This dependence is fundamental to the inherited name regex: a function can be
+renamed across its inclusion boundary without changing its syntax/graph. A
+classifier cannot both reproduce that name-dependent policy on every source
+and be invariant to arbitrary helper renaming. Fixed-reference transfer gives
+invariance only **conditional on that fixed reference**. The new probes expose
+the incompatibility rather than claiming a canonical reference-free solution.
+
+For future new-source studies, use independently specified, audited function-role
+annotations or a validated structural/semantic role classifier with an explicit
+unknown category. An all-functions strategy is a different, explicitly labeled
+scope estimand; it must not silently replace parser-excluded S. Reference choice
+or role annotation must be pre-specified and sensitivity reported. Conflicting
+parser/worker matches can make even self-comparisons unavailable under the
+scope policy; they are not changed to distance zero.
+
+The order/decomposition controlled group now uses its decomposition fixture as
+an explicitly named scope reference, so its helper has a known behavioral role.
+That supports a controlled sensitivity test, not a recipe for selecting a
+reference from real populations. With a simpler reference that has no such
+helper, the added helper's scope is unknown and S is unavailable.
+
+### Alignment ambiguity and conservative reporting
+
+Minimum and maximum S over architecture-optimal maps are retained. Successful
+results now carry `distance_interpretation: optimistic_minimum_not_formal_primary`,
+`primary_eligible: false`, and either `alignment_invariant` or
+`alignment_sensitive`. Any positive spread is flagged; no unvalidated “material”
+threshold is tuned to the fixtures. The pilot exports separate interval matrices
+and a list of affected non-diagonal pairs.
+
+The two symmetric-helper fixtures have two optimum A alignments and
+**S in [0, 0.090909]**, despite the minimum being zero. This is a substantive
+controlled sensitivity example: one mapping preserves call correspondence and
+the other swaps it. The same ambiguity can appear in the diagonal range even
+though the identity mapping gives the expected minimum zero. Real S ranges
+cannot currently be evaluated because all real comparisons are unavailable.
+
+Conservative future policy: report the full alignment range and possible function
+correspondences. Do not use the optimistic minimum as a formal primary scalar
+where alignments disagree. Before any clustering, either establish an independent
+alignment rule with validation, or adopt an explicit interval/uncertainty-aware
+analysis that only makes conclusions robust to all admissible alignments. Scope
+ambiguity is separate missingness; it is not an S confidence interval. No
+clustering or thresholds are introduced here.
+
+### Construct outcomes and reproducibility
+
+`docs/ordered_diversity_phase25_construct_results.json` is the new controlled
+report. The historical Phase-2 JSON remains untouched. The expanded manifest
+keeps each construct in its own C utility/checkpoint group.
+
+| Change | A | S outcome | Interpretation |
+| --- | ---: | --- | --- |
+| Argument slots swapped | 0 | 0.125, detected | Data association retained without claiming evaluation order. |
+| Initializer slots swapped | 0 | 0.0625, detected | Explicit slot labels; designator and nesting tests also pass. |
+| `x+x` to `x+y` | 0 | 0, missed | Identifier relationships are erased, not resolved bindings. |
+| Helper rename / declaration reorder | 0 | 0 | Invariant with fixed unambiguous scope transfer. |
+| Predicate `<` to `>` | 0 | 0.05, detected | Operator syntax retained. |
+| Predicate `x<y` to `x<x` | 0 | 0, missed | Same identifier-relationship limitation. |
+| Split work into a helper | 0.375 | 0.392857 with declared controlled reference | Unmatched scope without that reference is explicitly unavailable. |
+| Break to continue | 0 | 0.038462, detected | Transfer node differs; no destination CFG is inferred. |
+| Parser/behavior reference naming | 0 | reference-sensitive | 0 versus 0.130435 versus unknown in the controlled audit. |
+| Structurally ambiguous parser/worker matches | 0 | unavailable | Conflicting scope classifications retained. |
+| Header-only external declaration | unavailable | unavailable | No name-based fabricated target. |
+
+These are representation-sensitivity tests, not functional equivalence tests.
+Known misses are asserted in tests to document the representation's limits;
+no numerical weights were adjusted to force positive distances.
+
+Phase-2.5 validation: **84 tests passed**, including the Phase-1 and Phase-2
+regression suites with explicit updates for the two changed policies. The
+read-only real-source audit and expanded controlled pilot completed successfully.
+
+```sh
+python3 -m pytest -q tests/test_ordered_callgraph.py tests/test_ordered_distances.py tests/test_ordered_phase25.py
+python3 -m scripts.ordered_diversity_feasibility --output docs/ordered_diversity_phase25_feasibility.json
+python3 -m scripts.ordered_diversity_pilot --output docs/ordered_diversity_phase25_construct_results.json
+```
+
+### Specific Phase-3 recommendation
+
+**Do not integrate clustering yet.** First run a separately versioned,
+build-aware extraction feasibility study on these same fixed populations.
+Resolve includes, typedefs and macro expansion using recorded build context,
+retain expansion/source provenance, and distinguish declared direct calls from
+macro/cast syntax without inventing indirect targets. Keep that extractor
+independent of scientific vulnerability-depth analysis; no SVF change is needed.
+
+In parallel, specify a reference-independent scope estimand for new-source
+populations, and decide how identifier-binding relationships and control-transfer
+targets should be represented. Validate argument/initializer semantics against
+compiler-grounded examples. Then benchmark a certified exact/pruned matcher or
+explicit bound-producing alternative against the retained small-graph oracle,
+including S extrema and scope ambiguity. Only after adequate complete-case
+coverage, stable scope, and bounded alignment uncertainty are demonstrated
+should blinded human validation and a separately frozen clustering protocol
+be considered.

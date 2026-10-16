@@ -18,7 +18,7 @@ from typing import Any
 
 from .ordered_callgraph import BACKEND, normalized_structure, stable_json
 
-VERSION = "ordered-diversity-experimental-v2"
+VERSION = "ordered-diversity-experimental-v2.5"
 # Snapshot of the existing configured default; tested against the primary analyzer.
 DEFAULT_EXCLUDE = (
     r"^(?:.*(?:parse|parser|argument|arguments|argv|option|options|"
@@ -40,7 +40,9 @@ class Limits:
 
 
 class Unavailable(ValueError):
-    pass
+    def __init__(self, reason, details=None):
+        super().__init__(reason)
+        self.details = details
 
 
 class Budget:
@@ -73,8 +75,10 @@ def provenance() -> dict[str, Any]:
         "strategy_method": "rooted_subtree_edit_ordered_dp_unordered_assignment",
         "normalization": "edit_cost_divided_by_sum_of_representation_sizes",
         "alignment": "entry_anchored_architecture_optima_then_strategy_minimum",
-        "identifier_policy": "internal_calls_aligned_other_identifiers_erased_literals_retained",
-        "scope_policy": "fixed_reference_regex_transferred_over_all_graph_optima",
+        "identifier_policy": "internal_calls_aligned_ordinary_identifiers_erased_designators_and_literals_retained",
+        "scope_policy": "fixed_reference_transfer_unmatched_helpers_unknown",
+        "position_policy": "argument_and_initializer_slots_separate_from_evaluation_order",
+        "ambiguity_policy": "report_full_range_minimum_exploratory_only",
     }
 
 
@@ -87,9 +91,15 @@ def _walk(event):
 def coverage(result):
     calls = result.get("call_sites", [])
     resolved = sum(c.get("resolution") in {"internal_direct", "external_declared"} for c in calls)
+    try:
+        event_count = sum(1 for f in result.get("functions", []) for _ in _walk(f["structure"]))
+    except (KeyError, TypeError, RecursionError):
+        # Coverage must not bypass the fail-closed validator on corrupt artifacts.
+        event_count = None
     return {
         "extraction_status": result.get("status", "missing"),
         "function_count": len(result.get("functions", [])), "call_count": len(calls),
+        "event_count": event_count,
         "resolved_calls": resolved, "unresolved_calls": len(calls) - resolved,
         "resolution_fraction": resolved / len(calls) if calls else None,
     }
@@ -155,6 +165,12 @@ def _label_maps(left, right, mapping):
     return lm, rm
 
 
+def alignment_search_size(left_helpers: int, right_helpers: int) -> int:
+    """Exact number of partial injections; diagnostic only, not graph analysis."""
+    return sum(math.comb(left_helpers, k) * math.perm(right_helpers, k)
+               for k in range(min(left_helpers, right_helpers) + 1))
+
+
 def _align(left, right, budget):
     lf, rf = left["functions"], right["functions"]
     le = {f["name"]: f["id"] for f in lf if f["entry_point"]}
@@ -162,7 +178,7 @@ def _align(left, right, budget):
     anchors = {le[n]: re_[n] for n in le.keys() & re_.keys()}
     lh = [f["id"] for f in lf if not f["entry_point"]]
     rh = [f["id"] for f in rf if not f["entry_point"]]
-    count = sum(math.comb(len(lh), k) * math.perm(len(rh), k) for k in range(min(len(lh), len(rh)) + 1))
+    count = alignment_search_size(len(lh), len(rh))
     if count > budget.limits.max_alignments:
         raise Unavailable("alignment_search_limit")
     best, optima, denominator = None, [], 0
@@ -207,32 +223,48 @@ def _scope(reference, candidate, exclude, forced, budget):
         f["id"]: f["entry_point"] or f["name"] == "main" or f["name"] in forced or not pattern.search(f["name"])
         for f in reference["functions"]
     }
-    decisions = {}
+    decisions, unresolved = {}, {}
     for f in candidate["functions"]:
+        if f["entry_point"] or f["name"] == "main":
+            decisions[f["id"]] = True
+            continue
         possibilities = set()
         for mapping in mappings:
             inverse = {b: a for a, b in mapping.items()}
-            # New/unmatched functions are included, never classified by new names.
-            possibilities.add(bool(reference_scope[inverse[f["id"]]]) if f["id"] in inverse else True)
-        if len(possibilities) != 1:
-            raise Unavailable("scope_alignment_ambiguous")
-        decisions[f["id"]] = possibilities.pop()
+            # An unmatched helper has no reference-bound classification. Candidate
+            # naming cannot fill this gap without breaking rename invariance.
+            possibilities.add(bool(reference_scope[inverse[f["id"]]]) if f["id"] in inverse else None)
+        if len(possibilities) != 1 or None in possibilities:
+            unresolved[f["id"]] = {
+                "possibilities": sorted(possibilities, key=lambda p: (p is None, bool(p))),
+                "candidate_regex_would_include": not bool(pattern.search(f["name"])),
+            }
+        else:
+            decisions[f["id"]] = possibilities.pop()
+    if unresolved:
+        reason = "scope_unmatched_functions" if all(v["possibilities"] == [None] for v in unresolved.values()) else "scope_alignment_ambiguous"
+        raise Unavailable(reason, {"unresolved_scope": unresolved, "known_scope": decisions})
     return decisions
 
 
 def _tree(function, calls, labels):
     """Body-only syntax, with explicit unordered groups. Tuples are hashable."""
-    def convert(event):
+    def convert(event, slot=None, designator=False):
         kind = event["kind"]
+        designator = designator or kind in {"field_designator", "subscript_designator"}
         token = event.get("token", "")
-        if kind in {"identifier", "field_identifier", "type_identifier"}:
+        if kind in {"identifier", "field_identifier", "type_identifier"} and not designator:
             token = "IDENTIFIER"
         call = calls.get(event.get("call_site"))
         call_label = ""
         if call:
             call_label = labels[call["target"]] if call["target"] else "api:" + call["callee_name"]
-        label = (kind, event["role"], event["ordering"], event.get("operator", ""), token, call_label)
-        children = tuple(convert(c) for c in event["children"] if not (call and c["role"] == "function"))
+        label = (kind, event["role"], event["ordering"], event.get("operator", ""), token, call_label, slot)
+        children = tuple(
+            convert(c, (kind, index) if kind in {"argument_list", "initializer_list"} else None, designator)
+            for index, c in enumerate(event["children"])
+            if not (call and c["role"] == "function")
+        )
         return label, event["ordering"] in UNORDERED, children
     body = next(c for c in function["structure"]["children"] if c["role"] == "body")
     return convert(body)
@@ -260,7 +292,8 @@ def _tree_distance(left, right, budget):
                     return sum(_size(y[j]) for j in range(len(y)) if not mask & (1 << j))
                 choices = [_size(x[i]) + assign(i + 1, mask)]
                 choices.extend(edit(x[i], y[j]) + assign(i + 1, mask | (1 << j))
-                               for j in range(len(y)) if not mask & (1 << j))
+                               for j in range(len(y)) if not mask & (1 << j)
+                               and x[i][0][-1] == y[j][0][-1])
                 return min(choices)
             cost = assign(0, 0)
         else:
@@ -342,6 +375,9 @@ def compare(left: dict, right: dict, *, scope_reference: dict | None = None,
         distance, interval, winners = _strategy(left, right, mappings, ls, rs, budget)
         output["strategy"] = {
             "status": "success", "distance": distance, "alignment_range": interval,
+            "reporting_status": "alignment_sensitive" if interval[1] > interval[0] else "alignment_invariant",
+            "distance_interpretation": "optimistic_minimum_not_formal_primary",
+            "primary_eligible": False,
             "scope": {"left": ls, "right": rs, "exclude_regex": exclude_regex,
                       "forced_reference_names": sorted(forced),
                       "reference_sha256": hashlib.sha256(stable_json(normalized_structure(scope_reference)).encode()).hexdigest()},
@@ -349,5 +385,21 @@ def compare(left: dict, right: dict, *, scope_reference: dict | None = None,
         output["alignment"]["strategy_minimizers"] = _alignment_diagnostics(left, right, winners)
     except Exception as exc:
         output["strategy"]["reason"] = str(exc) if isinstance(exc, Unavailable) else "comparison_failure:" + type(exc).__name__
+        if isinstance(exc, Unavailable) and exc.details:
+            output["strategy"]["details"] = exc.details
     output["work_units"] = budget.work
     return output
+
+
+def reference_sensitivity(left, right, references: dict[str, dict], **kwargs):
+    """Audit every specified reference; never select the most favorable result."""
+    rows = {name: compare(left, right, scope_reference=ref, **kwargs)
+            for name, ref in sorted(references.items())}
+    outcomes = {(row["strategy"]["status"], row["strategy"].get("distance"),
+                 tuple(row["strategy"].get("alignment_range", [])), row["strategy"].get("reason"))
+                for row in rows.values()}
+    scopes = {json.dumps({side: row["strategy"].get("scope", {}).get(side) for side in ("left", "right")}, sort_keys=True)
+              for row in rows.values()}
+    return {"references": rows, "outcome_sensitive": len(outcomes) > 1,
+            "membership_sensitive": len(scopes) > 1,
+            "policy": "No reference-independent scope inferred; do not pool these alternatives"}

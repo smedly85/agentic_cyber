@@ -41,18 +41,19 @@ def distances(result):
     ("branch_first.c", "branch_second.c", False, True),
     ("order_forward.c", "order_decomposed.c", True, True),
     ("order_forward.c", "order_repeated.c", False, True),
-    ("unsequenced.c", "unsequenced_reverse.c", False, False),
+    ("unsequenced.c", "unsequenced_reverse.c", False, True),
     ("call_free.c", "call_free_changed.c", False, True),
     ("ambiguous.c", "ambiguous_renamed.c", False, False),
     ("empty.c", "empty.c", False, False),
 ])
 def test_controlled_properties(a, b, a_positive, s_positive):
-    result = measure(a, b)
+    reference = b if b == "order_decomposed.c" else a
+    result = measure(a, b, reference=reference)
     da, ds = distances(result)
     assert (da > 0) == a_positive
     assert (ds > 0) == s_positive
-    assert result == measure(a, b)
-    reverse = measure(b, a, reference=a)
+    assert result == measure(a, b, reference=reference)
+    reverse = measure(b, a, reference=reference)
     assert (da, ds) == distances(reverse)
     for value in (da, ds):
         assert math.isfinite(value) and 0 <= value <= 1
@@ -118,21 +119,28 @@ def test_scope_ambiguity_is_unavailable():
 def test_added_removed_and_empty_graphs():
     original = analyze_source_bytes("int main(void){return 0;}")
     extra = analyze_source_bytes("int main(void){return 0;} void extra(void){}")
-    result = compare(original, extra, scope_reference=original)
+    unknown = compare(original, extra, scope_reference=original)
+    assert unknown["architecture"]["distance"] > 0
+    assert unknown["strategy"]["reason"] == "scope_unmatched_functions"
+    result = compare(original, extra, scope_reference=extra)
     assert all(v > 0 for v in distances(result))
     assert result["alignment"]["definitely_added"] == ["f1:extra"]
-    reverse = compare(extra, original, scope_reference=original)
+    reverse = compare(extra, original, scope_reference=extra)
     assert result["alignment"]["definitely_added"] == reverse["alignment"]["definitely_removed"]
     empty = source("empty.c")
     assert distances(compare(empty, original, scope_reference=original)) == (1, 1)
 
 
-def test_unmatched_candidates_included_without_name_classification():
+def test_unmatched_candidates_not_silently_included_by_empty_or_small_reference():
     ref = analyze_source_bytes("int main(void){return 0;}")
     a = analyze_source_bytes("int main(void){return 0;} void parse(void){}")
     b = analyze_source_bytes("int main(void){return 0;} void arbitrary(void){}")
-    assert distances(compare(ref, a, scope_reference=ref)) == distances(compare(ref, b, scope_reference=ref))
-    assert distances(compare(a, b, scope_reference=ref)) == (0, 0)
+    for candidate in (a, b):
+        for reference in (ref, source("empty.c")):
+            result = compare(candidate, candidate, scope_reference=reference)
+            assert result["architecture"]["distance"] == 0
+            assert result["strategy"]["distance"] is None
+            assert result["strategy"]["reason"] == "scope_unmatched_functions"
 
 
 @pytest.mark.parametrize("name", ["malformed.c", "unsupported.rs", "indirect.c"])
@@ -266,4 +274,4 @@ def test_cli_repeatability_across_processes(tmp_path):
     for path in paths:
         subprocess.run([sys.executable, "-m", "scripts.ordered_diversity_pilot", "--output", str(path)], check=True)
     assert paths[0].read_bytes() == paths[1].read_bytes()
-    assert json.loads(paths[0].read_text())["provenance"]["representation_version"] == "ordered-diversity-experimental-v2"
+    assert json.loads(paths[0].read_text())["provenance"]["representation_version"] == "ordered-diversity-experimental-v2.5"
