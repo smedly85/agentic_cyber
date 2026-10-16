@@ -76,10 +76,9 @@ byte-identical output, fixes gzip timestamps and records SHA-256 digests.
 | 003 | 70 / 70 | — | 46 / 46 | — |
 | 004 | — | — | 75 / 75 | — |
 
-Counts are cumulative. **SORT counts currently describe pending recipes, not
-validated GNU goldens.** Its manifest records `pending-darwin-generation`, and
-its runner refuses judging pending inputs, including on Darwin. No Linux GNU
-outputs or existing C frozen results have been substituted. Held-out cases are separately maintained duals with distinct
+Counts are cumulative. **The SORT corpus is finalized and validated on Darwin
+against GNU Coreutils 9.11**, including all five public and held-out checkpoints.
+Its manifest records `validated`. Held-out cases are separately maintained duals with distinct
 paths/data, not additional requirements. The existing allowlisted stage-bundle
 builder exposes only applicable public cases and their runtime harness. Offline
 generators, full ladders, oracle paths, READMEs and held-out corpora are excluded.
@@ -140,7 +139,8 @@ checkpoint. For intentional corpus maintenance only, omit `--check` when invokin
 and isolation. No generated candidates, oracle installations/caches or run outputs
 should be added to Git.
 
-Finalize SORT on vessel as a non-root user, from the repository root. Replace
+To recheck the finalized SORT corpus on vessel, run as a non-root user from the
+repository root. Activate the validated Python 3.14.3 environment first. Replace
 the oracle path if the independent 9.11 installation lives elsewhere:
 
 ```bash
@@ -149,22 +149,19 @@ export PYTHONDONTWRITEBYTECODE=1
 export SORT_ORACLE_BIN="$HOME/opt/coreutils-9.11/bin/sort"
 test "$(uname -s)" = Darwin
 "$SORT_ORACLE_BIN" --version  # must start: sort (GNU coreutils) 9.11
-"$PYTHON_BIN" -B tests/python-sort-test-suite/gen/generate.py
 bash tests/python-sort-test-suite/selfcheck.sh
 "$PYTHON_BIN" -B scripts/check_heldout_isolation.py --utility python-sort
-test -f tests/test_python_infrastructure.py
-"$PYTHON_BIN" -B -m unittest discover -s tests -p 'test_python_infrastructure.py' -v
+"$PYTHON_BIN" -B -m unittest discover -s tests -p 'test_runtime_portability.py' -v
 ```
 
-Expect **15 integration tests**, with no skips when `SORT_ORACLE_BIN` is set.
-The test file must be included in the checkout transferred to vessel; unittest
-discovery alone otherwise reports success with zero tests when it is absent.
-
-Generation runs twice and replaces the pending public/held-out artifacts and
-their SHA-256 manifest. Self-check then compares regeneration byte-for-byte and
+Self-check regenerates in memory twice, compares against the finalized corpus
+byte-for-byte without modifying it, verifies its SHA-256 manifest, and
 exercises staged public and isolated held-out judging at all five checkpoints.
-Review the resulting corpus diff before formal collection. CP/MV also need
-their existing self-checks on vessel; MKDIR remains Linux-only.
+The runtime regression tests exercise portable timing and diagnostic plan
+resolution without model calls. Runtime measurements use the configured
+`PYTHON_BIN` and `time.monotonic_ns()`; metadata retains integer millisecond
+fields and existing aggregation semantics. CP/MV retain their existing
+self-checks on vessel; MKDIR remains Linux-only.
 
 To judge a separately generated candidate manually, first run the syntax helper,
 then the appropriate judge with the cumulative flags. For example:
@@ -178,8 +175,8 @@ VALIDATION_JSON_REPORT=/tmp/python-cp-validation.json \
 ## One diagnostic lineage per utility
 
 These are explicit diagnostic settings, not new runner defaults. They require the
-existing Aider/backend setup and available models. Run SORT on Darwin only after
-the above validation; run MKDIR on Linux. The commands
+existing Aider/backend setup and available models. CP/MV and the validated SORT
+corpus can be used on vessel; run MKDIR on Linux. The commands
 are provided for a later operator invocation; infrastructure self-checks do not
 launch them. Use fresh output directories.
 

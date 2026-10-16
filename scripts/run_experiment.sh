@@ -304,6 +304,12 @@ PY
     fi
 }
 
+monotonic_ns() {
+    # Python's system-wide monotonic clock is portable across Linux/macOS;
+    # wall-clock date formats cannot reliably measure elapsed nanoseconds.
+    "$PYTHON_BIN" -c 'import time; print(time.monotonic_ns())'
+}
+
 run_logged_command() {
     # Usage: run_logged_command LOGFILE COMMAND LOOP STAGE
     local logfile="$1"
@@ -319,14 +325,14 @@ run_logged_command() {
         return
     fi
 
-    start_ns="$(date +%s%N)"
+    start_ns="$(monotonic_ns)"
     (
         set +e
         export PYTHONDONTWRITEBYTECODE=1
         eval "$command"
     ) >>"$logfile" 2>&1
     status=$?
-    end_ns="$(date +%s%N)"
+    end_ns="$(monotonic_ns)"
 
     printf '%s %s\n' "$status" "$(( (end_ns - start_ns) / 1000000 ))"
 }
@@ -343,14 +349,14 @@ run_final_command() {
         return
     fi
 
-    start_ns="$(date +%s%N)"
+    start_ns="$(monotonic_ns)"
     (
         set +e
         export PYTHONDONTWRITEBYTECODE=1
         eval "$command"
     ) >"$logfile" 2>&1
     status=$?
-    end_ns="$(date +%s%N)"
+    end_ns="$(monotonic_ns)"
 
     printf '%s %s\n' "$status" "$(( (end_ns - start_ns) / 1000000 ))"
 }
@@ -373,7 +379,7 @@ run_aider() {
     current_log="$attempt_dir/.aider-current.log"
     printf '\n===== LLM INVOCATION %s: %s =====\n\n' \
         "$invocation" "$kind" >>"$logfile"
-    start_ns="$(date +%s%N)"
+    start_ns="$(monotonic_ns)"
     # Preserve only the process essentials and the explicitly selected Ollama
     # endpoint. In particular, no inherited AIDER_* variables can turn testing,
     # Git, shell suggestions or a user's global config back on. Git's ceiling
@@ -468,7 +474,7 @@ run_aider() {
     pipeline_status=("${PIPESTATUS[@]}")
     status="${pipeline_status[0]}"
     tee_status="${pipeline_status[1]}"
-    end_ns="$(date +%s%N)"
+    end_ns="$(monotonic_ns)"
     runtime_ms=$(( (end_ns - start_ns) / 1000000 ))
 
     # Aider has no OpenCode-style external-directory permission event. Its
