@@ -30,11 +30,6 @@ def artifacts(suite, utility, binary, version):
             engine.validate_case(case, Path(temp).resolve())
     public = [frozen(c, engine, binary) for c in public]
     private = [frozen(c, engine, binary) for c in private]
-    import base64
-    for case in public + private:
-        output = base64.b64decode(case['stdout_b64'])
-        if output.startswith(b'INVALID LISTING:'):
-            raise ValueError(f"{case['name']}: oracle output failed host-metadata validation: {output!r}")
     provenance = dict(project='GNU Coreutils', version='9.11', version_line=version,
                       role='functional_behavioral_oracle')
     private_payload = heldout_contract.build('python-' + utility, provenance, private)

@@ -157,20 +157,15 @@ def execute(case: dict, cmd: list[str], sanitizer: bool = False) -> Result:
         return Result(None, signal_name="SKIP_ROOT")
     executable = str(Path(cmd[0]).resolve(strict=True))
     with tempfile.TemporaryDirectory(prefix="filesystem-case-") as temp:
-        # Keep both '.' and '..' inside this case's private fixture.
-        root = Path(temp).resolve() / "fixture"
-        root.mkdir(mode=0o755)
-        root.chmod(0o755)
+        root = Path(temp).resolve()
         validate_case(case, root)
         try:
             materialize_fixture(case.get("fixture", []), root)
-            pin_timestamps(root)
             for arg in case["args"]:
                 if arg:
                     safe_path(root, arg)
             env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C",
-                   "LANGUAGE": "C", "TZ": "UTC", "TIME_STYLE": "long-iso",
-                   "QUOTING_STYLE": "literal", "HOME": str(root), "TMPDIR": str(root)}
+                   "LANGUAGE": "C", "TZ": "UTC", "HOME": str(root), "TMPDIR": str(root)}
             proc = subprocess.Popen(
                 [executable, *cmd[1:], *case["args"]], cwd=root, env=env,
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -183,8 +178,6 @@ def execute(case: dict, cmd: list[str], sanitizer: bool = False) -> Result:
                 os.killpg(proc.pid, signal.SIGKILL)
                 proc.communicate()
                 return Result(None, timed_out=True)
-            if "listing_groups" in case:
-                out = normalize_listing(out, root, case)
             result = Result(proc.returncode, out, err)
             if proc.returncode < 0:
                 result.signal_name = signal.Signals(-proc.returncode).name
@@ -192,76 +185,3 @@ def execute(case: dict, cmd: list[str], sanitizer: bool = False) -> Result:
             return result
         finally:
             restore_writable(root)
-
-
-def pin_timestamps(root):
-    # All fixture dates are old, stable UTC dates. No wall-clock goldens.
-    for path in [*root.rglob("*"), root, root.parent]:
-        os.utime(path, (946684800, 946684800), follow_symlinks=False)
-
-
-def normalize_listing(output, root, case):
-    """Validate host-dependent long fields before canonicalizing them.
-
-    GNU freezes entry order, names, types, permission strings, link rendering,
-    headers and blank lines. Ownership, link counts, sizes, mtimes and block
-    totals are checked against the actual fixture, not discarded unchecked.
-    This avoids freezing Linux directory sizes or the oracle operator's name.
-    """
-    import datetime
-    import grp
-    import pwd
-    import re
-    groups = case["listing_groups"]
-    current = ""
-    lines = []
-    pattern = re.compile(rb"^([bcdlps-][rwxStTs-]{9})\s+(\d+)\s+(\S+)\s+(\S+)\s+(\d+)\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}) (.+)$")
-    try:
-        for line in output.splitlines():
-            if not line:
-                lines.append(line)
-                continue
-            if line.endswith(b":"):
-                current = os.fsdecode(line[:-1])
-                if current not in groups:
-                    raise ValueError("unexpected directory header")
-                lines.append(line)
-                continue
-            directory = safe_path(root, groups[current])
-            if line.startswith(b"total "):
-                entries = [p for p in directory.iterdir() if case.get("listing_all") or not p.name.startswith(".")]
-                if case.get("listing_all"):
-                    entries += [directory, directory.parent]
-                blocks = sum(p.lstat().st_blocks for p in entries)
-                if int(line[6:]) != (blocks + 1) // 2:
-                    raise ValueError("incorrect allocated block total")
-                lines.append(b"total <blocks>")
-                continue
-            match = pattern.fullmatch(line)
-            if not match:
-                raise ValueError("malformed long record")
-            mode, links, owner, group, size, date, name = match.groups()
-            filename = name.split(b" -> ", 1)[0] if mode.startswith(b"l") else name
-            decoded = os.fsdecode(filename)
-            if decoded == "..":
-                path = directory.parent
-            else:
-                path = safe_path(root, str(directory.relative_to(root) / decoded))
-            info = path.lstat()
-            if mode != stat.filemode(info.st_mode).encode():
-                raise ValueError("incorrect type or permissions")
-            try:
-                want_owner = pwd.getpwuid(info.st_uid).pw_name
-            except KeyError:
-                want_owner = str(info.st_uid)
-            try:
-                want_group = grp.getgrgid(info.st_gid).gr_name
-            except KeyError:
-                want_group = str(info.st_gid)
-            want_date = datetime.datetime.fromtimestamp(info.st_mtime, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M").encode()
-            if (int(links), owner, group, int(size), date) != (info.st_nlink, os.fsencode(want_owner), os.fsencode(want_group), info.st_size, want_date):
-                raise ValueError("incorrect long metadata")
-            lines.append(mode + b" <links> <owner> <group> <size> <mtime> " + name)
-        return b"\n".join(lines) + (b"\n" if output.endswith(b"\n") else b"")
-    except (ValueError, OSError, KeyError) as error:
-        return b"INVALID LISTING: " + str(error).encode()

@@ -6,7 +6,7 @@ repository state, generated candidates, validation results, and metadata needed
 to reproduce and compare independent repository histories.
 
 The experiment generates C reimplementations of four standard utilities and
-Rust cp/mv implementations one feature at a time. Python cp, mv, ls and mkdir
+Rust cp/mv implementations one feature at a time. Python cp, mv, sort and mkdir
 also use this pipeline for functional-only lineages; see
 [Python setup, checks and diagnostic commands](docs/python_lineages.md).
 The primary paper analysis separates RQ1 correctness and

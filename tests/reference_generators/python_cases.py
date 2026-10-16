@@ -1,6 +1,6 @@
 """Offline scenarios for the Python ladders; no candidate implementations.
 
-Transfer scenarios reuse the Rust functional contract. Listing and creation
+Transfer scenarios reuse the Rust functional contract. Sorting and creation
 expectations are captured from GNU, never predicted by this module.
 """
 from __future__ import annotations
@@ -85,45 +85,10 @@ def definitions(utility):
         add("mode-missing", ["-m"], flags=["-p", "-m"])
         return cases
 
-    if utility != "ls":
-        raise ValueError(utility)
-    basic = [file("zeta"), file("Alpha"), file("beta name"), file(".secret")]
-    add("cwd-empty", [])
-    add("cwd", [], basic)
-    add("dot", ["."], basic)
-    add("file", ["zeta"], basic)
-    add("file-order", ["zeta", "Alpha", "beta name"], basic)
-    add("directories", ["zdir", "adir"], [directory("zdir"), file("zdir/b"), directory("adir"), file("adir/a")])
-    add("mixed", ["zdir", "plain"], [directory("zdir"), file("zdir/child"), file("plain")])
-    add("missing", ["absent"])
-    add("partial", ["absent", "zeta"], basic)
-    add("unknown", ["--invalid-option"])
-    add("unknown-after", [".", "--invalid-option"], basic)
-    add("terminator", ["--", "-operand"], [file("-operand")])
-    add("bare-dash", ["-"], [file("-")])
-    add("link-file", ["alias"], [file("target"), link("alias", "target")])
-    add("link-directory", ["alias"], [directory("target"), file("target/entry"), link("alias", "target")])
-    add("dangling-link", ["alias"], [link("alias", "absent")])
-    add("denied-directory", ["locked"], [directory("locked", "0000")], needs_non_root=True)
-    add("nonutf8-missing", ["absent-\udcff"])
-    for name, opts in (("all", ["-a"]), ("all-long", ["--all"]), ("all-repeat", ["-a", "-a"]), ("all-after", [".", "-a"])):
-        add(name, opts, basic, ["-a"])
-    add("all-hidden-operand", ["-a", ".secret"], basic, ["-a"])
-    listing = [file("file", b"12345", "0640"), directory("dir"), link("alias", "file"), link("dangling", "absent"), file(".secret")]
-    for name, args, all_entries in (("long", ["-l"], False), ("long-all", ["-a", "-l"], True), ("long-repeat", ["-l", "-l"], False)):
-        add(name, args, listing, ["-a", "-l"], listing_groups={"": "."}, listing_all=all_entries)
-    add("long-file", ["-l", "file"], listing, ["-a", "-l"], listing_groups={"": "."})
-    add("long-link-directory", ["-l", "alias"], [directory("target"), link("alias", "target")], ["-a", "-l"], listing_groups={"": "."})
-    add("long-missing", ["-l", "missing"], listing, ["-a", "-l"], listing_groups={"": "."})
-    tree = [directory("tree"), file("tree/file"), directory("tree/sub"), file("tree/sub/leaf"), directory("tree/empty"), directory("tree/.hidden"), file("tree/.hidden/inside"), link("tree/link", "sub"), link("tree/cycle", ".")]
-    for name, opts in (("recursive", ["-R"]), ("recursive-long-option", ["--recursive"]), ("recursive-repeat", ["-R", "-R"]), ("recursive-all", ["-R", "-a"])):
-        add(name, opts + ["tree"], tree, ["-a", "-l", "-R"])
-    add("recursive-long", ["-R", "-l", "tree"], tree, ["-a", "-l", "-R"], listing_groups={p:p for p in ("tree", "tree/sub", "tree/empty")})
-    add("recursive-all-long", ["-R", "-a", "-l", "tree"], tree, ["-a", "-l", "-R"], listing_all=True, listing_groups={p:p for p in ("tree", "tree/sub", "tree/empty", "tree/.hidden")})
-    add("recursive-denied", ["-R", "tree"], tree + [directory("tree/locked", "0000")], ["-a", "-l", "-R"], needs_non_root=True)
-    for case in cases:
-        case['mode_paths'] = [entry['path'] for entry in case['fixture'] if entry['type'] != 'symlink']
-    return cases
+    if utility == "sort":
+        from reference_generators.python_sort_cases import public_cases
+        return public_cases()
+    raise ValueError(utility)
 
 
 def heldout(utility, public):
@@ -136,6 +101,9 @@ def heldout(utility, public):
                     if entry['path'].endswith('/--'):
                         entry['path'] = '--'
         return private
+    if utility == "sort":
+        from reference_generators.python_sort_heldout import heldout_cases
+        return heldout_cases()
     result = []
     for ordinal, original in enumerate(public):
         case = deepcopy(original)
@@ -188,7 +156,5 @@ def heldout(utility, public):
             if entry["type"] == "file" and entry["contents_b64"]:
                 entry["contents_b64"] = base64.b64encode((prefix + " payload").encode()).decode()
         case["mode_paths"] = [rename(p) for p in case.get("mode_paths", [])]
-        if "listing_groups" in case:
-            case["listing_groups"] = {rename(k):rename(v) for k,v in case["listing_groups"].items()}
         result.append(case)
     return result

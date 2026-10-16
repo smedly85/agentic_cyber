@@ -208,6 +208,11 @@ def main() -> None:
     cmd = [os.path.abspath(t) if os.path.exists(t) else t for t in cmd]
 
     manifest = load_manifest(args.config, args.all_flags)
+    # The formal SORT contract is Darwin-only even with --all-flags. This
+    # harness must not turn host incompatibility into a candidate verdict.
+    if platform.system() != "Darwin":
+        print("platform incompatible: Python SORT requires Darwin", file=sys.stderr)
+        sys.exit(3)
     if platform.system() not in ("Darwin", "Linux"):
         print("POSIX filesystem suite requires Darwin or Linux", file=sys.stderr)
         sys.exit(3)
@@ -227,6 +232,9 @@ def main() -> None:
             cases.append(case)
 
     jobs = []
+    if any(case.get('oracle_pending') or case.get('exit_code') is None for case in cases):
+        print("corpus pending Darwin GNU 9.11 generation; refusing candidate judging", file=sys.stderr)
+        sys.exit(2)
     for case in cases:
         if args.only and args.only not in case.get("tags", []):
             continue

@@ -200,8 +200,10 @@ PROBES = {
     "python-cp": {"build": _transfer_probe, "requires_diagnostic": True},
     "python-mv": {"build": _transfer_probe, "requires_diagnostic": True},
     "python-mkdir": {"build": _mkdir_probe, "requires_diagnostic": True},
-    "python-ls": {"build": lambda option, flag, fixture: {
-        "argv": [option, "."], "stdin": b""}, "requires_diagnostic": True},
+    # Check mode can legitimately return 1 with stderr and no stdout; that is
+    # disorder detection, not rejection of a future option.
+    "python-sort": {"build": _sort_probe, "requires_diagnostic": True,
+                    "required_exit_status": 2},
     "cp": {"build": _transfer_probe, "requires_diagnostic": True},
     "mv": {"build": _transfer_probe, "requires_diagnostic": True},
     "sort": {"build": _sort_probe, "requires_diagnostic": True},
@@ -242,6 +244,10 @@ def run_probe(executable: Path, utility: str, option: str,
         status = completed.returncode
         combined = stdout + stderr
         problems = []
+
+        required_status = contract.get("required_exit_status")
+        if required_status is not None and status != required_status:
+            problems.append(f"expected argument-rejection status {required_status}, got {status}")
 
         if status == 0:
             problems.append(

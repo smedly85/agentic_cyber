@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Judge a candidate ls-like binary against this suite's frozen goldens,
+# Judge a candidate sort-like binary against this suite's frozen goldens,
 # with `implemented` set to exactly the flags given on the command line.
 #
 # Usage: judge_candidate.sh CANDIDATE_BIN [FLAG...]
-#   judge_candidate.sh build/new_ls.py           # no flags declared implemented
-#   judge_candidate.sh build/new_ls.py FLAG...   # those flags declared implemented
+#   judge_candidate.sh build/new_sort.py           # no flags declared implemented
+#   judge_candidate.sh build/new_sort.py FLAG...   # those flags declared implemented
 #
 # FLAG... is the cumulative list of flags the candidate is expected to support.
 # A frozen case runs only when every flag it needs appears in that list, so
@@ -60,7 +60,6 @@ PY
 
 shopt -s nullglob
 candidates=(suites/*.json suites/*.json.gz)
-shopt -u nullglob
 # suites/MANIFEST.json records how the goldens were frozen; it holds no cases.
 suites=()
 for suite in "${candidates[@]}"; do

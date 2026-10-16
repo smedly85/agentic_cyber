@@ -4,6 +4,6 @@ from pathlib import Path
 import sys
 SUITE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SUITE.parent))
-from reference_generators.python_oracle import main
+from reference_generators.python_sort_oracle import main
 if __name__ == '__main__':
-    raise SystemExit(main(SUITE, 'ls'))
+    raise SystemExit(main(SUITE, 'sort'))
