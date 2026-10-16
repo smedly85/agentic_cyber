@@ -1,5 +1,10 @@
 # Ordered call structure: Phase 1 exploratory prototype
 
+Follow-up: [Phase 2.6 compiler-grounded feasibility investigation](ordered_diversity_phase26_feasibility.md)
+records four real-source Clang attempts, explicit build-context failures, and
+proposed independent graph/AST descriptors. It implements no new distances or
+clustering and does not change the primary methodology.
+
 This is a **syntax-derived exploratory representation**, not an SVF-equivalent
 semantic call graph, a replacement RQ2 metric, or a clustering input. The
 implementation lives in `scripts/analysis/ordered_callgraph.py`; its independent
