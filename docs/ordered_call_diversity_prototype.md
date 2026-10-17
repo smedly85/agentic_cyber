@@ -1,5 +1,10 @@
 # Ordered call structure: Phase 1 exploratory prototype
 
+Latest: [Phase 2.7 reproducible Clang feasibility](ordered_diversity_phase27_feasibility.md)
+establishes complete extracted mkdir/002 and grep/004 pairs under an explicitly
+declared POSIX analysis profile. No descriptors, distances or production changes
+are introduced.
+
 Follow-up: [Phase 2.6 compiler-grounded feasibility investigation](ordered_diversity_phase26_feasibility.md)
 records four real-source Clang attempts, explicit build-context failures, and
 proposed independent graph/AST descriptors. It implements no new distances or
