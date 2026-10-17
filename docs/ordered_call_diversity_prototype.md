@@ -1,6 +1,55 @@
-# Ordered call structure: Phase 1 exploratory prototype
+# Experimental order-aware diversity: methodology and prototype history
 
-Latest: [Phase 2.7 reproducible Clang feasibility](ordered_diversity_phase27_feasibility.md)
+## Current publication status: QUALIFIED ACCEPT for exploratory reporting
+
+The [final implementation decision](ordered_diversity_final_decision.md) documents
+compiler-grounded extraction and the retained exact Architecture/Strategy
+objectives. The [threshold study](ordered_diversity_threshold_decision.md) reports
+the two audited populations, continuous merge heights, missingness and independent
+review. The reviewer reran all 66 comparisons, verified saved statistics, checked
+all 21 mkdir A pairs against the exhaustive oracle and found no CRITICAL defects.
+This qualified acceptance does not establish a frozen primary methodology.
+
+Architecture is **function decomposition and directed call/API connectivity**,
+not purely internal organization. Approximately **61–86% of Architecture atoms
+are external API nodes or edges** in the independent audit; this is atom
+composition, not an attribution of pairwise distance. At the legacy 0.30 reference,
+mkdir has **six implementations plus one singleton**, with that partition over
+approximately **[0.17671253, 0.34181367)**. Grep's three-family partition exists
+only over approximately **[0.29814588, 0.30127843)** (about [0.29815, 0.30128)).
+Continuous merge-height intervals, not grid counts alone, reveal this sensitivity.
+The 0.30 cut has not been independently calibrated for these distances.
+
+Current Strategy scope applies the inherited default exclusion regex independently
+to each candidate, always including `main` and configured forced includes. It
+excludes mkdir/002 mode-parsing helpers while retaining parser code inlined into
+`main`. Helper naming and scope compatibility therefore affect coverage; 12/13
+scope-incompatible grep pairs involve usage-helper versus no-excluded-helper
+differences. This policy is not invariant to renaming across exclusion boundaries.
+Declaration-order-based binding normalization also means an unused declaration
+can shift subsequent binding slots and increase S beyond its own inserted subtree.
+Consistent renaming and repeated-reference preservation do not imply invariance
+under every behavior-preserving edit.
+
+These are success-conditioned, single-model/configuration populations. Pairwise
+distances sharing candidates are statistically dependent. The results support no
+cross-utility causal or inferential comparison, and structural diversity does not
+establish exploit independence. Strategy population coverage remains incomplete;
+available-pair intervals are not full-population estimates or definitive families.
+
+Reproduction distinguishes raw extracted-byte SHA-256 values from LF-normalized
+hashes used to match manifest sources with CRLF line endings. Checkout conversion
+can change raw hashes and source offsets; report byte identity is checkout-dependent.
+Same-checkout regeneration from saved measurements does not guarantee identical
+report bytes across checkouts, paths or fresh runs with different timings.
+
+The sections below retain the historical prototype methods and limitations.
+Their syntax-only extraction and earlier scope policies are not the current
+Clang integration or independent per-candidate scope policy described above.
+
+## Historical Phase 1–2.7 record
+
+[Phase 2.7 reproducible Clang feasibility](ordered_diversity_phase27_feasibility.md)
 establishes complete extracted mkdir/002 and grep/004 pairs under an explicitly
 declared POSIX analysis profile. No descriptors, distances or production changes
 are introduced.

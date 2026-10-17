@@ -1,10 +1,18 @@
 # Bounded exploratory RQ2 threshold-sensitivity study
 
-**Decision:** retain these results as exploratory. Architecture has complete
+**Decision: QUALIFIED ACCEPT for exploratory reporting.** Architecture has complete
 measurement coverage in both audited populations, but family counts depend on
 threshold. Strategy is incomplete in both populations and cannot support
 full-population family statistics. **Do not freeze a new primary threshold from
-this study.** The legacy 0.30 remains a comparison reference only.
+this study.** The legacy 0.30 remains a comparison reference only; it has not been
+independently calibrated for these distances.
+
+The independent review reran all 66 pairwise comparisons, verified the saved
+statistics, and compared all 21 mkdir Architecture pairs against the exhaustive
+oracle. It reported no CRITICAL defects and a **QUALIFIED ACCEPT** verdict. This
+supports implementation correctness within the audited scope, not independent
+calibration or substantive validity of structural families. This documentation
+pass does not recompute measurements or change the saved results.
 
 ## Population, method and computation
 
@@ -14,7 +22,9 @@ from their respective `*-qwen38-t1-seed42-low-ctx64k-max64k-n10` formal runs.
 Formal run, utility, checkpoint, lineage, candidate identity and manifest source
 hashes are retained in the pairwise report. No successful member was dropped;
 the two populations were never pooled or compared across utilities. These are
-success-conditioned populations, not all attempted generations.
+success-conditioned populations, not all attempted generations. They share one
+model/configuration; these observations do not establish generality across models
+or generation configurations.
 
 Each candidate received exactly one Clang AST extraction under the unchanged
 `c11-posix2008-v1` profile, then a cached representation was reused. Compiler and
@@ -26,12 +36,26 @@ distinguished from actual extracted-byte hashes. No duplicate source hashes were
 observed; duplicate observations would nevertheless retain separate identities
 and weights rather than being silently deduplicated.
 
+The raw SHA-256 identifies the actual source bytes passed to Clang. An
+LF-normalized SHA-256 identifies bytes after CRLF-to-LF normalization and is
+reported separately when needed to verify manifest membership. These hashes are
+not interchangeable: a checkout's line-ending conversion can change the raw hash
+and source offsets without changing the normalized source. Report byte identity
+is therefore checkout-dependent, not a cross-checkout reproducibility guarantee;
+paths, raw-byte provenance and fresh-run timings can also differ.
+
 The committed graph-atom Architecture objective and rooted-subtree Strategy
 objective, optimizer and name-based scope policy were reused unchanged. The
 default production exclusion regex was applied independently, with `main` always
 included and no forced includes configured. Only unordered off-diagonal pairs
 were computed. Both original sprint pairs reproduced their committed A/S values
 exactly.
+
+In mkdir/002, the inherited default regex excludes mode-parsing helper functions.
+Parser code inlined into `main` remains included. Thus Strategy's
+content and measurement coverage depend on helper naming and compatible scope
+membership, even though no reference candidate is selected. A helper rename that
+crosses the exclusion boundary is not an invariant of this Strategy estimand.
 
 Budgets were prespecified: unchanged comparator defaults (45 s for alignment,
 128 admissible optima, 45 s/2,000,000 work units for S and the existing size
@@ -61,6 +85,12 @@ pairs, two pairs whose optimal-alignment enumeration reached the unchanged
 128-mapping cap, and six pairs reaching the unchanged Strategy work limit.
 Every pair and reason is retained in the machine report. No budget was increased
 and no scope rule was relaxed to improve coverage.
+
+The independent review found that **12 of the 13 scope-incompatible grep pairs**
+involve a usage-helper versus no-excluded-helper difference. No excluded helper
+does not imply absence of parsing/usage code: that code may remain in included
+functions. These failures expose a scope-policy limitation, not missing source
+implementations.
 
 Alignment uncertainty is distinct from missingness. Available S interval widths
 reach 0.00189633 for mkdir and 0.06682641 for grep. In particular, 22 of 24 available
@@ -93,7 +123,8 @@ threshold selection is performed. The first threshold has no previous assignment
 | **0.30 reference** | **2** | **3** |
 | Every grid point 0.35–0.95 | 1 | 1 |
 
-At 0.30, mkdir has effective count **1.50699**, dominant share **6/7**, singleton
+At 0.30, mkdir's partition is **six implementations plus one singleton**.
+It has effective count **1.50699**, dominant share **6/7**, singleton
 rate **1/7** and silhouette **0.48284**. Grep has effective count **2.45456**,
 dominant share **0.6**, singleton rate **0.1** and silhouette **0.20965**.
 Grep changes 13 pair co-memberships and six candidates' family memberships between
@@ -107,6 +138,10 @@ family from 0.35 onward on the grid, with final merge heights 0.34181367 and
 0.34187441 respectively. The JSON records every merge height, linkage tree,
 unchanged grid-partition range and continuous stability interval. Plateau width
 does not establish substantive correctness of a family definition.
+
+In particular, grep's three-family result exists only approximately over
+**[0.29815, 0.30128)**. The continuous merge-height intervals above, rather than
+grid-level counts alone, are necessary to interpret the 0.30 reference cut.
 
 ### Strategy endpoint scenarios
 
@@ -128,6 +163,30 @@ All matrix diagonals are zero **by candidate identity**, without self-comparison
 This convention does not assert that architecture-optimal alignments of equivalent
 representations have a singleton Strategy range. Distinct observations, including
 identical sources, still require an off-diagonal measurement.
+
+## Construct validity and interpretation limits
+
+Architecture measures **function decomposition and directed call/API
+connectivity**, using defined-function nodes, named external API nodes and
+distinct directed call edges. The independent review found that approximately
+**61–86% of Architecture atoms are external API nodes or edges** in the audited
+implementations. This is an atom-count composition, not a percentage attribution
+of pairwise distance. With the existing unit-atom objective, API connectivity is
+a substantial component; A must not be described as purely internal organization.
+
+Strategy's declaration-order-based binding normalization preserves repeated
+references under consistent renaming, but inserting an unused declaration can
+shift subsequent declaration slots and increase S. The effect can extend beyond
+the inserted declaration subtree. Renaming invariance does not imply invariance
+under all behavior-preserving edits, and syntax similarity is not behavioral
+equivalence.
+
+Shared candidates make pairwise distances statistically dependent: the 66 pairs
+are not 66 independent observations. The reported summaries are descriptive for
+these success-conditioned, single-model/configuration populations. No causal or
+inferential comparison across utilities is warranted. Structural diversity does
+not establish exploit independence, independent vulnerabilities, or a security
+benefit.
 
 ## Eventual frozen reporting protocol
 
@@ -164,7 +223,9 @@ to freeze a primary threshold. Existing production reporting remains unchanged.
 monotonicity, deterministic analysis, complete/incomplete matrices, bound rejection,
 alignment intervals, candidate indexing, duplicate observations, identity checks,
 manifest membership and cross-population rejection. Regenerating only the reports
-from saved measurements produced byte-identical JSON and CSV files. No candidate
+from saved measurements in the same checkout produced byte-identical JSON and CSV
+files; this is not a claim of byte identity across differently normalized
+checkouts or fresh extraction/comparison runs. No candidate
 was re-extracted or pair recomputed for that determinism check.
 
 ```sh

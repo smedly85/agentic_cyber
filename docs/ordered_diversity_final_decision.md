@@ -1,12 +1,19 @@
 # Experimental order-aware RQ2: final implementation decision
 
-**ACCEPT, with qualifications, for bounded experimental C analysis under
+**QUALIFIED ACCEPT for bounded exploratory C analysis under
 `c11-posix2008-v1`.** The existing Architecture and Strategy objectives now run
 on compiler-grounded structures for both requested real pairs. This is ready for
 broader *exploratory* use with explicit coverage and budget reporting, not adoption
-as frozen primary RQ2 metrics or a clustering input. Broader population coverage
+as frozen primary RQ2 metrics or a definitive clustering input. Broader population coverage
 and substantive validity have not been established. No alternative metric,
 fingerprint, clustering threshold or production change was introduced.
+
+This document records the implementation sprint's two-pair evidence. The later
+[threshold-sensitivity study](ordered_diversity_threshold_decision.md) reports the
+complete audited populations and the independent review's **QUALIFIED ACCEPT**:
+all 66 comparisons rerun, saved statistics verified, all 21 mkdir A pairs checked
+against the exhaustive oracle, and no CRITICAL defects found. Acceptance is for
+exploratory reporting, not a frozen primary methodology or calibrated families.
 
 ## Actual results
 
@@ -41,6 +48,12 @@ architecture-optimal mappings also exist for grep; their total is not enumerated
 They are flagged and never used to lower or enlarge the admissible S range.
 
 ## Definitions retained
+
+Architecture means **function decomposition and directed call/API connectivity**.
+The independent population audit found approximately **61–86% of its atoms are
+external API nodes or edges**. This describes atom composition, not the fraction
+of a pairwise distance caused by external APIs; A is not purely a measure of
+internal organization.
 
 For each graph, let its atoms be one atom per defined function or named external
 API node, and one per distinct directed caller/callee edge. Repeated call sites
@@ -92,6 +105,10 @@ external call sites. It retains AST statement sequences, control nesting,
 operators, literals, transfers and binding identities. Parameter/local bindings
 use lexical declaration slots; uses refer back to those slots, preserving
 shadowing and repeated-reference distinctions under consistent renaming.
+Declaration-order normalization can nevertheless increase S when an unused
+declaration is inserted: subsequent binding slots may shift, changing reference
+labels as well as adding the declaration subtree. This is a construct-validity
+limitation, not evidence of changed behavior.
 Internal function references use the same alignment labels as internal calls;
 callback references do not fabricate call edges. Explicit and implicit cast kinds
 remain distinct. Header-defined function bodies are excluded from candidate scope.
@@ -118,6 +135,12 @@ previously proposed all-functions estimand.
 
 **Renaming across an exclusion boundary can change S.** This inherited name-based
 policy is explicit and tested, not claimed rename-invariant. A is unaffected.
+The mkdir/002 mode-parsing helpers above are excluded by this inherited regex,
+whereas parser code inlined into `main` remains included. Scope compatibility and
+helper naming therefore affect Strategy coverage. In the later grep population
+audit, 12/13 scope-incompatible pairs involve usage-helper versus
+no-excluded-helper differences; absence of an excluded helper does not establish
+absence of parser/usage code.
 Architecture is optimized without scope restrictions; only its optimal mappings
 with matching inclusion decisions enter S. Unmatched included functions incur
 full tree costs. Both compatible ambiguity and incompatible correspondence are
@@ -145,8 +168,9 @@ A is unavailable. A remains exact if only optimum enumeration fails, while S is
 unavailable rather than an incomplete extrema estimate. Resource/dependency/
 extraction failures never become zero distances.
 
-Coverage limitations: this validates only four sources in two separate C
-populations. Compiler/header changes invalidate the saved profile checks.
+Coverage limitations: this sprint validates only four sources in two separate C
+populations; the linked threshold study reports subsequent population coverage.
+Compiler/header changes invalidate the saved profile checks.
 Unresolved indirect calls block comparisons; declared library callbacks are not
 semantic may-call edges. Active preprocessing only is measured. Generic selection,
 inline assembly, atomic builtins, and initializer `array_filler` forms currently
@@ -158,6 +182,18 @@ The representation is richer than call ordering but does not capture complete
 computational behavior, dataflow or path feasibility. Large or highly symmetric
 programs may still exhaust exact optimization/enumeration budgets.
 
+The populations are success-conditioned and use a single model/configuration.
+Pairs sharing candidates are statistically dependent, not independent replicates.
+Results do not support cross-utility causal or inferential comparisons, and
+structural diversity does not establish exploit independence.
+
+The later Architecture threshold study finds six implementations plus one
+singleton for mkdir at 0.30, with that partition approximately on
+**[0.17671253, 0.34181367)**. Grep's three-family partition exists only approximately
+on **[0.29814588, 0.30127843)** (about [0.29815, 0.30128)). Continuous merge-height
+intervals expose sensitivity hidden by grid-level counts. The legacy 0.30 is a
+comparison reference, not an independently calibrated threshold.
+
 ## Deliverables and reproduction
 
 Added `scripts/analysis/clang_ordered.py`, `scripts/analysis/ordered_exact.py`,
@@ -166,6 +202,13 @@ this decision document and
 [`ordered_diversity_final_results.json`](ordered_diversity_final_results.json).
 The JSON records commands, source/profile provenance, implementation hashes,
 scope, integer costs, all evaluated compatible mappings and timings.
+
+Raw source SHA-256 values identify the actual extracted bytes; LF-normalized
+hashes used for manifest verification are separate identities after CRLF-to-LF
+conversion. Checkout line-ending conversion can change raw hashes and offsets.
+Report byte identity is checkout-dependent; paths and fresh-run timings can also
+differ. The later study's byte-identical report regeneration was a same-checkout
+check using saved measurements, not a guarantee across checkouts or fresh runs.
 
 ```sh
 python3 -m scripts.ordered_diversity_final
@@ -176,5 +219,5 @@ Requires the Phase-2.7 recorded Clang/header environment plus NumPy/SciPy for th
 MILP backend; missing optimizer dependencies remain unavailable, with no fallback
 scalar. The exact matcher and primary metrics are unchanged. No full experiments,
 LLMs, lineage work, semantic depth changes, clustering, commits or pushes occurred.
-This sprint ends with working real comparisons and the qualified ACCEPT above;
+This sprint ends with working real comparisons and the QUALIFIED ACCEPT above;
 it does not initiate another methodology phase.
