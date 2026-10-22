@@ -370,7 +370,7 @@ run_aider() {
     local invocation="$4"
     local kind="$5"
     local current_log start_ns end_ns status runtime_ms isolation_rejected
-    local token_limit invalid_editor_output current_log_available
+    local token_limit invalid_editor_output current_log_available applied_edit
     local durable_log_available current_log_parent_available
     local current_log_parent_writable tee_status log_capture_condition
     local -a pipeline_status
@@ -495,10 +495,15 @@ run_aider() {
     # produce misleading diagnostics, and pathlib emits a traceback.
     current_log_available=false
     token_limit=unknown
+    applied_edit=unknown
     invalid_editor_output=unknown
     log_capture_condition=current_log_missing_after_pipeline
     if [[ -f "$current_log" ]]; then
         current_log_available=true
+        [[ "$tee_status" -eq 0 ]] && applied_edit=false
+        if grep -Eq '^Applied edit to .+' "$current_log"; then
+            applied_edit=true
+        fi
         log_capture_condition=none
         token_limit=false
         if grep -Fq 'has hit a token limit!' "$current_log"; then
@@ -516,17 +521,19 @@ run_aider() {
     else
         warn "Aider invocation $invocation current log unavailable after pipeline (tee_exit=$tee_status parent_directory_available=$current_log_parent_available parent_directory_writable=$current_log_parent_writable durable_log_available=$durable_log_available); token-limit and editor-output observations are unknown"
     fi
-    printf '%s %s %s %s %s %s %s %s %s %s %s\n' \
+    printf '%s %s %s %s %s %s %s %s %s %s %s %s\n' \
         "$status" "$runtime_ms" "$isolation_rejected" "$token_limit" \
         "$invalid_editor_output" "$current_log_available" "$tee_status" \
         "$current_log_parent_available" "$current_log_parent_writable" \
-        "$durable_log_available" "$log_capture_condition"
+        "$durable_log_available" "$log_capture_condition" "$applied_edit"
 }
 
 make_loop_record() {
-    "$PYTHON_BIN" - "$@" <<'PY'
+    "$PYTHON_BIN" - "$REPO/scripts" "$@" <<'PY'
 import json
 import sys
+sys.path.insert(0, sys.argv.pop(1))
+from invocation_observations import public_scores, compare_scores
 
 (
     loop,
@@ -551,6 +558,14 @@ import sys
     durable_log_available,
     log_capture_condition,
     agent_failure_reason,
+    source_before,
+    candidate_before,
+    candidate_after,
+    applied_edit,
+    attempt_dir,
+    previous_record,
+    prompt_sha256,
+    max_loops,
 ) = sys.argv[1:]
 
 
@@ -560,6 +575,10 @@ def observed_boolean(value):
     return value == "true"
 
 
+scores = public_scores(attempt_dir, int(loop))
+previous = json.loads(previous_record) if previous_record else {}
+changed = source_before != source_sha256
+available = candidate_after == "true"
 print(json.dumps({
     "loop": int(loop),
     "kind": kind,
@@ -574,6 +593,28 @@ print(json.dumps({
     "feature_test_runtime_ms": int(feature_test_ms),
     "validation_success": validation_success == "true",
     "source_sha256": source_sha256,
+    "observation_schema_version": 1,
+    "agent_timed_out": int(agent_exit) == 124,
+    "agent_execution_success": (
+        False if int(agent_exit) != 0 or any(value == "true" for value in
+                 (isolation_rejected, token_limit, invalid_editor_output))
+        else None if "unknown" in (token_limit, invalid_editor_output) else True
+    ),
+    "source_sha256_before": None if source_before == "absent" else source_before,
+    "source_sha256_after": None if source_sha256 == "absent" else source_sha256,
+    "candidate_available_before": candidate_before == "true",
+    "candidate_available_after": available,
+    "source_changed": changed,
+    "new_candidate_produced": available and changed,
+    "timeout_without_new_candidate": int(agent_exit) == 124 and not (available and changed),
+    "aider_reported_applied_edit": observed_boolean(applied_edit),
+    "validation_source": ("new_or_modified" if changed else "inherited") if available else "unavailable",
+    "controller_validation_success": all(int(code) == 0 for code in
+                                         (build_exit, base_test_exit, feature_test_exit)),
+    "public_validation_scores": scores,
+    "public_validation_change": compare_scores(previous.get("public_validation_scores"), scores),
+    "repair_budget_exhausted": int(loop) >= int(max_loops),
+    "prompt_sha256": prompt_sha256,
     "agent_token_limit": observed_boolean(token_limit),
     "agent_invalid_editor_output": observed_boolean(invalid_editor_output),
     "agent_current_log_available": current_log_available == "true",
@@ -1620,6 +1661,7 @@ PY
         stop_reason=""
         previous_source_sha=""
         loop_records=()
+        previous_loop_record=""
         # Timeout provenance. A session that runs out of time may still have
         # written a usable source, and the controller builds and tests that
         # source itself -- so the attempt can have real public-test feedback
@@ -1663,13 +1705,17 @@ PY
                 repair_loops=$((repair_loops + 1))
             fi
 
+            source_before="$(file_sha256 "$workdir/$SOURCE_PATH")"
+            candidate_before=false
+            [[ -s "$workdir/$SOURCE_PATH" ]] && candidate_before=true
+            invocation_prompt_sha="$(file_sha256 "$current_prompt")"
             read -r agent_exit agent_ms invocation_isolation_rejected \
                 invocation_token_limit invocation_invalid_editor_output \
                 invocation_current_log_available invocation_tee_exit \
                 invocation_log_parent_available \
                 invocation_log_parent_writable \
                 invocation_durable_log_available \
-                invocation_log_capture_condition < <(
+                invocation_log_capture_condition invocation_applied_edit < <(
                 run_aider \
                     "$attempt_dir/aider.log" \
                     "$workdir" \
@@ -1677,6 +1723,7 @@ PY
                     "$validation_loop" \
                     "$invocation_kind"
             )
+            source_sha="$(file_sha256 "$workdir/$SOURCE_PATH")"
             total_agent_ms=$((total_agent_ms + agent_ms))
             if [[ "$validation_loop" -eq 0 ]]; then
                 initial_agent_ms="$agent_ms"
@@ -1691,16 +1738,15 @@ PY
                 agent_log_capture_issue_observed=true
             fi
 
-            # Did this session leave a source behind? A timeout is only fatal
-            # when it did not. The controller compiles and tests the source
-            # itself, so a session that ran out of time after writing one still
-            # produced something with a real, actionable validation result --
-            # observed: exit 124 with build 0 and checkpoint tests 1, which the
-            # controller then refused to repair. Non-empty, because an empty
-            # file is not an implementation.
+            # Availability is not production: repairs already have a source.
+            # Only changed, nonempty source qualifies for timeout recovery.
             invocation_candidate_present=false
             if [[ -s "$workdir/$SOURCE_PATH" ]]; then
                 invocation_candidate_present=true
+            fi
+            invocation_new_candidate=false
+            if [[ "$invocation_candidate_present" == true && "$source_before" != "$source_sha" ]]; then
+                invocation_new_candidate=true
             fi
             invocation_timed_out=false
             if [[ "$agent_exit" -eq 124 ]]; then
@@ -1748,7 +1794,7 @@ PY
                 agent_execution_failed=true
                 agent_execution_failure_stage_json='"permission"'
             elif [[ "$invocation_timed_out" == true &&
-                    "$invocation_candidate_present" == true ]]; then
+                    "$invocation_new_candidate" == true ]]; then
                 # Repair-eligible timeout: fall through to controller
                 # validation and, if that fails, to the repair loop. Nothing is
                 # rewritten -- the exit code, timeout_enforced and
@@ -1756,6 +1802,12 @@ PY
                 # short, so reliability analysis can tell this apart from a
                 # session that finished on its own.
                 :
+            elif [[ "$invocation_timed_out" == true &&
+                    "$invocation_candidate_present" == true ]]; then
+                # Revalidate inherited source for observation only. Retain the
+                # historical loop_limit/no_progress precedence below, but do
+                # not credit this invocation with producing a usable candidate.
+                invocation_agent_failure_reason="timeout_without_source_change"
             elif [[ "$agent_exit" -ne 0 ]]; then
                 invocation_agent_execution_failed=true
                 agent_execution_failed=true
@@ -1763,12 +1815,11 @@ PY
                     # Timed out with nothing to show for it: no implementation
                     # exists, so there is nothing to repair.
                     agent_execution_failure_stage_json='"timeout"'
+                    invocation_agent_failure_reason="timeout_without_candidate"
                 else
                     agent_execution_failure_stage_json='"aider"'
                 fi
             fi
-
-            source_sha="$(file_sha256 "$workdir/$SOURCE_PATH")"
 
             # Independent verification, run by the controller not the agent.
             read -r build_exit build_ms < <(
@@ -1779,6 +1830,7 @@ PY
             )
             read -r base_test_exit base_test_ms < <(
                 cd "$workdir" &&
+                export VALIDATION_JSON_REPORT="$attempt_dir/public-validation-$validation_loop-base.json"
                 run_logged_command \
                     "$attempt_dir/base-tests.log" "$BASE_TEST_CMD" \
                     "$validation_loop" "BASE TESTS"
@@ -1810,6 +1862,10 @@ PY
             if [[ "$invocation_agent_execution_failed" == true ]]; then
                 validation_success=false
             fi
+            if [[ "$invocation_candidate_present" != true ||
+                  ( "$invocation_timed_out" == true && "$invocation_new_candidate" != true ) ]]; then
+                validation_success=false
+            fi
             if [[ "$validation_loop" -eq 0 ]]; then
                 initial_success="$validation_success"
             fi
@@ -1828,7 +1884,11 @@ PY
                 "$invocation_log_parent_writable" \
                 "$invocation_durable_log_available" \
                 "$invocation_log_capture_condition" \
-                "$invocation_agent_failure_reason")")
+                "$invocation_agent_failure_reason" \
+                "$source_before" "$candidate_before" "$invocation_candidate_present" \
+                "$invocation_applied_edit" "$attempt_dir" \
+                "$previous_loop_record" "$invocation_prompt_sha" "$MAX_LOOPS")")
+            previous_loop_record="${loop_records[validation_loop]}"
 
             printf '    loop %s: build=%s base=%s checkpoint=%s\n' \
                 "$validation_loop" "$build_exit" "$base_test_exit" \
@@ -1849,8 +1909,8 @@ PY
                 break
             fi
             if [[ "$ALLOW_NO_PROGRESS" -eq 0 &&
-                  -n "$previous_source_sha" &&
-                  "$source_sha" == "$previous_source_sha" ]]; then
+                  ( ( -n "$previous_source_sha" && "$source_sha" == "$previous_source_sha" ) ||
+                    ( "$invocation_timed_out" == true && "$invocation_new_candidate" != true ) ) ]]; then
                 stop_reason="no_progress"
                 printf '    stopping: source unchanged since the previous loop\n'
                 break
@@ -1859,13 +1919,9 @@ PY
 
             next_loop=$((validation_loop + 1))
             repair_prompt_file="$attempt_dir/repair-prompt-$next_loop.md"
-            json_report_dir=""
-            for test_dir_dest in "${TEST_DIR_DESTINATIONS[@]+"${TEST_DIR_DESTINATIONS[@]}"}"; do
-                if [[ -d "$workdir/$test_dir_dest/run_logs" ]]; then
-                    json_report_dir="$workdir/$test_dir_dest/run_logs"
-                    break
-                fi
-            done
+            candidate_state=missing
+            [[ -f "$workdir/$SOURCE_PATH" ]] && candidate_state=empty
+            [[ -s "$workdir/$SOURCE_PATH" ]] && candidate_state=available
 
             repair_args=(
                 --template "$REPAIR_TEMPLATE"
@@ -1878,6 +1934,7 @@ PY
                 --original-prompt "$PROMPT_ABS"
                 --program "$PROGRAM_NAME"
                 --source-path "$SOURCE_PATH"
+                --candidate-state "$candidate_state"
                 --loop-number "$next_loop"
                 --max-loops "$MAX_LOOPS"
                 --build-command "$BUILD_CMD"
@@ -1894,8 +1951,12 @@ PY
             for command in "$BUILD_CMD" "$BASE_TEST_CMD" "$FEATURE_TEST_CMD"; do
                 [[ -n "$command" ]] && repair_args+=(--validation-command "$command")
             done
-            [[ -n "$json_report_dir" ]] &&
-                repair_args+=(--json-report-dir "$json_report_dir")
+            # Explicit public paths only; absent reports fall back to this
+            # loop's text, never a directory search or a held-out report.
+            repair_args+=(
+                --base-json-report "$attempt_dir/public-validation-$validation_loop-base.json"
+                --feature-json-report "$attempt_dir/public-validation-$validation_loop.json"
+            )
 
             if ! "$PYTHON_BIN" "$REPAIR_TOOL" "${repair_args[@]}" \
                     >"$repair_prompt_file"; then
@@ -2092,6 +2153,8 @@ PY
             source_workdir_path "$SOURCE_PATH" \
             source_mode "$SOURCE_MODE" \
             max_loops "$MAX_LOOPS" \
+            controller_observation_schema_version 1 \
+            repair_template_sha256 "$(file_sha256 "$REPAIR_TEMPLATE")" \
             agent_exit_code "$agent_exit" \
             agent_isolation_rejected "$agent_isolation_rejected" \
             build_exit_code "$build_exit" \

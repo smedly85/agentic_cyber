@@ -87,10 +87,10 @@ def current_loop_section(text: str) -> str:
 
 
 def failures_from_json_report(report_dir: Path | None) -> tuple[list[Failure], str]:
-    """Read the newest --json-report emitted by a suite runner, if any."""
-    if report_dir is None or not report_dir.is_dir():
+    """Read an exact report, or the legacy opt-in report directory."""
+    if report_dir is None:
         return [], ""
-    reports = sorted(
+    reports = [report_dir] if not report_dir.is_dir() else sorted(
         report_dir.rglob("*.json"),
         key=lambda path: path.stat().st_mtime,
         reverse=True,
@@ -113,7 +113,8 @@ def failures_from_json_report(report_dir: Path | None) -> tuple[list[Failure], s
             counts = data.get("counts")
             summary = ""
             if isinstance(counts, dict):
-                scored = sum(int(v) for v in counts.values() if isinstance(v, int))
+                scored = sum(v for k, v in counts.items()
+                             if isinstance(v, int) and k not in {"SKIP", "XFAIL"})
                 passed = int(counts.get("PASS", 0) or 0)
                 summary = f"{passed}/{scored} pass"
             return failures, summary
@@ -296,6 +297,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--original-prompt", required=True, type=Path)
     parser.add_argument("--program", default="the implementation")
     parser.add_argument("--source-path", required=True)
+    parser.add_argument("--candidate-state", choices=("available", "missing", "empty"),
+                        default="available")
+    parser.add_argument("--base-json-report", type=Path)
+    parser.add_argument("--feature-json-report", type=Path)
     parser.add_argument("--loop-number", required=True, type=int)
     parser.add_argument("--max-loops", required=True, type=int)
     parser.add_argument("--test-dir", action="append", default=[])
@@ -342,6 +347,22 @@ def main() -> int:
     original_prompt = demote_headings(
         args.original_prompt.read_text(encoding="utf-8", errors="replace").strip()
     )
+    if args.candidate_state != "available":
+        # Preserve the formal template verbatim for normal repairs. Correct
+        # only claims that are false when generation left no implementation.
+        template = template.replace(
+            "Your previous session returned an implementation that did not pass validation.",
+            "Your previous session left no nonempty implementation; validation failed.",
+        ).replace(
+            "Continue the current implementation in this working directory.",
+            "Create the required implementation in this working directory.",
+        ).replace(
+            "Do not restart the task. Do not revert to an earlier version. Do not redesign\nwork that already passes.",
+            "Implement the original task using the validation feedback below.",
+        ).replace("Your implementation so far:", "Required source path:").replace(
+            "This file is your own previous work, already on disk in this directory. It is\nnot a baseline and not a reference solution.\n\nRead its contents supplied through Aider before changing it.",
+            f"The source is {args.candidate_state}. There is no previous nonempty implementation to continue.",
+        )
 
     stages = [
         (
@@ -354,13 +375,13 @@ def main() -> int:
             "Base tests",
             args.base_test_exit,
             current_loop_section(read_text(args.base_test_log)),
-            args.json_report_dir,
+            args.base_json_report if args.base_json_report is not None else args.json_report_dir,
         ),
         (
             "Checkpoint tests",
             args.feature_test_exit,
             current_loop_section(read_text(args.feature_test_log)),
-            args.json_report_dir,
+            args.feature_json_report if args.feature_json_report is not None else args.json_report_dir,
         ),
     ]
 
