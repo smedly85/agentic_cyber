@@ -36,8 +36,12 @@ EXPLICIT_INVALID_EDIT_PATTERNS = (
 APPLIED_EDIT = re.compile(r"^Applied edit to .+\s*$", re.MULTILINE)
 
 
-def malformed_editor_diff(text: str) -> bool:
-    """True only when concrete SEARCH/REPLACE markers violate the protocol."""
+def malformed_editor_diff(text: str, *, allow_incomplete_tail: bool = False) -> bool:
+    """Detect invalid ordering, and unfinished blocks unless interrupted.
+
+    A timeout may cut off a valid block at any point. It cannot explain an
+    already observed out-of-order marker, which remains protocol evidence.
+    """
     marker_lines = [
         line.strip()
         for line in text.splitlines()
@@ -59,7 +63,7 @@ def malformed_editor_diff(text: str) -> bool:
             state = "outside"
         else:
             return True
-    return saw_marker and state != "outside"
+    return saw_marker and state != "outside" and not allow_incomplete_tail
 
 
 def has_invalid_editor_output(
@@ -77,7 +81,9 @@ def has_invalid_editor_output(
             text = text[applied[-1].end():]
     if any(pattern.search(text) for pattern in EXPLICIT_INVALID_EDIT_PATTERNS):
         return True
-    return editor_edit_format == "editor-diff" and malformed_editor_diff(text)
+    return editor_edit_format == "editor-diff" and malformed_editor_diff(
+        text, allow_incomplete_tail=agent_exit_code == 124,
+    )
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

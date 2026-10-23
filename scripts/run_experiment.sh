@@ -1782,6 +1782,9 @@ PY
             elif [[ "$invocation_invalid_editor_output" == true ]]; then
                 # Only concrete protocol evidence reaches this branch. Failed
                 # tests and unchanged candidates are not edit-format failures.
+                # The parser excludes an unfinished trailing block on exit 124;
+                # explicit diagnostics/invalid ordering still reach this branch
+                # even on timeout. Keep the timeout observation independently.
                 invocation_agent_execution_failed=true
                 agent_execution_failed=true
                 agent_execution_failure_stage_json='"editor_output"'
