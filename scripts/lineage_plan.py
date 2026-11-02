@@ -52,6 +52,8 @@ SCHEMA_VERSION = 1
 RECORD_SEPARATOR = "\x1f"
 
 
+from linux_utilities_catalog import SELECTORS as LINUX_SELECTORS, suite_root as linux_suite_root, utility_name
+
 class ManifestError(SystemExit):
     def __init__(self, message: str) -> None:
         super().__init__(f"lineage_plan: {message}")
@@ -471,6 +473,31 @@ def resolve_plan(
         "automation_notice_sha256": prompt_render.notice_sha256(repo),
     }
     plan["config_fingerprint"] = fingerprint(plan)
+    if utility in LINUX_SELECTORS:
+        # New identities only: do not change historical fingerprints. Changes to
+        # the language-neutral contract or Docker verification are scientific
+        # configuration changes, even before functional validation is available.
+        infrastructure = [
+            "scripts/linux_benchmark.py",
+            "scripts/docker_benchmark.py",
+            "scripts/docker_benchmark_worker.py",
+            "scripts/linux_utilities_catalog.py",
+            "scripts/python_candidate.py",
+            "docker/linux-utilities/Rust.Dockerfile",
+            "scripts/linux_benchmark_isolation.py",
+            "docs/benchmarks/linux-utilities-contract.md",
+            "docker/linux-utilities/Dockerfile",
+            "docker/linux-utilities/build.sh",
+            "docker/linux-utilities/run.sh",
+        ]
+        plan["execution_environment"] = {
+            "benchmark": "linux-utilities", "protocol_version": 1, "required_platform": "Linux",
+            "preferred_architecture": "aarch64", "formal_execution_enabled": True,
+            "infrastructure_sha256": {name: sha256_file(repo / name) for name in infrastructure},
+        }
+        from docker_benchmark import settings
+        plan["execution_environment"]["docker"] = settings()
+        plan["config_fingerprint"] = fingerprint(plan)
     return plan
 
 

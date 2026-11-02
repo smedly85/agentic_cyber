@@ -74,6 +74,8 @@ SANITIZER_MARKERS = (
 PROBE_TIMEOUT_SECONDS = 20
 
 
+from linux_utilities_catalog import SELECTORS as LINUX_SELECTORS, suite_root as linux_suite_root, utility_name
+
 class GateError(SystemExit):
     def __init__(self, message: str) -> None:
         super().__init__(f"checkpoint_boundary_gate: {message}")
@@ -197,6 +199,11 @@ def _transfer_probe(option: str, flag: str, fixture: Path) -> dict[str, Any]:
 
 
 PROBES = {
+    "c-cp": {"build": _transfer_probe, "requires_diagnostic": True},
+    "c-mv": {"build": _transfer_probe, "requires_diagnostic": True},
+    "c-mkdir": {"build": _mkdir_probe, "requires_diagnostic": True},
+    "c-sort": {"build": _sort_probe, "requires_diagnostic": True,
+               "required_exit_status": 2},
     "python-cp": {"build": _transfer_probe, "requires_diagnostic": True},
     "python-mv": {"build": _transfer_probe, "requires_diagnostic": True},
     "python-mkdir": {"build": _mkdir_probe, "requires_diagnostic": True},
@@ -213,9 +220,19 @@ PROBES = {
 }
 
 
+for _selector in LINUX_SELECTORS:
+    PROBES[_selector] = PROBES["c-" + utility_name(_selector)]
+
+
 def run_probe(executable: Path, utility: str, option: str,
               flag: str) -> dict[str, Any]:
     """Invoke the candidate with one forbidden option and judge the refusal."""
+    if utility in LINUX_SELECTORS:
+        from docker_benchmark import boundary_probe, InfrastructureError
+        try:
+            return boundary_probe(executable, utility, option, flag)
+        except (InfrastructureError, OSError, ValueError) as error:
+            raise GateError(str(error)) from error
     contract = PROBES.get(utility)
     if contract is None:
         raise GateError(f"no rejection contract defined for {utility!r}")
@@ -291,6 +308,12 @@ def evaluate(repo: Path, utility: str, checkpoint_id: str,
         run_probe(executable, utility, entry["option"], entry["flag"])
         for entry in row["forbidden_options"]
     ]
+    if utility in LINUX_SELECTORS:
+        # Enforce the restricted surface as well as the incremental ladder.
+        excluded = {"c-cp": "-R", "c-mv": "-n", "c-mkdir": "-v", "c-sort": "-C"}
+        probes.append(run_probe(executable, utility, excluded["c-" + utility_name(utility)], excluded["c-" + utility_name(utility)]))
+        if utility in LINUX_SELECTORS and utility_name(utility) == "sort":
+            probes.append(run_probe(executable, utility, "@existing-file-operand", "operand"))
     violations = [probe for probe in probes if not probe["rejected"]]
     return {
         "schema_version": SCHEMA_VERSION,

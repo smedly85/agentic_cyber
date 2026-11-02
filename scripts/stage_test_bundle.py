@@ -90,6 +90,8 @@ OPTIONAL_FILES = frozenset({"props.py"})
 #   suites/*       shipped only after per-checkpoint filtering
 
 
+from linux_utilities_catalog import SELECTORS as LINUX_SELECTORS, suite_root as linux_suite_root, utility_name
+
 class BundleError(SystemExit):
     def __init__(self, message: str) -> None:
         super().__init__(f"stage_test_bundle: {message}")
@@ -335,7 +337,7 @@ def build_payload(
     A `.json.gz` member is carried uncompressed here and gzipped by
     write_bundle; digests are over the uncompressed form. See encode_suite.
     """
-    suite_root = repo / test_dir
+    suite_root = linux_suite_root(repo, utility, test_dir)
     if not suite_root.is_dir():
         raise BundleError(f"test suite not found: {suite_root}")
 
@@ -355,6 +357,9 @@ def build_payload(
             continue
         files[name] = source.read_bytes()
 
+    if utility in LINUX_SELECTORS:
+        files["judge_candidate.sh"] = (repo / test_dir / "judge_candidate.sh").read_bytes()
+
     files["config.json"] = bundle_config(suite_root / "config.json", implemented)
 
     kept_total = dropped_total = 0
@@ -369,7 +374,26 @@ def build_payload(
             continue
         if not (source.name.endswith(".json") or source.name.endswith(".json.gz")):
             continue
-        filtered, kept, dropped = filter_suite(read_suite(source), implemented_set)
+        payload = read_suite(source)
+        excluded_count = 0
+        if utility in LINUX_SELECTORS:
+            # Match the new namespace's runtime scope at bundle construction,
+            # so excluded compatibility cases are not agent-visible either.
+            config = json.loads((suite_root / "config.json").read_text())
+            entries = payload["cases"] if isinstance(payload, dict) else payload
+            def in_scope(case):
+                import re
+                if set(case.get("tags", [])) & set(config.get("excluded_tags", [])):
+                    return False
+                if utility in LINUX_SELECTORS and utility_name(utility) == "sort":
+                    return ("stdin_b64" in case and not any(
+                        re.fullmatch(r"-y[0-9]*", arg) for arg in case.get("args", [])))
+                return True
+            scoped = [case for case in entries if in_scope(case)]
+            excluded_count = len(entries) - len(scoped)
+            payload = dict(payload, cases=scoped) if isinstance(payload, dict) else scoped
+        filtered, kept, dropped = filter_suite(payload, implemented_set)
+        dropped += excluded_count
         kept_total += kept
         dropped_total += dropped
         per_suite[source.name] = kept
@@ -463,9 +487,11 @@ def fingerprint(
     several seconds of pure waste. The cache key includes the suite's file
     inventory, so an edited suite is never served from it.
     """
-    suite_root = repo / test_dir
+    suite_root = linux_suite_root(repo, utility, test_dir)
     key = (
         str(suite_root),
+        utility,
+        (repo / test_dir / "judge_candidate.sh").read_bytes() if utility in LINUX_SELECTORS else b"",
         tuple(checkpoint["implemented_flags"]),
         ALLOWED_FILES,
         _suite_inventory(suite_root) if suite_root.is_dir() else (),

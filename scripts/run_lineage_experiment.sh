@@ -321,6 +321,7 @@ command -v git >/dev/null 2>&1 || die "git is required (to resolve repo-relative
 REPO="$(git rev-parse --show-toplevel 2>/dev/null)" ||
     die "run this script inside a Git repository (only used to resolve paths)"
 REPO="$(cd "$REPO" && pwd -P)"
+export HELDOUT_ROOT="$REPO"
 
 PLAN_TOOL="$REPO/scripts/lineage_plan.py"
 [[ -f "$PLAN_TOOL" ]] || die "plan resolver not found: $PLAN_TOOL"
@@ -356,6 +357,14 @@ if [[ "$LIST_UTILITIES" -eq 1 ]]; then
 fi
 
 [[ -n "$UTILITY" ]] || die "--utility is required"
+LINUX_BENCHMARK=0
+case "$UTILITY" in
+    c-cp|c-mv|c-mkdir|c-sort|rust-cp|rust-mv|rust-mkdir|rust-sort|py-cp|py-mv|py-mkdir|py-sort)
+        LINUX_BENCHMARK=1
+        SECURITY_EVALUATION=0
+        export C_BENCHMARK_LOCK="${C_BENCHMARK_LOCK:-$REPO/docker/linux-utilities/lock-amd64.json}"
+        ;;
+esac
 [[ -n "$MODEL" ]] || die "--model is required"
 [[ "$MODEL" != "$EDITOR_MODEL" ]] ||
     die "--model and --editor-model must differ so their sampling settings remain role-specific"
@@ -663,7 +672,10 @@ if [[ "$SOURCE_PATH" == *.py ]]; then
     export PYTHON_CONTROLLER_ROOT="$REPO"
 fi
 RUST_TOOLCHAIN_JSON=null
-if [[ "$DRY_RUN" -eq 0 && "$SOURCE_PATH" == *.rs ]]; then
+if [[ "$DRY_RUN" -eq 0 && "$LINUX_BENCHMARK" -eq 1 ]]; then
+    "$PYTHON_BIN" "$REPO/scripts/docker_benchmark.py" preflight --utility "$UTILITY" || exit 4
+fi
+if [[ "$DRY_RUN" -eq 0 && "$SOURCE_PATH" == *.rs && "$LINUX_BENCHMARK" -eq 0 ]]; then
     source "$REPO/scripts/rust_toolchain.sh"
     rust_toolchain_preflight || exit 4
 fi
@@ -694,7 +706,8 @@ REPO_COMMIT="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || printf 'unknown')"
 # So: no lineage-* directory, no lineage.json, no checkpoint, no agent
 # invocation, and lineages_started stays 0. The outcome is recorded at the top
 # level only, as a run status.
-if [[ -n "$REQUIRED_PLATFORM" && "$REQUIRED_PLATFORM" != "None" &&
+if [[ "$LINUX_BENCHMARK" -eq 0 &&
+      -n "$REQUIRED_PLATFORM" && "$REQUIRED_PLATFORM" != "None" &&
       "$REQUIRED_PLATFORM" != "$HOST_PLATFORM" ]]; then
     if [[ "$DRY_RUN" -eq 1 ]]; then
         # A dry run starts no lineage, writes nothing and invokes no agent,
