@@ -5,10 +5,20 @@ across maintenance checkpoints. Each checkpoint preserves the prompt, baseline
 repository state, generated candidates, validation results, and metadata needed
 to reproduce and compare independent repository histories.
 
-The experiment generates C reimplementations of four standard utilities and
-Rust cp/mv implementations one feature at a time. Python cp, mv, sort and mkdir
-also use this pipeline for functional-only lineages; see
-[Python setup, checks and diagnostic commands](docs/python_lineages.md).
+The active [Linux utility benchmark](docs/benchmarks/linux-utilities.md) defines
+cp, mv, mkdir and sort in C, Rust and Python: 12 configurations and 45 checkpoints.
+Run `make test` from WSL/Linux with Docker and the pinned benchmark images
+available for bounded static and Docker integration checks, including the four
+restored regression modules. Logs go to a fresh directory under `/tmp`; no
+formal lineages are started. Candidate compilation and execution stay in Docker.
+
+Historical C chmod, grep, mkdir and sort manifests, checkpoint prompts and
+judging inputs remain available to reproduce the retained correctness and
+diversity claims. Their generators also support frozen-corpus self-checks, and
+the mkdir/sort models feed historical differential-fuzz checks. These are distinct
+from the standardized benchmark; the Darwin-frozen inputs are not Linux ground
+truth. Historical Rust cp/mv and Python configurations are likewise retained;
+see [Python setup, checks and diagnostic commands](docs/python_lineages.md).
 The primary paper analysis separates RQ1 correctness and
 lineage completion, RQ2 implementation diversity and maintenance variation,
 and RQ3 security. No composite score combines them.
@@ -22,6 +32,33 @@ optional post-hoc diagnostic and documented separately in
 `docs/execution_consistency_methodology.md`.
 
 ## Independent functional and security evaluation
+
+For research review, use these entry points:
+
+| Area | Entry point |
+| --- | --- |
+| Active benchmark, Docker execution and validation | [Linux utilities](docs/benchmarks/linux-utilities.md) |
+| Final diversity algorithms and methodology | [Canonical A/S methodology](docs/diversity_methodology.md) |
+| The 140 historical C observations and trajectories | [Checkpoint diversity](docs/checkpoint_diversity_trajectories.md) |
+| Historical C CVE evidence and reported depth limitations | [V2 evidence](security/historical/evidence/v2/README.md) |
+| Historical Rust analysis | [Rust method guide](security/historical/rust/SEMANTIC_README.md) |
+
+`runs/formal/` retains candidate sources, exact checkpoint inputs and evaluation
+records used by those analyses. Exploratory artifacts are not additional final
+results; follow the methodology links above to identify the reported datasets.
+The 150 per-attempt Aider pricing/context caches contained only two distinct
+payloads. One of each remains at its original
+`lineage-001/000/temp-1p0/attempt-001/aider-home/.aider/caches/model_prices_and_context_window.json` path under the
+`chmod-qwen38-t1-seed42-low-ctx64k-max64k-n10` and
+`grep-qwen38-t1-seed42-low-ctx64k-max64k-n10` formal runs. The other 148
+byte-identical copies were removed; measurement code does not consume these caches.
+Vendored historical sources omit rebuildable translation binaries; see the
+[source preservation note](security/historical/README.md).
+The four public `final-oracle/validated/c-*/suites/linux.json.gz` payloads under
+`docs/benchmarks/cross-language-validation/` were exact copies of
+`tests/c-*-test-suite/suites/linux.json.gz` and have been removed. Use those
+canonical suites when inspecting the retained validation records and manifests;
+the separate `rename-oracle` evidence used by regression checks remains intact.
 
 The Rust cp/mv experiments have no seed source: checkpoint 000 creates one Rust
 file from scratch; later checkpoints inherit only their own lineage's preceding

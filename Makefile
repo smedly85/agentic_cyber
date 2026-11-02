@@ -1,19 +1,13 @@
-CC ?= cc
-CFLAGS := -std=c11 -Wall -Wextra -Werror -pedantic -O2
+# Run from WSL/Linux with the pinned Docker images available.
+# Host Python only orchestrates; compilation and candidate execution use Docker.
+PYTHON ?= python3
+export PYTHONDONTWRITEBYTECODE := 1
 
-TARGET := build/new_sort
-SOURCE := src/new_sort/new_sort.c
+.PHONY: all test
+all: test
 
-.PHONY: all test clean
-
-all: $(TARGET)
-
-$(TARGET): $(SOURCE)
-	mkdir -p build
-	$(CC) $(CFLAGS) $(SOURCE) -o $(TARGET)
-
-test: $(TARGET)
-	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py' -v
-
-clean:
-	rm -rf build tests/__pycache__ .pytest_cache
+test:
+	@output=$$(mktemp -d /tmp/linux-utilities-checks.XXXXXX) || exit 1; \
+	echo "Validation logs: $$output"; \
+	$(PYTHON) scripts/validate_linux_static.py --output "$$output/linux-static" && \
+	$(PYTHON) scripts/validate_cross_language.py --output "$$output/cross-language"

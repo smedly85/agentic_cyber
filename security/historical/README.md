@@ -1,5 +1,12 @@
 # Historical vulnerability depth dataset
 
+Vendored releases retain their translation sources (`po/*.po`) but omit the
+617 generated `.gmo` message catalogs. The recorded C analysis build recipes
+use `--disable-nls`; catalogs are neither compiler inputs nor inputs to the
+C/header source-tree fingerprints. Localized builds can regenerate catalogs
+from the retained `.po` files with GNU gettext. Release archives, patches,
+source manifests and vulnerability evidence remain unchanged.
+
 This directory keeps vulnerability discovery separate from reproducible
 function mapping:
 
