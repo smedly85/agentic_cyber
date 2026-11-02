@@ -12,8 +12,12 @@ also use this pipeline for functional-only lineages; see
 The primary paper analysis separates RQ1 correctness and
 lineage completion, RQ2 implementation diversity and maintenance variation,
 and RQ3 security. No composite score combines them.
-`docs/diversity_methodology.md` defines the structural and maintenance
-measurement. The existing behavioral-consistency tool is retained as an
+[The canonical A/S methodology](docs/diversity_methodology.md) describes the
+compiler-grounded, order-aware implementation and links the final pairwise,
+population and longitudinal evidence. Reliability and maintenance outputs of
+the older analyzer are documented in the
+[experiment analysis reference](docs/experiment_analysis_reference.md).
+The existing behavioral-consistency tool is retained as an
 optional post-hoc diagnostic and documented separately in
 `docs/execution_consistency_methodology.md`.
 
@@ -584,6 +588,12 @@ behavioral-consistency tool remains a separate post-hoc diagnostic.
 
 ### 1. Reliability, change, and the diversity populations
 
+The commands in this section run the older schema-v7 analyzer, whose
+feature-vector/cosine A/S columns are not the final paper measurements.
+For the accepted Clang/MILP A/S pipeline and recorded results, start with
+[the canonical methodology](docs/diversity_methodology.md). The older analyzer
+remains available for its reliability, maintenance and lineage consumers.
+
 ```bash
 python3 scripts/analyze_lineages.py \
     --lineage-root runs/lineages/sort/<model-slug>/temp-0p2 \
@@ -678,7 +688,7 @@ level paper aggregate the analyzer maintains is never rewritten by a lineage
 analysis. Exploratory analysis retains CLI/metadata/default precedence. Only a
 row produced with `--formal-analysis` from a complete frozen configuration can
 enter or anchor a confirmatory aggregate. See
-`docs/diversity_methodology.md` for the formulas and their interpretation.
+`docs/experiment_analysis_reference.md` for these legacy formulas and their interpretation.
 
 Formal analysis uses `--analysis-config FILE --formal-analysis`. The versioned
 JSON must explicitly provide architecture/strategy thresholds, the sensitivity
@@ -1065,7 +1075,8 @@ agentic_cyber/
 ├── README.md
 ├── findings.md
 ├── docs/
-│   ├── diversity_methodology.md            # Canonical v5.2.0/schema-v7 methodology
+│   ├── diversity_methodology.md            # Canonical compiler-grounded A/S entry point
+│   ├── experiment_analysis_reference.md    # Legacy schema-v7 and active reliability/maintenance
 │   └── execution_consistency_methodology.md # Behavioral/execution consistency
 ├── experiments/
 │   └── utilities/                          # One manifest per experimental utility

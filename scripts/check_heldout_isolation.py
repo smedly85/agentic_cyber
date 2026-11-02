@@ -43,9 +43,11 @@ import stage_test_bundle  # noqa: E402
 from reference_generators import heldout_contract  # noqa: E402
 
 
+from linux_utilities_catalog import SELECTORS as LINUX_SELECTORS, suite_root as linux_suite_root, utility_name
+
 def suite_root(repo: Path, utility: str) -> Path:
     plan = lineage_plan.resolve_plan(repo, utility, "", "0", "build", 0, 0)
-    return repo / plan["test_dir"], plan
+    return linux_suite_root(repo, utility, plan["test_dir"]), plan
 
 
 def bundle_files(repo: Path, plan: dict[str, Any],
@@ -103,7 +105,11 @@ def scan_utility(repo: Path, utility: str) -> tuple[list[str], int, int]:
     )
     needles: list[tuple[str, str]] = []
     for case in heldout_contract.cases(corpus):
-        for value in heldout_contract.scannable_values(case, public_options=public_options):
+        values = heldout_contract.scannable_values(case, public_options=public_options)
+        if utility in LINUX_SELECTORS:
+            from linux_benchmark_isolation import identifying_values
+            values = identifying_values(utility, case, values)
+        for value in values:
             needles.append((case["name"], value))
 
     leaks: list[str] = []

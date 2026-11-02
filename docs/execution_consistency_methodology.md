@@ -4,7 +4,7 @@ This document defines an optional diagnostic subsystem. Behavioral/execution
 consistency is not a primary paper research question or paper-facing metric.
 `scripts/measure_execution_consistency.py` is its sole entry point. It is a
 strictly post-hoc, read-only layer over the canonical analysis in
-`docs/diversity_methodology.md`: it never re-runs the agent, never enters the
+`docs/experiment_analysis_reference.md`: it never re-runs the agent, never enters the
 repair loop, and never changes a success/failure determination.
 
 The paper-facing research questions remain separate from this diagnostic:
@@ -13,7 +13,7 @@ The paper-facing research questions remain separate from this diagnostic:
    rates, Pass@k) and `scripts/analyze_lineages.py` (lineage completion).
 2. **Implementation diversity and maintenance variation** —
    `scripts/analyze_experiment.py` with `scripts/analysis/diversity_metrics.py`,
-   defined in `docs/diversity_methodology.md`.
+   defined in `docs/experiment_analysis_reference.md`.
 3. **Security** — separate RQ3 analysis; security measurements do not enter
    behavioral fingerprints or structural clustering.
 
@@ -50,7 +50,7 @@ difference.
 
 ## Experimental unit and population
 
-The unit is the same one `docs/diversity_methodology.md` defines: one complete
+The unit is the same one `docs/experiment_analysis_reference.md` defines: one complete
 generation/repair trajectory is one independent attempt, and repeated identical
 candidates are retained as separate observations rather than deduplicated.
 
@@ -223,7 +223,7 @@ exact_behavioral_modal_share = largest fingerprint-group size / N
 These sample-size-dependent descriptive statistics retain exact profile count,
 modal share, coverage, and memberships. They are not primary paper statistics.
 They are the exact-convergence statistics of
-`docs/diversity_methodology.md` applied to a different hash, computed by the
+`docs/experiment_analysis_reference.md` applied to a different hash, computed by the
 same function — `diversity_metrics.exact_repetition_summary` is generic over
 hash strings and nothing in it is specific to source bytes. Reusing it keeps one
 definition of "distinct over N" in the repository rather than two that could
@@ -336,7 +336,7 @@ checkpoint's `build_command` and `feature_test_command` into the view's
   oracle.
 - Behavioral convergence is not evidence about vulnerability independence.
   Establishing that requires dynamic testing, vulnerability-class labeling and
-  exploit-transfer experiments, as `docs/diversity_methodology.md` also notes
+  exploit-transfer experiments, as `docs/experiment_analysis_reference.md` also notes
   for its security profiles.
 - Rebuilding is a re-execution of the recorded build on the analysis host, not
   a reproduction of the original toolchain. Cross-host rebuild failures are an

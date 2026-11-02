@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -75,6 +76,8 @@ JUDGING_CONTRACT_TYPES = {
     "required_platform": str,
 }
 
+
+from linux_utilities_catalog import SELECTORS as LINUX_SELECTORS, suite_root as linux_suite_root, utility_name
 
 def bundled_config(workdir: Path, test_dir: str) -> Path:
     """The per-checkpoint config the stage bundle placed in the sandbox."""
@@ -151,6 +154,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json-report", type=Path,
                         help="controller-owned durable result path, outside the agent workdir")
     args = parser.parse_args(argv)
+
+    if args.utility in LINUX_SELECTORS:
+        from docker_benchmark import judge, InfrastructureError
+        try:
+            contract = hidden_runner_config(bundled_config(args.workdir, args.test_dir), args.candidate)
+            return judge(args.utility, (args.workdir / args.candidate).resolve(),
+                         contract["implemented"], hidden=True,
+                         report_path=args.json_report or (Path(os.environ["HELDOUT_JSON_REPORT"])
+                             if os.environ.get("HELDOUT_JSON_REPORT") else None))["status"]
+        except (InfrastructureError, OSError, ValueError) as error:
+            print("heldout_judge: infrastructure failure: " + str(error), file=sys.stderr)
+            return HELDOUT_INFRASTRUCTURE_EXIT
 
     repo = args.repo.resolve()
     suite_root = repo / "tests" / f"{args.utility}-test-suite"

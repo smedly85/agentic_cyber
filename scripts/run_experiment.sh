@@ -793,6 +793,7 @@ command -v git >/dev/null 2>&1 || die "git is required (to resolve repo-relative
 REPO="$(git rev-parse --show-toplevel 2>/dev/null)" ||
     die "run this script inside a Git repository (only used to resolve paths)"
 REPO="$(cd "$REPO" && pwd -P)"
+export HELDOUT_ROOT="$REPO"
 TEMPERATURE_TOOL="$REPO/scripts/temperature_value.py"
 [[ -f "$TEMPERATURE_TOOL" ]] || die "temperature helper not found: $TEMPERATURE_TOOL"
 
@@ -1214,6 +1215,19 @@ if [[ -n "$ANALYSIS_DIVERSITY_K_MAX" &&
 fi
 
 ANALYZER_PATH="$REPO/scripts/analyze_experiment.py"
+case "$SOURCE_PATH" in
+    src/c_cp/*|src/c_mv/*|src/c_mkdir/*|src/c_sort/*|src/rust_cp/*|src/rust_mv/*|src/rust_mkdir/*|src/rust_sort/*|src/py_cp/*|src/py_mv/*|src/py_mkdir/*|src/py_sort/*)
+        NO_ANALYSIS=1
+        SECURITY_CMD=""
+        c_directory="$(basename "$(dirname "$SOURCE_PATH")")"
+        linux_selector="${c_directory/_/-}"
+        "$PYTHON_BIN" "$REPO/scripts/docker_benchmark.py" check-commands \
+            --utility "$linux_selector" --build-command "$BUILD_CMD" \
+            --feature-command "$FEATURE_TEST_CMD" --extra-command "$EXTRA_TEST_CMD" \
+            --base-command "$BASE_TEST_CMD" || die "Linux benchmark requires canonical Docker commands"
+        "$PYTHON_BIN" "$REPO/scripts/docker_benchmark.py" preflight --utility "$linux_selector" || exit 4
+        ;;
+esac
 if [[ "$SOURCE_PATH" == *.py ]]; then
     PYTHON_BIN="$("$PYTHON_BIN" -c 'import sys; print(sys.executable)')"
     export PYTHON_BIN
@@ -1222,7 +1236,7 @@ if [[ "$SOURCE_PATH" == *.py ]]; then
     NO_ANALYSIS=1
 fi
 RUST_TOOLCHAIN_JSON=null
-if [[ "$SOURCE_PATH" == *.rs ]]; then
+if [[ "$SOURCE_PATH" == *.rs && -z "${linux_selector:-}" ]]; then
     source "$REPO/scripts/rust_toolchain.sh"
     rust_toolchain_preflight || exit 4
     warn "Rust functional validation is supported; C-only structural analysis is skipped"
@@ -1687,10 +1701,14 @@ PY
         agent_log_capture_issue_observed=false
 
         # ---- generate / validate / continue -------------------------------
+        validation_infrastructure_failure=false
+        validation_infrastructure_stage_json=null
         # Loop 0 is the initial generation; loops 1..MAX_LOOPS are repairs, so
         # the budget bounds the iteration count directly.
         for (( validation_loop = 0; validation_loop <= MAX_LOOPS; validation_loop++ )); do
-            if [[ "$SOURCE_PATH" == *.py ]]; then
+            if [[ -n "${linux_selector:-}" || "$SOURCE_PATH" == *.py || "$SOURCE_PATH" == src/c_cp/* ||
+                  "$SOURCE_PATH" == src/c_mv/* || "$SOURCE_PATH" == src/c_mkdir/* ||
+                  "$SOURCE_PATH" == src/c_sort/* ]]; then
                 # Durable reports stay outside both the agent worktree and the
                 # immutable test bundle. The Aider environment is allowlisted.
                 export VALIDATION_JSON_REPORT="$attempt_dir/public-validation-$validation_loop.json"
@@ -1901,6 +1919,13 @@ PY
                 stop_reason="agent_execution_failure"
                 break
             fi
+            if [[ -n "${linux_selector:-}" &&
+                  ( "$build_exit" -eq 2 || ( "$build_exit" -eq 0 && "$feature_test_exit" -eq 2 ) ) ]]; then
+                validation_infrastructure_failure=true
+                validation_infrastructure_stage_json='"docker_public_validation"'
+                stop_reason="infrastructure_failure"
+                break
+            fi
             if [[ "$validation_success" == true ]]; then
                 public_validation_success=true
                 success_loop_json="$validation_loop"
@@ -2033,6 +2058,10 @@ PY
             cd "$workdir" &&
             run_final_command "$attempt_dir/extra-tests.log" "$EXTRA_TEST_CMD"
         )
+        if [[ -n "${linux_selector:-}" && "$public_validation_success" == true && "$extra_test_exit" -eq 2 ]]; then
+            validation_infrastructure_failure=true
+            validation_infrastructure_stage_json='"docker_heldout_validation"'
+        fi
 
         total_ms=$((total_agent_ms + total_build_ms + total_base_test_ms + total_feature_test_ms + extra_test_ms))
 
@@ -2185,8 +2214,8 @@ PY
             stop_reason "$stop_reason" \
             loop_limit_reached "$loop_limit_reached" \
             public_validation_success "$public_validation_success" \
-            infrastructure_failure false \
-            infrastructure_failure_stage "__JSON__:null" \
+            infrastructure_failure "$validation_infrastructure_failure" \
+            infrastructure_failure_stage "__JSON__:$validation_infrastructure_stage_json" \
             infrastructure_failure_classification_inferred false \
             agent_log_capture_complete "$agent_log_capture_complete" \
             agent_log_capture_issue_observed "$agent_log_capture_issue_observed" \
