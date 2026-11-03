@@ -174,6 +174,9 @@ No validation command starts Aider/Ollama or a formal lineage.
 
 ## Future vessel / ARM64 validation
 
+For the bounded AMD64-under-emulation preflight and checkpoint-000 Aider/Ollama
+smoke tests on vessel, see [linux-utilities-vessel.md](linux-utilities-vessel.md).
+
 No files were transferred to vessel and no Docker context was changed. Once IT
 restores access to its existing engine, use the same pinned multiarch inputs:
 
