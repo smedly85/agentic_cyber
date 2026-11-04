@@ -4,8 +4,10 @@
 Checks the host controller, Docker/Colima, the pinned Linux images, Aider, the
 local native Ollama API and the checkpoint-000 inputs. It never invokes model
 inference, never starts Aider generation, never installs or pulls anything,
-never builds images and never changes a Docker context. The only containers it
-starts are trusted probes from the already-pinned images (no candidate code).
+never builds images and never changes a Docker context. Default preflight starts
+only trusted probes. Opt-in vessel-built validation also runs existing isolated
+infrastructure controls, never generates candidate implementations or invokes
+Aider/Ollama.
 
 Exit status: 0 every essential check passed, 1 an essential check failed,
 2 usage error. Kept parseable by old interpreters (no 3.10+ syntax) so that a
@@ -65,6 +67,7 @@ RESULTS = []
 MODEL_IDENTITIES = {}
 IMAGE_IDENTITIES = {}
 IMAGE_KEYS = ("oracle_image", "compiler_image", "rust_compiler_image")
+VALIDATION_LOG = None
 # Platform manifests observed by resolving the ORIGINAL immutable lock refs.
 # A manifest commits to the complete OCI config blob and ordered layer blobs.
 # These are NOT configuration digests or portable classic-store image IDs.
@@ -98,6 +101,10 @@ def run(argv, timeout=60, env=None, cwd=None):
     try:
         done = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               timeout=timeout, env=env, cwd=cwd or str(ROOT))
+        if VALIDATION_LOG is not None:
+            with VALIDATION_LOG.open("a", encoding="utf-8") as log:
+                log.write(json.dumps({"argv": argv, "returncode": done.returncode}) + "\n")
+                log.write(done.stdout.decode("utf-8", "replace") + done.stderr.decode("utf-8", "replace") + "\n")
         return (done.returncode, done.stdout.decode("utf-8", "replace").strip(),
                 done.stderr.decode("utf-8", "replace").strip())
     except OSError as error:
@@ -345,6 +352,339 @@ def check_architecture_probe(config):
             record("architecture probe cleanup", "FAIL", "could not confirm removal of " + name)
 
 
+# Separate trust domain: these records authenticate a local rebuild, never the
+# Windows manifests. Keep image_identity/check_images above strict and unchanged.
+VALIDATION_MAX_AGE = 24 * 60 * 60
+DOCKERFILES = ("docker/linux-utilities/Dockerfile", "docker/linux-utilities/Rust.Dockerfile")
+
+
+def required_run(argv):
+    code, out, err = run(argv, timeout=180)
+    if code:
+        raise ValueError("command failed: %s\n%s" % (" ".join(argv), err))
+    return out
+
+
+def file_sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def write_new_json(path, value):
+    with external_path(path).open("x", encoding="utf-8") as output:
+        output.write(json.dumps(value, indent=2) + "\n")
+
+
+def vessel_environment():
+    if sys.flags.optimize or os.environ.get("PYTHONOPTIMIZE", "0") not in ("", "0"):
+        raise ValueError("Python assertion checks must be enabled for validation")
+    if required_run(["git", "status", "--porcelain", "--untracked-files=no"]):
+        raise ValueError("vessel-built validation requires a clean tracked checkout")
+    info = json.loads(required_run(["docker", "info", "--format", "{{json .}}"]))
+    context = required_run(["docker", "context", "show"])
+    return {
+        "revision": required_run(["git", "rev-parse", "HEAD"]),
+        "dockerfiles": {p: file_sha(ROOT / p) for p in DOCKERFILES},
+        "host": [platform.system(), platform.release(), platform.machine()],
+        "docker": {k: info.get(k) for k in ("ID", "ServerVersion", "OSType", "Architecture",
+                    "KernelVersion", "OperatingSystem", "Driver", "DriverStatus", "NCPU", "MemTotal",
+                    "SecurityOptions", "DockerRootDir")},
+        "docker_version": json.loads(required_run(["docker", "version", "--format", "{{json .}}"])),
+        "buildx": required_run(["docker", "buildx", "version"]),
+        "context": json.loads(required_run(["docker", "context", "inspect", context])),
+        "endpoint_overrides": {k: os.environ.get(k, "") for k in ("DOCKER_HOST", "DOCKER_CONTEXT")},
+        "emulation": emulation_identity(),
+    }
+
+
+def rebuilt_identity(data):
+    # Docker sometimes omits Descriptor.platform. Only this opt-in path permits
+    # absence; conflicting metadata is still rejected by the original checker.
+    normalized = dict(data, Descriptor=dict(data.get("Descriptor") or {}))
+    if "platform" not in normalized["Descriptor"]:
+        normalized["Descriptor"]["platform"] = {
+            "os": data.get("Os"), "architecture": data.get("Architecture"),
+            "variant": data.get("Variant", "")}
+    identity = image_identity(normalized)
+    for digest in (data.get("Id"), identity["manifest_digest"]):
+        if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+            raise ValueError("missing Docker ID or platform manifest digest")
+    identity["docker_id"] = data["Id"]  # may be an index; never called a config digest
+    return identity
+
+
+def probe_reference(ref, command=None, mounts=()):
+    name = "vessel-ref-" + uuid.uuid4().hex
+    try:
+        out = required_run(["docker", "run", "--rm", "--name", name, "--pull", "never",
+                            "--platform", "linux/amd64", "--network", "none", "--read-only",
+                            "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+                            "--cpus", "1", "--memory", "768m", "--pids-limit", "64",
+                            "--user", "1000:1000"] + list(mounts) + [ref] + (command or ["uname", "-m"]))
+        if command is None and out != "x86_64":
+            raise ValueError("immutable execution reference did not execute as x86_64")
+        return out
+    finally:
+        code, _, err = run(["docker", "rm", "-fv", name], timeout=20)
+        if code and "No such container" not in err:
+            raise ValueError("could not confirm probe cleanup: " + name)
+
+
+def emulation_identity():
+    # These read-only mounts refer to the Docker VM, not the macOS controller.
+    # No socket, privileges or candidate code are admitted to this trusted probe.
+    ref = json.loads(DEFAULT_LOCK.read_text())["compiler_image"]
+    script = ("import json,pathlib; p=pathlib.Path('/binfmt'); "
+              "print(json.dumps(dict(boot_id=pathlib.Path('/boot-id').read_text(), "
+              "registrations={f.name:f.read_text() for f in sorted(p.iterdir()) "
+              "if f.name != 'register'}),sort_keys=True))")
+    identity = json.loads(probe_reference(ref, ["python3", "-I", "-c", script], [
+        "--mount", "type=bind,src=/proc/sys/fs/binfmt_misc,dst=/binfmt,readonly",
+        "--mount", "type=bind,src=/proc/sys/kernel/random/boot_id,dst=/boot-id,readonly"]))
+    interpreters = {}
+    for registration in identity["registrations"].values():
+        for line in registration.splitlines():
+            if line.startswith("interpreter "):
+                path = line[len("interpreter "):]
+                if not path.startswith("/") or any(c in path for c in ",\n\r"):
+                    raise ValueError("unsupported binfmt interpreter path")
+                interpreters[path] = probe_reference(ref, ["python3", "-I", "-c",
+                    "import hashlib,pathlib; print(hashlib.sha256(pathlib.Path('/emulator').read_bytes()).hexdigest())"],
+                    ["--mount", "type=bind,src=" + path + ",dst=/emulator,readonly"])
+    identity["interpreter_sha256"] = interpreters
+    return identity
+
+
+def git_dockerfile_hashes(revision):
+    required_run(["git", "cat-file", "-e", revision + "^{commit}"])
+    hashes = {}
+    for name in DOCKERFILES:
+        # Hash raw Git blob bytes: run() strips whitespace and cannot be used here.
+        result = subprocess.run(["git", "show", revision + ":" + name], cwd=str(ROOT),
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        if result.returncode:
+            raise ValueError("cannot read build-revision Dockerfile: " + name)
+        hashes[name] = hashlib.sha256(result.stdout).hexdigest()
+    return hashes
+
+
+def check_jailed_execution():
+    # Reuse the real Docker controls for all three languages under unchanged limits.
+    command = [shutil.which("python3") or sys.executable, "-B", "-m", "unittest", "-f", "-v",
+               "tests.test_docker_benchmark_integration.DockerIntegration.test_nonroot_chroot_and_no_controller_assets",
+               "tests.test_cross_language_docker.CrossLanguageDocker.test_real_rust_and_python_runtime_isolation_and_io"]
+    code, out, err = run(command, timeout=600)
+    if code:
+        raise ValueError("fresh jailed execution failed; infrastructure failure: " + out + err)
+
+
+def prepare_vessel_lock(directory, build_record):
+    directory = external_path(directory)
+    baseline = json.loads(DEFAULT_LOCK.read_text())
+    build = json.loads(external_path(build_record).read_text())
+    if not check_docker("linux/amd64"):
+        raise ValueError("local Linux Docker required")
+    environment = vessel_environment()
+    verify_build_record(build, baseline, environment)
+    directory.mkdir(exist_ok=False)
+    config = dict(baseline)
+    images = {}
+    refs = {"oracle_image": "agentic-linux-utilities:latest",
+            "compiler_image": baseline["compiler_image"],
+            "rust_compiler_image": "agentic-linux-utilities-rust:latest"}
+    for key, ref in refs.items():
+        data = inspect_image(ref, "linux/amd64")
+        identity = rebuilt_identity(data)
+        # Keep the pinned Python base, resolve custom tags to Docker's actual ID.
+        selected = ref if key == "compiler_image" else identity["docker_id"]
+        if rebuilt_identity(inspect_image(selected, "linux/amd64")) != identity:
+            raise ValueError("selected immutable reference does not resolve to inspected image")
+        if key == "compiler_image" and identity["manifest_digest"] != baseline["base_amd64_manifest"]:
+            raise ValueError("pinned AMD64 Python base manifest mismatch")
+        probe_reference(selected)
+        config[key] = selected
+        images[key] = {"execution_ref": selected, "identity": identity, "inspect": data,
+                       "history": required_run(["docker", "history", "--no-trunc", "--format", "{{json .}}", selected])}
+        if key == "oracle_image":
+            metadata = {name: probe_reference(selected, ["cat", "/provenance/" + name])
+                        for name in ("base-image.txt", "build-architecture.txt", "packages.txt", "compiler.txt")}
+            if metadata["base-image.txt"] != baseline["compiler_image"] or metadata["build-architecture.txt"] != "amd64":
+                raise ValueError("oracle embedded build inputs differ from pinned AMD64 inputs")
+            images[key]["build_metadata"] = metadata
+    provenance = {"schema_version": 1, "mode": "vessel-built",
+                  "baseline_lock_sha256": canonical_sha(baseline), "lock_sha256": canonical_sha(config),
+                  "environment": environment, "images": images,
+                  "build_record": build,
+                  "build_record_status": "operator supplied; image history is not a signed build attestation",
+                  "pinned_bases": [baseline["compiler_image"], baseline["rust_base_image"]],
+                  "captured_at": time.time(), "windows_byte_identity_claimed": False}
+    write_new_json(directory / "lock.json", config)
+    write_new_json(directory / "provenance.json", provenance)
+    print("Captured only; independent validation and approval still required: " + str(directory))
+
+
+def verify_build_record(build, baseline, environment):
+    if (not isinstance(build, dict) or not re.fullmatch(r"[0-9a-f]{40}", build.get("revision", ""))
+            or build.get("dockerfiles") != environment["dockerfiles"]
+            or build.get("pinned_bases") != [baseline["compiler_image"], baseline["rust_base_image"]]
+            or not all(isinstance(build.get(k), str) and build[k].strip()
+                       for k in ("oracle_build_command", "rust_build_command", "builder_description"))):
+        raise ValueError("incomplete build record: actual revision, matching Dockerfile hashes, pinned bases, commands and builder description required")
+    if git_dockerfile_hashes(build["revision"]) != build["dockerfiles"]:
+        raise ValueError("build revision Dockerfiles differ from recorded hashes")
+
+
+def vessel_binding(config, lock_path, provenance_path):
+    external_path(lock_path)
+    provenance = json.loads(external_path(provenance_path).read_text())
+    baseline = json.loads(DEFAULT_LOCK.read_text())
+    if ({k: v for k, v in config.items() if k not in IMAGE_KEYS} !=
+            {k: v for k, v in baseline.items() if k not in IMAGE_KEYS}):
+        raise ValueError("vessel lock changed non-image benchmark fields")
+    if (provenance.get("schema_version") != 1 or provenance.get("mode") != "vessel-built"
+            or provenance.get("baseline_lock_sha256") != canonical_sha(baseline)
+            or provenance.get("lock_sha256") != canonical_sha(config)
+            or provenance.get("windows_byte_identity_claimed") is not False
+            or provenance.get("pinned_bases") != [baseline["compiler_image"], baseline["rust_base_image"]]):
+        raise ValueError("missing or mismatched local build provenance")
+    environment = vessel_environment()
+    verify_build_record(provenance.get("build_record"), baseline, environment)
+    if provenance.get("environment") != environment:
+        raise ValueError("checkout or Docker environment changed since provenance capture")
+    import docker_benchmark
+    if docker_benchmark.settings() != config:
+        raise ValueError("active Docker adapter lock differs from vessel lock")
+    IMAGE_IDENTITIES.clear()
+    for action, language in (("case", "c"), ("compile", "c"), ("compile", "rust"), ("compile", "py")):
+        command = docker_benchmark.command(action, "vessel-binding", language)
+        chosen = "oracle_image" if action == "case" else "rust_compiler_image" if language == "rust" else "compiler_image"
+        if command[command.index("-i") + 1] != config[chosen] or command[command.index("--platform") + 1] != "linux/amd64":
+            raise ValueError("Docker adapter execution reference mismatch")
+    for key in IMAGE_KEYS:
+        ref = config[key]
+        identity = rebuilt_identity(inspect_image(ref, "linux/amd64"))
+        expected = provenance.get("images", {}).get(key, {})
+        if (expected.get("execution_ref") != ref or expected.get("identity") != identity
+                or rebuilt_identity(expected.get("inspect", {})) != identity or not expected.get("history")):
+            raise ValueError("active image changed: " + key)
+        if key == "compiler_image" and (ref != baseline[key] or identity["manifest_digest"] != baseline["base_amd64_manifest"]):
+            raise ValueError("pinned Python base changed")
+        if key == "oracle_image":
+            metadata = expected.get("build_metadata", {})
+            if (metadata.get("base-image.txt") != baseline["compiler_image"]
+                    or metadata.get("build-architecture.txt") != "amd64"
+                    or not metadata.get("packages.txt") or not metadata.get("compiler.txt")):
+                raise ValueError("missing or mismatched embedded oracle build provenance")
+        IMAGE_IDENTITIES[key] = {"execution_ref": ref, "identity": identity}
+    return {"lock_sha256": file_sha(lock_path), "provenance_sha256": file_sha(provenance_path),
+            "environment": environment, "images": dict(IMAGE_IDENTITIES)}
+
+
+def validation_commands(directory, config):
+    python = shutil.which("python3") or sys.executable
+    commands = [["bash", str(ROOT / "docker/linux-utilities/run.sh"), config["oracle_image"], str(directory / "oracle"), "linux/amd64"],
+                [python, "-B", "-m", "unittest", "-f", "-v", "tests.test_docker_benchmark_integration", "tests.test_cross_language_docker", "tests.test_cross_language_static"],
+                [python, "-B", str(SCRIPTS / "validate_docker_adapter.py"), "--output", str(directory / "calibration")]]
+    for selector in DEFAULT_SELECTORS:
+        commands.append([python, "-B", str(SCRIPTS / "validate_docker_entrypoints.py"), "--utility", selector, "--output", str(directory / ("entry-" + selector))])
+    commands.append([python, "-B", str(SCRIPTS / "validate_linux_static.py"), "--output", str(directory / "static")])
+    return commands
+
+
+def validation_files(directory):
+    return {p.relative_to(directory).as_posix(): file_sha(p) for p in sorted(directory.rglob("*"))
+            if p.is_file() and p != directory / "validation.json"}
+
+
+def required_validation_files(directory, config):
+    import docker_benchmark
+    return ({"prerequisites.log", "oracle/validation.log", "calibration/summary.json", "static/summary.json"}
+            | {"step-%02d.log" % i for i in range(len(validation_commands(directory, config)))}
+            | {"oracle/validated/c-%s/validation.json" % u for u in ("cp", "mv", "mkdir", "sort")}
+            | {"calibration/%s-%s.json" % (s, kind) for s in docker_benchmark.SELECTORS for kind in ("public", "heldout")}
+            | {"entry-%s/%s.json" % (s, kind) for s in DEFAULT_SELECTORS for kind in ("summary", "public", "heldout")})
+
+
+def checked_validation(path, binding, config):
+    path = external_path(path)
+    report = json.loads(path.read_text())
+    if (report.get("schema_version") != 1 or report.get("passed") is not True
+            or report.get("generation_invoked") is not False or report.get("infrastructure_failure") is not False
+            or report.get("binding") != binding
+            or not 0 <= time.time() - report.get("completed_at", 0) <= VALIDATION_MAX_AGE
+            or report.get("commands") != validation_commands(path.parent, config)
+            or report.get("returncodes") != [0] * len(validation_commands(path.parent, config))
+            or report.get("files") != validation_files(path.parent)
+            or not required_validation_files(path.parent, config) <= set(report.get("files", {}))
+            or not required_validation_checks() <= {r["check"] for r in report.get("checks", []) if r["status"] == "PASS"}
+            or any(r["status"] == "FAIL" for r in report["checks"])):
+        raise ValueError("missing, incomplete, stale or mismatched independent validation evidence")
+    return report
+
+
+def required_validation_checks():
+    return {"python3 controller imports", "bash", "bash -n run_experiment.sh",
+            "bash -n run_lineage_experiment.sh", "bash -n vessel_smoke_stage.sh",
+            "timeout", "container architecture"} | {
+                prefix + selector for selector in DEFAULT_SELECTORS
+                for prefix in ("docker toolchain ", "judging inputs ", "checkpoint 000 ")}
+
+
+def validate_vessel(directory, config, lock_path, provenance_path, args):
+    global VALIDATION_LOG
+    directory = external_path(directory)
+    binding = vessel_binding(config, lock_path, provenance_path)
+    directory.mkdir(exist_ok=False)
+    report = {"schema_version": 1, "passed": False, "binding": binding,
+              "commands": validation_commands(directory, config), "generation_invoked": False, "returncodes": []}
+    VALIDATION_LOG = directory / "prerequisites.log"
+    try:
+        for check, arguments in ((check_python_and_bash, ()), (check_timeout, ()),
+                                 (check_architecture_probe, (config,)),
+                                 (check_toolchains, (shutil.which("python3") or sys.executable, DEFAULT_SELECTORS)),
+                                 (check_checkpoints, (shutil.which("python3") or sys.executable, DEFAULT_SELECTORS, args, "x86_64"))):
+            check(*arguments)
+            if any(r["status"] == "FAIL" for r in RESULTS):
+                raise ValueError("validation prerequisite failed; infrastructure/environment failure")
+        for index, command in enumerate(report["commands"]):
+            print("Validation %d/%d: %s" % (index + 1, len(report["commands"]), " ".join(command)), flush=True)
+            # Full logs, no truncated run() output. Existing inner limits remain unchanged.
+            with (directory / ("step-%02d.log" % index)).open("x") as log:
+                done = subprocess.run(command, cwd=str(ROOT), stdout=log, stderr=subprocess.STDOUT)
+            report["returncodes"].append(done.returncode)
+            if done.returncode:
+                raise ValueError("validation step %d failed (rc=%d); infrastructure/environment failure, not a candidate verdict" % (index, done.returncode))
+        if vessel_binding(config, lock_path, provenance_path) != binding:
+            raise ValueError("environment changed during validation")
+        if not required_validation_files(directory, config) <= set(validation_files(directory)):
+            raise ValueError("validation returned success without all required reports")
+        report["passed"] = True
+    finally:
+        VALIDATION_LOG = None
+        report.update(completed_at=time.time(), checks=list(RESULTS), files=validation_files(directory),
+                      infrastructure_failure=not report["passed"])
+        write_new_json(directory / "validation.json", report)
+    print("Independent checks passed; review reports before explicit approval. No generation authorized yet.")
+
+
+def check_vessel_built(config, lock_path, args, require_approval=True):
+    try:
+        binding = vessel_binding(config, lock_path, args.vessel_provenance)
+        checked_validation(args.vessel_validation, binding, config)
+        if require_approval:
+            approval = json.loads(external_path(args.vessel_approval).read_text())
+            if approval != {"schema_version": 1, "validation_sha256": file_sha(args.vessel_validation),
+                            "binding_sha256": canonical_sha(binding), "scope": "diagnostic-only"}:
+                raise ValueError("matching explicit diagnostic approval required")
+            check_jailed_execution()
+            if vessel_binding(config, lock_path, args.vessel_provenance) != binding:
+                raise ValueError("environment changed during fresh jailed execution")
+        record("vessel-built independent validation", "PASS", "matching local rebuild evidence; no Windows byte-identity claim")
+        return True
+    except (OSError, ValueError, KeyError, TypeError, IndexError, subprocess.SubprocessError) as error:
+        record("vessel-built independent validation", "FAIL", str(error))
+        return False
+
+
 def check_toolchains(python3, selectors):
     for selector in selectors:
         code, out, err = run([python3, str(SCRIPTS / "docker_benchmark.py"), "preflight", "--utility", selector],
@@ -516,9 +856,24 @@ def main(argv=None):
     parser.add_argument("--skip-aider", action="store_true", help="development hosts only; never on vessel")
     parser.add_argument("--json-report", type=Path)
     parser.add_argument("--image-evidence", type=Path, default=os.environ.get("VESSEL_IMAGE_EVIDENCE"))
-    parser.add_argument("--capture-image-evidence", type=Path,
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--capture-image-evidence", type=Path,
                         help="original Docker host only: write fresh identity metadata outside the repo; no archive")
+    parser.add_argument("--image-mode", choices=("original", "vessel-built"), default="original")
+    parser.add_argument("--vessel-provenance", type=Path, default=os.environ.get("VESSEL_BUILT_PROVENANCE"))
+    parser.add_argument("--vessel-validation", type=Path, default=os.environ.get("VESSEL_VALIDATION"))
+    parser.add_argument("--vessel-approval", type=Path, default=os.environ.get("VESSEL_APPROVAL"))
+    parser.add_argument("--build-record", type=Path)
+    actions.add_argument("--prepare-vessel-lock", type=Path, metavar="NEW_DIRECTORY")
+    actions.add_argument("--validate-vessel-built", type=Path, metavar="NEW_DIRECTORY")
+    actions.add_argument("--approve-vessel-validation", type=Path, metavar="NEW_APPROVAL_FILE")
+    actions.add_argument("--verify-vessel-built", action="store_true", help="recheck approval and jailed execution; no model checks")
     args = parser.parse_args(argv)
+    vessel_action = args.prepare_vessel_lock or args.validate_vessel_built or args.approve_vessel_validation or args.verify_vessel_built
+    if vessel_action and args.image_mode != "vessel-built":
+        parser.error("vessel-built actions require explicit --image-mode vessel-built")
+    if args.capture_image_evidence and args.image_mode != "original":
+        parser.error("source-host capture belongs only to original image mode")
     try:
         # Check explicit tempfile candidates before tempfile can probe them by writing.
         for name in ("TMPDIR", "TEMP", "TMP"):
@@ -533,6 +888,38 @@ def main(argv=None):
         parser.error(str(error))
     selectors = tuple(args.selector or DEFAULT_SELECTORS)
     python3 = shutil.which("python3") or sys.executable
+
+    # These actions return before all Aider/Ollama checks, including --version.
+    if vessel_action:
+        try:
+            if args.prepare_vessel_lock:
+                prepare_vessel_lock(args.prepare_vessel_lock, args.build_record)
+            else:
+                import docker_benchmark
+                lock_path = Path(os.environ["LINUX_BENCHMARK_LOCK"])
+                if not lock_path.is_absolute():
+                    raise ValueError("LINUX_BENCHMARK_LOCK must be absolute")
+                config = docker_benchmark.settings()
+                if not check_docker(config["platform"]):
+                    raise ValueError("local Linux Docker required")
+                if args.verify_vessel_built:
+                    return 0 if check_vessel_built(config, lock_path, args) else 1
+                elif args.validate_vessel_built:
+                    validate_vessel(args.validate_vessel_built, config, lock_path, args.vessel_provenance, args)
+                else:
+                    if not check_vessel_built(config, lock_path, args, require_approval=False):
+                        return 1
+                    target = external_path(args.approve_vessel_validation)
+                    if external_path(args.vessel_validation).parent in target.parents:
+                        raise ValueError("approval must be outside the sealed validation directory")
+                    binding = vessel_binding(config, lock_path, args.vessel_provenance)
+                    write_new_json(target, {"schema_version": 1, "validation_sha256": file_sha(args.vessel_validation),
+                                            "binding_sha256": canonical_sha(binding), "scope": "diagnostic-only"})
+                    print("Diagnostic approval recorded; generation still requires --generate and fresh preflight.")
+            return 0
+        except (OSError, ValueError, KeyError, TypeError, IndexError, subprocess.SubprocessError) as error:
+            record("vessel-built preparation", "FAIL", str(error))
+            return 1
 
     if args.capture_image_evidence:
         try:
@@ -575,12 +962,14 @@ def main(argv=None):
         config = None
     evidence = None
     try:
-        if args.image_evidence:
+        if args.image_mode == "original" and args.image_evidence:
             evidence = json.loads(args.image_evidence.read_text())
     except (OSError, ValueError) as error:
         record("image evidence", "FAIL", str(error))
     if config and check_docker(config["platform"]):
-        if check_images(config, lock_path, evidence):
+        images_ok = (check_images(config, lock_path, evidence) if args.image_mode == "original"
+                     else check_vessel_built(config, lock_path, args))
+        if images_ok:
             check_architecture_probe(config)
             check_toolchains(python3, selectors)
     lock_arch = None if config is None else ("x86_64" if config["platform"] == "linux/amd64" else "aarch64")
@@ -597,7 +986,8 @@ def main(argv=None):
                "selectors": list(selectors), "generation_invoked": False,
                "models": MODEL_IDENTITIES, "images": IMAGE_IDENTITIES,
                "benchmark_lock": config, "benchmark_lock_path": str(lock_path),
-               "image_evidence": evidence,
+               "image_mode": args.image_mode, "image_evidence": evidence,
+               "vessel_validation": str(args.vessel_validation) if args.image_mode == "vessel-built" else None,
                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "checks": RESULTS}
     if args.json_report:
         args.json_report.parent.mkdir(parents=True, exist_ok=True)

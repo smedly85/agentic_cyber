@@ -88,6 +88,8 @@ def compile_source(source, executable):
                                'python_validator': (ROOT/'scripts/python_candidate.py').read_text() if language == 'py' else None})
     if result['stderr']:
         print(result['stderr'], file=sys.stderr)
+    if result['status'] not in (0, 1):
+        raise InfrastructureError('abnormal compiler termination: ' + str(result['status']))
     if result['status'] != 0:
         if executable.is_file():
             executable.unlink()

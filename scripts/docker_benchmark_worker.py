@@ -186,6 +186,22 @@ def jailed_executor(engine, utility, binary, language='c'):
     return engine._original_execute
 
 
+def check_compiler_result(result):
+    diagnostic = result.stderr.decode(errors='replace').lower()
+    # Ordinary GCC/rustc source diagnostics exit 1. Signals, driver crashes and
+    # identifiable resource/toolchain failures are not candidate verdicts.
+    infrastructure = ('internal compiler error', 'the compiler unexpectedly panicked',
+                      'error while loading shared libraries', 'cannot execute',
+                      'killed signal terminated program', 'no space left on device',
+                      'cannot allocate memory', 'memory allocation of', 'out of memory',
+                      'disk quota exceeded', 'read-only file system',
+                      'resource temporarily unavailable')
+    if result.returncode not in (0, 1) or (result.returncode and any(
+            marker in diagnostic for marker in infrastructure)):
+        raise RuntimeError('compiler infrastructure failure (status %s): %s' %
+                           (result.returncode, result.stderr.decode(errors='replace')))
+
+
 def main():
     if (platform.system() != 'Linux' or os.uname().sysname != 'Linux'
             or not Path('/.dockerenv').is_file()):
@@ -235,6 +251,7 @@ def main():
                                      '-Wall', '-Wextra', '-Werror', '-pedantic', '-O2',
                                      str(source), '-o', str(binary)])
             result = subprocess.run(build, capture_output=True, timeout=60)
+            check_compiler_result(result)
             print(json.dumps({'status': result.returncode, 'stderr': result.stderr.decode(errors='replace'),
                               'binary': base64.b64encode(binary.read_bytes()).decode() if result.returncode == 0 else None}))
         return

@@ -29,6 +29,7 @@ Usage:
       --sampling-seed N --num-ctx N [--max-tokens N] [--top-p P] \
       [--max-loops 0|1] [--ollama-url URL] [--architect-model M] \
       [--editor-model M] [--output-dir NEW_DIR_OUTSIDE_REPO] [--generate]
+      [--image-mode original|vessel-built]
 
 Temperature, thinking, seed and context must be supplied explicitly; token cap
 and top-p remain optional (see docs/benchmarks/linux-utilities-vessel.md).
@@ -53,12 +54,13 @@ MODEL="ollama_chat/qwen3.8:27b"
 EDITOR_MODEL="ollama_chat/qwen3-coder-next:latest"
 OUTPUT_DIR=""
 GENERATE=0
+IMAGE_MODE=original
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --selector|--timeout|--temperature|--architect-think|--sampling-seed| \
         --num-ctx|--max-tokens|--top-p|--max-loops|--ollama-url| \
-        --architect-model|--editor-model|--output-dir)
+        --architect-model|--editor-model|--output-dir|--image-mode)
             [[ $# -ge 2 && -n "$2" ]] || die "$1 requires a value" ;;
     esac
     case "$1" in
@@ -76,10 +78,12 @@ while [[ $# -gt 0 ]]; do
         --editor-model) EDITOR_MODEL="$2"; shift 2 ;;
         --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
         --generate) GENERATE=1; shift ;;
+        --image-mode) IMAGE_MODE="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; die "unknown argument: $1" ;;
     esac
 done
+[[ "$IMAGE_MODE" == original || "$IMAGE_MODE" == vessel-built ]] || die "invalid --image-mode"
 
 case "$SELECTOR" in
     c-cp|rust-cp|py-cp) ;;
@@ -203,7 +207,7 @@ else
     mkdir "$OUTPUT_DIR" || die "cannot create $OUTPUT_DIR"
 fi
 OUTPUT_DIR="$(outside_path "$OUTPUT_DIR")" || die "unsafe resolved output directory"
-preflight_args=(--selector "$SELECTOR" --ollama-url "$OLLAMA_URL" --architect-model "$MODEL"
+preflight_args=(--image-mode "$IMAGE_MODE" --selector "$SELECTOR" --ollama-url "$OLLAMA_URL" --architect-model "$MODEL"
                 --editor-model "$EDITOR_MODEL" --temperature "$TEMPERATURE"
                 --architect-think "$ARCHITECT_THINK" --sampling-seed "$SAMPLING_SEED"
                 --num-ctx "$NUM_CTX" --json-report "$OUTPUT_DIR/preflight.json")
@@ -242,6 +246,14 @@ printf '%s\n' "$PLAN_JSON" >"$OUTPUT_DIR/plan.json"
 stage_args "$BUNDLE_DIR" "$STAGE_DIR"
 printf '%q ' bash scripts/run_experiment.sh "${runner_args[@]}" >"$OUTPUT_DIR/command.txt"
 printf '\n' >>"$OUTPUT_DIR/command.txt"
+if [[ "$IMAGE_MODE" == vessel-built ]]; then
+    "$PYTHON_BIN" scripts/vessel_preflight.py --image-mode vessel-built --verify-vessel-built \
+        >"$OUTPUT_DIR/image-recheck.log" 2>&1 || {
+        cat "$OUTPUT_DIR/image-recheck.log" >&2
+        printf 'error: vessel-built approval changed; no generation started\n' >&2
+        exit 4
+    }
+fi
 bash scripts/run_experiment.sh "${runner_args[@]}"
 runner_status=$?
 

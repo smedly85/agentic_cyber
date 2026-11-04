@@ -17,7 +17,7 @@ selectors). Diagnostic differences: `--max-loops` is capped at 1, the output dir
 be new and outside the repository, and observed model provenance is forwarded
 after preflight. The print-only plan has no observed model provenance yet.
 
-## 1. Execution path: AMD64 under emulation (Option A)
+## 1. Mode A: original validated AMD64 images under emulation
 
 `docker/linux-utilities/lock-amd64.json` pins `linux/amd64`. The frozen corpora
 record `x86_64`, and `docker_benchmark.py` refuses a mismatched target. Running
@@ -72,7 +72,7 @@ image references, and only to these original platform manifests:
 
 Select such a lock with an absolute `LINUX_BENCHMARK_LOCK` path. Preflight and the
 unchanged execution adapter resolve those same references from that same lock.
-Never edit `lock-amd64.json`. No alternate lock is created by these scripts.
+Never edit `lock-amd64.json`. Mode A does not create an alternate lock.
 The table identifies allowed manifests, not guaranteed Docker lookup handles:
 the source WSL engine does not resolve these bare manifest digests as image refs.
 An alternate reference is usable only if platform-aware inspection actually
@@ -97,7 +97,152 @@ QEMU/Rosetta can also distort the timing of per-case timeouts and the
 address-space rlimits, and such distortions would surface as candidate
 failures. Before any generation, run the jailed Docker validation in step 3.
 
-## 2. Preflight
+### Mode B: independently validated vessel-built AMD64 images
+
+Use this explicit mode for existing vessel-built images. It makes no claim of
+Windows byte identity or historical timing equivalence. Mode A remains the
+default and retains its original authentication requirements. Both modes use
+`LINUX_BENCHMARK_LOCK` and Docker-only compilation/execution, with the existing
+12 configurations, 45 checkpoints, limits and public/held-out separation.
+
+Prerequisites: a clean reviewed checkout, Python 3.10+ on PATH, Bash, GNU
+timeout/gtimeout, Docker with platform-aware image inspection and Buildx, and
+the existing AMD64 oracle, Rust and pinned Python images already present.
+No command below builds, pulls or transfers Docker images. Colima must share
+the checkout, `$V/tmp` and output directories used by trusted oracle/static
+validation. The oracle's UID 1000 must be able to write its external output bind
+mount. Fix sharing/ownership if needed; do not relax candidate isolation.
+
+Capture resolves custom tags to executable immutable Docker IDs and checks the
+pinned Python manifest. Provenance records full inspect identities, history,
+oracle package/compiler metadata, pinned bases, Git revision and Dockerfiles.
+The actual build revision must exist locally; its Dockerfile blob hashes must
+match the supplied record and current checkout. Commands and builder details
+remain operator-supplied history, not signed build attestations. Retain real
+build logs beside the build record; do not invent missing build history.
+
+The environment binding includes Docker identity/configuration and a read-only
+probe of the Docker VM's boot ID, binfmt registrations (including flags), and
+registered interpreter file hashes. These probes use the pinned Python image,
+no network, no privileges and no Docker socket. The VM paths must be readable
+through Docker read-only bind mounts. If an interpreter registration points to
+a missing/inaccessible file, capture fails closed; make that emulator identity
+inspectable before proceeding. A reboot, registration/flag/interpreter change,
+checkout change or other recorded environment change requires fresh capture,
+validation and approval. Do not change the Docker/emulation configuration during
+validation or generation. Keep evidence and lock files operator-controlled.
+
+Run these blocks in the same native Bash session on vessel after review and
+publication of this code. Use the real earlier build revision and commands:
+
+```bash
+set -euo pipefail
+cd "$HOME/agentic_cyber"
+git status --short
+git rev-parse HEAD
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHON_BIN="$(command -v python3)"
+V="$(mktemp -d "$HOME/linux-utilities-vessel.XXXXXX")"
+mkdir "$V/tmp"
+export TMPDIR="$V/tmp"
+printf 'Evidence root: %s\n' "$V"
+docker version >"$V/docker-version.txt"
+docker info >"$V/docker-info.txt"
+docker buildx version >"$V/buildx-version.txt"
+docker context inspect >"$V/docker-context.json"
+docker image inspect --platform linux/amd64 \
+  agentic-linux-utilities:latest agentic-linux-utilities-rust:latest \
+  'python:3.12.8-bookworm@sha256:68ca65265c466f4b64f8ddab669e13bcba8d4ba77ec4c26658d36f2b9d1b1cad' \
+  >"$V/initial-images.json"
+read -r -p 'Actual build Git revision: ' BUILD_REVISION
+BUILD_REVISION="$(git rev-parse "$BUILD_REVISION^{commit}")"
+read -r -p 'Actual oracle build command: ' ORACLE_BUILD_COMMAND
+read -r -p 'Actual Rust build command: ' RUST_BUILD_COMMAND
+read -r -p 'Builder/emulator details and original log locations: ' BUILDER_DESCRIPTION
+export BUILD_REVISION ORACLE_BUILD_COMMAND RUST_BUILD_COMMAND BUILDER_DESCRIPTION
+python3 - "$V/build-record.json" <<'PY'
+import hashlib, json, os, subprocess, sys
+from pathlib import Path
+baseline = json.loads(Path('docker/linux-utilities/lock-amd64.json').read_text())
+revision = os.environ['BUILD_REVISION']
+files = ('docker/linux-utilities/Dockerfile', 'docker/linux-utilities/Rust.Dockerfile')
+record = dict(revision=revision,
+    dockerfiles={p: hashlib.sha256(subprocess.check_output(['git', 'show', revision+':'+p])).hexdigest() for p in files},
+    pinned_bases=[baseline['compiler_image'], baseline['rust_base_image']],
+    oracle_build_command=os.environ['ORACLE_BUILD_COMMAND'],
+    rust_build_command=os.environ['RUST_BUILD_COMMAND'],
+    builder_description=os.environ['BUILDER_DESCRIPTION'])
+with open(sys.argv[1], 'x') as out:
+    json.dump(record, out, indent=2)
+PY
+python3 -B scripts/vessel_preflight.py --image-mode vessel-built \
+  --prepare-vessel-lock "$V/images" --build-record "$V/build-record.json" \
+  2>&1 | tee "$V/capture.log"
+export LINUX_BENCHMARK_LOCK="$V/images/lock.json"
+export VESSEL_BUILT_PROVENANCE="$V/images/provenance.json"
+export VESSEL_VALIDATION="$V/validation/validation.json"
+export VESSEL_APPROVAL="$V/approval.json"
+python3 -B scripts/vessel_preflight.py --image-mode vessel-built \
+  --validate-vessel-built "$V/validation" 2>&1 | tee "$V/validation-console.log"
+```
+
+Validation runs all four trusted GNU oracles, real Docker C/Rust/Python isolation
+and boundary controls, calibration for all twelve selectors against public and
+held-out expectations, three checkpoint-000 entrypoint controls and static
+contract checks. It invokes no Aider or Ollama. A failed step stops validation
+and is an infrastructure/environment failure, never a generated-candidate result.
+Compiler signals, abnormal statuses and identifiable toolchain/resource failures
+also stop candidate validation as infrastructure errors; ordinary syntax/type
+errors remain candidate failures.
+
+`validation.json` hashes the logs and reports and binds successful commands and
+prerequisite checks to the exact lock, provenance, images and environment.
+Missing/modified/incomplete evidence or evidence older than 24 hours is rejected.
+Do not add files inside the sealed validation directory after completion.
+Failed validation requires a new directory. Protect held-out reports from agents.
+Review the complete reports before explicitly approving diagnostic generation:
+
+```bash
+python3 -m json.tool "$VESSEL_BUILT_PROVENANCE"
+python3 -m json.tool "$VESSEL_VALIDATION"
+cat "$V/validation/oracle/validation.log"
+cat "$V/validation/step-01.log"
+cat "$V/validation/calibration/summary.json"
+cat "$V/validation/static/summary.json"
+for s in c-cp rust-cp py-cp; do cat "$V/validation/entry-$s/summary.json"; done
+# Only after the complete evidence is acceptable:
+python3 -B scripts/vessel_preflight.py --image-mode vessel-built \
+  --approve-vessel-validation "$VESSEL_APPROVAL"
+SAMPLING=(--temperature 1.0 --architect-think low --sampling-seed 42 --num-ctx 65536 --max-tokens 65536)
+python3 -B scripts/vessel_preflight.py --image-mode vessel-built "${SAMPLING[@]}" \
+  --json-report "$V/preflight.json" 2>&1 | tee "$V/preflight.log"
+for s in c-cp rust-cp py-cp; do
+  bash scripts/vessel_smoke_stage.sh --image-mode vessel-built --selector "$s" \
+    --timeout 1800 --max-loops 1 "${SAMPLING[@]}" --output-dir "$V/smoke-$s" \
+    | tee "$V/print-$s.log"
+done
+```
+
+Approval is a separate new file outside validation, bound to its report hash
+and limited to diagnostics. These are local evidence records, not signatures.
+Normal preflight checks Aider's version and Ollama metadata without inference.
+After approval, preflight and the immediate pre-generation recheck rerun the
+existing jailed C isolation/architecture/rlimit test and Rust/Python isolation
+controls, then recheck the environment binding. Any failure prevents generation.
+
+The commands above print plans only. To generate later, run one selector at a
+time with the same four exported lock/evidence paths and explicit `--generate`:
+
+```bash
+bash scripts/vessel_smoke_stage.sh --image-mode vessel-built --selector c-cp \
+  --timeout 1800 --max-loops 1 "${SAMPLING[@]}" --output-dir "$V/smoke-c-cp" --generate
+```
+
+Repeat with `rust-cp` and `py-cp`, each using a new output directory. Successful
+diagnostics do not authorize formal experiments or establish historical model,
+image or timing equivalence. Existing model and sampling settings are unchanged.
+
+## 2. Preflight (Mode A)
 
 ```bash
 cd ~/agentic_cyber            # /Users/sonjabrown/agentic_cyber

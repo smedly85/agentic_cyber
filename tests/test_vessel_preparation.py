@@ -1,5 +1,6 @@
 """Vessel preparation regressions: metadata mocks and print-only/failing shell paths."""
 import contextlib
+import ast
 import copy
 import io
 import json
@@ -8,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -135,6 +137,226 @@ class PreflightTests(unittest.TestCase):
             self.assertEqual(error.exception.code, 2)
             git.assert_not_called()
 
+    @contextlib.contextmanager
+    def rebuilt_fixture(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            config = dict(self.config)
+            images = copy.deepcopy(self.images)
+            for index, key in enumerate(v.IMAGE_KEYS):
+                data = images.pop(self.config[key])
+                data['Id'] = 'sha256:' + str(index + 1) * 64
+                if key != 'compiler_image':
+                    config[key] = data['Id']
+                    data['Descriptor']['digest'] = 'sha256:' + str(index + 4) * 64
+                images[config[key]] = data
+            del images[config['oracle_image']]['Descriptor']['platform']
+            environment = {'revision': 'a' * 40, 'dockerfiles': {'Dockerfile': 'digest'}, 'docker': {'ID': 'vessel'}}
+            bases = [config['compiler_image'], config['rust_base_image']]
+            build = {'revision': 'b' * 40, 'dockerfiles': environment['dockerfiles'], 'pinned_bases': bases,
+                     'oracle_build_command': 'recorded oracle command', 'rust_build_command': 'recorded rust command',
+                     'builder_description': 'operator build record'}
+            provenance = {'schema_version': 1, 'mode': 'vessel-built',
+                          'baseline_lock_sha256': v.canonical_sha(self.config), 'lock_sha256': v.canonical_sha(config),
+                          'environment': environment, 'build_record': build, 'pinned_bases': bases,
+                          'windows_byte_identity_claimed': False,
+                          'images': {k: {'execution_ref': config[k], 'identity': v.rebuilt_identity(images[config[k]]),
+                                         'inspect': images[config[k]], 'history': 'captured history'} for k in v.IMAGE_KEYS}}
+            provenance['images']['oracle_image']['build_metadata'] = {
+                'base-image.txt': config['compiler_image'], 'build-architecture.txt': 'amd64',
+                'packages.txt': 'recorded packages', 'compiler.txt': 'gcc'}
+            lock = directory / 'lock.json'
+            args = SimpleNamespace(vessel_provenance=directory / 'provenance.json',
+                                   vessel_validation=directory / 'validation' / 'validation.json',
+                                   vessel_approval=directory / 'approval.json')
+            v.write_new_json(lock, config)
+            v.write_new_json(args.vessel_provenance, provenance)
+            with patch.dict(os.environ, LINUX_BENCHMARK_LOCK=str(lock)), \
+                    patch.object(v, 'vessel_environment', return_value=environment), \
+                    patch.object(v, 'git_dockerfile_hashes', return_value=environment['dockerfiles']), \
+                    patch.object(v, 'check_jailed_execution'), \
+                    patch.object(v, 'inspect_image', side_effect=lambda ref, platform: images[ref]):
+                binding = v.vessel_binding(config, lock, args.vessel_provenance)
+                args.vessel_validation.parent.mkdir()
+                for name in v.required_validation_files(args.vessel_validation.parent, config):
+                    path = args.vessel_validation.parent / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text('fixture report')
+                (args.vessel_validation.parent / 'step.log').write_text('complete fixture output')
+                commands = v.validation_commands(args.vessel_validation.parent, config)
+                report = {'schema_version': 1, 'passed': True, 'binding': binding,
+                          'generation_invoked': False, 'infrastructure_failure': False,
+                          'completed_at': v.time.time(), 'commands': commands, 'returncodes': [0] * len(commands),
+                          'checks': [{'check': c, 'status': 'PASS'} for c in v.required_validation_checks()],
+                          'files': v.validation_files(args.vessel_validation.parent)}
+                v.write_new_json(args.vessel_validation, report)
+                v.write_new_json(args.vessel_approval, {'schema_version': 1, 'validation_sha256': v.file_sha(args.vessel_validation),
+                                                       'binding_sha256': v.canonical_sha(binding), 'scope': 'diagnostic-only'})
+                yield config, lock, args, images, report
+
+    def test_rebuilt_missing_descriptor_platform_is_separate_from_original_auth(self):
+        with self.rebuilt_fixture() as (config, lock, args, images, report):
+            self.assertTrue(v.check_vessel_built(config, lock, args))
+            with self.assertRaises(ValueError):
+                v.image_identity(images[config['oracle_image']])
+            self.assertFalse(v.check_images(config, lock, self.evidence))
+            for field, value in [('Architecture', 'arm64'), ('Config', {'Env': ['different']}),
+                                 ('Id', 'sha256:' + 'f' * 64), ('RootFS', {'Layers': ['sha256:' + 'e' * 64]})]:
+                data = images[config['oracle_image']]
+                original = data[field]
+                data[field] = value
+                self.assertFalse(v.check_vessel_built(config, lock, args), field)
+                data[field] = original
+            images[config['oracle_image']]['Descriptor']['platform'] = {'os': 'linux', 'architecture': 'arm64'}
+            self.assertFalse(v.check_vessel_built(config, lock, args))
+
+    def test_capture_inspects_actual_ids_and_preserves_original_lock(self):
+        with self.rebuilt_fixture() as (config, lock, args, images, report):
+            original = v.DEFAULT_LOCK.read_bytes()
+            record_path = lock.parent / 'build-record.json'
+            record_path.write_text(json.dumps(json.loads(args.vessel_provenance.read_text())['build_record']))
+            aliases = {'agentic-linux-utilities:latest': config['oracle_image'],
+                       'agentic-linux-utilities-rust:latest': config['rust_compiler_image']}
+            def probe(ref, command=None):
+                if command is None:
+                    self.assertNotIn('latest', ref)
+                    return 'x86_64'
+                return {'base-image.txt': config['compiler_image'], 'build-architecture.txt': 'amd64',
+                        'packages.txt': 'packages', 'compiler.txt': 'gcc'}[Path(command[1]).name]
+            target = lock.parent / 'capture'
+            with patch.object(v, 'check_docker', return_value=True), patch.object(v, 'required_run', return_value='history'), \
+                    patch.object(v, 'probe_reference', side_effect=probe), \
+                    patch.object(v, 'inspect_image', side_effect=lambda ref, platform: images[aliases.get(ref, ref)]):
+                v.prepare_vessel_lock(target, record_path)
+                with self.assertRaises(FileExistsError):
+                    v.prepare_vessel_lock(target, record_path)
+            self.assertEqual(json.loads((target / 'lock.json').read_text()), config)
+            self.assertEqual(v.DEFAULT_LOCK.read_bytes(), original)
+            self.assertFalse((target / 'validation.json').exists())
+            self.assertFalse(json.loads((target / 'provenance.json').read_text())['windows_byte_identity_claimed'])
+
+    def test_rebuilt_validation_rejects_stale_missing_incomplete_and_modified_reports(self):
+        with self.rebuilt_fixture() as (config, lock, args, images, report):
+            original = args.vessel_validation.read_text()
+            for field, value in [('passed', False), ('completed_at', 0), ('completed_at', v.time.time() + 100),
+                                 ('binding', {}), ('commands', []), ('returncodes', [0]), ('files', {}), ('checks', [])]:
+                changed = dict(report, **{field: value})
+                args.vessel_validation.write_text(json.dumps(changed))
+                self.assertFalse(v.check_vessel_built(config, lock, args, require_approval=False), field)
+            args.vessel_validation.write_text(original)
+            (args.vessel_validation.parent / 'step.log').write_text('changed')
+            self.assertFalse(v.check_vessel_built(config, lock, args))
+            args.vessel_validation.unlink()
+            self.assertFalse(v.check_vessel_built(config, lock, args))
+
+    def test_rebuilt_approval_provenance_environment_and_active_adapter_required(self):
+        with self.rebuilt_fixture() as (config, lock, args, images, report):
+            args.vessel_approval.unlink()
+            self.assertFalse(v.check_vessel_built(config, lock, args))
+            self.assertTrue(v.check_vessel_built(config, lock, args, require_approval=False))
+            with patch.object(v, 'vessel_environment', return_value={'revision': 'changed'}):
+                self.assertFalse(v.check_vessel_built(config, lock, args))
+            with patch.dict(os.environ, LINUX_BENCHMARK_LOCK=str(v.DEFAULT_LOCK)):
+                self.assertFalse(v.check_vessel_built(config, lock, args, require_approval=False))
+            changed = dict(config, gcc='different')
+            with self.assertRaises(ValueError):
+                v.vessel_binding(changed, lock, args.vessel_provenance)
+            args.vessel_provenance.write_text('{}')
+            self.assertFalse(v.check_vessel_built(config, lock, args, require_approval=False))
+
+    def test_validation_stops_at_first_failed_command_and_never_approves(self):
+        with self.rebuilt_fixture() as (config, lock, args, images, report), contextlib.ExitStack() as stack:
+            for name in ('check_python_and_bash', 'check_timeout', 'check_architecture_probe', 'check_toolchains', 'check_checkpoints'):
+                stack.enter_context(patch.object(v, name))
+            invocation = stack.enter_context(patch.object(v.subprocess, 'run', return_value=SimpleNamespace(returncode=1)))
+            directory = lock.parent / 'failed-validation'
+            with self.assertRaisesRegex(ValueError, 'infrastructure/environment failure'):
+                v.validate_vessel(directory, config, lock, args.vessel_provenance, args)
+            self.assertEqual(invocation.call_count, 1)
+            self.assertFalse(json.loads((directory / 'validation.json').read_text())['passed'])
+            self.assertIsNone(v.VALIDATION_LOG)
+
+    def test_vessel_capture_requires_opt_in_and_never_checks_models(self):
+        with patch.object(v, 'prepare_vessel_lock') as prepare, patch.object(v, 'check_aider') as aider, patch.object(v, 'check_ollama') as ollama:
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                v.main(['--prepare-vessel-lock', '/tmp/new'])
+            prepare.assert_not_called()
+            self.assertEqual(v.main(['--image-mode', 'vessel-built', '--prepare-vessel-lock', '/tmp/new']), 0)
+            aider.assert_not_called()
+            ollama.assert_not_called()
+
+    def test_immutable_probe_failure_and_cleanup(self):
+        with patch.object(v, 'run', side_effect=[(1, '', 'cannot execute digest'), (0, '', '')]) as invoke:
+            with self.assertRaisesRegex(ValueError, 'cannot execute digest'):
+                v.probe_reference('sha256:' + '1' * 64)
+            self.assertIn('--pull', invoke.call_args_list[0].args[0])
+            self.assertEqual(invoke.call_args_list[1].args[0][:3], ['docker', 'rm', '-fv'])
+
+    def test_changed_python_files_parse(self):
+        for name in ('scripts/vessel_preflight.py', 'tests/test_vessel_preparation.py',
+                     'tests/test_docker_benchmark_integration.py'):
+            ast.parse((ROOT / name).read_text(), filename=name)
+
+    def test_git_build_revision_hashes_raw_blobs_and_rejects_mismatch(self):
+        import hashlib
+        blobs = [b'FROM pinned\n', b'FROM rust\n\n']
+        with patch.object(v, 'required_run') as commit, patch.object(v.subprocess, 'run',
+                side_effect=[SimpleNamespace(returncode=0, stdout=b) for b in blobs]) as show:
+            hashes = v.git_dockerfile_hashes('a' * 40)
+        self.assertEqual(hashes, {p: hashlib.sha256(b).hexdigest() for p, b in zip(v.DOCKERFILES, blobs)})
+        commit.assert_called_once_with(['git', 'cat-file', '-e', 'a' * 40 + '^{commit}'])
+        self.assertEqual(show.call_args_list[0].args[0], ['git', 'show', 'a' * 40 + ':' + v.DOCKERFILES[0]])
+        with self.rebuilt_fixture() as (config, lock, args, images, report):
+            with patch.object(v, 'git_dockerfile_hashes', return_value={'different': 'hash'}):
+                self.assertFalse(v.check_vessel_built(config, lock, args))
+        with patch.object(v, 'required_run', side_effect=ValueError('unknown revision')):
+            with self.assertRaisesRegex(ValueError, 'unknown revision'):
+                v.git_dockerfile_hashes('0' * 40)
+        with patch.object(v, 'required_run'), patch.object(v.subprocess, 'run',
+                return_value=SimpleNamespace(returncode=1)):
+            with self.assertRaisesRegex(ValueError, 'cannot read'):
+                v.git_dockerfile_hashes('a' * 40)
+
+    def test_emulation_identity_records_vm_registration_and_interpreter(self):
+        registration = {'boot_id': 'boot-one', 'registrations': {
+            'status': 'enabled\n', 'qemu-x86_64': 'enabled\ninterpreter /usr/bin/qemu-x86_64\nflags: F\n'}}
+        with patch.object(v, 'probe_reference', side_effect=[json.dumps(registration), 'a' * 64]) as probe:
+            identity = v.emulation_identity()
+        self.assertEqual(identity['interpreter_sha256'], {'/usr/bin/qemu-x86_64': 'a' * 64})
+        self.assertIn('type=bind,src=/proc/sys/fs/binfmt_misc,dst=/binfmt,readonly', probe.call_args_list[0].args[2])
+        self.assertIn('type=bind,src=/usr/bin/qemu-x86_64,dst=/emulator,readonly', probe.call_args_list[1].args[2])
+        with patch.object(v, 'probe_reference', side_effect=ValueError('unreadable emulator')):
+            with self.assertRaisesRegex(ValueError, 'unreadable'):
+                v.emulation_identity()
+
+    def test_emulation_change_and_failed_fresh_jail_invalidate_approval(self):
+        with self.rebuilt_fixture() as (config, lock, args, images, report):
+            environment = report['binding']['environment']
+            for emulation in ({'boot_id': 'new'}, {'registrations': 'flags changed'},
+                              {'interpreter_sha256': 'changed'}):
+                with patch.object(v, 'vessel_environment', return_value=dict(environment, emulation=emulation)):
+                    self.assertFalse(v.check_vessel_built(config, lock, args))
+            with patch.object(v, 'check_jailed_execution', side_effect=ValueError('jail failed')):
+                self.assertFalse(v.check_vessel_built(config, lock, args))
+            with patch.object(v, 'check_jailed_execution') as jail:
+                self.assertTrue(v.check_vessel_built(config, lock, args))
+                jail.assert_called_once_with()
+            with patch.object(v, 'check_jailed_execution') as jail:
+                self.assertTrue(v.check_vessel_built(config, lock, args, require_approval=False))
+                jail.assert_not_called()
+            binding = report['binding']
+            with patch.object(v, 'vessel_binding', side_effect=[binding, dict(binding, environment={})]):
+                self.assertFalse(v.check_vessel_built(config, lock, args))
+
+    def test_fresh_jail_uses_real_docker_controls_and_fails_closed(self):
+        for code in (1, 124, 127):
+            with patch.object(v, 'run', return_value=(code, '', 'failed')) as run:
+                with self.assertRaisesRegex(ValueError, 'infrastructure failure'):
+                    v.check_jailed_execution()
+                command = run.call_args.args[0]
+                self.assertIn('tests.test_docker_benchmark_integration.DockerIntegration.test_nonroot_chroot_and_no_controller_assets', command)
+                self.assertIn('tests.test_cross_language_docker.CrossLanguageDocker.test_real_rust_and_python_runtime_isolation_and_io', command)
+
 
 @unittest.skipUnless(os.name == 'posix', 'Bash paths exercised under WSL/macOS')
 class SmokeTests(unittest.TestCase):
@@ -151,6 +373,25 @@ class SmokeTests(unittest.TestCase):
                 result = subprocess.run(self.command(*extra), cwd=ROOT, env=dict(os.environ, TMPDIR=tmp), capture_output=True, text=True)
                 self.assertEqual(result.returncode, 2, result.stderr)
 
+    def test_bash_syntax_and_three_checkpoint_zero_print_commands(self):
+        import shlex
+        import lineage_plan
+        for script in ('scripts/vessel_smoke_stage.sh', 'docker/linux-utilities/build.sh', 'docker/linux-utilities/run.sh'):
+            subprocess.run(['/bin/bash', '-n', str(ROOT / script)], check=True)
+        with tempfile.TemporaryDirectory() as temp:
+            for selector in v.DEFAULT_SELECTORS:
+                command = self.command('--image-mode', 'vessel-built', '--output-dir', str(Path(temp) / selector))
+                command[command.index('--selector') + 1] = selector
+                result = subprocess.run(command, cwd=ROOT, env=dict(os.environ, TMPDIR=temp), capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse((Path(temp) / selector).exists())
+                line = next(row.strip() for row in result.stdout.splitlines() if row.startswith('  bash scripts/run_experiment.sh'))
+                words = shlex.split(line)
+                plan = lineage_plan.resolve_plan(ROOT, selector, '', '1', None, 1, 1)
+                for option, field in (('--build-cmd', 'build_command'), ('--extra-test-cmd', 'extra_test_command'), ('--source', 'source_path')):
+                    self.assertEqual(words[words.index(option) + 1], plan[field])
+                self.assertEqual(words[words.index('--feature-test-cmd') + 1], plan['checkpoints'][0]['feature_test_command'])
+
     def test_failed_preflight_cannot_reach_runner_and_retains_report(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -158,21 +399,28 @@ class SmokeTests(unittest.TestCase):
             shim.write_text('#!' + sys.executable + '\nimport os,sys,json\n'
                             'from pathlib import Path\n'
                             'if sys.argv[1].endswith("vessel_preflight.py"):\n'
-                            ' p=Path(sys.argv[sys.argv.index("--json-report")+1]); p.write_text(json.dumps({"preflight_passed":False})); sys.exit(1)\n'
+                            ' if "--verify-vessel-built" in sys.argv: sys.exit(1)\n'
+                            ' ok=os.environ.get("TEST_INITIAL_PASS")=="yes"\n'
+                            ' p=Path(sys.argv[sys.argv.index("--json-report")+1]); p.write_text(json.dumps({"preflight_passed":ok,"models":{"architect":{},"editor":{}}})); sys.exit(0 if ok else 1)\n'
                             'os.execv(sys.executable,[sys.executable]+sys.argv[1:])\n')
             shim.chmod(0o755)
             sentinel = root / 'runner-called'
             bash = root / 'bash'
             bash.write_text('#!/bin/sh\nprintf forbidden >"' + str(sentinel) + '"\nexit 99\n')
             bash.chmod(0o755)
-            output = root / 'diagnostic'
-            result = subprocess.run(self.command('--generate', '--output-dir', str(output)), cwd=ROOT,
-                                    env=dict(os.environ, PYTHON_BIN=str(shim), TMPDIR=temp,
-                                             PATH=temp + os.pathsep + os.environ['PATH']), capture_output=True, text=True)
-            self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
-            self.assertFalse(sentinel.exists())
-            self.assertFalse(json.loads((output / 'preflight.json').read_text())['preflight_passed'])
-            self.assertFalse((output / '000').exists())
+            for mode, initial_pass in (('original', False), ('vessel-built', False), ('vessel-built', True)):
+                output = root / ('diagnostic-%s-%s' % (mode, initial_pass))
+                result = subprocess.run(self.command('--image-mode', mode, '--generate', '--output-dir', str(output)), cwd=ROOT,
+                                        env=dict(os.environ, PYTHON_BIN=str(shim), TMPDIR=temp,
+                                                 TEST_INITIAL_PASS='yes' if initial_pass else 'no',
+                                                 PATH=temp + os.pathsep + os.environ['PATH']), capture_output=True, text=True)
+                self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+                self.assertFalse(sentinel.exists())
+                self.assertEqual(json.loads((output / 'preflight.json').read_text())['preflight_passed'], initial_pass)
+                if initial_pass:
+                    self.assertTrue((output / 'image-recheck.log').exists())
+                else:
+                    self.assertFalse((output / '000').exists())
 
 
 if __name__ == '__main__':
