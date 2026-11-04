@@ -477,6 +477,26 @@ def check_jailed_execution():
         raise ValueError("fresh jailed execution failed; infrastructure failure: " + out + err)
 
 
+def repository_execution_ref(ref, data, identity):
+    # RepoDigests can name an index rather than the selected platform manifest.
+    # Neither digest shape nor inspect metadata alone proves local resolution.
+    repository = ref.rsplit(":", 1)[0]  # capture's custom refs have explicit tags
+    candidates = list(data.get("RepoDigests") or [])
+    candidates += [repository + "@" + identity["manifest_digest"],
+                   repository + "@" + identity["docker_id"]]
+    for candidate in dict.fromkeys(candidates):
+        if not isinstance(candidate, str) or not re.fullmatch(
+                r"[^\s@]+@sha256:[0-9a-f]{64}", candidate):
+            continue
+        try:
+            resolved = rebuilt_identity(inspect_image(candidate, "linux/amd64"))
+        except (ValueError, KeyError, TypeError, IndexError):
+            continue
+        if resolved == identity:
+            return candidate
+    raise ValueError("no locally resolvable immutable repository digest matches " + ref)
+
+
 def prepare_vessel_lock(directory, build_record):
     directory = external_path(directory)
     baseline = json.loads(DEFAULT_LOCK.read_text())
@@ -494,8 +514,9 @@ def prepare_vessel_lock(directory, build_record):
     for key, ref in refs.items():
         data = inspect_image(ref, "linux/amd64")
         identity = rebuilt_identity(data)
-        # Keep the pinned Python base, resolve custom tags to Docker's actual ID.
-        selected = ref if key == "compiler_image" else identity["docker_id"]
+        # Keep the pinned Python base; custom images need a Docker-resolvable
+        # repository digest, not an assumed runnable bare index/config ID.
+        selected = ref if key == "compiler_image" else repository_execution_ref(ref, data, identity)
         if rebuilt_identity(inspect_image(selected, "linux/amd64")) != identity:
             raise ValueError("selected immutable reference does not resolve to inspected image")
         if key == "compiler_image" and identity["manifest_digest"] != baseline["base_amd64_manifest"]:

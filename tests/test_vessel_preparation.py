@@ -210,14 +210,27 @@ class PreflightTests(unittest.TestCase):
             images[config['oracle_image']]['Descriptor']['platform'] = {'os': 'linux', 'architecture': 'arm64'}
             self.assertFalse(v.check_vessel_built(config, lock, args))
 
-    def test_capture_inspects_actual_ids_and_preserves_original_lock(self):
+    def test_capture_uses_repository_digests_when_bare_ids_do_not_resolve(self):
         with self.rebuilt_fixture() as (config, lock, args, images, report):
             original = v.DEFAULT_LOCK.read_bytes()
             record_path = lock.parent / 'build-record.json'
             record_path.write_text(json.dumps(json.loads(args.vessel_provenance.read_text())['build_record']))
             aliases = {'agentic-linux-utilities:latest': config['oracle_image'],
                        'agentic-linux-utilities-rust:latest': config['rust_compiler_image']}
+            expected = dict(config)
+            for tag, image_id in list(aliases.items()):
+                digest_ref = tag.rsplit(':', 1)[0] + '@' + image_id
+                images[image_id]['RepoDigests'] = [digest_ref]
+                aliases[digest_ref] = image_id
+                key = 'oracle_image' if tag == 'agentic-linux-utilities:latest' else 'rust_compiler_image'
+                expected[key] = digest_ref
+            def inspect(ref, platform):
+                self.assertEqual(platform, 'linux/amd64')
+                if ref.startswith('sha256:'):
+                    raise ValueError('bare image ID cannot be resolved')
+                return images[aliases.get(ref, ref)]
             def probe(ref, command=None):
+                self.assertIn(ref, expected.values())
                 if command is None:
                     self.assertNotIn('latest', ref)
                     return 'x86_64'
@@ -225,15 +238,45 @@ class PreflightTests(unittest.TestCase):
                         'packages.txt': 'packages', 'compiler.txt': 'gcc'}[Path(command[1]).name]
             target = lock.parent / 'capture'
             with patch.object(v, 'check_docker', return_value=True), patch.object(v, 'required_run', return_value='history'), \
-                    patch.object(v, 'probe_reference', side_effect=probe), \
-                    patch.object(v, 'inspect_image', side_effect=lambda ref, platform: images[aliases.get(ref, ref)]):
+                    patch.object(v, 'probe_reference', side_effect=probe) as probes, \
+                    patch.object(v, 'inspect_image', side_effect=inspect):
                 v.prepare_vessel_lock(target, record_path)
                 with self.assertRaises(FileExistsError):
                     v.prepare_vessel_lock(target, record_path)
-            self.assertEqual(json.loads((target / 'lock.json').read_text()), config)
+                failed = lock.parent / 'failed-capture'
+                with patch.object(v, 'probe_reference', side_effect=ValueError('execution failed')):
+                    with self.assertRaisesRegex(ValueError, 'execution failed'):
+                        v.prepare_vessel_lock(failed, record_path)
+                self.assertFalse((failed / 'lock.json').exists())
+                self.assertFalse((failed / 'provenance.json').exists())
+            self.assertEqual(json.loads((target / 'lock.json').read_text()), expected)
+            for key in v.IMAGE_KEYS:
+                self.assertIn(unittest.mock.call(expected[key]), probes.call_args_list)
             self.assertEqual(v.DEFAULT_LOCK.read_bytes(), original)
             self.assertFalse((target / 'validation.json').exists())
             self.assertFalse(json.loads((target / 'provenance.json').read_text())['windows_byte_identity_claimed'])
+
+    def test_repository_digest_selection_rejects_missing_and_mismatched_images(self):
+        with self.rebuilt_fixture() as (config, lock, args, images, report):
+            data = images[config['oracle_image']]
+            identity = v.rebuilt_identity(data)
+            ref = 'agentic-linux-utilities:latest'
+            data['RepoDigests'] = ['mutable:latest', 'example@sha256:' + 'c' * 64]
+            with patch.object(v, 'inspect_image', side_effect=ValueError('missing')):
+                with self.assertRaisesRegex(ValueError, 'no locally resolvable'):
+                    v.repository_execution_ref(ref, data, identity)
+            changed = copy.deepcopy(data)
+            changed['Config'] = {'Env': ['changed']}
+            with patch.object(v, 'inspect_image', return_value=changed):
+                with self.assertRaisesRegex(ValueError, 'no locally resolvable'):
+                    v.repository_execution_ref(ref, data, identity)
+            # A matching repository-qualified manifest also works when Docker
+            # omits RepoDigests; it must still be inspected, never assumed.
+            data['RepoDigests'] = []
+            with patch.object(v, 'inspect_image', return_value=data) as inspect:
+                selected = v.repository_execution_ref(ref, data, identity)
+                self.assertEqual(selected, 'agentic-linux-utilities@' + identity['manifest_digest'])
+                inspect.assert_called_once_with(selected, 'linux/amd64')
 
     def test_rebuilt_validation_rejects_stale_missing_incomplete_and_modified_reports(self):
         with self.rebuilt_fixture() as (config, lock, args, images, report):
@@ -421,6 +464,92 @@ class SmokeTests(unittest.TestCase):
                     self.assertTrue((output / 'image-recheck.log').exists())
                 else:
                     self.assertFalse((output / '000').exists())
+
+
+@unittest.skipUnless(os.name == 'posix', 'Bash regression tests run under WSL/macOS')
+class OracleLauncherTests(unittest.TestCase):
+    """Real shell execution with Docker and staging copies stubbed; no workloads."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.log = self.root / 'docker.jsonl'
+        self.image_id = 'sha256:' + 'b' * 64
+        docker = self.root / 'docker'
+        docker.write_text('#!' + sys.executable + '\n'
+            'import json,os,sys\n'
+            'with open(os.environ["DOCKER_LOG"],"a") as out: out.write(json.dumps(sys.argv[1:])+"\\n")\n'
+            'if sys.argv[1:3]==["image","inspect"] and "--platform" in sys.argv:\n'
+            ' print(os.environ["INSPECT_ID"]); sys.exit(int(os.environ.get("INSPECT_EXIT","0")))\n'
+            'if "{{.State.ExitCode}}" in sys.argv: print(os.environ.get("ORACLE_EXIT","0"))\n'
+            'elif "{{.State.Status}}" in sys.argv: print("exited")\n'
+            'else: print("{}")\n')
+        docker.chmod(0o755)
+        copy = self.root / 'cp'
+        copy.write_text('#!/bin/sh\nexit 0\n')
+        copy.chmod(0o755)
+        self.env = dict(os.environ, PATH=str(self.root) + os.pathsep + os.environ['PATH'],
+                        TMPDIR=str(self.root), DOCKER_LOG=str(self.log), INSPECT_ID=self.image_id)
+
+    def invoke(self, ref, number=0, **env):
+        output = self.root / ('output-' + str(number))
+        result = subprocess.run(['/bin/bash', str(ROOT / 'docker/linux-utilities/run.sh'),
+                                 ref, str(output), 'linux/amd64'],
+                                env=dict(self.env, **env), capture_output=True, text=True)
+        return result, output
+
+    def test_immutable_refs_keep_execution_platform_isolation_and_provenance(self):
+        digest = 'sha256:' + 'a' * 64
+        refs = [digest, 'agentic-linux-utilities@' + digest,
+                'agentic-linux-utilities-rust@' + digest,
+                'localhost:5000/team/image@' + digest,
+                'registry.example/team/image:release@' + digest]
+        for i, ref in enumerate(refs):
+            with self.subTest(ref=ref):
+                result, output = self.invoke(ref, i)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+                create = next(call for call in calls if call[0] == 'create')
+                self.assertEqual(create[create.index('--pull') + 1], 'never')
+                self.assertEqual(create[create.index('--platform') + 1], 'linux/amd64')
+                self.assertEqual(create[create.index('--network') + 1], 'none')
+                self.assertIn('--read-only', create)
+                self.assertEqual(create[create.index('--cap-drop') + 1], 'ALL')
+                self.assertIn('no-new-privileges', create)
+                for option, value in (('--cpus', '2'), ('--memory', '2g'), ('--pids-limit', '128')):
+                    self.assertEqual(create[create.index(option) + 1], value)
+                self.assertEqual(create[create.index('bash') - 1], ref)
+                self.assertIn('BENCHMARK_ARCH=x86_64', create)
+                self.assertIn('BENCHMARK_IMAGE_ID=' + (self.image_id if '@' in ref else ref), create)
+                self.assertTrue((output / 'validation.log').is_file())
+                self.log.unlink()
+
+    def test_mutable_and_malformed_refs_stop_before_docker_or_output(self):
+        digest = 'sha256:' + 'a' * 64
+        refs = ['image', 'image:latest', '@' + digest, 'image@@' + digest,
+                'image@sha256:abc', 'image@sha256:' + 'A' * 64,
+                'image@sha512:' + 'a' * 64, 'image@' + digest + 'extra',
+                'bad image@' + digest, 'team//image@' + digest, '-image@' + digest,
+                'image/@' + digest, 'https://registry/image@' + digest]
+        for ref in refs:
+            with self.subTest(ref=ref):
+                result, output = self.invoke(ref)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertFalse(output.exists())
+                self.assertFalse(self.log.exists())
+
+    def test_failed_resolution_and_oracle_failure_remain_fail_closed(self):
+        ref = 'image@sha256:' + 'a' * 64
+        for env in ({'INSPECT_EXIT': '1'}, {'INSPECT_ID': 'malformed'}):
+            result, output = self.invoke(ref, **env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(output.exists())
+            self.assertFalse(any(json.loads(line)[0] == 'create' for line in self.log.read_text().splitlines()))
+            self.log.unlink()
+        result, output = self.invoke(ref, ORACLE_EXIT='7')
+        self.assertEqual(result.returncode, 7)
+        self.assertTrue((output / 'container-inspect.json').exists())
 
 
 if __name__ == '__main__':
