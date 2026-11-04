@@ -108,10 +108,13 @@ default and retains its original authentication requirements. Both modes use
 Prerequisites: a clean reviewed checkout, Python 3.10+ on PATH, Bash, GNU
 timeout/gtimeout, Docker with platform-aware image inspection and Buildx, and
 the existing AMD64 oracle, Rust and pinned Python images already present.
-No command below builds, pulls or transfers Docker images. Colima must share
-the checkout, `$V/tmp` and output directories used by trusted oracle/static
-validation. The oracle's UID 1000 must be able to write its external output bind
-mount. Fix sharing/ownership if needed; do not relax candidate isolation.
+No command below builds, pulls or transfers Docker images. Oracle/static
+validation copies inputs through the Docker API into temporary Docker-managed
+volumes, mounted read-only during validation. Oracle output uses a fresh volume
+initialized from the image's UID-1000-owned `/output` directory and is copied
+back to the controller after exit, including partial output on failure. These
+jobs need neither Colima nor host-directory sharing. Temporary containers and
+volumes are removed afterward; retained reports remain outside the repository.
 
 Capture resolves custom tags to executable immutable Docker IDs and checks the
 pinned Python manifest. Provenance records full inspect identities, history,
@@ -317,8 +320,9 @@ ORACLE="$(python3 -B -c 'import sys; sys.path.insert(0,"scripts"); import docker
 bash docker/linux-utilities/run.sh "$ORACLE" "$V/oracle" linux/amd64
 ```
 
-That script bind-mounts a `mktemp -d` directory under `/var/folders`, so first
-confirm Colima shares that path. The smoke path itself uses no bind mounts.
+That script streams staged files into Docker-managed storage and copies reports
+back; the daemon does not need access to host temporary paths. Candidate smoke
+execution continues to use the existing isolated Docker transport.
 
 ## 4. Smoke tests (explicitly opt-in; one selector at a time)
 

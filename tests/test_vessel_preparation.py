@@ -482,6 +482,13 @@ class OracleLauncherTests(unittest.TestCase):
             'with open(os.environ["DOCKER_LOG"],"a") as out: out.write(json.dumps(sys.argv[1:])+"\\n")\n'
             'if sys.argv[1:3]==["image","inspect"] and "--platform" in sys.argv:\n'
             ' print(os.environ["INSPECT_ID"]); sys.exit(int(os.environ.get("INSPECT_EXIT","0")))\n'
+            'if sys.argv[1]=="cp":\n'
+            ' from pathlib import Path\n'
+            ' outgoing=":/output/." in sys.argv[2]\n'
+            ' if os.environ.get("COPY_FAIL")==("out" if outgoing else "in"): sys.exit(1)\n'
+            ' if outgoing:\n'
+            '  p=Path(sys.argv[3])/"validated/c-cp/validation.json"; p.parent.mkdir(parents=True); p.write_text("{}")\n'
+            'if sys.argv[1]=="run": sys.exit(int(os.environ.get("STATIC_EXIT","0")))\n'
             'if "{{.State.ExitCode}}" in sys.argv: print(os.environ.get("ORACLE_EXIT","0"))\n'
             'elif "{{.State.Status}}" in sys.argv: print("exited")\n'
             'else: print("{}")\n')
@@ -510,7 +517,7 @@ class OracleLauncherTests(unittest.TestCase):
                 result, output = self.invoke(ref, i)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 calls = [json.loads(line) for line in self.log.read_text().splitlines()]
-                create = next(call for call in calls if call[0] == 'create')
+                create = next(call for call in calls if call[0] == 'create' and 'bash' in call)
                 self.assertEqual(create[create.index('--pull') + 1], 'never')
                 self.assertEqual(create[create.index('--platform') + 1], 'linux/amd64')
                 self.assertEqual(create[create.index('--network') + 1], 'none')
@@ -523,6 +530,11 @@ class OracleLauncherTests(unittest.TestCase):
                 self.assertIn('BENCHMARK_ARCH=x86_64', create)
                 self.assertIn('BENCHMARK_IMAGE_ID=' + (self.image_id if '@' in ref else ref), create)
                 self.assertTrue((output / 'validation.log').is_file())
+                self.assertTrue((output / 'validated/c-cp/validation.json').is_file())
+                self.assertFalse(any('type=bind' in arg for call in calls for arg in call))
+                self.assertTrue(any(arg.startswith('type=volume,') and arg.endswith('target=/work,readonly') for arg in create))
+                self.assertTrue(any(call[0] == 'cp' and call[2].endswith(':/work') for call in calls))
+                self.assertEqual(calls[-1][:2], ['volume', 'rm'])
                 self.log.unlink()
 
     def test_mutable_and_malformed_refs_stop_before_docker_or_output(self):
@@ -550,6 +562,49 @@ class OracleLauncherTests(unittest.TestCase):
         result, output = self.invoke(ref, ORACLE_EXIT='7')
         self.assertEqual(result.returncode, 7)
         self.assertTrue((output / 'container-inspect.json').exists())
+        self.assertTrue((output / 'validated/c-cp/validation.json').exists())
+
+    def test_oracle_copy_failures_stop_validation_and_cleanup_volumes(self):
+        ref = 'image@sha256:' + 'a' * 64
+        for i, direction in enumerate(('in', 'out')):
+            result, output = self.invoke(ref, i, COPY_FAIL=direction)
+            self.assertNotEqual(result.returncode, 0)
+            calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+            self.assertEqual(calls[-1][:2], ['volume', 'rm'])
+            self.assertEqual(calls[-2][:2], ['rm', '-fv'])
+            if direction == 'in':
+                self.assertFalse(any(call[0] == 'start' for call in calls))
+            else:
+                self.assertEqual(result.returncode, 2)
+                self.assertTrue((output / 'container-inspect.json').is_file())
+            self.log.unlink()
+
+    def test_static_validator_copies_inputs_and_preserves_all_checks(self):
+        lock = self.root / 'lock.json'
+        config = json.loads(v.DEFAULT_LOCK.read_text())
+        config['oracle_image'] = 'image@sha256:' + 'a' * 64
+        lock.write_text(json.dumps(config))
+        for i, extra in enumerate(({}, {'STATIC_EXIT': '7'}, {'COPY_FAIL': 'in'})):
+            output = self.root / ('static-' + str(i))
+            result = subprocess.run([sys.executable, '-B', str(ROOT / 'scripts/validate_linux_static.py'),
+                                     '--output', str(output)], capture_output=True, text=True,
+                                    env=dict(self.env, LINUX_BENCHMARK_LOCK=str(lock), **extra))
+            self.assertEqual(result.returncode == 0, not extra, result.stderr)
+            calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+            self.assertFalse(any('type=bind' in arg for call in calls for arg in call))
+            runs = [call for call in calls if call[0] == 'run']
+            self.assertEqual(len(runs), 0 if 'COPY_FAIL' in extra else 4)
+            for call in runs:
+                self.assertIn('--read-only', call)
+                self.assertEqual(call[call.index('--pull') + 1], 'never')
+                self.assertIn('BENCHMARK_IMAGE_ID=' + self.image_id, call)
+                self.assertTrue(any(arg.endswith('target=/work,readonly') for arg in call))
+            self.assertEqual(calls[-2][:2], ['rm', '-fv'])
+            self.assertEqual(calls[-1][:2], ['volume', 'rm'])
+            if runs:
+                summary = json.loads((output / 'summary.json').read_text())
+                self.assertEqual(set(summary), {'syntax', 'contract', 'static', 'isolation'})
+            self.log.unlink()
 
 
 if __name__ == '__main__':
