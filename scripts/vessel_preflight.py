@@ -597,7 +597,8 @@ def vessel_binding(config, lock_path, provenance_path):
                 raise ValueError("missing or mismatched embedded oracle build provenance")
         IMAGE_IDENTITIES[key] = {"execution_ref": ref, "identity": identity}
     return {"lock_sha256": file_sha(lock_path), "provenance_sha256": file_sha(provenance_path),
-            "environment": environment, "images": dict(IMAGE_IDENTITIES)}
+            "environment": environment, "images": dict(IMAGE_IDENTITIES),
+            "execution_profile": docker_benchmark.execution_profile()}
 
 
 def validation_commands(directory, config):
@@ -656,6 +657,7 @@ def validate_vessel(directory, config, lock_path, provenance_path, args):
     binding = vessel_binding(config, lock_path, provenance_path)
     directory.mkdir(exist_ok=False)
     report = {"schema_version": 1, "passed": False, "binding": binding,
+              "diagnostic_only": True, "formal_result": False,
               "commands": validation_commands(directory, config), "generation_invoked": False, "returncodes": []}
     VALIDATION_LOG = directory / "prerequisites.log"
     try:
@@ -881,6 +883,8 @@ def main(argv=None):
     actions.add_argument("--capture-image-evidence", type=Path,
                         help="original Docker host only: write fresh identity metadata outside the repo; no archive")
     parser.add_argument("--image-mode", choices=("original", "vessel-built"), default="original")
+    parser.add_argument("--diagnostic-rosetta", action="store_true",
+                        help="non-formal vessel-built diagnostics only: omit the jail RLIMIT_AS cap")
     parser.add_argument("--vessel-provenance", type=Path, default=os.environ.get("VESSEL_BUILT_PROVENANCE"))
     parser.add_argument("--vessel-validation", type=Path, default=os.environ.get("VESSEL_VALIDATION"))
     parser.add_argument("--vessel-approval", type=Path, default=os.environ.get("VESSEL_APPROVAL"))
@@ -890,6 +894,11 @@ def main(argv=None):
     actions.add_argument("--approve-vessel-validation", type=Path, metavar="NEW_APPROVAL_FILE")
     actions.add_argument("--verify-vessel-built", action="store_true", help="recheck approval and jailed execution; no model checks")
     args = parser.parse_args(argv)
+    if args.diagnostic_rosetta and args.image_mode != "vessel-built":
+        parser.error("--diagnostic-rosetta requires --image-mode vessel-built")
+    if os.environ.get("VESSEL_DIAGNOSTIC_ROSETTA", "0") != "0" and not args.diagnostic_rosetta:
+        parser.error("inherited diagnostic profile requires explicit --diagnostic-rosetta")
+    os.environ["VESSEL_DIAGNOSTIC_ROSETTA"] = "1" if args.diagnostic_rosetta else "0"
     vessel_action = args.prepare_vessel_lock or args.validate_vessel_built or args.approve_vessel_validation or args.verify_vessel_built
     if vessel_action and args.image_mode != "vessel-built":
         parser.error("vessel-built actions require explicit --image-mode vessel-built")
@@ -1008,6 +1017,8 @@ def main(argv=None):
                "models": MODEL_IDENTITIES, "images": IMAGE_IDENTITIES,
                "benchmark_lock": config, "benchmark_lock_path": str(lock_path),
                "image_mode": args.image_mode, "image_evidence": evidence,
+               "execution_profile": docker_benchmark.execution_profile(),
+               "diagnostic_only": True, "formal_result": False,
                "vessel_validation": str(args.vessel_validation) if args.image_mode == "vessel-built" else None,
                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "checks": RESULTS}
     if args.json_report:

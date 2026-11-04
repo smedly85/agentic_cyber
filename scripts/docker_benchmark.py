@@ -33,8 +33,22 @@ def settings():
     return config
 
 
+def execution_profile():
+    mode = os.environ.get('VESSEL_DIAGNOSTIC_ROSETTA', '0')
+    if mode not in ('0', '1'):
+        raise InfrastructureError('invalid VESSEL_DIAGNOSTIC_ROSETTA value')
+    if mode == '1':
+        return {'mode': 'vessel-rosetta-diagnostic', 'rlimit_as_bytes': None,
+                'diagnostic_only': True, 'formal_result': False}
+    return {'mode': 'standard', 'rlimit_as_bytes': 256 * 1024**2}
+
+
 def command(action, name, language='c'):
     config = settings()
+    profile = execution_profile()
+    if profile.get('diagnostic_only'):
+        if config['platform'] != 'linux/amd64':
+            raise InfrastructureError('Rosetta diagnostic requires linux/amd64')
     arch = 'x86_64' if config['platform'] == 'linux/amd64' else 'aarch64'
     args = ['docker', 'run', '--rm', '--name', name, '--platform', config['platform'],
             '--network', 'none', '--read-only', '--cap-drop', 'ALL',
@@ -42,6 +56,8 @@ def command(action, name, language='c'):
             '--pids-limit', '64', '--ulimit', 'nofile=256:256',
             '--tmpfs', '/tmp:rw,exec,nosuid,nodev,size=512m',
             '-e', 'LC_ALL=C', '-e', 'TZ=UTC', '-e', 'BENCHMARK_ARCH=' + arch]
+    if profile['mode'] == 'vessel-rosetta-diagnostic':
+        args += ['-e', 'BENCHMARK_DIAGNOSTIC_ROSETTA=1']
     if action == 'case':
         args += ['--user', '0:0']
         for cap in ('SYS_CHROOT', 'SETUID', 'SETGID', 'CHOWN', 'DAC_OVERRIDE', 'FOWNER', 'FSETID', 'KILL'):
@@ -147,7 +163,7 @@ def boundary_probe(executable, selector, option, flag):
             'exit_status': result['exit_code'], 'stdout_bytes': len(stdout),
             'stderr_bytes': len(stderr), 'rejected': passed,
             'violation': None if passed else 'did not reject future option with required status and diagnostic',
-            'docker_provenance': settings()}
+            'docker_provenance': settings(), 'execution_profile': execution_profile()}
 
 
 def judge(selector, candidate, flags, hidden=False, report_path=None, cases_override=None, *, calibration_native=False):
@@ -194,6 +210,9 @@ def judge(selector, candidate, flags, hidden=False, report_path=None, cases_over
         if proc.returncode != 0 or final is None:
             raise InfrastructureError('trusted judge did not produce a verdict: ' + proc.stderr.read()[-1000:])
         final['report']['docker_provenance'] = settings()
+        final['report']['execution_profile'] = execution_profile()
+        if execution_profile().get('diagnostic_only'):
+            final['report'].update(diagnostic_only=True, formal_result=False)
         if report_path:
             report_path.parent.mkdir(parents=True, exist_ok=True)
             report_path.write_text(json.dumps(final['report'], indent=2) + '\n')

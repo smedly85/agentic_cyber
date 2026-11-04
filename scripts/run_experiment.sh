@@ -40,6 +40,11 @@
 #     --feature-test-cmd "tests/sort-test-suite/run_all.sh build/new_sort"
 
 set -uo pipefail
+if [[ "${VESSEL_DIAGNOSTIC_ROSETTA:-0}" != 0 &&
+      "${VESSEL_DIAGNOSTIC_GENERATION_APPROVED:-0}" != 1 ]]; then
+    echo 'error: Rosetta diagnostics require vessel_smoke_stage.sh and its fresh jailed preflight' >&2
+    exit 2
+fi
 
 usage() {
     cat <<'EOF'
@@ -246,6 +251,10 @@ optional_think() {
 write_metadata() {
     local file="$1"
     shift
+    if [[ "${VESSEL_DIAGNOSTIC_ROSETTA:-0}" == 1 ]]; then
+        set -- "$@" diagnostic_only true formal_result false \
+            execution_profile '__STR__:vessel-rosetta-diagnostic' rlimit_as_bytes '__JSON__:null'
+    fi
     "${PYTHON_BIN}" - "$file" "$@" <<'PY'
 import json
 import sys

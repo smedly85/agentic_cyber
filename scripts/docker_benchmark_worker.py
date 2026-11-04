@@ -50,6 +50,16 @@ def modules(request):
     return importlib.import_module('engine'), importlib.import_module('runner')
 
 
+def set_jail_limits():
+    address_space = (resource.RLIM_INFINITY if os.environ.get('BENCHMARK_DIAGNOSTIC_ROSETTA') == '1'
+                     else 256 * 1024**2)
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    resource.setrlimit(resource.RLIMIT_CPU, (10, 10))
+    resource.setrlimit(resource.RLIMIT_AS, (address_space, address_space))
+    resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024**2, 64 * 1024**2))
+    resource.setrlimit(resource.RLIMIT_NPROC, (16, 16))
+
+
 def jailed_executor(engine, utility, binary, language='c'):
     jail = Path(tempfile.mkdtemp(prefix='jail-'))
     # Resolve dependencies of trusted GNU binaries, never run ldd on a candidate.
@@ -130,11 +140,7 @@ def jailed_executor(engine, utility, binary, language='c'):
                 os.setgroups([])
                 os.setgid(1000)
                 os.setuid(1000)
-                resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-                resource.setrlimit(resource.RLIMIT_CPU, (10, 10))
-                resource.setrlimit(resource.RLIMIT_AS, (256 * 1024**2, 256 * 1024**2))
-                resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024**2, 64 * 1024**2))
-                resource.setrlimit(resource.RLIMIT_NPROC, (16, 16))
+                set_jail_limits()
                 if original_preexec:
                     original_preexec()
 

@@ -76,13 +76,15 @@ int main(void) {
   struct utsname host;
   if (uname(&host) || strcmp(host.sysname, "Linux") || strcmp(host.machine, "EXPECTED_ARCH")) return 20;
   const int resources[] = {RLIMIT_CORE, RLIMIT_CPU, RLIMIT_AS, RLIMIT_FSIZE, RLIMIT_NPROC};
-  const rlim_t limits[] = {0, 10, 256UL*1024*1024, 64UL*1024*1024, 16};
+  const rlim_t limits[] = {0, 10, EXPECTED_AS, 64UL*1024*1024, 16};
   for (unsigned i=0; i<sizeof(resources)/sizeof(resources[0]); ++i) {
     struct rlimit limit;
     if (getrlimit(resources[i], &limit) || limit.rlim_cur != limits[i] || limit.rlim_max != limits[i]) return 21;
   }
-  void *too_large = malloc(512UL*1024*1024);
-  if (too_large) { free(too_large); return 22; }
+  if (EXPECT_AS_LIMIT) {
+    void *too_large = malloc(512UL*1024*1024);
+    if (too_large) { free(too_large); return 22; }
+  }
   const char *paths[] = {"/opt/gnu/bin/cp", "/bin/cp", "/work", "/proc/1/environ",
     "/var/run/docker.sock", "/tmp/harness/runner.py", "/output", "/etc/shadow"};
   if (getuid() != 1000 || getgid() != 1000) return 10;
@@ -98,6 +100,8 @@ int main(void) {
   puts("isolated uid=1000"); return 0;
 }
 '''.replace('if (chroot("/")==0) return 12;', 'if (setuid(0)==0) return 12;')
+           .replace('EXPECTED_AS', 'RLIM_INFINITY' if docker.execution_profile().get('diagnostic_only') else '256UL*1024*1024')
+           .replace('EXPECT_AS_LIMIT', '0' if docker.execution_profile().get('diagnostic_only') else '1')
            .replace('EXPECTED_ARCH', 'x86_64' if docker.settings()['platform'] == 'linux/amd64' else 'aarch64'))
         result = docker.execute_case('c-cp', binary.read_bytes(), {'args': [], 'fixture': []})['result']
         self.assertEqual(result['exit_code'], 0)

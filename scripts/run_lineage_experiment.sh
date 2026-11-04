@@ -39,6 +39,10 @@
 #   python3 scripts/analyze_lineages.py --lineage-root <output-dir>
 
 set -uo pipefail
+if [[ "${VESSEL_DIAGNOSTIC_ROSETTA:-0}" != 0 ]]; then
+    echo 'error: Rosetta diagnostics cannot run as formal lineages' >&2
+    exit 2
+fi
 
 usage() {
     cat <<'EOF'

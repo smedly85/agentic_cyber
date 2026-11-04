@@ -30,6 +30,7 @@ Usage:
       [--max-loops 0|1] [--ollama-url URL] [--architect-model M] \
       [--editor-model M] [--output-dir NEW_DIR_OUTSIDE_REPO] [--generate]
       [--image-mode original|vessel-built]
+      [--diagnostic-rosetta]
 
 Temperature, thinking, seed and context must be supplied explicitly; token cap
 and top-p remain optional (see docs/benchmarks/linux-utilities-vessel.md).
@@ -55,6 +56,7 @@ EDITOR_MODEL="ollama_chat/qwen3-coder-next:latest"
 OUTPUT_DIR=""
 GENERATE=0
 IMAGE_MODE=original
+DIAGNOSTIC_ROSETTA=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -79,11 +81,23 @@ while [[ $# -gt 0 ]]; do
         --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
         --generate) GENERATE=1; shift ;;
         --image-mode) IMAGE_MODE="$2"; shift 2 ;;
+        --diagnostic-rosetta) DIAGNOSTIC_ROSETTA=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; die "unknown argument: $1" ;;
     esac
 done
 [[ "$IMAGE_MODE" == original || "$IMAGE_MODE" == vessel-built ]] || die "invalid --image-mode"
+if [[ "$DIAGNOSTIC_ROSETTA" == 1 && "$IMAGE_MODE" != vessel-built ]]; then
+    die "--diagnostic-rosetta requires --image-mode vessel-built"
+fi
+if [[ "${VESSEL_DIAGNOSTIC_ROSETTA:-0}" != 0 && "$DIAGNOSTIC_ROSETTA" != 1 ]]; then
+    die "inherited diagnostic profile requires explicit --diagnostic-rosetta"
+fi
+export VESSEL_DIAGNOSTIC_ROSETTA="$DIAGNOSTIC_ROSETTA"
+# Only a successful final jailed recheck may authorize this single-stage runner.
+unset VESSEL_DIAGNOSTIC_GENERATION_APPROVED
+profile_args=()
+[[ "$DIAGNOSTIC_ROSETTA" == 1 ]] && profile_args+=(--diagnostic-rosetta)
 
 case "$SELECTOR" in
     c-cp|rust-cp|py-cp) ;;
@@ -188,6 +202,7 @@ printf 'Prompt:      %s\n' "$STAGE_PROMPT"
 printf 'Bundle:      planned fingerprint %s\n' "$STAGE_FINGERPRINT"
 printf 'Config:      %s\n' "$CONFIG_FINGERPRINT"
 printf 'Lock:        %s\n' "${LINUX_BENCHMARK_LOCK:-${C_BENCHMARK_LOCK:-docker/linux-utilities/lock-amd64.json}}"
+[[ "$DIAGNOSTIC_ROSETTA" == 1 ]] && printf 'Profile:     vessel-rosetta-diagnostic (non-formal; no RLIMIT_AS cap)\n'
 printf 'Output:      %s\n' "$OUTPUT_DISPLAY"
 
 if [[ "$GENERATE" -eq 0 ]]; then
@@ -211,6 +226,7 @@ preflight_args=(--image-mode "$IMAGE_MODE" --selector "$SELECTOR" --ollama-url "
                 --editor-model "$EDITOR_MODEL" --temperature "$TEMPERATURE"
                 --architect-think "$ARCHITECT_THINK" --sampling-seed "$SAMPLING_SEED"
                 --num-ctx "$NUM_CTX" --json-report "$OUTPUT_DIR/preflight.json")
+preflight_args+=("${profile_args[@]}")
 [[ -n "$MAX_TOKENS" ]] && preflight_args+=(--max-tokens "$MAX_TOKENS")
 [[ -n "$TOP_P" ]] && preflight_args+=(--top-p "$TOP_P")
 "$PYTHON_BIN" scripts/vessel_preflight.py "${preflight_args[@]}" >"$OUTPUT_DIR/preflight.log" 2>&1
@@ -225,7 +241,9 @@ import json, sys
 report = json.load(open(sys.argv[1]))
 if report.get("preflight_passed") is not True or set(report.get("models", {})) != {"architect", "editor"}:
     raise SystemExit("successful preflight with both model identities is required")
-print(json.dumps({"diagnostic_observed_models": report["models"]}, separators=(",", ":")))
+print(json.dumps({"diagnostic_observed_models": report["models"],
+                  "diagnostic_only": True, "formal_result": False,
+                  "execution_profile": report.get("execution_profile")}, separators=(",", ":")))
 PY
 )" || { printf 'error: invalid preflight evidence; no generation started\n' >&2; exit 4; }
 plan_args+=(--model-provenance-json "$MODEL_PROVENANCE_JSON")
@@ -247,13 +265,14 @@ stage_args "$BUNDLE_DIR" "$STAGE_DIR"
 printf '%q ' bash scripts/run_experiment.sh "${runner_args[@]}" >"$OUTPUT_DIR/command.txt"
 printf '\n' >>"$OUTPUT_DIR/command.txt"
 if [[ "$IMAGE_MODE" == vessel-built ]]; then
-    "$PYTHON_BIN" scripts/vessel_preflight.py --image-mode vessel-built --verify-vessel-built \
+    "$PYTHON_BIN" scripts/vessel_preflight.py --image-mode vessel-built --verify-vessel-built "${profile_args[@]}" \
         >"$OUTPUT_DIR/image-recheck.log" 2>&1 || {
         cat "$OUTPUT_DIR/image-recheck.log" >&2
         printf 'error: vessel-built approval changed; no generation started\n' >&2
         exit 4
     }
 fi
+[[ "$DIAGNOSTIC_ROSETTA" == 1 ]] && export VESSEL_DIAGNOSTIC_GENERATION_APPROVED=1
 bash scripts/run_experiment.sh "${runner_args[@]}"
 runner_status=$?
 
@@ -286,6 +305,7 @@ fi
     "$OUTPUT_DIR/smoke-summary.json" "$SELECTOR" "$CONFIG_FINGERPRINT" "$built" <<'PY'
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -322,6 +342,8 @@ infrastructure = (public_outcome in ("stage_runner_failure", "stage_run_incomple
                   or heldout in ("heldout_infrastructure_failure", "platform_incompatible", "unknown"))
 summary = {
     "diagnostic_only": True, "formal_result": False, "lineage_seed": False,
+    "execution_profile": "vessel-rosetta-diagnostic" if os.environ.get("VESSEL_DIAGNOSTIC_ROSETTA") == "1" else "standard",
+    "rlimit_as_bytes": None if os.environ.get("VESSEL_DIAGNOSTIC_ROSETTA") == "1" else 256 * 1024**2,
     "preflight_report": "preflight.json",
     "selector": selector, "checkpoint": "000", "config_fingerprint": config,
     "test_bundle_fingerprint": bundle, "run_experiment_exit_code": int(runner),

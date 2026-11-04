@@ -340,6 +340,27 @@ class PreflightTests(unittest.TestCase):
                      'tests/test_docker_benchmark_integration.py'):
             ast.parse((ROOT / name).read_text(), filename=name)
 
+    def test_diagnostic_profile_invalidates_standard_validation_approval(self):
+        for validated, changed in (('0', '1'), ('1', '0')):
+            with patch.dict(os.environ, VESSEL_DIAGNOSTIC_ROSETTA=validated), self.rebuilt_fixture() as (config, lock, args, images, report):
+                self.assertTrue(v.check_vessel_built(config, lock, args))
+                with patch.dict(os.environ, VESSEL_DIAGNOSTIC_ROSETTA=changed), patch.object(v, 'check_jailed_execution') as jail:
+                    self.assertFalse(v.check_vessel_built(config, lock, args))
+                    jail.assert_not_called()
+
+    def test_diagnostic_preflight_requires_explicit_vessel_built_opt_in(self):
+        with patch.dict(os.environ, VESSEL_DIAGNOSTIC_ROSETTA='1'), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                v.main(['--image-mode', 'vessel-built', '--verify-vessel-built'])
+        with patch.dict(os.environ, VESSEL_DIAGNOSTIC_ROSETTA='0'), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                v.main(['--diagnostic-rosetta'])
+            with patch.object(v, 'prepare_vessel_lock') as prepare:
+                self.assertEqual(v.main(['--diagnostic-rosetta', '--image-mode', 'vessel-built',
+                                         '--prepare-vessel-lock', '/tmp/not-created']), 0)
+                prepare.assert_called_once()
+                self.assertEqual(os.environ['VESSEL_DIAGNOSTIC_ROSETTA'], '1')
+
     def test_git_build_revision_hashes_raw_blobs_and_rejects_mismatch(self):
         import hashlib
         blobs = [b'FROM pinned\n', b'FROM rust\n\n']
@@ -442,7 +463,7 @@ class SmokeTests(unittest.TestCase):
             shim.write_text('#!' + sys.executable + '\nimport os,sys,json\n'
                             'from pathlib import Path\n'
                             'if sys.argv[1].endswith("vessel_preflight.py"):\n'
-                            ' if "--verify-vessel-built" in sys.argv: sys.exit(1)\n'
+                            ' if "--verify-vessel-built" in sys.argv: print(json.dumps(sys.argv)); sys.exit(1)\n'
                             ' ok=os.environ.get("TEST_INITIAL_PASS")=="yes"\n'
                             ' p=Path(sys.argv[sys.argv.index("--json-report")+1]); p.write_text(json.dumps({"preflight_passed":ok,"models":{"architect":{},"editor":{}}})); sys.exit(0 if ok else 1)\n'
                             'os.execv(sys.executable,[sys.executable]+sys.argv[1:])\n')
@@ -451,9 +472,11 @@ class SmokeTests(unittest.TestCase):
             bash = root / 'bash'
             bash.write_text('#!/bin/sh\nprintf forbidden >"' + str(sentinel) + '"\nexit 99\n')
             bash.chmod(0o755)
-            for mode, initial_pass in (('original', False), ('vessel-built', False), ('vessel-built', True)):
-                output = root / ('diagnostic-%s-%s' % (mode, initial_pass))
-                result = subprocess.run(self.command('--image-mode', mode, '--generate', '--output-dir', str(output)), cwd=ROOT,
+            for mode, initial_pass, rosetta in (('original', False, False), ('vessel-built', False, False),
+                                                ('vessel-built', True, False), ('vessel-built', True, True)):
+                output = root / ('diagnostic-%s-%s-%s' % (mode, initial_pass, rosetta))
+                extra = ['--diagnostic-rosetta'] if rosetta else []
+                result = subprocess.run(self.command('--image-mode', mode, '--generate', '--output-dir', str(output), *extra), cwd=ROOT,
                                         env=dict(os.environ, PYTHON_BIN=str(shim), TMPDIR=temp,
                                                  TEST_INITIAL_PASS='yes' if initial_pass else 'no',
                                                  PATH=temp + os.pathsep + os.environ['PATH']), capture_output=True, text=True)
@@ -462,8 +485,83 @@ class SmokeTests(unittest.TestCase):
                 self.assertEqual(json.loads((output / 'preflight.json').read_text())['preflight_passed'], initial_pass)
                 if initial_pass:
                     self.assertTrue((output / 'image-recheck.log').exists())
+                    if rosetta:
+                        self.assertIn('--diagnostic-rosetta', (output / 'image-recheck.log').read_text())
                 else:
                     self.assertFalse((output / '000').exists())
+
+
+class RosettaDiagnosticTests(unittest.TestCase):
+    def test_docker_isolation_is_identical_except_explicit_worker_profile(self):
+        import docker_benchmark as docker
+        for action, language in (('case', 'c'), ('compile', 'c'), ('compile', 'rust'), ('compile', 'py')):
+            with patch.dict(os.environ, VESSEL_DIAGNOSTIC_ROSETTA='0'):
+                standard = docker.command(action, 'probe', language)
+                self.assertEqual(docker.execution_profile()['rlimit_as_bytes'], 256 * 1024**2)
+            with patch.dict(os.environ, VESSEL_DIAGNOSTIC_ROSETTA='1'):
+                diagnostic = docker.command(action, 'probe', language)
+                self.assertIs(docker.execution_profile()['formal_result'], False)
+                self.assertIsNone(docker.execution_profile()['rlimit_as_bytes'])
+            index = diagnostic.index('BENCHMARK_DIAGNOSTIC_ROSETTA=1')
+            self.assertEqual(diagnostic[index - 1], '-e')
+            del diagnostic[index - 1:index + 1]
+            self.assertEqual(diagnostic, standard)
+        with patch.dict(os.environ, VESSEL_DIAGNOSTIC_ROSETTA='unexpected'):
+            with self.assertRaises(docker.InfrastructureError):
+                docker.command('case', 'probe')
+        config = dict(docker.settings(), platform='linux/arm64')
+        with patch.dict(os.environ, VESSEL_DIAGNOSTIC_ROSETTA='1'), patch.object(docker, 'settings', return_value=config):
+            with self.assertRaises(docker.InfrastructureError):
+                docker.command('case', 'probe')
+
+    @unittest.skipUnless(os.name == 'posix', 'Linux resource module')
+    def test_only_address_space_rlimit_changes(self):
+        import docker_benchmark_worker as worker
+        import resource
+        observed = []
+        for mode in ('0', '1'):
+            with patch.dict(os.environ, BENCHMARK_DIAGNOSTIC_ROSETTA=mode), patch.object(worker.resource, 'setrlimit') as limit:
+                worker.set_jail_limits()
+                observed.append({call.args[0]: call.args[1] for call in limit.call_args_list})
+        self.assertEqual(observed[0].pop(resource.RLIMIT_AS), (256 * 1024**2,) * 2)
+        self.assertEqual(observed[1].pop(resource.RLIMIT_AS), (resource.RLIM_INFINITY,) * 2)
+        self.assertEqual(observed[0], observed[1])
+        self.assertEqual(observed[0], {resource.RLIMIT_CORE: (0, 0), resource.RLIMIT_CPU: (10, 10),
+                                      resource.RLIMIT_FSIZE: (64 * 1024**2,) * 2, resource.RLIMIT_NPROC: (16, 16)})
+
+    @unittest.skipUnless(os.name == 'posix', 'Bash entrypoints')
+    def test_formal_and_direct_generation_reject_diagnostic_environment(self):
+        for script in ('run_lineage_experiment.sh', 'run_experiment.sh'):
+            result = subprocess.run(['/bin/bash', str(ROOT / 'scripts' / script), '--help'],
+                                    env=dict(os.environ, VESSEL_DIAGNOSTIC_ROSETTA='1',
+                                             VESSEL_DIAGNOSTIC_GENERATION_APPROVED='0'), capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn('Rosetta diagnostics', result.stderr)
+        result = subprocess.run(['/bin/bash', str(ROOT / 'scripts/run_lineage_experiment.sh'), '--help'],
+                                env=dict(os.environ, VESSEL_DIAGNOSTIC_ROSETTA='1',
+                                         VESSEL_DIAGNOSTIC_GENERATION_APPROVED='1'), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+
+    @unittest.skipUnless(os.name == 'posix', 'Bash metadata writer')
+    def test_diagnostic_attempt_metadata_cannot_claim_formal_results(self):
+        import shlex
+        script = (ROOT / 'scripts/run_experiment.sh').read_text()
+        writer = 'write_metadata() {' + script.split('write_metadata() {', 1)[1].split('\n}\n', 1)[0] + '\n}\n'
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp) / 'metadata.json'
+            for mode in ('0', '1'):
+                result = subprocess.run(['/bin/bash'], input=writer + '\nwrite_metadata ' + shlex.quote(str(target)) + ' formal_result true\n',
+                                        env=dict(os.environ, PYTHON_BIN=sys.executable, VESSEL_DIAGNOSTIC_ROSETTA=mode),
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                data = json.loads(target.read_text())
+                self.assertEqual(data['formal_result'], mode == '0')
+                if mode == '1':
+                    self.assertIs(data['diagnostic_only'], True)
+                    self.assertEqual(data['execution_profile'], 'vessel-rosetta-diagnostic')
+                    self.assertIsNone(data['rlimit_as_bytes'])
+                else:
+                    self.assertNotIn('execution_profile', data)
 
 
 @unittest.skipUnless(os.name == 'posix', 'Bash regression tests run under WSL/macOS')

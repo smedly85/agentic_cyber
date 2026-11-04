@@ -245,6 +245,47 @@ Repeat with `rust-cp` and `py-cp`, each using a new output directory. Successful
 diagnostics do not authorize formal experiments or establish historical model,
 image or timing equivalence. Existing model and sampling settings are unchanged.
 
+### Optional Rosetta diagnostic profile (never formal)
+
+If Rosetta cannot execute with the 256 MiB address-space limit, explicitly add
+`--diagnostic-rosetta` to vessel-built validation, approval, preflight and smoke
+commands. This sets only the jailed `RLIMIT_AS` soft/hard limits to unlimited.
+The Docker 768 MiB memory cap, CPU/time/file/process limits, non-root chroot,
+read-only filesystem, capability restrictions and network isolation remain
+unchanged. The standard profile still enforces 256 MiB; formal lineage runs
+reject the diagnostic profile.
+
+Validation/approval binds the profile, so standard-profile evidence cannot
+authorize Rosetta diagnostics or vice versa. After updating to a clean reviewed
+checkout, recapture image provenance as above, then use a new validation directory:
+
+```bash
+PROFILE=(--image-mode vessel-built --diagnostic-rosetta)
+export VESSEL_VALIDATION="$V/validation-rosetta/validation.json"
+export VESSEL_APPROVAL="$V/approval-rosetta.json"
+python3 -B scripts/vessel_preflight.py "${PROFILE[@]}" \
+  --validate-vessel-built "$V/validation-rosetta"
+```
+
+Review the full reports as above before explicitly approving:
+
+```bash
+python3 -B scripts/vessel_preflight.py "${PROFILE[@]}" \
+  --approve-vessel-validation "$VESSEL_APPROVAL"
+bash scripts/vessel_smoke_stage.sh "${PROFILE[@]}" --selector c-cp \
+  --timeout 1800 --max-loops 1 "${SAMPLING[@]}" \
+  --output-dir "$V/rosetta-c-cp" --generate
+```
+
+Use a new output directory for each diagnostic. Do not export the internal
+profile/authorization variables manually: the wrapper sets them and refuses
+implicit inherited opt-in. Before Aider starts, it runs the actual jailed C
+architecture/isolation/rlimit test (expecting unlimited address space only in
+this profile), plus Rust and Python jailed controls. Failed probes stop generation.
+Validation, judge reports, attempt metadata and smoke summaries identify these
+results as diagnostic and non-formal. They are not comparable formal results or
+lineage seeds. Model settings and benchmark expectations are unchanged.
+
 ## 2. Preflight (Mode A)
 
 ```bash
