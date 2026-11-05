@@ -24,7 +24,7 @@ set -uo pipefail
 usage() {
     cat <<'EOF'
 Usage:
-  vessel_smoke_stage.sh --selector c-cp|rust-cp|py-cp --timeout SECONDS \
+  vessel_smoke_stage.sh --selector LANGUAGE-UTILITY --timeout SECONDS \
       --temperature T --architect-think false|low|medium|high \
       --sampling-seed N --num-ctx N [--max-tokens N] [--top-p P] \
       [--max-loops 0|1] [--ollama-url URL] [--architect-model M] \
@@ -34,6 +34,7 @@ Usage:
 
 Temperature, thinking, seed and context must be supplied explicitly; token cap
 and top-p remain optional (see docs/benchmarks/linux-utilities-vessel.md).
+LANGUAGE is c, rust or py; UTILITY is cp, mv, mkdir or sort (all 12 combinations).
 The editor is pinned by scripts/aider_settings.py (temperature 0, seed 0) and
 uses --editor-edit-format editor-diff.
 EOF
@@ -100,8 +101,8 @@ profile_args=()
 [[ "$DIAGNOSTIC_ROSETTA" == 1 ]] && profile_args+=(--diagnostic-rosetta)
 
 case "$SELECTOR" in
-    c-cp|rust-cp|py-cp) ;;
-    *) die "--selector must be c-cp, rust-cp or py-cp" ;;
+    c-cp|c-mv|c-mkdir|c-sort|rust-cp|rust-mv|rust-mkdir|rust-sort|py-cp|py-mv|py-mkdir|py-sort) ;;
+    *) die "--selector must be a standardized c/rust/py cp/mv/mkdir/sort configuration" ;;
 esac
 [[ "$TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || die "--timeout must be a positive integer (explicit bound required)"
 [[ "$MAX_LOOPS" == 0 || "$MAX_LOOPS" == 1 ]] || die "--max-loops must be 0 or 1 for a smoke test"

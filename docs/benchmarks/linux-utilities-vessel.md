@@ -12,10 +12,23 @@ Docker all run locally, so no tunnel and no remote endpoint are involved.
 | Reused unchanged | `lineage_plan.py`, `stage_test_bundle.py`, `run_experiment.sh`, `heldout_judge.py` (via the manifest `extra_test_command`), `checkpoint_boundary_gate.py`, `docker_benchmark.py` |
 
 The smoke wrapper's `run_experiment.sh` arguments are identical to the stage-000
-line from `run_lineage_experiment.sh --dry-run` (checked on WSL for all three
+line from `run_lineage_experiment.sh --dry-run` (checked on WSL for all twelve
 selectors). Diagnostic differences: `--max-loops` is capped at 1, the output directory must
 be new and outside the repository, and observed model provenance is forwarded
 after preflight. The print-only plan has no observed model provenance yet.
+
+Supported selectors (each smoke invocation runs checkpoint `000` only):
+
+| Language | Selectors |
+|---|---|
+| C | `c-cp`, `c-mv`, `c-mkdir`, `c-sort` |
+| Rust | `rust-cp`, `rust-mv`, `rust-mkdir`, `rust-sort` |
+| Python | `py-cp`, `py-mv`, `py-mkdir`, `py-sort` |
+
+Every smoke starts with `source-mode=new`, no inherited flags or seed, and its
+canonical language-specific source, build command, executable, prompt and public
+test bundle. Held-out evaluation and the checkpoint boundary gate stay
+controller-only. The diagnostic repair budget remains at most one.
 
 ## 1. Mode A: original validated AMD64 images under emulation
 
@@ -145,6 +158,7 @@ git status --short
 git rev-parse HEAD
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHON_BIN="$(command -v python3)"
+SELECTORS=(c-cp c-mv c-mkdir c-sort rust-cp rust-mv rust-mkdir rust-sort py-cp py-mv py-mkdir py-sort)
 V="$(mktemp -d "$HOME/linux-utilities-vessel.XXXXXX")"
 mkdir "$V/tmp"
 export TMPDIR="$V/tmp"
@@ -191,12 +205,22 @@ python3 -B scripts/vessel_preflight.py --image-mode vessel-built \
 
 Validation runs all four trusted GNU oracles, real Docker C/Rust/Python isolation
 and boundary controls, calibration for all twelve selectors against public and
-held-out expectations, three checkpoint-000 entrypoint controls and static
+held-out expectations, twelve checkpoint-000 entrypoint controls and static
 contract checks. It invokes no Aider or Ollama. A failed step stops validation
 and is an infrastructure/environment failure, never a generated-candidate result.
 Compiler signals, abnormal statuses and identifiable toolchain/resource failures
 also stop candidate validation as infrastructure errors; ordinary syntax/type
 errors remain candidate failures.
+
+The independent workflow now has **16 stages instead of 7**: trusted oracle,
+integration/static test module run, all-selector calibration, twelve separate
+entrypoint validators, and final static checks. The nine added entrypoint stages
+each require summary/public/held-out reports. Toolchain, judging-input and
+checkpoint-000 prerequisite checks also cover all twelve selectors. Earlier
+cp-only validation/approval is insufficient, even if still within 24 hours;
+recapture after updating the clean checkout, revalidate in a new directory and
+approve the new evidence. `--selector` restricts normal preflight only; it does
+not narrow independent vessel-built validation or its required evidence.
 
 `validation.json` hashes the logs and reports and binds successful commands and
 prerequisite checks to the exact lock, provenance, images and environment.
@@ -212,14 +236,14 @@ cat "$V/validation/oracle/validation.log"
 cat "$V/validation/step-01.log"
 cat "$V/validation/calibration/summary.json"
 cat "$V/validation/static/summary.json"
-for s in c-cp rust-cp py-cp; do cat "$V/validation/entry-$s/summary.json"; done
+for s in "${SELECTORS[@]}"; do cat "$V/validation/entry-$s/summary.json"; done
 # Only after the complete evidence is acceptable:
 python3 -B scripts/vessel_preflight.py --image-mode vessel-built \
   --approve-vessel-validation "$VESSEL_APPROVAL"
 SAMPLING=(--temperature 1.0 --architect-think low --sampling-seed 42 --num-ctx 65536 --max-tokens 65536)
 python3 -B scripts/vessel_preflight.py --image-mode vessel-built "${SAMPLING[@]}" \
   --json-report "$V/preflight.json" 2>&1 | tee "$V/preflight.log"
-for s in c-cp rust-cp py-cp; do
+for s in "${SELECTORS[@]}"; do
   bash scripts/vessel_smoke_stage.sh --image-mode vessel-built --selector "$s" \
     --timeout 1800 --max-loops 1 "${SAMPLING[@]}" --output-dir "$V/smoke-$s" \
     | tee "$V/print-$s.log"
@@ -241,7 +265,7 @@ bash scripts/vessel_smoke_stage.sh --image-mode vessel-built --selector c-cp \
   --timeout 1800 --max-loops 1 "${SAMPLING[@]}" --output-dir "$V/smoke-c-cp" --generate
 ```
 
-Repeat with `rust-cp` and `py-cp`, each using a new output directory. Successful
+Repeat with any of the twelve selectors, each using a new output directory. Successful
 diagnostics do not authorize formal experiments or establish historical model,
 image or timing equivalence. Existing model and sampling settings are unchanged.
 
@@ -347,8 +371,9 @@ set -euo pipefail
 export PYTHONDONTWRITEBYTECODE=1
 V="$HOME/linux-utilities-smoke/docker-validation-$(date -u +%Y%m%dT%H%M%SZ)"; mkdir -p "$V"
 python3 -m unittest tests.test_docker_benchmark_integration tests.test_cross_language_docker 2>&1 | tee "$V/unittest.log"
-python3 scripts/validate_docker_adapter.py --utility c-cp --utility rust-cp --utility py-cp --output "$V/calibration"
-for s in c-cp rust-cp py-cp; do
+SELECTORS=(c-cp c-mv c-mkdir c-sort rust-cp rust-mv rust-mkdir rust-sort py-cp py-mv py-mkdir py-sort)
+python3 scripts/validate_docker_adapter.py --output "$V/calibration"
+for s in "${SELECTORS[@]}"; do
   python3 scripts/validate_docker_entrypoints.py --utility "$s" --output "$V/entry-$s" || exit $?
 done
 ```
@@ -386,7 +411,8 @@ and included in the final plan fingerprint. It then:
 export PYTHON_BIN="$(command -v python3)"
 SAMPLING=(--temperature 1.0 --architect-think low --sampling-seed 42 --num-ctx 65536 --max-tokens 65536)  # explicit diagnostic selection; not historical equivalence
 mkdir -p "$HOME/linux-utilities-smoke"
-for s in c-cp rust-cp py-cp; do
+SELECTORS=(c-cp c-mv c-mkdir c-sort rust-cp rust-mv rust-mkdir rust-sort py-cp py-mv py-mkdir py-sort)
+for s in "${SELECTORS[@]}"; do
   bash scripts/vessel_smoke_stage.sh --selector "$s" --timeout 1800 --max-loops 1 "${SAMPLING[@]}" \
     --ollama-url http://127.0.0.1:11434 \
     --output-dir "$HOME/linux-utilities-smoke/$s-$(date -u +%Y%m%dT%H%M%SZ)"          # print only
@@ -397,7 +423,7 @@ bash scripts/vessel_smoke_stage.sh --selector c-cp --timeout 1800 --max-loops 1 
   --output-dir "$HOME/linux-utilities-smoke/c-cp-$(date -u +%Y%m%dT%H%M%SZ)" --generate
 ```
 
-Repeat the `--generate` command with `--selector rust-cp`, then `--selector py-cp`.
+Repeat the `--generate` command with any selector from `SELECTORS` above.
 Each run uses a fresh directory and starts from no source, so the candidates are
 independent.
 

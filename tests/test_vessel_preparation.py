@@ -340,6 +340,47 @@ class PreflightTests(unittest.TestCase):
                      'tests/test_docker_benchmark_integration.py'):
             ast.parse((ROOT / name).read_text(), filename=name)
 
+    def test_all_twelve_selectors_require_independent_entrypoint_evidence(self):
+        import linux_utilities_catalog as catalog
+        self.assertEqual(v.DEFAULT_SELECTORS, catalog.SELECTORS)
+        self.assertEqual(len(v.DEFAULT_SELECTORS), 12)
+        with self.rebuilt_fixture() as (config, lock, args, images, report):
+            commands = v.validation_commands(args.vessel_validation.parent, config)
+            self.assertEqual(len(commands), 16)  # oracle, integration, calibration, 12 entrypoints, static
+            entries = [cmd for cmd in commands if '--utility' in cmd]
+            self.assertEqual([cmd[cmd.index('--utility') + 1] for cmd in entries], list(catalog.SELECTORS))
+            original = args.vessel_validation.read_text()
+            for selector in catalog.SELECTORS:
+                for kind in ('summary', 'public', 'heldout'):
+                    relative = 'entry-%s/%s.json' % (selector, kind)
+                    path = args.vessel_validation.parent / relative
+                    saved = path.read_bytes()
+                    path.unlink()
+                    # Even rehashing a directory with a missing report must fail.
+                    changed = dict(report, files=v.validation_files(path.parent.parent))
+                    args.vessel_validation.write_text(json.dumps(changed))
+                    self.assertFalse(v.check_vessel_built(config, lock, args, require_approval=False), relative)
+                    path.write_bytes(saved)
+                changed = dict(report, checks=[r for r in report['checks']
+                                              if r['check'] != 'checkpoint 000 ' + selector])
+                args.vessel_validation.write_text(json.dumps(changed))
+                self.assertFalse(v.check_vessel_built(config, lock, args, require_approval=False), selector)
+            args.vessel_validation.write_text(original)
+            self.assertTrue(v.check_vessel_built(config, lock, args))
+            # The old cp-only command list cannot authorize any selector now.
+            old = [cmd for cmd in commands if '--utility' not in cmd or cmd[cmd.index('--utility') + 1].endswith('-cp')]
+            self.assertEqual(len(old), 7)
+            args.vessel_validation.write_text(json.dumps(dict(report, commands=old, returncodes=[0] * len(old))))
+            self.assertFalse(v.check_vessel_built(config, lock, args, require_approval=False))
+
+    def test_invalid_preflight_selector_rejected_before_checks(self):
+        with patch.object(v, 'check_git') as git, contextlib.redirect_stderr(io.StringIO()):
+            for selector in ('cp', 'python-cp', 'c-ls', 'c-cp/../sort'):
+                with self.assertRaises(SystemExit) as error:
+                    v.main(['--selector', selector])
+                self.assertEqual(error.exception.code, 2)
+            git.assert_not_called()
+
     def test_diagnostic_profile_invalidates_standard_validation_approval(self):
         for validated, changed in (('0', '1'), ('1', '0')):
             with patch.dict(os.environ, VESSEL_DIAGNOSTIC_ROSETTA=validated), self.rebuilt_fixture() as (config, lock, args, images, report):
@@ -437,24 +478,86 @@ class SmokeTests(unittest.TestCase):
                 result = subprocess.run(self.command(*extra), cwd=ROOT, env=dict(os.environ, TMPDIR=tmp), capture_output=True, text=True)
                 self.assertEqual(result.returncode, 2, result.stderr)
 
-    def test_bash_syntax_and_three_checkpoint_zero_print_commands(self):
+    def test_all_twelve_checkpoint_zero_commands_match_formal_dry_run(self):
         import shlex
         import lineage_plan
-        for script in ('scripts/vessel_smoke_stage.sh', 'docker/linux-utilities/build.sh', 'docker/linux-utilities/run.sh'):
+        import stage_test_bundle
+        import docker_benchmark
+        for script in ('scripts/vessel_smoke_stage.sh', 'scripts/run_lineage_experiment.sh',
+                       'scripts/run_experiment.sh', 'docker/linux-utilities/build.sh', 'docker/linux-utilities/run.sh'):
             subprocess.run(['/bin/bash', '-n', str(ROOT / script)], check=True)
         with tempfile.TemporaryDirectory() as temp:
+            sentinel = Path(temp) / 'backend-called'
+            for tool in ('aider', 'ollama', 'docker'):
+                stub = Path(temp) / tool
+                stub.write_text('#!/bin/sh\ntouch ' + shlex.quote(str(sentinel)) + '\nexit 99\n')
+                stub.chmod(0o755)
+            env = dict(os.environ, TMPDIR=temp, PYTHON_BIN=sys.executable,
+                       PATH=temp + os.pathsep + os.environ['PATH'], AIDER_BIN=str(Path(temp) / 'absent-aider'),
+                       VESSEL_DIAGNOSTIC_ROSETTA='0', PYTHONDONTWRITEBYTECODE='1')
             for selector in v.DEFAULT_SELECTORS:
                 command = self.command('--image-mode', 'vessel-built', '--output-dir', str(Path(temp) / selector))
                 command[command.index('--selector') + 1] = selector
-                result = subprocess.run(command, cwd=ROOT, env=dict(os.environ, TMPDIR=temp), capture_output=True, text=True)
+                command[command.index('--temperature') + 1] = '1.0'
+                # Both standard and explicit Rosetta profiles plan identically;
+                # only validation/authorization and diagnostic metadata differ.
+                result = subprocess.run(command, cwd=ROOT, env=env, capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertFalse((Path(temp) / selector).exists())
                 line = next(row.strip() for row in result.stdout.splitlines() if row.startswith('  bash scripts/run_experiment.sh'))
                 words = shlex.split(line)
                 plan = lineage_plan.resolve_plan(ROOT, selector, '', '1', None, 1, 1)
+                manifest = json.loads((ROOT / 'experiments/utilities' / (selector + '.json')).read_text())
+                checkpoint = plan['checkpoints'][0]
+                self.assertEqual(checkpoint['id'], '000')
+                self.assertEqual(checkpoint['source_mode'], 'new')
+                self.assertEqual(checkpoint['implemented_flags'], [])
+                self.assertEqual(words[words.index('--source-mode') + 1], 'new')
+                self.assertNotIn('--seed-file', words)
+                self.assertEqual(words[words.index('--prompt') + 1], checkpoint['prompt'])
+                self.assertEqual(checkpoint['prompt'], manifest['checkpoints'][0]['prompt'])
+                self.assertEqual(plan['executable_path'], manifest['executable_path'])
+                self.assertEqual(words[words.index('--test-dir') + 1].split(':', 1)[1], manifest['test_dir'])
+                language = selector.split('-', 1)[0]
+                self.assertEqual(Path(plan['source_path']).suffix, {'c': '.c', 'rust': '.rs', 'py': '.py'}[language])
+                compiler = docker_benchmark.command('compile', 'planning-only', language)
+                key = 'rust_compiler_image' if language == 'rust' else 'compiler_image'
+                self.assertEqual(compiler[compiler.index('-i') + 1], docker_benchmark.settings()[key])
+                bundle = stage_test_bundle.build_payload(ROOT, manifest['test_dir'], checkpoint, selector)
+                self.assertEqual(bundle['manifest']['bundle_fingerprint'], checkpoint['test_bundle_fingerprint'])
+                self.assertIn(checkpoint['test_bundle_fingerprint'], result.stdout)
+                self.assertFalse(any(name.startswith(('heldout/', 'gen/', 'model/')) for name in bundle['files']))
                 for option, field in (('--build-cmd', 'build_command'), ('--extra-test-cmd', 'extra_test_command'), ('--source', 'source_path')):
                     self.assertEqual(words[words.index(option) + 1], plan[field])
-                self.assertEqual(words[words.index('--feature-test-cmd') + 1], plan['checkpoints'][0]['feature_test_command'])
+                    self.assertEqual(plan[field], manifest[field])
+                self.assertEqual(words[words.index('--feature-test-cmd') + 1], checkpoint['feature_test_command'])
+                formal = subprocess.run(['/bin/bash', str(ROOT / 'scripts/run_lineage_experiment.sh'),
+                    '--dry-run', '--utility', selector, '--lineages', '1', '--max-loops', '1', '--timeout', '1',
+                    '--temperature', '1', '--architect-think', 'low', '--sampling-seed', '42', '--num-ctx', '65536',
+                    '--model', 'ollama_chat/qwen3.8:27b', '--editor-model', 'ollama_chat/qwen3-coder-next:latest',
+                    '--editor-edit-format', 'editor-diff', '--remote-base-url', 'http://127.0.0.1:11434',
+                    '--output-dir', str(Path(temp) / ('formal-' + selector))],
+                    cwd=ROOT, env=env, capture_output=True, text=True)
+                self.assertEqual(formal.returncode, 0, formal.stderr)
+                self.assertFalse((Path(temp) / ('formal-' + selector)).exists())
+                formal_line = next(row for row in formal.stdout.splitlines() if '[000 ' in row and 'bash scripts/run_experiment.sh' in row)
+                formal_words = shlex.split(formal_line[formal_line.index('bash scripts/run_experiment.sh'):])
+                for option in ('--output-dir', '--test-dir'):
+                    formal_words[formal_words.index(option) + 1] = words[words.index(option) + 1]
+                self.assertEqual(words, formal_words, selector)
+                rosetta = subprocess.run(command + ['--diagnostic-rosetta'], cwd=ROOT, env=env, capture_output=True, text=True)
+                self.assertEqual(rosetta.returncode, 0, rosetta.stderr)
+                self.assertIn(line, rosetta.stdout)
+                self.assertIn('non-formal', rosetta.stdout)
+                self.assertFalse(sentinel.exists())
+                self.assertFalse((Path(temp) / selector).exists())
+
+    def test_rejected_selectors_and_options_fail_before_generation(self):
+        for extra in (('--selector', 'cp'), ('--selector', 'python-cp'), ('--selector', 'c-ls'),
+                      ('--selector', 'c-sort/../cp'), ('--max-loops', '2'), ('--timeout', '0'),
+                      ('--unknown',), ('--selector',), ('--diagnostic-rosetta',), ('--image-mode', 'unknown')):
+            result = subprocess.run(self.command(*extra), cwd=ROOT, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2, (extra, result.stderr))
 
     def test_failed_preflight_cannot_reach_runner_and_retains_report(self):
         with tempfile.TemporaryDirectory() as temp:
