@@ -41,9 +41,20 @@ unlimited diagnostic modes; it is not adapted or weakened for the sweep.
 
 Transfer this directory alongside the reviewed repository. Substitute your
 existing absolute pinned lock path. No image is built or intentionally pulled
-by the harness; it inspects both required pinned images locally before execution
-and stops if either is absent. Docker's existing worker command and pull policy
+by the harness. Each exact pinned compiler/oracle reference must execute using
+`--pull never --platform linux/amd64` and report `uname -m` as `x86_64` before
+measurements begin. Failed execution or a different architecture stops collection
+after saving `metadata.json`. Docker's existing worker command and pull policy
 are unchanged; do not remove images during collection.
+
+Image inspection is best-effort: platform-specific and ordinary inspection of
+the original pinned reference are recorded, including raw output, errors and
+unavailable Descriptor/OS/architecture fields. Inspection failure or incomplete
+metadata alone does not block measurement. All collected image metadata remains
+explicitly **unverified**, even if an image ID is present. Successful execution
+proves local usability of that exact reference, not formal image provenance.
+No local image ID is substituted for the pinned execution reference, and formal
+preflight/image validation is unchanged.
 
 ```bash
 cd ~/agentic_cyber
@@ -131,5 +142,8 @@ or provenance change is justified by the currently available measurements.
 `py -3 -B diagnostics/vessel_runtime_probe.py --repo . --self-test` verifies 12
 combinations of cap, instrumentation and inherited diagnostic environment using
 a stub resource API. It verifies exact soft/hard arguments and all other rlimits,
-parses substituted sources, and rejects a missing substitution target. It does
-not validate Linux kernel behavior, Docker transport, or Vessel runtime.
+parses substituted sources, and rejects a missing substitution target. Mocked
+image checks also cover failed, incomplete and malformed inspection; preservation
+of pinned references and errors; and rejection of failed, timed-out or wrong-arch
+execution. These checks do not validate Linux kernel behavior, Docker transport,
+or Vessel runtime.

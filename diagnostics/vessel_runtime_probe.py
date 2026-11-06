@@ -83,6 +83,34 @@ __attribute__((constructor)) static void started(void) {
 '''
 
 
+def diagnostic_image(vessel, ref):
+    """Best-effort metadata; exact-reference execution is the diagnostic gate."""
+    evidence = {'pinned_reference': ref, 'metadata_status': 'unverified',
+                'formal_provenance_verified': False, 'inspections': []}
+    for options in (['--platform', 'linux/amd64'], []):
+        command = ['docker', 'image', 'inspect', *options, ref]
+        attempt = {'command': command}
+        try:
+            code, out, err = vessel.run(command, timeout=30)
+            attempt.update(returncode=code, stdout=out, stderr=err)
+            if code == 0:
+                data = json.loads(out)[0]
+                attempt['metadata'] = data
+                attempt['unavailable_fields'] = [key for key in ('Descriptor', 'Os', 'Architecture')
+                                                  if not data.get(key)]
+        except Exception as error:
+            attempt['error'] = repr(error)
+        evidence['inspections'].append(attempt)
+    try:
+        # Existing bounded probe uses this exact ref, --pull never, linux/amd64,
+        # and requires uname -m == x86_64. No image-ID substitution is permitted.
+        evidence['execution_architecture'] = vessel.probe_reference(ref)
+        evidence['execution_verified'] = evidence['execution_architecture'] == 'x86_64'
+    except Exception as error:
+        evidence.update(execution_verified=False, execution_error=repr(error))
+    return evidence
+
+
 def self_test(source):
     from types import SimpleNamespace
     for limit in (None, 256 * 1024**2, 4 * 1024**3):
@@ -109,6 +137,31 @@ def self_test(source):
     else:
         raise AssertionError('missing substitution was accepted')
     print('PASS: 12 limit/instrumentation/environment combinations; other rlimits unchanged; drift rejected')
+    ref = 'python:3.12.8-bookworm@sha256:' + 'a' * 64
+    for inspections in ([(1, '', 'reference cannot be inspected')] * 2,
+                        [(0, '[{"Id":"sha256:local"}]', '')] * 2,
+                        [(0, 'invalid JSON', '')] * 2):
+        fake = SimpleNamespace(run=unittest.mock.Mock(side_effect=inspections),
+                               probe_reference=unittest.mock.Mock(return_value='x86_64'))
+        evidence = diagnostic_image(fake, ref)
+        assert evidence['execution_verified'] and evidence['pinned_reference'] == ref
+        assert not evidence['formal_provenance_verified'] and evidence['metadata_status'] == 'unverified'
+        assert len(evidence['inspections']) == 2
+        fake.probe_reference.assert_called_once_with(ref)
+        assert all(call.args[0][-1] == ref for call in fake.run.call_args_list)
+        if 'local' in inspections[0][1]:
+            assert evidence['inspections'][0]['unavailable_fields'] == ['Descriptor', 'Os', 'Architecture']
+        elif inspections[0][0]:
+            assert evidence['inspections'][0]['stderr'] == inspections[0][2]
+        else:
+            assert 'error' in evidence['inspections'][0]
+    for result in ('aarch64', RuntimeError('execution failed'), TimeoutError('probe timed out')):
+        fake.probe_reference.reset_mock()
+        fake.probe_reference.side_effect = result if isinstance(result, Exception) else None
+        fake.probe_reference.return_value = result
+        fake.run.side_effect = [(1, '', 'unavailable')] * 2
+        assert not diagnostic_image(fake, ref)['execution_verified']
+    print('PASS: unavailable/incomplete/malformed inspection tolerated; wrong-arch/failed/timed-out execution rejected')
 
 
 def main():
@@ -148,9 +201,11 @@ def main():
     (output / 'lock.json').write_bytes(args.lock.read_bytes())
     metadata = {'diagnostic_only': True, 'formal_result': False, 'config': config,
                 'worker_sha256': hashlib.sha256(original.encode()).hexdigest()}
-    # Fail before execution if either required pinned image is absent locally.
-    metadata['images'] = {key: vessel.inspect_image(config[key], 'linux/amd64')
+    metadata['images'] = {key: diagnostic_image(vessel, config[key])
                           for key in ('compiler_image', 'oracle_image')}
+    (output / 'metadata.json').write_text(json.dumps(metadata, indent=2))
+    if not all(image['execution_verified'] for image in metadata['images'].values()):
+        raise RuntimeError('exact pinned image execution check failed; see metadata.json')
     for label, command in [('revision', ['git', '-C', str(repo), 'rev-parse', 'HEAD']),
                            ('status', ['git', '-C', str(repo), 'status', '--short']),
                            ('docker-version', ['docker', 'version']),
