@@ -82,7 +82,7 @@ int main(void) {
     if (getrlimit(resources[i], &limit) || limit.rlim_cur != limits[i] || limit.rlim_max != limits[i]) return 21;
   }
   if (EXPECT_AS_LIMIT) {
-    void *too_large = malloc(512UL*1024*1024);
+    void *too_large = malloc((size_t)EXPECTED_AS + 4096UL);
     if (too_large) { free(too_large); return 22; }
   }
   const char *paths[] = {"/opt/gnu/bin/cp", "/bin/cp", "/work", "/proc/1/environ",
@@ -100,7 +100,8 @@ int main(void) {
   puts("isolated uid=1000"); return 0;
 }
 '''.replace('if (chroot("/")==0) return 12;', 'if (setuid(0)==0) return 12;')
-           .replace('EXPECTED_AS', 'RLIM_INFINITY' if docker.execution_profile().get('diagnostic_only') else '256UL*1024*1024')
+           .replace('EXPECTED_AS', 'RLIM_INFINITY' if docker.execution_profile().get('diagnostic_only')
+                    else str(docker.execution_profile()['rlimit_as_bytes']) + 'ULL')
            .replace('EXPECT_AS_LIMIT', '0' if docker.execution_profile().get('diagnostic_only') else '1')
            .replace('EXPECTED_ARCH', 'x86_64' if docker.settings()['platform'] == 'linux/amd64' else 'aarch64'))
         result = docker.execute_case('c-cp', binary.read_bytes(), {'args': [], 'fixture': []})['result']

@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 
 LIMIT_EXPR = """    address_space = (resource.RLIM_INFINITY if os.environ.get('BENCHMARK_DIAGNOSTIC_ROSETTA') == '1'
-                     else 256 * 1024**2)"""
+                     else 8 * 1024**3 if profile == 'vessel-8g' else 256 * 1024**2)"""
 
 
 def replace_once(text, old, new):
@@ -188,6 +188,7 @@ def main():
     os.environ['LINUX_BENCHMARK_LOCK'] = str(args.lock)
     os.environ.pop('C_BENCHMARK_LOCK', None)
     os.environ['VESSEL_DIAGNOSTIC_ROSETTA'] = '0'
+    os.environ['LINUX_BENCHMARK_PROFILE'] = 'standard'
     sys.path[:0] = [str(repo / 'scripts'), str(repo)]
     import docker_benchmark as docker
     import vessel_preflight as vessel
@@ -216,8 +217,7 @@ def main():
                            'stderr': result.stderr.decode(errors='replace')}
     try:
         # Existing trusted read-only metadata probe, using the selected compiler image.
-        with patch.object(vessel, 'DEFAULT_LOCK', args.lock):
-            metadata['emulation'] = vessel.emulation_identity()
+        metadata['emulation'] = vessel.emulation_identity()
     except Exception as error:
         metadata['emulation_error'] = repr(error)
     (output / 'metadata.json').write_text(json.dumps(metadata, indent=2))

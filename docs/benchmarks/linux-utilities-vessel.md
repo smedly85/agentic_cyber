@@ -1,5 +1,116 @@
 # linux-utilities on vessel: preflight and checkpoint-000 smoke tests
 
+## Fixed 8 GiB Vessel condition
+
+The explicit `LINUX_BENCHMARK_PROFILE=vessel-8g` condition sets jailed soft and
+hard `RLIMIT_AS` to **8589934592 bytes**. Unset the variable, or select `standard`,
+to retain 256 MiB. These are fixed choices; there is no arbitrary numeric override
+or automatic host detection. The finite Vessel condition requires linux/amd64,
+an explicit absolute `LINUX_BENCHMARK_LOCK`, and no conflicting legacy
+`C_BENCHMARK_LOCK`. It cannot be combined with unlimited Rosetta diagnostics.
+
+This choice follows operator-supplied diagnostic evidence: trusted probes failed
+at 4 GiB but passed at 8/12/16 GiB, and repaired cp checkpoint 000 passed 32 public
+and 32 selected held-out tests at 8 GiB. These observations are not formal results
+or all-language validation. The Docker 768 MiB memory cap and every other jail,
+CPU/time/process/file limit remain unchanged. Address space is not resident RAM.
+
+Judge reports and boundary reports record the selected profile and limit. The
+lineage configuration fingerprint and `lineages.json` execution environment now
+include it; direct experiment/sweep/attempt metadata carries `docker_execution`,
+and direct resume also checks that condition. Worker readback must match both
+configured limits. The existing C isolation control checks the selected value
+and rejects allocation beyond it. Public/held-out cases, checkpoint boundaries,
+and agent-visible bundles are unchanged. Use fresh formal output directories;
+do not resume historical 256 MiB runs as 8 GiB runs or reuse diagnostic candidates.
+
+Vessel uses **Docker Desktop**, not Colima. Use the existing local Docker context;
+do not install or start Colima. The emulator metadata probe now uses the selected
+lock's compiler reference. Strict image identity checks remain unchanged: an
+executable reference or local image ID without the required platform Descriptor
+is still insufficient for formal provenance. The temporary diagnostic harness's
+best-effort metadata policy does not apply here.
+
+Boot IDs remain in captured environment records. Only this field is excluded
+from cross-run provenance/validation/approval matching. Emulator registrations,
+interpreter hashes, images, Docker settings/versions, checkout, all evidence
+hashes, and the 24-hour validation expiry still bind approval. Fresh jailed
+C/Rust/Python controls are still required. Any boot/environment change *during*
+validation or a fresh jailed recheck fails. Never edit sealed old records; this
+code revision requires new evidence and approval.
+
+The existing approval mechanism still defaults to `diagnostic-only`. An explicit
+`--approval-scope formal-vessel-8g` can authorize **future fresh runs** only after
+complete matching 8 GiB validation and operator review. It cannot approve a
+standard/unlimited profile or consume an existing diagnostic-scope approval.
+Validation itself remains non-generative infrastructure evidence, not a formal
+experimental result. Formal lineage and direct finite-profile generation check
+the explicit formal approval before generation; the smoke wrapper remains
+diagnostic and selects diagnostic-only scope. No approval is issued by selecting
+the environment variable alone. Formal model/sampling conditions and identities
+still require explicit selection and provenance; smoke defaults do not establish
+historical equivalence.
+
+Run the following from a reviewed clean checkout on Vessel. Substitute the
+existing pinned lock and matching newly captured build-provenance paths. This
+does not change locks, pull/build images, generate candidates or approve runs:
+
+```bash
+cd ~/agentic_cyber
+set -euo pipefail
+export PYTHON_BIN="$(command -v python3)"
+export PYTHONDONTWRITEBYTECODE=1
+unset C_BENCHMARK_LOCK VESSEL_DIAGNOSTIC_GENERATION_APPROVED VESSEL_GENERATION_SCOPE
+export VESSEL_DIAGNOSTIC_ROSETTA=0
+export LINUX_BENCHMARK_PROFILE=vessel-8g
+export LINUX_BENCHMARK_LOCK="/absolute/path/to/pinned-vessel-lock.json"
+export VESSEL_BUILT_PROVENANCE="/absolute/path/to/new-matching/provenance.json"
+V="$(mktemp -d "$HOME/vessel-8g-validation.XXXXXX")"
+chmod 700 "$V"
+export VESSEL_VALIDATION="$V/validation/validation.json"
+export VESSEL_APPROVAL="$V/formal-approval.json"
+python3 -B scripts/docker_benchmark.py condition --utility c-cp | tee "$V/condition.json"
+
+# Fast check of the actual jailed controls in all three languages.
+python3 -B -m unittest -v \
+  tests.test_docker_benchmark_integration.DockerIntegration.test_nonroot_chroot_and_no_controller_assets \
+  tests.test_cross_language_docker.CrossLanguageDocker.test_real_rust_and_python_runtime_isolation_and_io \
+  2>&1 | tee "$V/jail-controls.log"
+
+# Complete existing 16-stage validation: all twelve selectors, public/held-out
+# calibration, entrypoints, oracle, isolation, boundaries and static contracts.
+python3 -B scripts/vessel_preflight.py --image-mode vessel-built \
+  --validate-vessel-built "$V/validation" 2>&1 | tee "$V/validation-console.log"
+```
+
+If formal image metadata is still unavailable, the final command must fail;
+resolve image provenance rather than bypassing the check. To independently
+exercise all languages while that issue is unresolved, the following remains
+non-formal runtime validation, using the same exported lock and finite profile:
+
+```bash
+python3 -B -m unittest -v tests.test_docker_benchmark_integration tests.test_cross_language_docker
+python3 -B scripts/validate_docker_adapter.py --output "$V/calibration-only"
+for s in c-cp c-mv c-mkdir c-sort rust-cp rust-mv rust-mkdir rust-sort py-cp py-mv py-mkdir py-sort; do
+  python3 -B scripts/validate_docker_entrypoints.py --utility "$s" --output "$V/entry-only-$s"
+done
+```
+
+Only after complete matching validation passes and its existing reports are
+reviewed, an operator may explicitly approve and recheck the new condition:
+
+```bash
+python3 -B scripts/vessel_preflight.py --image-mode vessel-built \
+  --approval-scope formal-vessel-8g --approve-vessel-validation "$VESSEL_APPROVAL"
+python3 -B scripts/vessel_preflight.py --image-mode vessel-built \
+  --approval-scope formal-vessel-8g --verify-vessel-built
+```
+
+Those commands do not generate candidates. Keep the same exports when later
+launching approved fresh lineages with explicitly chosen model/sampling settings.
+Do not pass `--diagnostic-rosetta` or export a diagnostic generation scope for a
+formal run. Ordinary smoke commands and the rest of this guide remain diagnostic.
+
 Diagnostic procedure only. It produces no formal results, no lineage seeds and no
 change to the AMD64 lock, corpora or validation evidence. Run everything from the
 repository root on vessel, in a native arm64 shell. The controller, Ollama and
@@ -354,7 +465,7 @@ Resolving failures (operator actions; preflight performs none of them):
 | python3 too old | `brew install python@3.12`, then put it first on `PATH` (or use `ac_venv/bin`) |
 | no timeout | `brew install coreutils` (provides `gtimeout`), or `ln -sf "$PWD/scripts/timeout.py" ~/.local/bin/timeout` |
 | aider missing or wrong version | `uv tool install --force aider-chat==0.86.2`, or `python3 -m pip install aider-install && aider-install`, then pin 0.86.2 |
-| docker/colima | `brew install docker colima`, then `colima start` with the intended profile |
+| Docker Desktop | start the existing Docker Desktop installation and check the selected local context |
 | image missing or unverified | stop; arrange reviewed image availability and the source-host evidence in section 1 |
 | Ollama down / model missing | start the existing service; `ollama pull <name>` only by explicit decision |
 

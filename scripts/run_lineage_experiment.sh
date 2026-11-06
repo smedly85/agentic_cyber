@@ -43,6 +43,11 @@ if [[ "${VESSEL_DIAGNOSTIC_ROSETTA:-0}" != 0 ]]; then
     echo 'error: Rosetta diagnostics cannot run as formal lineages' >&2
     exit 2
 fi
+if [[ "${LINUX_BENCHMARK_PROFILE:-standard}" == vessel-8g &&
+      "${VESSEL_GENERATION_SCOPE:-formal-vessel-8g}" != formal-vessel-8g ]]; then
+    echo 'error: diagnostic Vessel scope cannot authorize formal lineages' >&2
+    exit 2
+fi
 
 usage() {
     cat <<'EOF'
@@ -366,7 +371,9 @@ case "$UTILITY" in
     c-cp|c-mv|c-mkdir|c-sort|rust-cp|rust-mv|rust-mkdir|rust-sort|py-cp|py-mv|py-mkdir|py-sort)
         LINUX_BENCHMARK=1
         SECURITY_EVALUATION=0
-        export C_BENCHMARK_LOCK="${C_BENCHMARK_LOCK:-$REPO/docker/linux-utilities/lock-amd64.json}"
+        if [[ -z "${LINUX_BENCHMARK_LOCK:-}" ]]; then
+            export C_BENCHMARK_LOCK="${C_BENCHMARK_LOCK:-$REPO/docker/linux-utilities/lock-amd64.json}"
+        fi
         ;;
 esac
 [[ -n "$MODEL" ]] || die "--model is required"
@@ -677,6 +684,10 @@ if [[ "$SOURCE_PATH" == *.py ]]; then
 fi
 RUST_TOOLCHAIN_JSON=null
 if [[ "$DRY_RUN" -eq 0 && "$LINUX_BENCHMARK" -eq 1 ]]; then
+    if [[ "${LINUX_BENCHMARK_PROFILE:-standard}" == vessel-8g ]]; then
+        "$PYTHON_BIN" "$REPO/scripts/vessel_preflight.py" --image-mode vessel-built \
+            --verify-vessel-built --approval-scope formal-vessel-8g || exit 4
+    fi
     "$PYTHON_BIN" "$REPO/scripts/docker_benchmark.py" preflight --utility "$UTILITY" || exit 4
 fi
 if [[ "$DRY_RUN" -eq 0 && "$SOURCE_PATH" == *.rs && "$LINUX_BENCHMARK" -eq 0 ]]; then
@@ -982,6 +993,7 @@ record.update(
         "judge": plan["judge"],
         "required_platform": plan.get("required_platform"),
         "host_platform": plan.get("host_platform"),
+        "execution_environment": plan.get("execution_environment"),
         "config_fingerprint": plan["config_fingerprint"],
         # Security is independent instrumentation, so it has its own frozen
         # fingerprint and cannot perturb the generation configuration hash.

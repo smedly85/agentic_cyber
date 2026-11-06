@@ -495,8 +495,9 @@ def resolve_plan(
             "preferred_architecture": "aarch64", "formal_execution_enabled": True,
             "infrastructure_sha256": {name: sha256_file(repo / name) for name in infrastructure},
         }
-        from docker_benchmark import settings
+        from docker_benchmark import settings, execution_profile
         plan["execution_environment"]["docker"] = settings()
+        plan["execution_environment"]["execution_profile"] = execution_profile()
         plan["config_fingerprint"] = fingerprint(plan)
     return plan
 

@@ -151,7 +151,9 @@ class PreflightTests(unittest.TestCase):
                     data['Descriptor']['digest'] = 'sha256:' + str(index + 4) * 64
                 images[config[key]] = data
             del images[config['oracle_image']]['Descriptor']['platform']
-            environment = {'revision': 'a' * 40, 'dockerfiles': {'Dockerfile': 'digest'}, 'docker': {'ID': 'vessel'}}
+            environment = {'revision': 'a' * 40, 'dockerfiles': {'Dockerfile': 'digest'}, 'docker': {'ID': 'vessel'},
+                           'emulation': {'boot_id': 'boot-one', 'registrations': {'handler': 'enabled'},
+                                         'interpreter_sha256': {'/emulator': 'a' * 64}}}
             bases = [config['compiler_image'], config['rust_base_image']]
             build = {'revision': 'b' * 40, 'dockerfiles': environment['dockerfiles'], 'pinned_bases': bases,
                      'oracle_build_command': 'recorded oracle command', 'rust_build_command': 'recorded rust command',
@@ -191,7 +193,7 @@ class PreflightTests(unittest.TestCase):
                           'files': v.validation_files(args.vessel_validation.parent)}
                 v.write_new_json(args.vessel_validation, report)
                 v.write_new_json(args.vessel_approval, {'schema_version': 1, 'validation_sha256': v.file_sha(args.vessel_validation),
-                                                       'binding_sha256': v.canonical_sha(binding), 'scope': 'diagnostic-only'})
+                                                       'binding_sha256': v.canonical_sha(v.stable_binding(binding)), 'scope': 'diagnostic-only'})
                 yield config, lock, args, images, report
 
     def test_rebuilt_missing_descriptor_platform_is_separate_from_original_auth(self):
@@ -437,7 +439,11 @@ class PreflightTests(unittest.TestCase):
     def test_emulation_change_and_failed_fresh_jail_invalidate_approval(self):
         with self.rebuilt_fixture() as (config, lock, args, images, report):
             environment = report['binding']['environment']
-            for emulation in ({'boot_id': 'new'}, {'registrations': 'flags changed'},
+            rebooted = dict(environment, emulation=dict(environment['emulation'], boot_id='boot-two'))
+            with patch.object(v, 'vessel_environment', return_value=rebooted), patch.object(v, 'check_jailed_execution') as jail:
+                self.assertTrue(v.check_vessel_built(config, lock, args))
+                jail.assert_called_once_with()
+            for emulation in ({'registrations': 'flags changed'},
                               {'interpreter_sha256': 'changed'}):
                 with patch.object(v, 'vessel_environment', return_value=dict(environment, emulation=emulation)):
                     self.assertFalse(v.check_vessel_built(config, lock, args))
@@ -452,6 +458,8 @@ class PreflightTests(unittest.TestCase):
             binding = report['binding']
             with patch.object(v, 'vessel_binding', side_effect=[binding, dict(binding, environment={})]):
                 self.assertFalse(v.check_vessel_built(config, lock, args))
+            with patch.object(v, 'vessel_binding', side_effect=[binding, dict(binding, environment=rebooted)]):
+                self.assertFalse(v.check_vessel_built(config, lock, args))
 
     def test_fresh_jail_uses_real_docker_controls_and_fails_closed(self):
         for code in (1, 124, 127):
@@ -461,6 +469,30 @@ class PreflightTests(unittest.TestCase):
                 command = run.call_args.args[0]
                 self.assertIn('tests.test_docker_benchmark_integration.DockerIntegration.test_nonroot_chroot_and_no_controller_assets', command)
                 self.assertIn('tests.test_cross_language_docker.CrossLanguageDocker.test_real_rust_and_python_runtime_isolation_and_io', command)
+
+    def test_formal_scope_requires_new_finite_profile_approval(self):
+        with patch.dict(os.environ, LINUX_BENCHMARK_PROFILE='vessel-8g', VESSEL_DIAGNOSTIC_ROSETTA='0'), \
+                self.rebuilt_fixture() as (config, lock, args, images, report):
+            args.approval_scope = 'formal-vessel-8g'
+            self.assertFalse(v.check_vessel_built(config, lock, args))
+            approval = json.loads(args.vessel_approval.read_text())
+            approval['scope'] = args.approval_scope
+            args.vessel_approval.write_text(json.dumps(approval))
+            self.assertTrue(v.check_vessel_built(config, lock, args))
+            with patch.dict(os.environ, LINUX_BENCHMARK_PROFILE='standard'):
+                self.assertFalse(v.check_vessel_built(config, lock, args))
+        for profile in ({'mode': 'standard', 'rlimit_as_bytes': 256 * 1024**2},
+                        {'mode': 'vessel-rosetta-diagnostic', 'rlimit_as_bytes': None}):
+            with self.assertRaisesRegex(ValueError, 'fixed vessel-8g'):
+                v.approval_scope(SimpleNamespace(approval_scope='formal-vessel-8g'), {'execution_profile': profile})
+
+    def test_emulator_probe_uses_selected_lock(self):
+        import docker_benchmark as docker
+        ref = 'example@sha256:' + 'b' * 64
+        with patch.object(docker, 'settings', return_value={'compiler_image': ref}), \
+                patch.object(v, 'probe_reference', return_value=json.dumps({'boot_id': 'one', 'registrations': {}})) as probe:
+            v.emulation_identity()
+            self.assertEqual(probe.call_args.args[0], ref)
 
 
 @unittest.skipUnless(os.name == 'posix', 'Bash paths exercised under WSL/macOS')
@@ -594,6 +626,78 @@ class SmokeTests(unittest.TestCase):
                     self.assertFalse((output / '000').exists())
 
 
+class VesselFiniteProfileTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == 'posix', 'Bash print-only plan')
+    def test_lineage_planning_preserves_explicit_vessel_lock(self):
+        with tempfile.TemporaryDirectory() as temp:
+            lock = Path(temp) / 'vessel.json'
+            lock.write_bytes(v.DEFAULT_LOCK.read_bytes())
+            env = dict(os.environ, LINUX_BENCHMARK_PROFILE='vessel-8g', LINUX_BENCHMARK_LOCK=str(lock),
+                       VESSEL_DIAGNOSTIC_ROSETTA='0', PYTHON_BIN=sys.executable,
+                       AIDER_BIN=str(Path(temp) / 'absent-aider'))
+            env.pop('C_BENCHMARK_LOCK', None)
+            env.pop('VESSEL_GENERATION_SCOPE', None)
+            command = ['/bin/bash', str(ROOT / 'scripts/run_lineage_experiment.sh'), '--print-plan',
+                       '--utility', 'c-cp', '--model', 'ollama_chat/qwen3.8:27b']
+            result = subprocess.run(command, cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('8589934592', result.stdout)
+            env['VESSEL_GENERATION_SCOPE'] = 'diagnostic-only'
+            result = subprocess.run(command, cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn('cannot authorize formal lineages', result.stderr)
+
+    def test_only_explicit_profile_and_lock_select_eight_gib(self):
+        import docker_benchmark as docker
+        with patch.dict(os.environ, LINUX_BENCHMARK_PROFILE='standard', VESSEL_DIAGNOSTIC_ROSETTA='0',
+                        LINUX_BENCHMARK_LOCK=str(v.DEFAULT_LOCK), C_BENCHMARK_LOCK=''):
+            standard = docker.command('case', 'probe')
+            with patch.dict(os.environ, LINUX_BENCHMARK_PROFILE='vessel-8g'):
+                self.assertEqual(docker.execution_profile(), {'mode': 'vessel-8g', 'rlimit_as_bytes': 8589934592})
+                finite = docker.command('case', 'probe')
+                index = finite.index('BENCHMARK_EXECUTION_PROFILE=vessel-8g')
+                finite[index] = 'BENCHMARK_EXECUTION_PROFILE=standard'
+                self.assertEqual(finite, standard)
+                for changes in ({'LINUX_BENCHMARK_LOCK': ''}, {'LINUX_BENCHMARK_LOCK': 'relative.json'},
+                                {'C_BENCHMARK_LOCK': str(ROOT / 'other.json')}, {'VESSEL_DIAGNOSTIC_ROSETTA': '1'}):
+                    with patch.dict(os.environ, changes), self.assertRaises(docker.InfrastructureError):
+                        docker.command('case', 'probe')
+            with patch.dict(os.environ, LINUX_BENCHMARK_PROFILE='8g'), self.assertRaises(docker.InfrastructureError):
+                docker.execution_profile()
+
+    def test_worker_limits_and_readback_host_safe(self):
+        tree = ast.parse((ROOT / 'scripts/docker_benchmark_worker.py').read_text())
+        function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'set_jail_limits')
+        for profile, diagnostic, expected in [('standard', '0', 256 * 1024**2),
+                                               ('vessel-8g', '0', 8 * 1024**3), ('standard', '1', -1)]:
+            calls = {}
+            resource = SimpleNamespace(RLIM_INFINITY=-1, RLIMIT_CORE=0, RLIMIT_CPU=1, RLIMIT_AS=2,
+                RLIMIT_FSIZE=3, RLIMIT_NPROC=4, setrlimit=lambda k, val: calls.update({k: val}),
+                getrlimit=lambda k: calls[k])
+            namespace = {'resource': resource, 'os': SimpleNamespace(environ={
+                'BENCHMARK_EXECUTION_PROFILE': profile, 'BENCHMARK_DIAGNOSTIC_ROSETTA': diagnostic})}
+            exec(compile(ast.Module(body=[function], type_ignores=[]), '<worker-test>', 'exec'), namespace)
+            namespace['set_jail_limits']()
+            self.assertEqual(calls, {0: (0, 0), 1: (10, 10), 2: (expected, expected),
+                                     3: (64 * 1024**2,) * 2, 4: (16, 16)})
+            resource.getrlimit = lambda k: (0, 0)
+            with self.assertRaisesRegex(RuntimeError, 'readback mismatch'):
+                namespace['set_jail_limits']()
+        namespace['os'].environ.update(BENCHMARK_EXECUTION_PROFILE='vessel-8g', BENCHMARK_DIAGNOSTIC_ROSETTA='1')
+        with self.assertRaises(ValueError):
+            namespace['set_jail_limits']()
+
+    def test_profile_changes_lineage_fingerprint(self):
+        import lineage_plan
+        with patch.dict(os.environ, VESSEL_DIAGNOSTIC_ROSETTA='0', LINUX_BENCHMARK_PROFILE='standard',
+                        LINUX_BENCHMARK_LOCK=str(v.DEFAULT_LOCK), C_BENCHMARK_LOCK=''):
+            standard = lineage_plan.resolve_plan(ROOT, 'c-cp', '', '0', None, 0, 0)
+            with patch.dict(os.environ, LINUX_BENCHMARK_PROFILE='vessel-8g'):
+                finite = lineage_plan.resolve_plan(ROOT, 'c-cp', '', '0', None, 0, 0)
+        self.assertNotEqual(standard['config_fingerprint'], finite['config_fingerprint'])
+        self.assertEqual(finite['execution_environment']['execution_profile']['rlimit_as_bytes'], 8589934592)
+
+
 class RosettaDiagnosticTests(unittest.TestCase):
     def test_docker_isolation_is_identical_except_explicit_worker_profile(self):
         import docker_benchmark as docker
@@ -607,7 +711,7 @@ class RosettaDiagnosticTests(unittest.TestCase):
                 self.assertIsNone(docker.execution_profile()['rlimit_as_bytes'])
             index = diagnostic.index('BENCHMARK_DIAGNOSTIC_ROSETTA=1')
             self.assertEqual(diagnostic[index - 1], '-e')
-            del diagnostic[index - 1:index + 1]
+            diagnostic[index] = 'BENCHMARK_DIAGNOSTIC_ROSETTA=0'
             self.assertEqual(diagnostic, standard)
         with patch.dict(os.environ, VESSEL_DIAGNOSTIC_ROSETTA='unexpected'):
             with self.assertRaises(docker.InfrastructureError):
@@ -623,7 +727,9 @@ class RosettaDiagnosticTests(unittest.TestCase):
         import resource
         observed = []
         for mode in ('0', '1'):
-            with patch.dict(os.environ, BENCHMARK_DIAGNOSTIC_ROSETTA=mode), patch.object(worker.resource, 'setrlimit') as limit:
+            expected = resource.RLIM_INFINITY if mode == '1' else 256 * 1024**2
+            with patch.dict(os.environ, BENCHMARK_DIAGNOSTIC_ROSETTA=mode), patch.object(worker.resource, 'setrlimit') as limit, \
+                    patch.object(worker.resource, 'getrlimit', return_value=(expected, expected)):
                 worker.set_jail_limits()
                 observed.append({call.args[0]: call.args[1] for call in limit.call_args_list})
         self.assertEqual(observed[0].pop(resource.RLIMIT_AS), (256 * 1024**2,) * 2)
@@ -665,6 +771,17 @@ class RosettaDiagnosticTests(unittest.TestCase):
                     self.assertIsNone(data['rlimit_as_bytes'])
                 else:
                     self.assertNotIn('execution_profile', data)
+            condition = {'execution_profile': {'mode': 'vessel-8g', 'rlimit_as_bytes': 8589934592}}
+            result = subprocess.run(['/bin/bash'],
+                input=writer + '\nwrite_metadata ' + shlex.quote(str(target)) + ' formal_result true\n',
+                env=dict(os.environ, PYTHON_BIN=sys.executable, VESSEL_DIAGNOSTIC_ROSETTA='0',
+                         VESSEL_GENERATION_SCOPE='diagnostic-only', DOCKER_EXECUTION_JSON=json.dumps(condition)),
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(target.read_text())
+            self.assertEqual(data['docker_execution'], condition)
+            self.assertIs(data['formal_result'], False)
+            self.assertIs(data['diagnostic_only'], True)
 
 
 @unittest.skipUnless(os.name == 'posix', 'Bash regression tests run under WSL/macOS')

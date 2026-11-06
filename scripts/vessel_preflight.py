@@ -84,6 +84,28 @@ def canonical_sha(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def stable_environment(environment):
+    """Boot IDs are observations; every other environment field remains binding."""
+    result = dict(environment)
+    if isinstance(result.get("emulation"), dict):
+        result["emulation"] = {k: v for k, v in result["emulation"].items() if k != "boot_id"}
+    return result
+
+
+def stable_binding(binding):
+    return dict(binding, environment=stable_environment(binding["environment"]))
+
+
+def approval_scope(args, binding):
+    scope = getattr(args, "approval_scope", "diagnostic-only")
+    if scope not in ("diagnostic-only", "formal-vessel-8g"):
+        raise ValueError("unsupported approval scope")
+    if scope == "formal-vessel-8g" and binding["execution_profile"] != {
+            "mode": "vessel-8g", "rlimit_as_bytes": 8 * 1024**3}:
+        raise ValueError("formal Vessel approval requires the fixed vessel-8g condition")
+    return scope
+
+
 def external_path(path):
     resolved = Path(path).resolve()
     if resolved == ROOT or ROOT in resolved.parents:
@@ -217,7 +239,7 @@ def check_aider(expected):
 
 def check_docker(lock_platform):
     if not shutil.which("docker"):
-        record("docker cli", "FAIL", "docker not on PATH", "brew install docker colima")
+        record("docker cli", "FAIL", "docker not on PATH", "start Docker Desktop and enable its CLI on PATH")
         return False
     if shutil.which("colima"):
         code, out, err = run(["colima", "status"], timeout=30)
@@ -248,7 +270,7 @@ def check_docker(lock_platform):
     code, out, err = run(["docker", "info", "--format", "{{json .}}"], timeout=60)
     if code != 0:
         record("docker daemon", "FAIL", err or "unreachable",
-               "colima start (with the existing profile), or fix DOCKER_HOST/context; preflight changes neither")
+               "start Docker Desktop, or fix DOCKER_HOST/context; preflight changes neither")
         return False
     info = json.loads(out)
     store = dict(info.get("DriverStatus") or []).get("driver-type", "classic (" + str(info.get("Driver")) + ")")
@@ -434,7 +456,8 @@ def probe_reference(ref, command=None, mounts=()):
 def emulation_identity():
     # These read-only mounts refer to the Docker VM, not the macOS controller.
     # No socket, privileges or candidate code are admitted to this trusted probe.
-    ref = json.loads(DEFAULT_LOCK.read_text())["compiler_image"]
+    import docker_benchmark
+    ref = docker_benchmark.settings()["compiler_image"]
     script = ("import json,pathlib; p=pathlib.Path('/binfmt'); "
               "print(json.dumps(dict(boot_id=pathlib.Path('/boot-id').read_text(), "
               "registrations={f.name:f.read_text() for f in sorted(p.iterdir()) "
@@ -571,7 +594,7 @@ def vessel_binding(config, lock_path, provenance_path):
         raise ValueError("missing or mismatched local build provenance")
     environment = vessel_environment()
     verify_build_record(provenance.get("build_record"), baseline, environment)
-    if provenance.get("environment") != environment:
+    if stable_environment(provenance.get("environment", {})) != stable_environment(environment):
         raise ValueError("checkout or Docker environment changed since provenance capture")
     import docker_benchmark
     if docker_benchmark.settings() != config:
@@ -633,7 +656,7 @@ def checked_validation(path, binding, config):
     report = json.loads(path.read_text())
     if (report.get("schema_version") != 1 or report.get("passed") is not True
             or report.get("generation_invoked") is not False or report.get("infrastructure_failure") is not False
-            or report.get("binding") != binding
+            or stable_binding(report.get("binding", {"environment": {}})) != stable_binding(binding)
             or not 0 <= time.time() - report.get("completed_at", 0) <= VALIDATION_MAX_AGE
             or report.get("commands") != validation_commands(path.parent, config)
             or report.get("returncodes") != [0] * len(validation_commands(path.parent, config))
@@ -695,15 +718,18 @@ def check_vessel_built(config, lock_path, args, require_approval=True):
     try:
         binding = vessel_binding(config, lock_path, args.vessel_provenance)
         checked_validation(args.vessel_validation, binding, config)
+        scope = approval_scope(args, binding)
         if require_approval:
             approval = json.loads(external_path(args.vessel_approval).read_text())
             if approval != {"schema_version": 1, "validation_sha256": file_sha(args.vessel_validation),
-                            "binding_sha256": canonical_sha(binding), "scope": "diagnostic-only"}:
-                raise ValueError("matching explicit diagnostic approval required")
+                            "binding_sha256": canonical_sha(stable_binding(binding)), "scope": scope}:
+                raise ValueError("matching explicit " + scope + " approval required")
             check_jailed_execution()
             if vessel_binding(config, lock_path, args.vessel_provenance) != binding:
                 raise ValueError("environment changed during fresh jailed execution")
-        record("vessel-built independent validation", "PASS", "matching local rebuild evidence; no Windows byte-identity claim")
+        boot_id = binding['environment'].get('emulation', {}).get('boot_id', 'unavailable')
+        record("vessel-built independent validation", "PASS",
+               "matching local rebuild evidence; no Windows byte-identity claim; scope=%s boot_id=%s" % (scope, boot_id))
         return True
     except (OSError, ValueError, KeyError, TypeError, IndexError, subprocess.SubprocessError) as error:
         record("vessel-built independent validation", "FAIL", str(error))
@@ -890,6 +916,8 @@ def main(argv=None):
     parser.add_argument("--vessel-provenance", type=Path, default=os.environ.get("VESSEL_BUILT_PROVENANCE"))
     parser.add_argument("--vessel-validation", type=Path, default=os.environ.get("VESSEL_VALIDATION"))
     parser.add_argument("--vessel-approval", type=Path, default=os.environ.get("VESSEL_APPROVAL"))
+    parser.add_argument("--approval-scope", choices=("diagnostic-only", "formal-vessel-8g"),
+                        default="diagnostic-only", help="explicit scope; formal requires fresh vessel-8g evidence")
     parser.add_argument("--build-record", type=Path)
     actions.add_argument("--prepare-vessel-lock", type=Path, metavar="NEW_DIRECTORY")
     actions.add_argument("--validate-vessel-built", type=Path, metavar="NEW_DIRECTORY")
@@ -946,8 +974,9 @@ def main(argv=None):
                         raise ValueError("approval must be outside the sealed validation directory")
                     binding = vessel_binding(config, lock_path, args.vessel_provenance)
                     write_new_json(target, {"schema_version": 1, "validation_sha256": file_sha(args.vessel_validation),
-                                            "binding_sha256": canonical_sha(binding), "scope": "diagnostic-only"})
-                    print("Diagnostic approval recorded; generation still requires --generate and fresh preflight.")
+                                            "binding_sha256": canonical_sha(stable_binding(binding)),
+                                            "scope": approval_scope(args, binding)})
+                    print("Approval recorded for " + args.approval_scope + "; fresh pre-generation verification still required.")
             return 0
         except (OSError, ValueError, KeyError, TypeError, IndexError, subprocess.SubprocessError) as error:
             record("vessel-built preparation", "FAIL", str(error))
@@ -980,9 +1009,10 @@ def main(argv=None):
     else:
         check_aider(args.expected_aider_version)
     sys.path.insert(0, str(SCRIPTS))
-    lock_path = Path(os.environ.get("LINUX_BENCHMARK_LOCK", os.environ.get("C_BENCHMARK_LOCK", DEFAULT_LOCK)))
+    lock_path = None
     try:
         import docker_benchmark
+        lock_path = docker_benchmark.lock_path()
         if not lock_path.is_absolute():
             raise ValueError("benchmark lock must use an absolute path so controller working directories cannot change its meaning")
         config = docker_benchmark.settings()

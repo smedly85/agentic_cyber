@@ -20,8 +20,19 @@ class InfrastructureError(RuntimeError):
     pass
 
 
-def settings():
+def lock_path():
     path = Path(os.environ.get('LINUX_BENCHMARK_LOCK', os.environ.get('C_BENCHMARK_LOCK', ROOT / 'docker/linux-utilities/lock-amd64.json')))
+    if os.environ.get('LINUX_BENCHMARK_PROFILE', 'standard') == 'vessel-8g':
+        if not os.environ.get('LINUX_BENCHMARK_LOCK') or not path.is_absolute():
+            raise InfrastructureError('vessel-8g requires an explicit absolute LINUX_BENCHMARK_LOCK')
+        legacy = os.environ.get('C_BENCHMARK_LOCK')
+        if legacy and Path(legacy).resolve() != path.resolve():
+            raise InfrastructureError('conflicting benchmark locks; unset C_BENCHMARK_LOCK')
+    return path
+
+
+def settings():
+    path = lock_path()
     config = json.loads(path.read_text())
     for key in ('oracle_image', 'compiler_image', 'rust_compiler_image'):
         if key == 'rust_compiler_image' and key not in config:
@@ -34,21 +45,26 @@ def settings():
 
 
 def execution_profile():
+    profile = os.environ.get('LINUX_BENCHMARK_PROFILE', 'standard')
+    if profile not in ('standard', 'vessel-8g'):
+        raise InfrastructureError('invalid LINUX_BENCHMARK_PROFILE; use standard or vessel-8g')
     mode = os.environ.get('VESSEL_DIAGNOSTIC_ROSETTA', '0')
     if mode not in ('0', '1'):
         raise InfrastructureError('invalid VESSEL_DIAGNOSTIC_ROSETTA value')
     if mode == '1':
+        if profile != 'standard':
+            raise InfrastructureError('vessel-8g cannot be combined with unlimited diagnostics')
         return {'mode': 'vessel-rosetta-diagnostic', 'rlimit_as_bytes': None,
                 'diagnostic_only': True, 'formal_result': False}
-    return {'mode': 'standard', 'rlimit_as_bytes': 256 * 1024**2}
+    return {'mode': profile, 'rlimit_as_bytes': 8 * 1024**3 if profile == 'vessel-8g' else 256 * 1024**2}
 
 
 def command(action, name, language='c'):
     config = settings()
     profile = execution_profile()
-    if profile.get('diagnostic_only'):
+    if profile.get('diagnostic_only') or profile['mode'] == 'vessel-8g':
         if config['platform'] != 'linux/amd64':
-            raise InfrastructureError('Rosetta diagnostic requires linux/amd64')
+            raise InfrastructureError('Vessel execution requires linux/amd64')
     arch = 'x86_64' if config['platform'] == 'linux/amd64' else 'aarch64'
     args = ['docker', 'run', '--rm', '--name', name, '--platform', config['platform'],
             '--network', 'none', '--read-only', '--cap-drop', 'ALL',
@@ -56,8 +72,10 @@ def command(action, name, language='c'):
             '--pids-limit', '64', '--ulimit', 'nofile=256:256',
             '--tmpfs', '/tmp:rw,exec,nosuid,nodev,size=512m',
             '-e', 'LC_ALL=C', '-e', 'TZ=UTC', '-e', 'BENCHMARK_ARCH=' + arch]
-    if profile['mode'] == 'vessel-rosetta-diagnostic':
-        args += ['-e', 'BENCHMARK_DIAGNOSTIC_ROSETTA=1']
+    # Always override image ENV defaults; the reported profile must be the one
+    # received by the trusted worker, including when standard is selected.
+    args += ['-e', 'BENCHMARK_DIAGNOSTIC_ROSETTA=' + ('1' if profile.get('diagnostic_only') else '0'),
+             '-e', 'BENCHMARK_EXECUTION_PROFILE=' + ('vessel-8g' if profile['mode'] == 'vessel-8g' else 'standard')]
     if action == 'case':
         args += ['--user', '0:0']
         for cap in ('SYS_CHROOT', 'SETUID', 'SETGID', 'CHOWN', 'DAC_OVERRIDE', 'FOWNER', 'FSETID', 'KILL'):
@@ -233,7 +251,7 @@ def judge(selector, candidate, flags, hidden=False, report_path=None, cases_over
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('build', 'judge', 'check-commands', 'preflight'))
+    parser.add_argument('action', choices=('build', 'judge', 'check-commands', 'preflight', 'condition'))
     parser.add_argument('--utility', choices=SELECTORS, required=True)
     parser.add_argument('--candidate', type=Path)
     parser.add_argument('--hidden', action='store_true')
@@ -246,6 +264,9 @@ def main(argv=None):
     args = parser.parse_args(argv)
     manifest = json.loads((ROOT / 'experiments/utilities' / (args.utility + '.json')).read_text())
     candidate = args.candidate or Path(manifest['executable_path'])
+    if args.action == 'condition':
+        print(json.dumps({'docker': settings(), 'execution_profile': execution_profile()}, sort_keys=True))
+        return 0
     if args.action == 'preflight':
         print(json.dumps(invoke('toolchain', {'language':language_name(args.utility)}), sort_keys=True))
         return 0

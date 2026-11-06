@@ -274,6 +274,7 @@ if [[ "$IMAGE_MODE" == vessel-built ]]; then
     }
 fi
 [[ "$DIAGNOSTIC_ROSETTA" == 1 ]] && export VESSEL_DIAGNOSTIC_GENERATION_APPROVED=1
+export VESSEL_GENERATION_SCOPE=diagnostic-only
 bash scripts/run_experiment.sh "${runner_args[@]}"
 runner_status=$?
 
@@ -311,6 +312,9 @@ import sys
 from pathlib import Path
 
 attempt, candidate, runner, gate, gate_report, out, selector, config, bundle = sys.argv[1:]
+sys.path.insert(0, str(Path.cwd() / 'scripts'))
+from docker_benchmark import execution_profile
+profile = execution_profile()
 attempt, candidate = Path(attempt), Path(candidate)
 meta = {}
 if (attempt / "metadata.json").is_file():
@@ -343,8 +347,8 @@ infrastructure = (public_outcome in ("stage_runner_failure", "stage_run_incomple
                   or heldout in ("heldout_infrastructure_failure", "platform_incompatible", "unknown"))
 summary = {
     "diagnostic_only": True, "formal_result": False, "lineage_seed": False,
-    "execution_profile": "vessel-rosetta-diagnostic" if os.environ.get("VESSEL_DIAGNOSTIC_ROSETTA") == "1" else "standard",
-    "rlimit_as_bytes": None if os.environ.get("VESSEL_DIAGNOSTIC_ROSETTA") == "1" else 256 * 1024**2,
+    "execution_profile": profile['mode'],
+    "rlimit_as_bytes": profile['rlimit_as_bytes'],
     "preflight_report": "preflight.json",
     "selector": selector, "checkpoint": "000", "config_fingerprint": config,
     "test_bundle_fingerprint": bundle, "run_experiment_exit_code": int(runner),

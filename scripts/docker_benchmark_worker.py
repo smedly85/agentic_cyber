@@ -51,11 +51,19 @@ def modules(request):
 
 
 def set_jail_limits():
+    profile = os.environ.get('BENCHMARK_EXECUTION_PROFILE', 'standard')
+    diagnostic = os.environ.get('BENCHMARK_DIAGNOSTIC_ROSETTA', '0')
+    if profile not in ('standard', 'vessel-8g') or diagnostic not in ('0', '1'):
+        raise ValueError('invalid jail execution profile')
+    if profile == 'vessel-8g' and diagnostic != '0':
+        raise ValueError('conflicting jail execution profiles')
     address_space = (resource.RLIM_INFINITY if os.environ.get('BENCHMARK_DIAGNOSTIC_ROSETTA') == '1'
-                     else 256 * 1024**2)
+                     else 8 * 1024**3 if profile == 'vessel-8g' else 256 * 1024**2)
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     resource.setrlimit(resource.RLIMIT_CPU, (10, 10))
     resource.setrlimit(resource.RLIMIT_AS, (address_space, address_space))
+    if resource.getrlimit(resource.RLIMIT_AS) != (address_space, address_space):
+        raise RuntimeError('jail address-space limit readback mismatch')
     resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024**2, 64 * 1024**2))
     resource.setrlimit(resource.RLIMIT_NPROC, (16, 16))
 

@@ -251,6 +251,12 @@ optional_think() {
 write_metadata() {
     local file="$1"
     shift
+    if [[ -n "${DOCKER_EXECUTION_JSON:-}" ]]; then
+        set -- "$@" docker_execution "__JSON__:$DOCKER_EXECUTION_JSON"
+    fi
+    if [[ "${VESSEL_GENERATION_SCOPE:-}" == diagnostic-only ]]; then
+        set -- "$@" diagnostic_only true formal_result false
+    fi
     if [[ "${VESSEL_DIAGNOSTIC_ROSETTA:-0}" == 1 ]]; then
         set -- "$@" diagnostic_only true formal_result false \
             execution_profile '__STR__:vessel-rosetta-diagnostic' rlimit_as_bytes '__JSON__:null'
@@ -1224,6 +1230,7 @@ if [[ -n "$ANALYSIS_DIVERSITY_K_MAX" &&
 fi
 
 ANALYZER_PATH="$REPO/scripts/analyze_experiment.py"
+DOCKER_EXECUTION_JSON=""
 case "$SOURCE_PATH" in
     src/c_cp/*|src/c_mv/*|src/c_mkdir/*|src/c_sort/*|src/rust_cp/*|src/rust_mv/*|src/rust_mkdir/*|src/rust_sort/*|src/py_cp/*|src/py_mv/*|src/py_mkdir/*|src/py_sort/*)
         NO_ANALYSIS=1
@@ -1235,6 +1242,11 @@ case "$SOURCE_PATH" in
             --feature-command "$FEATURE_TEST_CMD" --extra-command "$EXTRA_TEST_CMD" \
             --base-command "$BASE_TEST_CMD" || die "Linux benchmark requires canonical Docker commands"
         "$PYTHON_BIN" "$REPO/scripts/docker_benchmark.py" preflight --utility "$linux_selector" || exit 4
+        DOCKER_EXECUTION_JSON="$("$PYTHON_BIN" "$REPO/scripts/docker_benchmark.py" condition --utility "$linux_selector")" || exit 4
+        if [[ "${LINUX_BENCHMARK_PROFILE:-standard}" == vessel-8g ]]; then
+            "$PYTHON_BIN" "$REPO/scripts/vessel_preflight.py" --image-mode vessel-built \
+                --verify-vessel-built --approval-scope "${VESSEL_GENERATION_SCOPE:-formal-vessel-8g}" || exit 4
+        fi
         ;;
 esac
 if [[ "$SOURCE_PATH" == *.py ]]; then
@@ -1409,7 +1421,7 @@ for temperature in "${TEMPERATURES_ARR[@]}"; do
                 "${MODEL_PROVENANCE_JSON:-__NONE__}" \
                 "${REMOTE_BASE_URL:-__NONE__}" \
                 "${REMOTE_API_KEY_ENV:-__NONE__}" \
-                "$REMOTE_TRANSPORT" <<'PY'
+                "$REMOTE_TRANSPORT" "${DOCKER_EXECUTION_JSON:-null}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -1442,9 +1454,11 @@ data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
     remote_base_url,
     remote_api_key_env,
     remote_transport,
+    docker_execution_json,
 ) = sys.argv[2:]
 expected = {
     "agent_backend": "aider",
+    "docker_execution": json.loads(docker_execution_json),
     "aider_version": aider_version,
     "architect_model": model,
     "editor_model": editor_model,
