@@ -72,9 +72,7 @@ export VESSEL_APPROVAL="$V/formal-approval.json"
 python3 -B scripts/docker_benchmark.py condition --utility c-cp | tee "$V/condition.json"
 
 # Fast check of the actual jailed controls in all three languages.
-python3 -B -m unittest -v \
-  tests.test_docker_benchmark_integration.DockerIntegration.test_nonroot_chroot_and_no_controller_assets \
-  tests.test_cross_language_docker.CrossLanguageDocker.test_real_rust_and_python_runtime_isolation_and_io \
+python3 -B scripts/run_vessel_validation_tests.py --suite jailed \
   2>&1 | tee "$V/jail-controls.log"
 
 # Complete existing 16-stage validation: all twelve selectors, public/held-out
@@ -89,7 +87,7 @@ exercise all languages while that issue is unresolved, the following remains
 non-formal runtime validation, using the same exported lock and finite profile:
 
 ```bash
-python3 -B -m unittest -v tests.test_docker_benchmark_integration tests.test_cross_language_docker
+python3 -B scripts/run_vessel_validation_tests.py --suite runtime
 python3 -B scripts/validate_docker_adapter.py --output "$V/calibration-only"
 for s in c-cp c-mv c-mkdir c-sort rust-cp rust-mv rust-mkdir rust-sort py-cp py-mv py-mkdir py-sort; do
   python3 -B scripts/validate_docker_entrypoints.py --utility "$s" --output "$V/entry-only-$s"
@@ -481,7 +479,7 @@ automatically run these validators: completing them is a required operator step.
 set -euo pipefail
 export PYTHONDONTWRITEBYTECODE=1
 V="$HOME/linux-utilities-smoke/docker-validation-$(date -u +%Y%m%dT%H%M%SZ)"; mkdir -p "$V"
-python3 -m unittest tests.test_docker_benchmark_integration tests.test_cross_language_docker 2>&1 | tee "$V/unittest.log"
+python3 -B scripts/run_vessel_validation_tests.py --suite runtime 2>&1 | tee "$V/unittest.log"
 SELECTORS=(c-cp c-mv c-mkdir c-sort rust-cp rust-mv rust-mkdir rust-sort py-cp py-mv py-mkdir py-sort)
 python3 scripts/validate_docker_adapter.py --output "$V/calibration"
 for s in "${SELECTORS[@]}"; do
@@ -590,3 +588,6 @@ a corpus whose recorded architecture differs from the lock.
 | Ready to attempt preflight on vessel | yes |
 | Verified ready for model generation | only after sections 2 and 3 pass on vessel |
 | Formal lineage readiness | no: needs explicitly chosen formal conditions, model identity controls and accepted emulation evidence |
+
+For the post-cleanup validation coverage map and revalidation after a new commit,
+see [Vessel validation maintenance](vessel-validation-maintenance.md).

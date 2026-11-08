@@ -17,9 +17,9 @@ base=['docker','run','--rm','--platform',config['platform'],'--network','none','
       '-e','BENCHMARK_ARCH='+('x86_64' if config['platform']=='linux/amd64' else 'aarch64'),
       '-e','BENCHMARK_IMAGE_ID='+config['oracle_image'],config['oracle_image']]
 commands={
- 'static':base+['python3','tests/test_cross_language_static.py'],
- 'integration':[sys.executable,str(docker.ROOT/'tests/test_cross_language_docker.py')],
- 'c-integration':[sys.executable,str(docker.ROOT/'tests/test_docker_benchmark_integration.py')],
+ 'static':base+['python3','-B','scripts/run_vessel_validation_tests.py','--suite','integrity'],
+ 'integration':[sys.executable,'-B',str(docker.ROOT/'scripts/run_vessel_validation_tests.py'),'--suite','cross-runtime'],
+ 'c-integration':[sys.executable,'-B',str(docker.ROOT/'scripts/run_vessel_validation_tests.py'),'--suite','c-runtime'],
 }
 results={}
 for name,command in commands.items():

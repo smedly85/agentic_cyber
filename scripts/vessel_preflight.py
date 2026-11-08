@@ -494,9 +494,8 @@ def git_dockerfile_hashes(revision):
 
 def check_jailed_execution():
     # Reuse the real Docker controls for all three languages under unchanged limits.
-    command = [shutil.which("python3") or sys.executable, "-B", "-m", "unittest", "-f", "-v",
-               "tests.test_docker_benchmark_integration.DockerIntegration.test_nonroot_chroot_and_no_controller_assets",
-               "tests.test_cross_language_docker.CrossLanguageDocker.test_real_rust_and_python_runtime_isolation_and_io"]
+    command = [shutil.which("python3") or sys.executable, "-B",
+               str(SCRIPTS / "run_vessel_validation_tests.py"), "--suite", "jailed"]
     code, out, err = run(command, timeout=600)
     if code:
         raise ValueError("fresh jailed execution failed; infrastructure failure: " + out + err)
@@ -629,7 +628,8 @@ def vessel_binding(config, lock_path, provenance_path):
 def validation_commands(directory, config):
     python = shutil.which("python3") or sys.executable
     commands = [["bash", str(ROOT / "docker/linux-utilities/run.sh"), config["oracle_image"], str(directory / "oracle"), "linux/amd64"],
-                [python, "-B", "-m", "unittest", "-f", "-v", "tests.test_docker_benchmark_integration", "tests.test_cross_language_docker", "tests.test_cross_language_static"],
+                [python, "-B", str(SCRIPTS / "run_vessel_validation_tests.py"),
+                 "--suite", "runtime", "--suite", "integrity"],
                 [python, "-B", str(SCRIPTS / "validate_docker_adapter.py"), "--output", str(directory / "calibration")]]
     for selector in DEFAULT_SELECTORS:
         commands.append([python, "-B", str(SCRIPTS / "validate_docker_entrypoints.py"), "--utility", selector, "--output", str(directory / ("entry-" + selector))])
