@@ -140,6 +140,18 @@ def optional_json_object(value: Any, label: str) -> dict[str, Any] | None:
     return parsed
 
 
+def seed_schedule(base: Any, sampling_seed: Any = None) -> dict[str, Any] | None:
+    """Only explicit schedules add fingerprint material; legacy plans are unchanged."""
+    if base is None or base == "":
+        return None
+    if sampling_seed is not None and sampling_seed != "":
+        raise ManifestError("--lineage-seed-base and --sampling-seed are mutually exclusive")
+    if not str(base).isascii() or not str(base).isdigit():
+        raise ManifestError("--lineage-seed-base must be a non-negative integer")
+    return {"version": 1, "base_seed": int(base),
+            "formula": "base_seed + lineage_number - 1", "scope": "architect"}
+
+
 def resolve_plan(
     repo: Path,
     utility: str,
@@ -159,11 +171,13 @@ def resolve_plan(
     remote_api_key_env: str = "",
     architect_think: Any = None,
     editor_edit_format: str = aider_settings.EDITOR_EDIT_FORMAT,
+    lineage_seed_base: Any = None,
 ) -> dict[str, Any]:
     # `agent` remains only as a Python-call compatibility slot for older test
     # and analysis helpers. It is not emitted, fingerprinted or exposed by the
     # shell CLIs; Aider always uses architect mode.
     del agent
+    schedule = seed_schedule(lineage_seed_base, sampling_seed)
     architect_model = model
     temperature = temperature_value.canonicalize(temperature)
     try:
@@ -472,6 +486,13 @@ def resolve_plan(
         # exactly as editing a checkpoint prompt does.
         "automation_notice_sha256": prompt_render.notice_sha256(repo),
     }
+    if schedule is not None:
+        plan["sampling_seed_schedule"] = schedule
+        # A protocol template, never an executable settings file. Explicit
+        # markers distinguish variable seeds from server-default sampling.
+        plan["sampling_seed"] = "per_lineage"
+        if plan["aider_model_settings"]:
+            plan["aider_model_settings"][0]["extra_params"]["seed"] = schedule["formula"]
     plan["config_fingerprint"] = fingerprint(plan)
     if utility in LINUX_SELECTORS:
         # New identities only: do not change historical fingerprints. Changes to
@@ -593,6 +614,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # argument and becomes a JSON null rather than 0.
     parser.add_argument("--top-p", default="")
     parser.add_argument("--sampling-seed", default="")
+    parser.add_argument("--lineage-seed-base", default="")
     parser.add_argument("--max-tokens", default="")
     parser.add_argument("--num-ctx", default="")
     parser.add_argument("--architect-think", default="")
@@ -631,6 +653,7 @@ def main(argv: list[str] | None = None) -> int:
         args.timeout_seconds,
         top_p=args.top_p,
         sampling_seed=args.sampling_seed,
+        lineage_seed_base=args.lineage_seed_base,
         max_tokens=args.max_tokens,
         num_ctx=args.num_ctx,
         architect_think=args.architect_think,

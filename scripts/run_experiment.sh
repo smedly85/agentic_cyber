@@ -544,11 +544,12 @@ run_aider() {
 }
 
 make_loop_record() {
-    "$PYTHON_BIN" - "$REPO/scripts" "$@" <<'PY'
+    "$PYTHON_BIN" - "$REPO/scripts" "$AIDER_MODEL_SETTINGS_JSON" "$@" <<'PY'
 import json
 import sys
 sys.path.insert(0, sys.argv.pop(1))
 from invocation_observations import public_scores, compare_scores
+settings = json.loads(sys.argv.pop(1))
 
 (
     loop,
@@ -595,6 +596,9 @@ previous = json.loads(previous_record) if previous_record else {}
 changed = source_before != source_sha256
 available = candidate_after == "true"
 print(json.dumps({
+    "sampling_seed": settings[0]["extra_params"].get("seed"),
+    "editor_sampling_seed": settings[1]["extra_params"]["seed"],
+    "editor_temperature": settings[1]["extra_params"]["temperature"],
     "loop": int(loop),
     "kind": kind,
     "agent_exit_code": int(agent_exit),
