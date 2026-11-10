@@ -1,0 +1,676 @@
+
+===== LLM INVOCATION 0: INITIAL =====
+
+
+Aider v0.86.2
+Main model: ollama_chat/qwen3.8:27b with architect edit format
+Editor model: ollama_chat/qwen3-coder-next:latest with whole edit format
+Weak model: ollama_chat/qwen3-coder-next:latest
+Git repo: none
+Repo-map: disabled
+Added c_cp.c to the chat.
+Added ../../tests/c-cp-test-suite/engine.py to the chat (read-only).
+Added ../../tests/c-cp-test-suite/config.py to the chat (read-only).
+Added ../../tests/c-cp-test-suite/judge_candidate.sh to the chat (read-only).
+Added ../../tests/c-cp-test-suite/props.py to the chat (read-only).
+Added ../../tests/c-cp-test-suite/runner.py to the chat (read-only).
+Added ../../tests/c-cp-test-suite/BUNDLE.json to the chat (read-only).
+Added ../../tests/c-cp-test-suite/config.json to the chat (read-only).
+Note: in-chat filenames are always relative to the git working dir, not the 
+current working dir.
+Cur working dir: 
+/Users/sonjabrown/agentic_cyber/runs/formal/c-cp-vessel8g-10/lineage-006/001/tem
+p-1p0/attempt-001/workdir
+Git working dir: /Users/sonjabrown/agentic_cyber
+
+
+--------------
+► **THINKING**
+
+Let me analyze the task:
+
+1. The current `c_cp.c` already implements:
+   - Basic SOURCE DEST and SOURCE... DIRECTORY copying
+   - Multi-source with directory validation
+   - Single source with directory destination (basename)
+   - Per-source failure continuation
+   - Symlink handling (follow source symlinks, reject dangling dest symlinks)
+   - Self-copy rejection
+   - Permission handling (source rwx bits masked by umask for new files, retain existing dest permissions)
+   - Option parsing (unknown options rejected, `--` separator)
+
+2. What needs to be added for checkpoint 001:
+   - `-f` / `--force` flag
+   - When force is enabled and opening an existing nondirectory destination fails, remove that entry and create a replacement
+   - The replacement receives source rwx bits masked by umask
+   - Force does NOT bypass source or parent permissions
+   - Force does NOT replace a directory with a file
+   - Idempotent (can be passed multiple times)
+
+Let me think about what the current code does and what changes are needed:
+
+Current `copy_path` behavior when destination exists:
+- Opens with `O_WRONLY | O_TRUNC`
+- If that fails, returns error
+
+With `-f`:
+- If destination exists and is a regular file, and `open(dst, O_WRONLY|O_TRUNC)` fails, try `unlink(dst)` then `open(dst, O_WRONLY|O_CREAT|O_TRUNC, mode)`
+- If destination is a directory, reject (don't replace directory with file)
+- If destination is a dangling symlink, the current code rejects it. With force, should we allow removing it? Let me re-read the spec.
+
+"When normal opening fails for an existing nondirectory destination, force permits removing that entry and creating its replacement if parent permissions allow."
+
+So "nondirectory destination" - this means if it's a file or symlink (not a directory), and normal open fails, we can remove and recreate.
+
+"Force does not bypass source or parent permissions or replace a directory with a file."
+
+So if dest is a directory, even with force, we reject.
+
+Let me think about the cases:
+1. Dest exists, is a regular file, open fails (e.g., read-only) → force: unlink + create
+2. Dest exists, is a directory → reject (even with force)
+3. Dest exists, is a dangling symlink → current code rejects. With force, "nondirectory destination" includes symlinks, so we could unlink and recreate.
+4. Dest doesn't exist → create normally (no force needed)
+
+Wait, let me re-read: "When normal opening fails for an existing nondirectory destination, force permits removing that entry and creating its replacement if parent permissions allow."
+
+So the sequence is:
+1. Try normal open (O_WRONLY|O_TRUNC for existing, O_WRONLY|O_CREAT|O_TRUNC for new)
+2. If dest exists and is nondirectory and open fails → if force: unlink(dst), then open with O_WRONLY|O_CREAT|O_TRUNC and source mode
+3. If dest is a directory → reject regardless of force
+
+Now let me think about the implementation:
+
+I need to:
+1. Add a global or passed `force` flag
+2. Modify `copy_path` to accept a `force` parameter
+3. In the option parsing, recognize `-f` and `--force`
+4. Pass the force flag to `copy_path`
+
+Let me look at the current option parsing. Currently it rejects any dash-prefixed arg before `--`. I need to add recognition of `-f` and `--force`.
+
+Wait, the spec says "Combined short options are outside scope." So I just need to handle `-f` as a standalone option and `--force` as a standalone option.
+
+Let me also re-read: "Options may appear anywhere before the first `--`; thereafter all arguments are literal operands. Bare `-` is a filename."
+
+So before `--`:
+- `-f` → force flag
+- `--force` → force flag
+- `-` → filename (operand)
+- Other `-x` → unknown option error
+
+After `--`: everything is an operand.
+
+Now let me think about the `copy_path` changes:
+
+```c
+static int copy_path(const char *src, const char *dst, int force)
+```
+
+The key change is in the destination handling:
+
+Current logic:
+1. stat(src) → must be regular file
+2. stat(dst) → if exists, must be regular file, not same inode
+3. If dst doesn't exist, check lstat for dangling symlink → reject
+4. Open src
+5. Open dst (O_WRONLY|O_TRUNC if exists, O_WRONLY|O_CREAT|O_TRUNC if not)
+6. Copy data
+
+New logic with force:
+1. stat(src) → must be regular file (unchanged)
+2. stat(dst) → if exists:
+   - If directory → reject (even with force)
+   - If regular file → check self-copy, proceed to open
+   - If doesn't exist → check lstat for dangling symlink:
+     - With force: we can unlink it and create
+     - Without force: reject
+3. Open src
+4. Open dst:
+   - If exists (regular file): try O_WRONLY|O_TRUNC
+     - If fails and force: unlink(dst), then open O_WRONLY|O_CREAT|O_TRUNC with source mode
+     - If fails and !force: error
+   - If doesn't exist: open O_WRONLY|O_CREAT|O_TRUNC with source mode
+5. Copy data
+
+Wait, I need to reconsider. Let me think about what "normal opening fails" means. If the destination is a regular file that's read-only (mode 0444), then `open(dst, O_WRONLY|O_TRUNC)` will fail with EACCES. With force, we unlink and recreate.
+
+If the destination is a dangling symlink, `stat(dst)` will fail (returns -1), so `dst_exists` is 0. Then we check `lstat(dst)` and find it's a symlink. Currently we reject. With force, we should unlink it and create a new file.
+
+Let me restructure:
+
+```c
+static int copy_path(const char *src, const char *dst, int force)
+{
+    struct stat src_st;
+    if (stat(src, &src_st) != 0) { ... }
+    if (!S_ISREG(src_st.st_mode)) { ... }
+
+    struct stat dst_st;
+    int dst_exists = (stat(dst, &dst_st) == 0);
+    
+    if (dst_exists) {
+        if (S_ISDIR(dst_st.st_mode)) {
+            // Reject - can't replace directory with file, even with force
+            fprintf(stderr, ...);
+            return 1;
+        }
+        if (!S_ISREG(dst_st.st_mode)) {
+            // Special file etc - reject
+            fprintf(stderr, ...);
+            return 1;
+        }
+        if (src_st.st_dev == dst_st.st_dev && src_st.st_ino == dst_st.st_ino) {
+            // Self-copy
+            fprintf(stderr, ...);
+            return 1;
+        }
+    } else {
+        struct stat lst;
+        if (lstat(dst, &lst) == 0) {
+            if (S_ISLNK(lst.st_mode)) {
+                // Dangling symlink
+                if (!force) {
+                    fprintf(stderr, ...);
+                    return 1;
+                }
+                // With force, we'll unlink below before creating
+            } else if (S_ISDIR(lst.st_mode)) {
+                // This shouldn't happen if stat succeeded, but be safe
+                fprintf(stderr, ...);
+                return 1;
+            }
+        }
+    }
+
+    int src_fd = open(src, O_RDONLY);
+    if (src_fd < 0) { ... }
+
+    int dst_fd = -1;
+    mode_t mode = (mode_t)(src_st.st_mode & 0777);
+    
+    if (dst_exists) {
+        dst_fd = open(dst, O_WRONLY | O_TRUNC);
+        if (dst_fd < 0 && force) {
+            // Force: try to remove and recreate
+            if (unlink(dst) != 0) {
+                fprintf(stderr, ...);
+                close(src_fd);
+                return 1;
+            }
+            dst_fd = open(dst, O_WRONLY | O_CREAT | O_TRUNC, mode);
+        }
+    } else {
+        // Handle dangling symlink with force
+        struct stat lst;
+        if (force && lstat(dst, &lst) == 0 && S_ISLNK(lst.st_mode)) {
+            if (unlink(dst) != 0) {
+                fprintf(stderr, ...);
+                close(src_fd);
+                return 1;
+            }
+        }
+        dst_fd = open(dst, O_WRONLY | O_CREAT | O_TRUNC, mode);
+    }
+    
+    if (dst_fd < 0) {
+        fprintf(stderr, ...);
+        close(src_fd);
+        return 1;
+    }
+    
+    // ... copy loop ...
+}
+```
+
+Wait, I also need to think about: what if dst exists and is a regular file, and open succeeds? Then we just overwrite, retaining permissions. That's already the case.
+
+What about the case where dst doesn't exist but lstat shows it's a symlink (dangling)? Without force, we reject. With force, we unlink and create.
+
+Actually wait - let me reconsider the case where dst doesn't exist. If `stat(dst)` fails, that means:
+- dst doesn't exist at all, OR
+- dst is a dangling symlink (stat follows symlinks, so it fails)
+
+In the current code, if dst doesn't exist (stat fails), it checks lstat:
+- If lstat shows a symlink → reject (dangling symlink)
+- If lstat fails → proceed to create
+
+With force:
+- If lstat shows a symlink → unlink it, then create
+- If lstat fails → just create (same as before)
+
+OK, let me also think about whether I need to handle the case where `unlink` succeeds but `open` fails. In that case, we've already removed the destination. But the spec says "Preserve source data on failure" - the source is untouched, so that's fine. The destination is gone, but that's the expected behavior of force (we tried to replace it).
+
+Actually, re-reading: "When normal opening fails for an existing nondirectory destination, force permits removing that entry and creating its replacement if parent permissions allow."
+
+So the flow is:
+1. Normal open fails
+2. Force allows: remove the entry
+3. Create replacement (if parent permissions allow)
+
+If step 2 or 3 fails, that's an error. The source is preserved. Good.
+
+Now for the option parsing, I need to modify the loop that currently rejects all dash-prefixed args. I need to:
+- Recognize `-f` as the force flag
+- Recognize `--force` as the force flag
+- Still reject other dash-prefixed args
+- Still treat bare `-` as a filename
+
+Let me write the changes:
+
+1. Add a `force` variable in main
+2. Modify the option parsing loop to recognize `-f` and `--force`
+3. Pass `force` to `copy_path`
+
+Let me also consider: should I check for `S_ISREG` in the dst_exists case more carefully? The current code checks `!S_ISREG(dst_st.st_mode)` and rejects. But what about a symlink to a regular file? `stat` follows symlinks, so if dst is a symlink to a regular file, `stat(dst)` succeeds and `S_ISREG` is true. That's correct - we should allow that.
+
+What about a symlink to a directory? `stat(dst)` would show it as a directory. We'd reject it. Good.
+
+What about a symlink to a non-existent file (dangling)? `stat(dst)` fails, `lstat(dst)` shows symlink. Without force: reject. With force: unlink and create. Good.
+
+I think my plan is solid. Let me write the concrete changes.
+
+Actually, one more thing: the current code's handling of the "dst doesn't exist" case checks lstat and rejects if it's a symlink. With force, I want to allow removing it. But I also need to make sure I don't accidentally allow replacing a directory with a file via force. If dst is a directory, `stat(dst)` would succeed (directories are visible), so `dst_exists` would be 1, and we'd hit the `S_ISDIR` check. Good.
+
+But what if dst is a symlink to a directory? `stat(dst)` follows the symlink and sees a directory. `dst_exists` is 1, `S_ISDIR` is true → reject. Good.
+
+What if dst is a symlink to a non-existent path (dangling)? `stat(dst)` fails. `lstat(dst)` shows symlink. With force: unlink, create. This is correct because the symlink itself is a "nondirectory destination."
+
+I'm satisfied with the logic. Let me write the instructions.
+
+One more consideration: the `copy_path` function signature changes. I need to update all call sites. There's only one call site in `main`.
+
+Let me also think about whether I should handle the case where `unlink` succeeds but `open` with O_CREAT fails (e.g., parent is read-only). In that case, we've removed the destination but can't create a new one. The spec says "force permits removing that entry and creating its replacement if parent permissions allow." If parent permissions don't allow creation, that's an error. The source is preserved. We should report an error. This is handled naturally: we unlink, then open fails, we report the error. The destination is gone (which is the intended force behavior - we tried to replace it), and the source is intact.
+
+Actually wait, is that the right behavior? If we unlink the destination and then can't create the new one, we've destroyed data. But the spec says "force permits removing that entry and creating its replacement if parent permissions allow." The "if parent permissions allow" qualifier suggests that if the parent doesn't allow creation, the operation should fail. But we've already removed the entry...
+
+Hmm, but in practice, if the parent directory is writable (which it must be to unlink), then creating a new file in it should also be possible (unless the filesystem is read-only or full). And the spec says "Do not bypass operating-system permission errors." So if the OS says we can't create, we report the error. The fact that we already unlinked is a consequence of the force semantics.
+
+Actually, re-reading more carefully: "force permits removing that entry and creating its replacement if parent permissions allow." I think "if parent permissions allow" is a condition on the entire operation, not just the creation part. But in practice, if you can unlink (which requires write permission on the parent), you can also create (which also requires write permission on the parent). The only edge case is if the filesystem becomes read-only between the two calls, or if there's a disk full condition. In those cases, we report the error.
+
+I think this is fine. The current behavior is acceptable.
+
+Let me finalize my changes:
+
+1. Change `copy_path` signature to add `int force` parameter
+2. Modify the destination handling in `copy_path`:
+   - In the `dst_exists` case: if open fails and force, unlink and recreate
+   - In the `!dst_exists` case: if lstat shows symlink and force, unlink before creating
+3. Add `force` variable in `main`
+4. Modify option parsing to recognize `-f` and `--force`
+5. Pass `force` to `copy_path` call
+
+Let me write this out clearly.
+
+------------
+► **ANSWER**
+
+## Changes to `src/c_cp/c_cp.c`
+
+### 1. Modify `copy_path` signature and destination-handling logic
+
+Change the function signature to accept a `force` flag:
+
+```c
+static int copy_path(const char *src, const char *dst, int force)
+```
+
+Replace the entire destination-existence block and the destination-open block. The new logic after the source validation (the `S_ISREG` check on `src_st`) should be:
+
+**Destination existence check** (replace the existing `dst_exists` block through the dangling-symlink rejection):
+
+```c
+    struct stat dst_st;
+    int dst_exists = (stat(dst, &dst_st) == 0);
+    if (dst_exists) {
+        if (S_ISDIR(dst_st.st_mode)) {
+            fprintf(stderr, "c_cp: %s: destination is a directory\n", dst);
+            return 1;
+        }
+        if (!S_ISREG(dst_st.st_mode)) {
+            fprintf(stderr, "c_cp: %s: destination not a regular file\n", dst);
+            return 1;
+        }
+        if (src_st.st_dev == dst_st.st_dev && src_st.st_ino == dst_st.st_ino) {
+            fprintf(stderr, "c_cp: '%s' and '%s': same file (self-copy)\n", src, dst);
+            return 1;
+        }
+    } else {
+        struct stat lst;
+        if (lstat(dst, &lst) == 0 && S_ISLNK(lst.st_mode)) {
+            if (!force) {
+                fprintf(stderr, "c_cp: %s: dangling symlink\n", dst);
+                return 1;
+            }
+            /* force: remove dangling symlink before creating replacement */
+            if (unlink(dst) != 0) {
+                fprintf(stderr, "c_cp: %s: %s\n", dst, strerror(errno));
+                return 1;
+            }
+        }
+    }
+```
+
+**Destination open** (replace the existing `dst_fd` open block):
+
+```c
+    int dst_fd;
+    mode_t mode = (mode_t)(src_st.st_mode & 0777);
+    if (dst_exists) {
+        dst_fd = open(dst, O_WRONLY | O_TRUNC);
+        if (dst_fd < 0 && force) {
+            if (unlink(dst) != 0) {
+                fprintf(stderr, "c_cp: %s: %s\n", dst, strerror(errno));
+                close(src_fd);
+                return 1;
+            }
+            dst_fd = open(dst, O_WRONLY | O_CREAT | O_TRUNC, mode);
+        }
+    } else {
+        dst_fd = open(dst, O_WRONLY | O_CREAT | O_TRUNC, mode);
+    }
+    if (dst_fd < 0) {
+        fprintf(stderr, "c_cp: %s: %s\n", dst, strerror(errno));
+        close(src_fd);
+        return 1;
+    }
+```
+
+### 2. Modify option parsing in `main` to recognize `-f` / `--force`
+
+Add a `force` flag variable before the operand-collection loop:
+
+```c
+    int force = 0;
+```
+
+Replace the pre-`--` argument loop (the `for (int i = 1; i < lim; i++)` block) with:
+
+```c
+    for (int i = 1; i < lim; i++) {
+        if (argv[i][0] == '-' && argv[i][1] != '\0') {
+            if (strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--force") == 0) {
+                force = 1;
+                continue;
+            }
+            fprintf(stderr, "c_cp: unknown option: '%s'\n", argv[i]);
+            free(ops);
+            return 1;
+        }
+        ops[n_ops++] = argv[i];
+    }
+```
+
+### 3. Pass `force` to `copy_path`
+
+Change the single call site from:
+
+```c
+        if (copy_path(src, dst) != 0)
+```
+
+to:
+
+```c
+        if (copy_path(src, dst, force) != 0)
+```
+
+---
+
+**Summary of behavior implemented:**
+- `-f` / `--force` recognized anywhere before `--`; idempotent (repeated occurrences just re-set the flag).
+- With force, if a destination is an existing regular file and `open(O_WRONLY|O_TRUNC)` fails (e.g. read-only), the file is unlinked and recreated with source rwx bits masked by umask.
+- With force, a dangling destination symlink is removed and replaced with a new regular file.
+- Force does **not** replace a directory with a file (the `S_ISDIR` check fires before any force path).
+- Force does **not** bypass source readability or parent-directory permissions (all OS calls still checked).
+- Without force, behavior is unchanged from the prior implementation.
+Tokens: 9.1k sent, 4.4k received.
+I will implement the requested changes to `c_cp.c`.
+
+c_cp.c
+```
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+/*
+ * copy_path — core filesystem copy operation.
+ * Reads the regular file at src (following symlinks) and writes its contents
+ * to dst (following dst symlinks to regular files).  Rejects directory sources,
+ * dangling destination symlinks (unless force), non-regular destinations, and self-copies.
+ * Returns 0 on success, 1 on failure (diagnostic on stderr).
+ */
+static int copy_path(const char *src, const char *dst, int force)
+{
+    struct stat src_st;
+    if (stat(src, &src_st) != 0) {
+        fprintf(stderr, "c_cp: %s: %s\n", src, strerror(errno));
+        return 1;
+    }
+    if (!S_ISREG(src_st.st_mode)) {
+        fprintf(stderr, "c_cp: %s: not a regular file\n", src);
+        return 1;
+    }
+
+    struct stat dst_st;
+    int dst_exists = (stat(dst, &dst_st) == 0);
+    if (dst_exists) {
+        if (S_ISDIR(dst_st.st_mode)) {
+            fprintf(stderr, "c_cp: %s: destination is a directory\n", dst);
+            return 1;
+        }
+        if (!S_ISREG(dst_st.st_mode)) {
+            fprintf(stderr, "c_cp: %s: destination not a regular file\n", dst);
+            return 1;
+        }
+        if (src_st.st_dev == dst_st.st_dev && src_st.st_ino == dst_st.st_ino) {
+            fprintf(stderr, "c_cp: '%s' and '%s': same file (self-copy)\n", src, dst);
+            return 1;
+        }
+    } else {
+        struct stat lst;
+        if (lstat(dst, &lst) == 0 && S_ISLNK(lst.st_mode)) {
+            if (!force) {
+                fprintf(stderr, "c_cp: %s: dangling symlink\n", dst);
+                return 1;
+            }
+            /* force: remove dangling symlink before creating replacement */
+            if (unlink(dst) != 0) {
+                fprintf(stderr, "c_cp: %s: %s\n", dst, strerror(errno));
+                return 1;
+            }
+        }
+    }
+
+    int src_fd = open(src, O_RDONLY);
+    if (src_fd < 0) {
+        fprintf(stderr, "c_cp: %s: %s\n", src, strerror(errno));
+        return 1;
+    }
+
+    int dst_fd;
+    mode_t mode = (mode_t)(src_st.st_mode & 0777);
+    if (dst_exists) {
+        dst_fd = open(dst, O_WRONLY | O_TRUNC);
+        if (dst_fd < 0 && force) {
+            if (unlink(dst) != 0) {
+                fprintf(stderr, "c_cp: %s: %s\n", dst, strerror(errno));
+                close(src_fd);
+                return 1;
+            }
+            dst_fd = open(dst, O_WRONLY | O_CREAT | O_TRUNC, mode);
+        }
+    } else {
+        dst_fd = open(dst, O_WRONLY | O_CREAT | O_TRUNC, mode);
+    }
+    if (dst_fd < 0) {
+        fprintf(stderr, "c_cp: %s: %s\n", dst, strerror(errno));
+        close(src_fd);
+        return 1;
+    }
+
+    char buf[65536];
+    for (;;) {
+        ssize_t n = read(src_fd, buf, sizeof buf);
+        if (n < 0) {
+            fprintf(stderr, "c_cp: %s: %s\n", src, strerror(errno));
+            close(src_fd);
+            close(dst_fd);
+            return 1;
+        }
+        if (n == 0)
+            break;
+        ssize_t off = 0;
+        while (off < n) {
+            ssize_t w = write(dst_fd, buf + off, (size_t)(n - off));
+            if (w < 0) {
+                fprintf(stderr, "c_cp: %s: %s\n", dst, strerror(errno));
+                close(src_fd);
+                close(dst_fd);
+                return 1;
+            }
+            off += w;
+        }
+    }
+
+    close(src_fd);
+    close(dst_fd);
+    return 0;
+}
+
+/*
+ * basename_of — return pointer to the last path component of a pathname.
+ * For "a/b/foo" returns "foo"; for "foo" returns "foo"; for "/foo" returns "foo".
+ */
+static const char *basename_of(const char *path)
+{
+    const char *slash = strrchr(path, '/');
+    return slash ? slash + 1 : path;
+}
+
+int main(int argc, char *argv[])
+{
+    /* Locate the '--' separator, if any. */
+    int dd = -1;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--") == 0) {
+            dd = i;
+            break;
+        }
+    }
+
+    /* Collect operands.
+       Before '--': dash-prefixed args (length > 1) are unknown options → error.
+       After '--': every argument is a literal operand. */
+    int cap = (argc > 1) ? argc - 1 : 1;
+    char **ops = malloc((size_t)cap * sizeof *ops);
+    if (!ops) {
+        fprintf(stderr, "c_cp: out of memory\n");
+        return 1;
+    }
+    int n_ops = 0;
+
+    int force = 0;
+    int lim = (dd >= 0) ? dd : argc;
+    for (int i = 1; i < lim; i++) {
+        if (argv[i][0] == '-' && argv[i][1] != '\0') {
+            if (strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--force") == 0) {
+                force = 1;
+                continue;
+            }
+            fprintf(stderr, "c_cp: unknown option: '%s'\n", argv[i]);
+            free(ops);
+            return 1;
+        }
+        ops[n_ops++] = argv[i];
+    }
+    int after_dd = (dd >= 0) ? dd + 1 : argc;
+    for (int i = after_dd; i < argc; i++) {
+        ops[n_ops++] = argv[i];
+    }
+
+    /* Require at least two operands. */
+    if (n_ops < 2) {
+        fprintf(stderr, "c_cp: missing required operand\n");
+        free(ops);
+        return 1;
+    }
+
+    /* Multi-source: last operand must be an existing directory (invocation-wide check). */
+    int n_src;
+    const char *dest;
+    if (n_ops == 2) {
+        n_src = 1;
+        dest = ops[1];
+    } else {
+        n_src = n_ops - 1;
+        dest = ops[n_ops - 1];
+        struct stat st;
+        if (stat(dest, &st) != 0) {
+            fprintf(stderr, "c_cp: %s: %s\n", dest, strerror(errno));
+            free(ops);
+            return 1;
+        }
+        if (!S_ISDIR(st.st_mode)) {
+            fprintf(stderr, "c_cp: %s: not a directory\n", dest);
+            free(ops);
+            return 1;
+        }
+    }
+
+    /* Determine whether single-source dest is a directory (→ use basename). */
+    int single_dest_is_dir = 0;
+    if (n_ops == 2) {
+        struct stat st;
+        if (stat(dest, &st) == 0 && S_ISDIR(st.st_mode))
+            single_dest_is_dir = 1;
+    }
+
+    /* Process each source in operand order; continue on per-source failure. */
+    int any_fail = 0;
+    for (int i = 0; i < n_src; i++) {
+        const char *src = ops[i];
+        char *dst = NULL;
+        int use_basename = (n_ops > 2) || single_dest_is_dir;
+
+        if (use_basename) {
+            const char *base = basename_of(src);
+            size_t dlen = strlen(dest);
+            size_t blen = strlen(base);
+            dst = malloc(dlen + 1 + blen + 1);
+            if (!dst) {
+                fprintf(stderr, "c_cp: out of memory\n");
+                any_fail = 1;
+                break;
+            }
+            memcpy(dst, dest, dlen);
+            dst[dlen] = '/';
+            memcpy(dst + dlen + 1, base, blen + 1);
+        } else {
+            size_t dlen = strlen(dest);
+            dst = malloc(dlen + 1);
+            if (!dst) {
+                fprintf(stderr, "c_cp: out of memory\n");
+                any_fail = 1;
+                break;
+            }
+            memcpy(dst, dest, dlen + 1);
+        }
+
+        if (copy_path(src, dst, force) != 0)
+            any_fail = 1;
+        free(dst);
+    }
+
+    free(ops);
+    return any_fail ? 1 : 0;
+}
+```
+Tokens: 9.3k sent, 2.0k received.
+Applied edit to c_cp.c
