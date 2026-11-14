@@ -9,9 +9,11 @@ import platform
 import time
 from typing import Any
 
-from .unified_graph import SCHEMA_VERSION
+from .unified_graph import BACKEND, SCHEMA_VERSION
 
-ALGORITHM_VERSION = "unified-graph-distance-exact-constrained-search-v1"
+ALGORITHM_VERSION = "unified-graph-distance-exact-constrained-search-v2"
+CFG_EDGE_LABELS = {"cfg:unconditional", "cfg:true", "cfg:false", "cfg:default",
+                   "cfg:normal", "cfg:exception", "cfg:indirect"}
 
 
 @dataclass(frozen=True)
@@ -28,7 +30,7 @@ class InvalidGraph(ValueError):
 def _validate(graph: dict[str, Any]) -> None:
     if graph.get("status") != "success":
         raise InvalidGraph("representation_unavailable:" + str(graph.get("reason", graph.get("status"))))
-    if graph.get("schema_version") != SCHEMA_VERSION or graph.get("backend") != "llvm-ir-cfg-v1":
+    if graph.get("schema_version") != SCHEMA_VERSION or graph.get("backend") != BACKEND:
         raise InvalidGraph("unsupported_representation")
     if graph.get("language") != "c":
         raise InvalidGraph("unsupported_language")
@@ -37,17 +39,58 @@ def _validate(graph: dict[str, Any]) -> None:
     if not isinstance(nodes, list) or not isinstance(edges, list):
         raise InvalidGraph("invalid_graph_shape")
     ids = [node.get("id") for node in nodes]
-    if len(ids) != len(set(ids)) or any(node.get("kind") not in {"function", "block", "api"} for node in nodes):
+    if (len(ids) != len(set(ids))
+            or any(not isinstance(identifier, str) or not identifier for identifier in ids)
+            or any(node.get("kind") not in {"function", "block", "api"} for node in nodes)):
         raise InvalidGraph("invalid_nodes")
     known = set(ids)
+    by_id = {node["id"]: node for node in nodes}
     for node in nodes:
-        if not isinstance(node.get("label"), str) or not isinstance(node.get("content"), list):
+        if (not isinstance(node.get("label"), str) or not isinstance(node.get("content"), list)
+                or not all(isinstance(atom, str) for atom in node.get("content", []))):
             raise InvalidGraph("invalid_node_attributes")
-        if node.get("kind") == "block" and node.get("owner") not in known:
-            raise InvalidGraph("invalid_block_owner")
-    if any(edge.get("source") not in known or edge.get("target") not in known or not isinstance(edge.get("label"), str)
-           for edge in edges):
-        raise InvalidGraph("invalid_edges")
+        kind, label = node["kind"], node["label"]
+        if kind == "block":
+            if node.get("owner") not in known or by_id[node["owner"]].get("kind") != "function":
+                raise InvalidGraph("invalid_block_owner")
+            if not label.startswith("block:"):
+                raise InvalidGraph("invalid_block_label")
+        elif node.get("owner") is not None:
+            raise InvalidGraph("invalid_nonblock_owner")
+        elif kind == "api" and (not label.startswith("api:") or len(label) == 4):
+            raise InvalidGraph("invalid_api_identity")
+        elif kind == "function" and not (label == "function:helper" or label.startswith("function:entry:")):
+            raise InvalidGraph("invalid_function_label")
+    edge_ids = [edge.get("id") for edge in edges]
+    if len(edge_ids) != len(set(edge_ids)):
+        raise InvalidGraph("invalid_duplicate_edge_identity")
+    for edge in edges:
+        source, target, label = edge.get("source"), edge.get("target"), edge.get("label")
+        if source not in known or target not in known or not isinstance(label, str):
+            raise InvalidGraph("invalid_edges")
+        sk, tk = by_id[source]["kind"], by_id[target]["kind"]
+        if label in {"contains", "entry"}:
+            if sk != "function" or tk != "block" or by_id[target].get("owner") != source:
+                raise InvalidGraph("invalid_ownership_edge")
+        elif label in CFG_EDGE_LABELS or (label.startswith("cfg:case:") and len(label) > len("cfg:case:")):
+            if sk != "block" or tk != "block" or by_id[source].get("owner") != by_id[target].get("owner"):
+                raise InvalidGraph("invalid_cfg_edge")
+        elif label.startswith("cfg:"):
+            raise InvalidGraph("unsupported_cfg_edge_label:" + label)
+        elif label == "call":
+            if sk != "block" or tk not in {"function", "api"}:
+                raise InvalidGraph("invalid_call_edge")
+        else:
+            raise InvalidGraph("unsupported_edge_label:" + label)
+    for function in (node for node in nodes if node["kind"] == "function"):
+        owned = [node["id"] for node in nodes if node.get("owner") == function["id"]]
+        entries = [edge for edge in edges if edge["source"] == function["id"] and edge["label"] == "entry"]
+        contains_edges = [edge for edge in edges
+                          if edge["source"] == function["id"] and edge["label"] == "contains"]
+        contains = {edge["target"] for edge in contains_edges}
+        if (not owned or len(entries) != 1 or len(contains_edges) != len(owned)
+                or contains != set(owned) or entries[0]["target"] not in contains):
+            raise InvalidGraph("invalid_function_block_inventory")
 
 
 def _edit_sequence(left: list[str], right: list[str]) -> int:
@@ -59,6 +102,63 @@ def _edit_sequence(left: list[str], right: list[str]) -> int:
                                previous[j - 1] + int(a != b)))
         previous = current
     return previous[-1]
+
+
+def _function_atom_records(graph: dict[str, Any], owner: str) -> list[dict[str, Any]]:
+    """Canonical CFG traversal, independent of textual LLVM block order."""
+    nodes = {node["id"]: node for node in graph["nodes"]}
+    blocks = {identifier for identifier, node in nodes.items()
+              if node["kind"] == "block" and node.get("owner") == owner}
+    entry = next(edge["target"] for edge in graph["edges"]
+                 if edge["source"] == owner and edge["label"] == "entry")
+    adjacency: dict[str, list[tuple[str, str]]] = {identifier: [] for identifier in blocks}
+    for edge in graph["edges"]:
+        if edge["source"] in blocks and edge["target"] in blocks and edge["label"].startswith("cfg:"):
+            adjacency[edge["source"]].append((edge["label"], edge["target"]))
+    order, seen = [], set()
+    def visit(identifier: str) -> None:
+        if identifier in seen:
+            return
+        seen.add(identifier); order.append(identifier)
+        edge_rank = {"cfg:true": 0, "cfg:unconditional": 1, "cfg:normal": 1,
+                     "cfg:false": 2, "cfg:exception": 3, "cfg:default": 4}
+        choices = sorted(adjacency[identifier],
+                         key=lambda item: (edge_rank.get(item[0], 3 if item[0].startswith("cfg:case:") else 9),
+                                           item[0], nodes[item[1]]["label"],
+                                           tuple(nodes[item[1]]["content"]), item[1]))
+        for _, target in choices:
+            visit(target)
+    visit(entry)
+    unreachable = sorted(blocks - seen, key=lambda identifier: (
+        nodes[identifier]["label"], tuple(nodes[identifier]["content"]),
+        sorted(label for label, _ in adjacency[identifier]), identifier))
+    for identifier in unreachable:
+        visit(identifier)
+    return [{"block": identifier, "index": index, "atom": atom}
+            for identifier in order for index, atom in enumerate(nodes[identifier]["content"])]
+
+
+def _sequence_correspondence(left: list[dict[str, Any]], right: list[dict[str, Any]]) -> tuple[int, list[dict[str, Any]]]:
+    rows, columns = len(left), len(right)
+    dp = [[0] * (columns + 1) for _ in range(rows + 1)]
+    for i in range(rows + 1): dp[i][0] = i
+    for j in range(columns + 1): dp[0][j] = j
+    for i in range(1, rows + 1):
+        for j in range(1, columns + 1):
+            dp[i][j] = min(dp[i - 1][j] + 1, dp[i][j - 1] + 1,
+                           dp[i - 1][j - 1] + int(left[i - 1]["atom"] != right[j - 1]["atom"]))
+    operations, i, j = [], rows, columns
+    while i or j:
+        if i and j and dp[i][j] == dp[i - 1][j - 1] + int(left[i - 1]["atom"] != right[j - 1]["atom"]):
+            status = "retained" if left[i - 1]["atom"] == right[j - 1]["atom"] else "substituted"
+            operations.append({"status": status, "left": left[i - 1], "right": right[j - 1]})
+            i -= 1; j -= 1
+        elif i and dp[i][j] == dp[i - 1][j] + 1:
+            operations.append({"status": "deleted", "left": left[i - 1], "right": None}); i -= 1
+        else:
+            operations.append({"status": "inserted", "left": None, "right": right[j - 1]}); j -= 1
+    operations.reverse()
+    return dp[rows][columns], operations
 
 
 def representation_size(graph: dict[str, Any]) -> int:
@@ -82,17 +182,15 @@ def edit_components(left: dict[str, Any], right: dict[str, Any], mapping: dict[s
     # alignment.  A parent insertion may split a block; unchanged instructions
     # can therefore remain corresponding while the new blocks/CFG edges still
     # incur their own costs.
-    def function_content(nodes: dict[str, dict[str, Any]], owner: str) -> list[str]:
-        return [atom for node in sorted(nodes.values(), key=lambda n: (n.get("audit", {}).get("block_index", -1), n["id"]))
-                if node["kind"] == "block" and node.get("owner") == owner
-                for atom in node["content"]]
+    def function_content(graph: dict[str, Any], owner: str) -> list[str]:
+        return [record["atom"] for record in _function_atom_records(graph, owner)]
     function_mapping = {a: b for a, b in mapping.items() if ln[a]["kind"] == "function"}
-    content_cost = sum(_edit_sequence(function_content(ln, a), function_content(rn, b))
+    content_cost = sum(_edit_sequence(function_content(left, a), function_content(right, b))
                        for a, b in function_mapping.items())
-    content_cost += sum(len(function_content(ln, a)) for a, n in ln.items()
+    content_cost += sum(len(function_content(left, a)) for a, n in ln.items()
                         if n["kind"] == "function" and a not in function_mapping)
     used_functions = set(function_mapping.values())
-    content_cost += sum(len(function_content(rn, b)) for b, n in rn.items()
+    content_cost += sum(len(function_content(right, b)) for b, n in rn.items()
                         if n["kind"] == "function" and b not in used_functions)
     right_edges = Counter((e["source"], e["target"], e["label"]) for e in right["edges"])
     mapped_edges = Counter((mapping[e["source"]], mapping[e["target"]], e["label"])
@@ -120,6 +218,62 @@ def _greedy(left: dict[str, Any], right: dict[str, Any]) -> dict[str, str]:
                                                    _edit_sequence(node["content"], r["content"]), r["id"]))
             mapping[node["id"]] = best["id"]; used.add(best["id"])
     return mapping
+
+
+def correspondence_diagnostics(left: dict[str, Any], right: dict[str, Any],
+                               mapping: dict[str, str]) -> dict[str, Any]:
+    ln, rn = {n["id"]: n for n in left["nodes"]}, {n["id"]: n for n in right["nodes"]}
+    used = set(mapping.values())
+    matched_nodes = [{"left": a, "right": b, "left_label": ln[a]["label"],
+                      "right_label": rn[b]["label"],
+                      "status": "retained" if ln[a]["label"] == rn[b]["label"] else "substituted"}
+                     for a, b in sorted(mapping.items())]
+    function_scripts = []
+    for a, b in sorted(mapping.items()):
+        if ln[a]["kind"] != "function":
+            continue
+        cost, operations = _sequence_correspondence(_function_atom_records(left, a),
+                                                    _function_atom_records(right, b))
+        function_scripts.append({"left_function": a, "right_function": b, "cost": cost,
+                                 "operations": operations})
+    for a, node in sorted(ln.items()):
+        if node["kind"] == "function" and a not in mapping:
+            function_scripts.append({"left_function": a, "right_function": None,
+                "cost": len(_function_atom_records(left, a)),
+                "operations": [{"status": "deleted", "left": record, "right": None}
+                               for record in _function_atom_records(left, a)]})
+    for b, node in sorted(rn.items()):
+        if node["kind"] == "function" and b not in used:
+            function_scripts.append({"left_function": None, "right_function": b,
+                "cost": len(_function_atom_records(right, b)),
+                "operations": [{"status": "inserted", "left": None, "right": record}
+                               for record in _function_atom_records(right, b)]})
+    right_edges = Counter((e["source"], e["target"], e["label"]) for e in right["edges"])
+    mapped_left = Counter((mapping[e["source"]], mapping[e["target"]], e["label"])
+                          for e in left["edges"] if e["source"] in mapping and e["target"] in mapping)
+    retained = mapped_left & right_edges
+    def expand(counter: Counter) -> list[dict[str, Any]]:
+        return [{"source": key[0], "target": key[1], "label": key[2], "count": count}
+                for key, count in sorted(counter.items()) if count]
+    left_original = Counter((e["source"], e["target"], e["label"]) for e in left["edges"])
+    mapped_retained_left = Counter()
+    remaining = Counter(retained)
+    for edge in left["edges"]:
+        if edge["source"] in mapping and edge["target"] in mapping:
+            key = (mapping[edge["source"]], mapping[edge["target"]], edge["label"])
+            if remaining[key]:
+                mapped_retained_left[(edge["source"], edge["target"], edge["label"])] += 1
+                remaining[key] -= 1
+    return {
+        "interpretation": "Optimal structural edit correspondence; not semantic equivalence or data-flow proof.",
+        "nodes": {"matched": matched_nodes,
+                  "deleted": [identifier for identifier in sorted(ln) if identifier not in mapping],
+                  "inserted": [identifier for identifier in sorted(rn) if identifier not in used]},
+        "edges": {"retained_after_relabeling": expand(retained),
+                  "deleted": expand(left_original - mapped_retained_left),
+                  "inserted": expand(right_edges - retained)},
+        "local_content": function_scripts,
+    }
 
 
 def compare(left: dict[str, Any], right: dict[str, Any], *, limits: Limits = Limits()) -> dict[str, Any]:
@@ -188,7 +342,8 @@ def compare(left: dict[str, Any], right: dict[str, Any], *, limits: Limits = Lim
     search(0, {}, set())
     distance = best_cost / denominator
     output.update(cost=best_cost, normalization_value=denominator, components=best_components,
-                  mapping=best_mapping, states=states, exact=complete)
+                  mapping=best_mapping, correspondence=correspondence_diagnostics(left, right, best_mapping),
+                  states=states, exact=complete)
     if complete:
         output.update(status="success", distance=distance, bounds=[distance, distance])
     else:

@@ -1,208 +1,283 @@
-# Experimental unified graph distance: specification and bounded validation
+# U and S_node: controlled validation and scientific assessment
 
-Status: **prototype accepted for graph-level regression only; retain A/S pending
-compiler-backed population evidence.** This work does not change the accepted
-Architecture or Strategy implementation, thresholds, journals, candidate sources,
-or benchmark execution.
+Status: **experimental**. This work does not alter accepted Architecture (A),
+Strategy (S), historical results, thresholds, journals, sources, or benchmark
+images. The controlled comparison is deliberately small; no 495-pair historical
+experiment was run.
 
-## Audit of the retained measurements
+## Audit of the accepted measurements
 
-Architecture A minimizes the symmetric difference of unit atoms (defined-function
-nodes, named external-API nodes, and distinct directed caller/callee edges) under
-an entry-anchored partial injection. It divides by the sum of atom counts. The
-MILP maximizes the equivalent common-atom objective, rechecks the integer result,
-and enumerates all scope-compatible A-optimal function mappings.
+Architecture A minimizes the symmetric difference of unit atoms (defined
+functions, named external APIs, and directed caller/callee relationships) under
+an entry-anchored partial injection. The result is divided by the sum of atom
+counts. The exact implementation enumerates every scope-compatible A-optimal
+function mapping.
 
-Strategy S is then evaluated over those mappings. A root-label substitution costs
-one. Insertion or deletion costs the size of the entire rooted subtree. Ordered
-children use sequence dynamic programming; explicitly unordered groups use
-slot-constrained assignment. Unmatched selected functions cost their full trees.
-The reported result is the range over admissible A optima, not necessarily a
-scalar. This recurrence is the source of the parent-node amplification.
+Strategy S is evaluated only over those A-optimal mappings. Its labels retain
+syntax kinds, operators, normalized binding information, literals, roles, and
+call alignment. A root substitution costs one. Its recurrence charges the full
+rooted-tree size for an insertion or deletion. Ordered children use sequence
+dynamic programming; declared unordered argument, initializer, and related
+groups use exact slot-constrained assignment. An unmatched selected function
+costs its whole tree. This full-subtree primitive causes the parent-node
+amplification under investigation.
 
-`diversity_validation.apted_distance` uses ordinary node-level APTED and therefore
-has the right edit semantics to preserve descendants when a parent is inserted.
-The package is not installed in the available Python environment, so no fresh
-APTED result is reported here.
+The repository's APTED validation baseline is an ordered, node-level tree edit
+over tree-sitter named-node kinds. Its node-splicing semantics can retain
+descendants after a parent edit, but the baseline does not reproduce S's rich
+labels, A-optimal function alignment, or constrained-unordered groups. The
+`apted` package is absent from the available environment, so no new APTED number
+is represented as evidence here.
 
-The retained Clang adapter provides JSON AST structure, direct calls, API names,
-operators, literals, casts, and normalized local bindings. It has no compiler CFG
-or basic blocks. The new extractor consequently consumes textual LLVM IR and uses
-LLVM basic blocks and terminators as the compiler CFG. It is not an AST-derived
-CFG approximation.
+The accepted Clang adapter provides JSON ASTs, direct calls, API identities,
+operators, literals, casts, and normalized bindings; it does not provide a CFG.
+U therefore consumes textual LLVM IR and calls its basic-block graph a compiler
+CFG only when that IR was emitted by Clang. Hand-authored IR in the focused tests
+is explicitly a graph test double, not a compiler-backed C result.
 
-All ordered test files named by the historical documentation are absent from this
-checkout. The only pre-existing root test is `test_lineage_seed_schedule.py`.
-The active reporting consumers remain the final and threshold runners, the
-final-checkpoint and longitudinal reporters, and the legacy experiment analyzer's
-construct-validation imports. Several historical report scripts rewrite outputs
-even in reporting modes and were not run.
+Existing production consumers remain `ordered_distances.py`, `ordered_exact.py`,
+`ordered_thresholds.py`, `ordered_diversity_threshold_study.py`, and the two
+checkpoint reporting scripts. None imports `strategy_node.py`. Historical
+provenance contracts and artifacts remain unchanged.
 
-The immutable Phase 2.5→2.7 evidence chain, compiler/header hashes, raw and
-LF-normalized source identities, pairwise artifacts, and measurement journal were
-left unchanged.
+## U representation and objective
 
-## Representation
+Schema `unified-program-graph-v2` contains function, basic-block, and external
+API nodes. Edges record ownership, entry, direct calls, and typed CFG relations:
+unconditional, true, false, exact switch case, default, normal, and exception.
+Block content is a canonical sequence of LLVM operation signatures.
 
-Schema `unified-program-graph-v1` contains three node kinds:
-
-- function nodes, with entry versus helper labels;
-- LLVM basic-block nodes, owned by functions and labeled by terminator category;
-- external API nodes, labeled by exact API identity.
-
-Directed labeled edges are `contains`, `entry`, typed CFG edges (`true`, `false`,
-`case`, `default`, `normal`, `exception`, and unconditional), and direct call
-edges from blocks to functions or APIs. Each block stores an ordered sequence of
-canonical LLVM-instruction signatures. Signatures erase SSA/local names but retain
-operations, comparison predicates, integer-operation flags, direct external API
-identity, argument index/type/value category, PHI arity, and branch category.
-
-The artifact records raw source and LLVM-IR SHA-256 identities, compiler version
-and binary hash, command, profile, extractor version, and explicit limitations.
-The source-to-IR CLI refuses non-C inputs and refuses to compile outside Docker.
-Unsupported extraction is `unavailable`, never an empty graph.
-
-## Mathematical objective
+Version 2 retains exact integer and floating constants, argument slots, global
+identities, arithmetic/comparison operators, and limited CFG-ordered SSA producer
+descriptors, including branch conditions, returns, PHIs, calls, stores, and
+selects. It erases SSA spellings and local names. This fixes the observed
+v1 collisions for `x + 1` versus `x + 9`, different switch constants, and
+`x + y` versus `x + x`, without making ordinary variable renaming observable.
+This remains limited structural/data-dependency evidence, not a claim of
+semantic equivalence or complete data-flow equivalence.
 
 For graph `G`, define
 
 ```text
-size(G) = |V_G| + |E_G| + number of local instruction atoms.
+size(G) = |V_G| + |E_G| + number of local operation atoms.
 ```
 
-Let `m` be a partial one-to-one correspondence between compatible nodes. Function
-entry points of the same identity are anchored when present on both sides; helper
-functions may match any helper. A block can match only a block whose owner
-functions are matched. API nodes can match other API nodes, with differing API
-identity charged as a label substitution.
-
-For a fixed `m`, the edit cost is
+An alignment `m` is a partial one-to-one map between compatible nodes. Matching
+entry functions are anchored by identity; helpers can match helpers; a block can
+match only when its owner functions match; APIs match APIs. For fixed `m`,
 
 ```text
 C(m) = C_node(m) + C_edge(m) + C_content(m)
-C_node = unmatched nodes + unequal labels on matched nodes
-C_edge = multiset symmetric difference of directed labeled edges after relabeling by m
-```
 
-`C_content` is unit-cost Levenshtein distance over the ordered local-atom sequence
-of each matched function, plus all local atoms in unmatched functions. Content is
-compared at function scope so inserting a parent that splits a basic block does
-not force unchanged instructions to be deleted and recreated. Block ownership,
-placement, and control relationships remain observable through block nodes and
-edges.
+C_node    = unmatched nodes + unequal labels on matched nodes
+C_edge    = multiset symmetric difference of directed labeled edges after m
+C_content = unit Levenshtein edit cost on matched-function operation streams
+            + all operations belonging to unmatched functions
 
-Every primitive costs exactly one: node insertion/deletion/label substitution,
-directed labeled edge insertion/deletion, and local-atom insertion/deletion/
-substitution. There are no fitted feature weights.
-
-```text
 D_U(P,Q) = min_m C(m) / (size(P) + size(Q)).
 ```
 
-Both-empty representations have distance zero. One empty and one nonempty graph
-have distance one. A completed exact comparison is symmetric and lies in `[0,1]`.
-No triangle-inequality or identity-of-indiscernibles proof is claimed, so this is
-called a distance/objective rather than a mathematical metric.
+Each node insertion, node deletion, node-label substitution, directed labeled
+edge insertion/deletion, and local atom insertion/deletion/substitution costs
+one. There are no fitted weights. Function operation streams are ordered by a
+deterministic CFG traversal, so textual LLVM block order alone does not alter
+content distance. Unreachable blocks are appended deterministically.
 
-The implementation uses deterministic constrained exhaustive search, greedy
-incumbent ordering, a state limit, node limit, and wall-clock limit. Completion is
-reported as exact. Exhaustion returns a `bounded` result with a certified (currently
-trivial) lower bound and incumbent upper bound; `distance` remains null. A separate
-Cartesian-product oracle checks tiny graphs.
+Both empty graphs have distance zero; exactly one empty graph has distance one.
+A completed exhaustive comparison is symmetric and is in `[0,1]`. No triangle
+inequality or identity-of-indiscernibles proof is claimed, so U is not called a
+mathematical metric.
 
-## Parent-node regression and construct sensitivity
+The diagnostic result now includes the node map, inserted/deleted/substituted
+nodes, retained/inserted/deleted relabeled edges, and an explicit local-operation
+edit script. These are edit correspondences, not inferred semantic homologies.
 
-On an abstract eight-descendant tree, the retained rooted-subtree recurrence gives
-sizes 9 and 10 and cost **16/19 = 0.8421** for inserting one parent. The descendants
-are involved in the charged delete/insert alternatives.
+### Extraction and validation changes
 
-On the attributed-graph regression with eight unchanged arithmetic operations and
-an inserted conditional, U is **12/37 = 0.3243**:
+The v2 extractor fails explicitly on unresolved indirect calls, `callbr` and
+other unsupported exceptional terminators, missing or unsupported terminators,
+unclosed functions, empty/missing basic blocks, and unsupported instruction
+syntax. It no longer silently emits a call to an empty target. Exact switch-case
+values are present in signatures and edge labels. `invoke` has normal and
+exception edges when its direct target is resolvable.
 
-| Diagnostic | Unit cost |
-| --- | ---: |
-| Node edits | 3 |
-| Directed edge edits | 5 |
-| Local-content edits | 4 |
-| Total | 12 |
+Graph validation now rejects duplicate node/edge IDs, unknown owners/endpoints,
+invalid ownership/entry direction, cross-function CFG edges, invalid call edge
+types, incomplete block ownership, and missing or multiple function entries.
+The JSON schema rejects undeclared fields and separately specifies success and
+unavailable artifacts.
 
-The local cost is exactly the four introduced IR atoms and does not grow with the
-eight unchanged operations. The new blocks and CFG relationships remain visible.
-The reverse removal has the same exact distance. Tests also show zero for identical
-and SSA/local renaming cases, and nonzero changes for comparison predicates,
-arithmetic operations, external APIs, helper extraction/inlining, loop edges,
-instruction order/content, and unreachable padding. These are hand-authored LLVM
-IR test doubles for algorithm validation, not compiler-backed C construct results
-or evidence of semantic equivalence.
+Remaining representation limitations include unresolved dynamic dispatch,
+memory aliasing, full def-use graphs, path feasibility, volatile/atomic semantic
+detail, inline assembly, and some exceptional LLVM constructs. Producer slots and
+compiler canonicalization may still vary when CFG structure or optimization
+changes, although textual block serialization alone is covered by regression.
 
-The referenced Kelpie paper motivates testing both CFG and instruction features:
-it inserts opaque-predicate dummy blocks and dead instructions to mimic target
-binaries. It does **not** define this objective or algorithm. The same attack shows
-that U can be manipulated: padding deliberately changes exactly the block, edge,
-and local atoms U observes. U measures representation difference, not behavior,
-exploit independence, or attack difficulty. See the [Kelpie paper](https://arxiv.org/pdf/2605.18231).
+## Experimental S_node
 
-## Historical comparison coverage
+`strategy_node.py` retains the accepted scope rule, comparison trees, labels,
+identifier normalization, call alignment, Architecture objective, and all
+scope-compatible A-optimal mappings. It emits a separate
+`strategy-node-splicing-constrained-unordered-v1` result and never writes S.
 
-The read-only journal contains 140 candidates in 18 populations and 495 pairs:
-480 exact A outcomes and 363 available S outcomes. Of 140 AST extractions, 137 are
-comparison-eligible. None has a saved LLVM IR/CFG artifact. Docker Desktop was
-started successfully, but inspection of both immutable local C and Rust images
-found no Clang binary; the pinned C image contains GCC 12.2. Substituting GCC or
-downloading an unpinned toolchain would violate the extraction contract. The
-extractor returns `clang_unavailable_in_docker`. Therefore fresh U coverage is
-**0/495**.
+Its primitive costs are:
 
-No U means, distributions, rank correlations, disagreements, or pair-ranking
-changes are reported. Reporting numerical comparisons from ASTs as if they were
-compiler CFGs would violate the representation contract. Historical A/S files and
-the journal were not modified. The old 0.30 Architecture threshold is not applied
-to U.
+```text
+insert one ordinary node and splice its ordered children: 1
+delete one ordinary node and splice its ordered children: 1
+substitute one node label:                             1
+retain equal labels:                                  0
+unmatched selected function:             full node count
+```
+
+Ordered forests use an exact dynamic program for those primitives. When two
+compatible unordered containers align, immediate children use exact subset
+assignment under the existing role/slot labels. Slot labels are removed only
+inside the assigned child pair, allowing a wrapper to be inserted within an
+argument slot. An unmatched unordered-rooted child costs its full size and may
+not splice across the frontier. This is an exact algorithm for this documented
+frontier-preserving extension; it is not unrestricted unordered tree edit and is
+not labeled APTED.
+
+Limits cover events, exact A-optimum enumeration, unordered width, dynamic-
+program work, time, and diagnostic size. Limit exhaustion returns unavailable.
+If A optimum enumeration is incomplete, S_node is unavailable. When A has
+multiple admissible optima, S_node reports the complete range and correspondence
+evidence instead of selecting an undisclosed mapping.
+
+## Controlled three-method comparison
+
+`unified_controlled_comparison.py` compares retained A/S, A with S_node, and U on
+eight deliberately small cases. A/S and S_node use synthetic Clang-adapter
+structures; U uses hand-authored LLVM IR. Thus the table validates algorithms and
+construct sensitivity, not compiler normalization. Raw costs and denominators
+from different representations are **not interchangeable**.
+
+| Case | A raw/den | S raw/den | S_node raw/den | U node+edge+content / den |
+| --- | ---: | ---: | ---: | ---: |
+| Parent insertion, 8 retained descendants | 0/2 | 16/19 | **1/19** | 3+5+5 / 37 |
+| Helper extraction | 2/4 | 8/12 | 9/12 | 2+3+4 / 19 |
+| Inlining | 2/4 | 8/12 | 9/12 | 2+3+4 / 19 |
+| Branch predicate change | 0/2 | 1/16 | 1/16 | 0+0+1 / 48 |
+| Constant change | 0/2 | 1/8 | 1/8 | 0+0+1 / 12 |
+| Operand dependency change | 0/2 | 1/8 | 1/8 | 0+0+1 / 12 |
+| Conditional-to-loop CFG restructuring | 0/2 | 1/16 | 1/16 | 0+2+0 / 48 |
+| Dead local-operation padding | 0/2 | 1/9 | 1/9 | 0+0+1 / 13 |
+
+All results in this table completed exact search for their stated models.
+Helper extraction and inlining illustrate that S_node is not uniformly smaller:
+its constrained unordered frontier prevents a cross-function call wrapper from
+being treated as a cheap arbitrary splice. Architecture and U also detect the
+function/call decomposition change.
+
+For the parent case, U's operation edit script explicitly retains all eight
+`add` operations, inserts `icmp`, conditional `br`, unconditional `br`, and
+`phi`, substitutes the return dependency from the last `add` to the new `phi`,
+and reports no local deletion. Low edit cost is not being used as a substitute
+for this correspondence evidence.
+
+The original parent fixture changes output on some inputs and is retained only
+as a shape stress test. It is not evidence of semantics-preserving diversity.
+`tests/fixtures/unified_diversity/equivalent_transformations.c` independently
+checks output equality over 10,000 inputs plus boundary values for:
+
+- a conditional wrapper whose two branches compute the same result;
+- helper extraction;
+- dead arithmetic/instruction padding; and
+- if/else versus switch branch restructuring.
+
+The fixture passes when compiled and executed with strict C11 flags in the
+pinned C Docker image. That image has GCC 12.2 and no Clang, so this is executable
+functional evidence only; it is not a compiler-backed U extraction. The checks
+establish finite-domain construct sensitivity, not proof of semantic equivalence.
+
+## Scalability and compiler environment
+
+U currently enumerates compatible partial node injections. With `n` compatible
+nodes on each side, the state population is
+`sum(k=0..n) choose(n,k)^2 k!`. It is 1,441,729 at 8 nodes, 234,662,231 at 10,
+53,334,454,417 at 12, and about 1.73e21 at 20. The default two-million-state
+limit therefore barely covers eight fully compatible nodes.
+
+A read-only size audit of the existing successful C population found 137
+eligible representations, 1--16 functions (mean 7.04), and 143--2,762 accepted
+AST events (mean 1,199). A U graph additionally contains blocks and API nodes.
+The present exhaustive aligner is therefore not a realistic engine for the
+historical population. The limit was not raised, and no historical pair was run.
+
+The most viable exact replacement is a pinned mixed-integer model with binary
+node-pair variables, owner/entry compatibility constraints, edge conjunction
+variables, and precomputed node-label/content rewards, modeled after the exact A
+solver. Solver bounds must be reported when time expires. Branch-and-bound/A*
+with admissible label, ownership, and edge lower bounds is another exact option.
+Greedy matching, WL-style embeddings, or relaxed assignment can supply an
+explicit incumbent upper bound, but must be labeled heuristic and never exact.
+
+Compiler-backed U requires a separate analysis image, not a benchmark-image
+change. It must pin an immutable digest; Clang/LLVM version (the current accepted
+analysis contract names 21.1.8), binary hash, target triple, headers, C profile,
+optimization level, and LLVM emission flags; run without network access; record
+source and IR hashes and the full command; and pass deterministic repeat checks.
+The existing pinned C and Rust images contain no Clang, so the extractor honestly
+returns `clang_unavailable_in_docker`.
 
 ## Scientific assessment
 
-1. **Parent amplification:** graph-level evidence is positive. Unchanged local
-   atoms remain aligned across a block split; only the parent-related content and
-   graph structure are charged. Compiler-backed C validation remains outstanding.
-2. **Function decomposition:** retained through function nodes, ownership, entry,
-   and direct call edges. Helper extraction/inlining is detected.
-3. **Local strategy:** operations, predicates, API identities, argument roles, and
-   order are detected at LLVM-IR granularity. Data flow and path feasibility are
-   not modeled.
-4. **Manipulability:** dummy branches, unreachable blocks, and dead-instruction
-   padding change U. Kelpie makes this an important validity threat, not a corner
-   case.
-5. **Compiler stability:** untested here. O0/O2, Clang versions, target triples,
-   lowering, inlining, and dead-code elimination can change every component.
-6. **Information lost versus A/S:** source-level nesting, declaration/binding
-   details, implicit casts, and A's easily interpretable pure call-graph objective
-   are less separable in one scalar. Diagnostic components help but do not restore
-   two independently interpretable estimands.
-7. **Replacement evidence needed:** Docker-pinned extraction of all controlled C
-   pairs; exact/oracle agreement; broad historical coverage; correlation and
-   disagreement analysis; compiler/optimization sensitivity; adversarial padding
-   analysis; and preregistered interpretation/threshold validation.
-8. **Cross-language consistency:** Rust needs a pinned rustc/LLVM or MIR-to-CFG
-   extractor with monomorphization, trait/dynamic dispatch, panic/unwind, and
-   source-to-instance provenance. Python needs a pinned interpreter bytecode CFG
-   with exception edges, dynamic call-resolution policy, closures/comprehensions,
-   and version-specific opcode normalization. Neither is implemented or claimed.
+1. **Parent amplification:** S_node directly removes the artifact: 16 edits become
+   one parent insertion while nine unchanged nodes remain matched. U also avoids
+   recreating unchanged local operations, but still charges real CFG structure.
+2. **Function decomposition:** A already measures it transparently. S_node retains
+   A's alignment and U observes function, ownership, and call changes.
+3. **Local distinctions:** S_node retains accepted syntax labels and detects the
+   tested branch, constant, operand, and padding changes. U v2 detects the tested
+   instruction/CFG forms, but is incomplete as a data-flow model.
+4. **Manipulation:** U is intentionally sensitive to dummy blocks and instruction
+   padding. Kelpie motivates this adversarial test but does not define U. S_node
+   is also sensitive when padding survives the source AST. Neither implies a
+   behavior, exploit-independence, or attack-difficulty result.
+5. **Compiler stability:** U remains unvalidated across optimization levels,
+   targets, and Clang versions. S_node inherits the already pinned source-AST
+   extraction contract and has the smaller new validity burden.
+6. **Information tradeoff:** A/S preserves two interpretable estimands. U combines
+   function, CFG, and local evidence into one denominator; diagnostics do not make
+   those scientific constructs interchangeable. S_node loses S's intentional
+   full-subtree penalty but preserves labels and unordered role boundaries.
+7. **Evidence still required:** compiler-backed equivalent C pairs, exact solver/
+   tiny-oracle agreement, optimization/version sensitivity, broader alignment-
+   ambiguity tests, adversarial padding, and then a preregistered historical run.
+8. **Other languages:** Rust needs pinned rustc/LLVM or MIR CFG extraction with
+   monomorphization, trait/dynamic dispatch, panic/unwind, and instance provenance.
+   Python needs a pinned bytecode CFG with exception edges, dynamic call policy,
+   closures/comprehensions, and opcode-version normalization. Neither is supported.
 
-Replacing only S with a node-splicing tree edit (such as APTED with richer labels)
-is lower risk: it directly fixes the known recurrence artifact while preserving
-A's interpretation and existing function alignment. U may ultimately capture
-richer CFG and local structure, but combining everything into one scalar is not
-automatically scientifically superior.
+## Verification and environmental blockers
 
-## Recommendation and blockers
+The focused Python suite contains 28 passing tests covering U extraction,
+validation, collision regressions, textual block-order invariance, tiny-oracle
+agreement, bounded outcomes, operation correspondence, S_node node splicing,
+constrained unordered groups, alignment-sensitive ranges, and the controlled
+comparison. Python byte-compilation and Draft 2020-12 schema validation pass.
 
-**Retain A/S pending further evidence**, while prioritizing an experiment that
-retains A and replaces only S's rooted-subtree recurrence with labeled node-level
-tree edit. Do not adopt U or transfer any clustering threshold yet.
+The equivalent-transformation C fixture passes strict C11 compilation and its
+finite-domain output checks at both `-O0` and `-O2` in pinned image
+`sha256:02cf23e5c3273ff2969f25010e79346dfbd98ae51499e04996ba802d49f99ad7`.
+Full `unittest` discovery reaches all new tests but cannot import the pre-existing
+`test_lineage_seed_schedule.py` because `pytest` is not installed in the host
+Python environment. No dependency was installed. The absent pinned Clang and
+absent `apted` package remain scientific blockers described above.
 
-Remaining blockers are the absent pinned Clang CFG environment,
-missing APTED dependency, absent historical LLVM IR, zero historical U coverage,
-no compiler-setting sensitivity run, and the exponential exact alignment search
-(larger cases will be bounded/unavailable). These are measurement limitations, not
-silent approximations.
+## Recommendation
+
+The evidence supports **keeping Architecture and replacing only Strategy with
+S_node as the preferred experimental direction**, subject to compiler-backed
+controlled validation before changing the paper's accepted measurement. S_node
+fixes the identified recurrence artifact directly while preserving A's clear
+function/call interpretation and accepted alignment policy.
+
+U should continue as a potential replacement research track, not be adopted now.
+Its representation is more discriminating than v1 and its parent correspondence
+is credible, but exhaustive alignment is unscalable, compiler stability is
+untested, dummy padding is an exposed manipulation surface, and a single scalar
+does not yet justify discarding the separate A/S constructs. No U threshold or
+historical A threshold transfer is scientifically warranted.
 
