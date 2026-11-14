@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""py_cp — checkpoint 000: basic file copy utility."""
+import os
+import stat
+import sys
+
+
+def parse_args(argv):
+    operands = []
+    after_ddash = False
+    for token in argv:
+        if not after_ddash and token == '--':
+            after_ddash = True
+            continue
+        if after_ddash:
+            operands.append(token)
+        else:
+            if token.startswith('-') and token != '-':
+                return None, f"unknown option: {token}"
+            operands.append(token)
+    return operands, None
+
+
+def copy_path(src, dst):
+    src_fd = os.open(src, os.O_RDONLY)
+    try:
+        src_stat = os.fstat(src_fd)
+        try:
+            dst_fd = os.open(dst, os.O_WRONLY | os.O_TRUNC)
+        except FileNotFoundError:
+            if os.path.lexists(dst):
+                raise OSError(f"{dst}: Dangling symbolic link")
+            dst_fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+            mode = stat.S_IMODE(src_stat.st_mode) & ~0o022
+            os.fchmod(dst_fd, mode)
+        try:
+            while True:
+                chunk = os.read(src_fd, 131072)
+                if not chunk:
+                    break
+                view = memoryview(chunk)
+                while view:
+                    n = os.write(dst_fd, view)
+                    view = view[n:]
+        finally:
+            os.close(dst_fd)
+    finally:
+        os.close(src_fd)
+
+
+def main():
+    operands, err = parse_args(sys.argv[1:])
+    if err is not None:
+        print(f"py_cp: {err}", file=sys.stderr)
+        sys.exit(1)
+
+    if len(operands) < 2:
+        print("py_cp: missing required operand", file=sys.stderr)
+        sys.exit(1)
+
+    multi = len(operands) > 2
+    if multi:
+        dest_dir = operands[-1]
+        sources = operands[:-1]
+        try:
+            st = os.stat(dest_dir)
+        except OSError:
+            print(f"py_cp: {dest_dir}: Not a directory", file=sys.stderr)
+            sys.exit(1)
+        if not stat.S_ISDIR(st.st_mode):
+            print(f"py_cp: {dest_dir}: Not a directory", file=sys.stderr)
+            sys.exit(1)
+        into_dir = True
+    else:
+        sources = [operands[0]]
+        dest_dir = operands[1]
+        try:
+            st = os.stat(dest_dir)
+            into_dir = stat.S_ISDIR(st.st_mode)
+        except OSError:
+            into_dir = False
+
+    exit_status = 0
+
+    for src in sources:
+        dst = os.path.join(dest_dir, os.path.basename(src)) if into_dir else dest_dir
+        try:
+            src_stat = os.stat(src)
+            if not stat.S_ISREG(src_stat.st_mode):
+                print(f"py_cp: {src}: Not a regular file", file=sys.stderr)
+                exit_status = 1
+                continue
+            try:
+                dst_stat = os.stat(dst)
+                if not stat.S_ISREG(dst_stat.st_mode):
+                    print(f"py_cp: {dst}: Not a regular file", file=sys.stderr)
+                    exit_status = 1
+                    continue
+                if (src_stat.st_dev == dst_stat.st_dev
+                        and src_stat.st_ino == dst_stat.st_ino):
+                    print(f"py_cp: '{src}' and '{dst}' are the same file",
+                          file=sys.stderr)
+                    exit_status = 1
+                    continue
+            except FileNotFoundError:
+                if os.path.lexists(dst):
+                    print(f"py_cp: {dst}: Dangling symbolic link",
+                          file=sys.stderr)
+                    exit_status = 1
+                    continue
+            except PermissionError:
+                print(f"py_cp: {dst}: Permission denied", file=sys.stderr)
+                exit_status = 1
+                continue
+
+            copy_path(src, dst)
+        except (OSError, MemoryError) as e:
+            print(f"py_cp: {src}: {e.strerror or e}", file=sys.stderr)
+            exit_status = 1
+
+    sys.exit(exit_status)
+
+
+if __name__ == "__main__":
+    main()

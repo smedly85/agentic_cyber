@@ -1,0 +1,2024 @@
+
+===== LLM INVOCATION 0: INITIAL =====
+
+
+Aider v0.86.2
+Main model: ollama_chat/qwen3.8:27b with architect edit format
+Editor model: ollama_chat/qwen3-coder-next:latest with whole edit format
+Weak model: ollama_chat/qwen3-coder-next:latest
+Git repo: none
+Repo-map: disabled
+Added py_cp.py to the chat.
+Added ../../tests/py-cp-test-suite/BUNDLE.json to the chat (read-only).
+Added ../../tests/py-cp-test-suite/config.py to the chat (read-only).
+Added ../../tests/py-cp-test-suite/engine.py to the chat (read-only).
+Added ../../tests/py-cp-test-suite/config.json to the chat (read-only).
+Added ../../tests/py-cp-test-suite/props.py to the chat (read-only).
+Added ../../tests/py-cp-test-suite/judge_candidate.sh to the chat (read-only).
+Added ../../tests/py-cp-test-suite/runner.py to the chat (read-only).
+Note: in-chat filenames are always relative to the git working dir, not the 
+current working dir.
+Cur working dir: 
+/Users/sonjabrown/agentic_cyber/runs/formal/py-cp-vessel8g-10/lineage-004/003/te
+mp-1p0/attempt-001/workdir
+Git working dir: /Users/sonjabrown/agentic_cyber
+
+
+--------------
+► **THINKING**
+
+Let me analyze the task carefully:
+
+1. I need to extend `py_cp.py` to add `-r`/`--recursive` flag while preserving existing `-f`/`--force` and `-i`/`--interactive` behavior.
+
+2. Key requirements for `-r`/`--recursive`:
+   - Directory sources copy their descendants and empty directories
+   - A missing destination becomes the tree root
+   - An existing directory destination receives source-basename, merging existing directories
+   - New directories receive source rwx bits masked by umask; existing directories keep their bits
+   - All source symlinks (including operand symlinks and dangling/cyclic links) are recreated with identical target bytes and are not traversed
+   - Without recursive mode preserve earlier symlink behavior
+   - Preserve force and interactive behavior for regular files
+   - Reject incompatible types and copying a directory into itself or a descendant
+   - An initial empty output directory may remain, but no descendants may be copied into it
+   - Resource limits must produce a diagnostic rather than looping or crashing
+
+3. Must preserve the `copy_path` function as the semantic anchor - it must be reachable from main through it.
+
+4. Must keep the existing `-f` and `-i` behavior intact.
+
+Let me think about the architecture:
+
+Current code has:
+- `_parse_operands` - parses args, returns (operands, force, interactive)
+- `_validate_source` - validates a regular file source
+- `_validate_destination` - validates destination
+- `copy_path` - copies a single file (the semantic anchor)
+- `main` - orchestrates
+
+For `-r`:
+- Need to add `recursive` to `_parse_operands`
+- Need a new function or logic to handle directory copying
+- Directory copy should:
+  1. Determine the destination directory (if dest is missing, it's the new root; if dest exists as a directory, it's dest/source-basename)
+  2. Recursively traverse the source tree
+  3. For each entry:
+     - If it's a symlink: recreate with identical target bytes (don't follow)
+     - If it's a directory: create if missing (with source rwx & ~umask), keep bits if existing
+     - If it's a regular file: use `copy_path` to copy it (preserving force/interactive)
+  4. Reject copying a directory into itself or its descendant
+
+Let me think about the self-copy detection for directories:
+- If source is `/a/b` and destination would resolve to `/a/b/c` or `/a/b` itself, that's a self-copy
+- Need to check if the destination path (after resolution) is the same as or inside the source path
+
+For the "copying a directory into itself or a descendant" check:
+- Resolve source to its absolute path
+- Resolve destination to its absolute path
+- If destination == source, or destination starts with source + "/", it's a self-copy
+- Also if source starts with destination + "/", that would mean we're trying to copy into an ancestor... wait, that doesn't make sense for the "into itself or descendant" rule.
+
+Actually, re-reading: "Reject ... copying a directory into itself or a descendant". So:
+- Source is dir, destination resolves to source itself → reject
+- Source is dir, destination resolves to a path inside source → reject
+
+Wait, let me re-think. In `cp -r src dest`:
+- If dest doesn't exist, dest becomes the new directory (tree root)
+- If dest exists as a directory, the source dir is copied INTO dest as dest/basename(src)
+
+So the effective destination for the source dir is:
+- If dest doesn't exist: dest
+- If dest is a directory: dest/basename(src)
+
+Then we check if this effective destination is the same as or a descendant of source.
+
+For the traversal:
+- I should use `os.scandir` or `os.walk` but I need to handle symlinks specially (don't follow them)
+- `os.walk` with `followlinks=False` should work, but I also need to handle the top-level being a symlink
+
+Wait, for recursive mode:
+- "all source symlinks, including operand symlinks and dangling or cyclic links, are recreated with identical target bytes and are not traversed"
+
+So if the SOURCE itself is a symlink (operand symlink), in recursive mode we should... recreate it as a symlink? Let me re-read: "In recursive mode all source symlinks, including operand symlinks and dangling or cyclic links, are recreated with identical target bytes and are not traversed."
+
+So if the source is a symlink (even at the top level), in recursive mode we just recreate the symlink at the destination. We don't follow it to copy the target's contents.
+
+This makes sense - `cp -r symlink dest` would just create a symlink at dest pointing to the same target.
+
+Let me now plan the implementation:
+
+1. Modify `_parse_operands` to also return `recursive` (add `-r`/`--recursive` recognition)
+
+2. Add a `_copy_tree(source, destination, force, interactive)` function that:
+   - Determines effective destination
+   - Checks for self-copy (source is ancestor of or equal to effective dest)
+   - Recursively copies the tree
+   - For symlinks: recreate with `os.readlink` and `os.symlink_to`
+   - For directories: create with appropriate permissions
+   - For regular files: call `copy_path`
+   - Handles errors per-entry, continuing on failure
+
+3. Modify `main` to:
+   - Accept `recursive` from `_parse_operands`
+   - When recursive and source is a directory, call `_copy_tree` instead of `_validate_source` + `copy_path`
+   - When recursive and source is a regular file, still use existing path (validate_source + copy_path)
+   - When recursive and source is a symlink, recreate the symlink
+
+Wait, let me reconsider the flow in main:
+
+Current main:
+1. Parse operands, force, interactive
+2. Determine sources and dest (multi vs single)
+3. For each source:
+   a. Validate source is a regular file
+   b. Validate destination
+   c. Check self-copy
+   d. Call copy_path
+
+New main should:
+1. Parse operands, force, interactive, recursive
+2. Determine sources and dest
+3. For each source:
+   a. If recursive:
+      - If source is a directory (or symlink to directory? No - "all source symlinks... are recreated")
+        - Wait, "including operand symlinks" means if the source operand IS a symlink, in recursive mode we just recreate the symlink
+      - If source is a regular file: use existing logic (validate + copy_path)
+      - If source is a directory: use _copy_tree
+      - If source is a symlink: recreate the symlink
+      - If source doesn't exist: error
+   b. If not recursive:
+      - Existing logic (validate source is regular file, copy_path)
+
+Actually wait, let me re-read: "In recursive mode all source symlinks, including operand symlinks and dangling or cyclic links, are recreated with identical target bytes and are not traversed."
+
+This means:
+- In recursive mode, if a source is a symlink (regardless of what it points to), we just recreate it as a symlink with the same target.
+- This applies to both the top-level source AND symlinks found during traversal.
+
+So in recursive mode:
+- Source is a symlink → recreate symlink at destination
+- Source is a directory → copy tree
+- Source is a regular file → copy file (existing logic)
+- Source doesn't exist → error
+
+For the tree copy, during traversal:
+- Encounter a symlink → recreate it (don't follow)
+- Encounter a directory → create it and recurse
+- Encounter a regular file → copy it with copy_path
+- Encounter anything else → error/skip?
+
+Let me think about the destination logic for recursive:
+
+For `cp -r src dest`:
+- If dest doesn't exist: dest becomes the new directory (the tree root). The source tree is copied to dest.
+- If dest exists as a directory: the source is copied INTO dest. The effective root is dest/basename(src).
+- If dest exists as a file: this is an error (incompatible types) - actually wait, can this happen? If src is a directory and dest is a file, that's an error.
+
+Actually, re-reading: "A missing destination becomes the tree root; an existing directory destination receives source-basename, merging existing directories there."
+
+So:
+- dest missing → effective_dest = dest (this becomes the new directory)
+- dest is a directory → effective_dest = dest/basename(src)
+- dest is a file → error (incompatible)
+
+Now for the self-copy check in recursive mode:
+- effective_dest == source (after resolving) → error
+- effective_dest is inside source → error (copying into a descendant)
+
+I need to be careful with symlink resolution here. If source is a symlink, we don't follow it in recursive mode. But for the self-copy check, we should probably use the resolved path.
+
+Actually, if source is a symlink, we just recreate it - no tree traversal, so no self-copy issue.
+
+Let me think about the self-copy check more carefully:
+- We need to compare the resolved real paths
+- source_real = os.path.realpath(source)
+- effective_dest_real = os.path.realpath(effective_dest) - but wait, if effective_dest doesn't exist yet, realpath will still resolve as much as it can
+
+Actually for the "into itself or descendant" check:
+- If source_real == effective_dest_real → self-copy
+- If effective_dest_real starts with source_real + os.sep → copying into a descendant
+
+But we need to be careful: if effective_dest doesn't exist yet, realpath will resolve the existing portion. Let me use a simpler approach:
+- Normalize both paths (os.path.normpath(os.path.abspath(...)))
+- Check equality or prefix relationship
+
+Actually, `os.path.realpath` is better because it resolves symlinks. But for paths that don't exist yet, it still works (resolves the existing prefix).
+
+Let me use:
+```python
+src_real = os.path.realpath(source)
+dest_real = os.path.realpath(effective_dest)
+if dest_real == src_real:
+    # self-copy
+if dest_real.startswith(src_real + os.sep):
+    # into descendant
+```
+
+This should work. Even if dest doesn't exist yet, realpath will resolve the existing portion and append the rest.
+
+Now let me think about the `_copy_tree` implementation:
+
+```python
+def _copy_tree(source, effective_dest, force, interactive):
+    """Recursively copy a directory tree from source to effective_dest."""
+    had_error = False
+    # Create the top-level destination directory
+    try:
+        os.stat(effective_dest)
+    except FileNotFoundError:
+        try:
+            os.makedirs(effective_dest)  # or os.mkdir
+        except OSError as exc:
+            raise _CopyError(f"cannot create directory: {effective_dest}: ...")
+        # Set permissions: source rwx & ~umask
+        umask = _get_umask()
+        src_st = os.stat(source)
+        try:
+            os.chmod(effective_dest, stat.S_IMODE(src_st.st_mode) & ~umask)
+        except OSError:
+            pass
+    else:
+        # Already exists as a directory, keep its bits
+        pass
+    
+    # Now traverse and copy contents
+    _copy_tree_contents(source, effective_dest, force, interactive)
+```
+
+Wait, but I need to handle errors per-entry and continue. Let me restructure:
+
+```python
+def _copy_tree(source, effective_dest, force, interactive):
+    """Recursively copy directory tree. Returns True if any error occurred."""
+    had_error = False
+    umask = _get_umask()
+    
+    # Create or verify the top-level destination
+    try:
+        dst_st = os.stat(effective_dest)
+        if not stat.S_ISDIR(dst_st.st_mode):
+            raise _CopyError(f"not a directory: {effective_dest}")
+    except FileNotFoundError:
+        try:
+            os.mkdir(effective_dest)
+        except OSError as exc:
+            print(f"py_cp: cannot create directory: {effective_dest}: {exc.strerror or exc}", file=sys.stderr)
+            return True
+        src_st = os.stat(source)
+        try:
+            os.chmod(effective_dest, stat.S_IMODE(src_st.st_mode) & ~umask)
+        except OSError:
+            pass
+    
+    # Recursively copy contents
+    try:
+        entries = list(os.scandir(source))
+    except PermissionError:
+        print(f"py_cp: cannot read directory: {source}", file=sys.stderr)
+        return True
+    except OSError as exc:
+        print(f"py_cp: cannot read directory: {source}: {exc.strerror or exc}", file=sys.stderr)
+        return True
+    
+    for entry in entries:
+        src_path = entry.path
+        dst_path = os.path.join(effective_dest, entry.name)
+        try:
+            # Determine what the entry is (without following symlinks for the entry itself)
+            st = os.lstat(src_path)
+            if stat.S_ISLNK(st.st_mode):
+                # Recreate symlink
+                target = os.readlink(src_path)
+                # Remove existing dst if it's a symlink or file, but not a directory?
+                # Actually "Destination symlink collisions within a copied tree are excluded"
+                # So we just need to handle the simple case
+                try:
+                    os.lstat(dst_path)
+                except FileNotFoundError:
+                    os.symlink(target, dst_path)
+                else:
+                    # dst exists - this is a collision, which is excluded from tests
+                    # But we should handle it gracefully
+                    os.unlink(dst_path)
+                    os.symlink(target, dst_path)
+            elif stat.S_ISDIR(st.st_mode):
+                # Recurse
+                sub_error = _copy_tree(src_path, dst_path, force, interactive)
+                if sub_error:
+                    had_error = True
+            elif stat.S_ISREG(st.st_mode):
+                # Copy file using copy_path
+                copy_path(src_path, dst_path, force=force, interactive=interactive)
+            else:
+                # Unsupported type (socket, fifo, etc.) - skip with error?
+                # "Special files... are excluded" so this shouldn't happen in tests
+                pass
+        except _CopyDeclined:
+            had_error = True
+        except _CopyError as exc:
+            print(f"py_cp: {exc}", file=sys.stderr)
+            had_error = True
+        except OSError as exc:
+            print(f"py_cp: {exc.strerror or exc}", file=sys.stderr)
+            had_error = True
+    
+    return had_error
+```
+
+Hmm wait, I need to think about this more carefully. The "Destination symlink collisions within a copied tree are excluded" means I don't need to worry about that case in tests. But I should still not crash.
+
+Also, I need to think about what happens when the destination for a symlink already exists as something else. The spec says collisions are excluded from tests, so I'll just do a simple unlink + recreate.
+
+Now, for the interactive prompt in recursive mode: "Preserve force and interactive behavior for regular files." So when copying a regular file within a tree, if the destination exists and interactive is set, we prompt. This is already handled by `copy_path`.
+
+Let me also think about the "reject incompatible types" for recursive mode:
+- If source is a regular file and dest is a directory → actually this is fine, dest/basename(src) is the effective dest
+- If source is a directory and dest is a regular file → error
+- If source is a directory and dest exists as a symlink to a file → error? Or do we follow it?
+
+Actually, re-reading: "Reject incompatible types and copying a directory into itself or a descendant"
+
+So if in recursive mode:
+- Source is a directory
+- Dest exists and is not a directory (it's a file or a symlink to a file) → error
+
+Wait, what about a symlink to a directory? "Follow source symlinks to regular files and existing destination symlinks to regular files" - this is for non-recursive mode. In recursive mode, "all source symlinks... are recreated with identical target bytes and are not traversed."
+
+So if in recursive mode, the source is a symlink, we just recreate it. If the source is a real directory, we copy it.
+
+What if dest is a symlink to a directory in recursive mode? The spec says "an existing directory destination receives source-basename". A symlink to a directory - is that a "directory destination"? I think for the purpose of this checkpoint, if os.stat(dest) (which follows symlinks) shows it's a directory, we treat it as a directory destination. But os.lstat shows it's a symlink.
+
+Hmm, this is getting complex. Let me re-read the spec:
+
+"A missing destination becomes the tree root; an existing directory destination receives source-basename, merging existing directories there."
+
+I think "existing directory destination" means os.stat shows it's a directory (i.e., it could be a real dir or a symlink to a dir). Let me use os.stat for this check.
+
+Actually wait - "Follow source symlinks to regular files and existing destination symlinks to regular files" is stated for non-recursive mode. For recursive mode, the behavior for symlinks is different - they're just recreated.
+
+Let me simplify: In recursive mode, when determining the effective destination:
+- If os.stat(dest) shows it's a directory (following symlinks) → effective_dest = dest/basename(src)
+- If os.stat(dest) fails (doesn't exist) → effective_dest = dest
+- If os.stat(dest) shows it's a file → error (incompatible)
+- If os.lstat(dest) shows it's a symlink but os.stat fails (dangling) → error? Or treat as missing?
+
+I think for a dangling symlink destination in recursive mode, it's an error (incompatible type) since we can't put a directory through it.
+
+Let me also think about what happens with the "force" flag in recursive mode. "Preserve force and interactive behavior for regular files." So force only applies to the individual file copies within the tree, not to directory creation. If a directory already exists, we just merge into it.
+
+OK let me also reconsider the self-copy check. The spec says:
+"Reject incompatible types and copying a directory into itself or a descendant; an initial empty output directory may remain, but no descendants may be copied into it."
+
+So the check is:
+- If effective_dest (after resolution) == source (after resolution) → reject
+- If effective_dest is inside source → reject
+
+The "an initial empty output directory may remain" means if we create the destination directory and then discover it's a self-copy, we can leave the empty dir. But actually, we should check BEFORE creating anything. Let me do the check before any filesystem changes.
+
+Actually wait - "Validate invocation-wide errors before any filesystem changes." So the self-copy check must happen before we create the destination directory. Good.
+
+Let me now write the complete implementation plan:
+
+1. **`_parse_operands`**: Add `-r` / `--recursive` to the recognized flags. Return `(operands, force, interactive, recursive)`.
+
+2. **New function `_copy_tree(source, effective_dest, force, interactive)`**: 
+   - Creates the destination directory if missing (with source rwx & ~umask)
+   - Recursively traverses source
+   - For symlinks: recreates with identical target
+   - For directories: recurses
+   - For regular files: calls `copy_path`
+   - Returns True if any error occurred
+
+3. **`main` modifications**:
+   - Unpack `recursive` from `_parse_operands`
+   - For each source in the loop:
+     - If recursive:
+       - lstat the source
+       - If symlink: determine effective dest, recreate symlink
+       - If directory: determine effective dest, check self-copy, call `_copy_tree`
+       - If regular file: existing logic (validate + copy_path)
+       - If missing: error
+     - If not recursive: existing logic
+
+Wait, I need to think about how to determine the effective destination for recursive mode. Let me create a helper:
+
+For recursive mode, given a source and a base destination:
+- If source is a directory (or we're treating it as such):
+  - If base_dest doesn't exist → effective_dest = base_dest
+  - If base_dest is a directory → effective_dest = base_dest/basename(source)
+  - If base_dest is a file → error
+- If source is a symlink or regular file:
+  - Same logic as non-recursive mode (the dest is just the base_dest, or base_dest/basename if base_dest is a dir)
+
+Actually wait, in the multi-source case with recursive, the dest is always a directory (validated). So for each source:
+- If source is a dir → dest/basename(src)
+- If source is a symlink or file → dest/basename(src)
+
+In the single-source case:
+- If dest doesn't exist → effective_dest = dest
+- If dest is a directory → effective_dest = dest/basename(src)
+- If dest is a file → depends on source type
+
+Let me restructure the main logic:
+
+```python
+def main():
+    try:
+        operands, force, interactive, recursive = _parse_operands(sys.argv[1:])
+    except _CopyError as exc:
+        print(f"py_cp: {exc}", file=sys.stderr)
+        return 1
+
+    if len(operands) < 2:
+        print("py_cp: missing operand", file=sys.stderr)
+        return 1
+
+    multi = len(operands) > 2
+    if multi:
+        dest_dir = operands[-1]
+        # Validate dest_dir is an existing directory
+        try:
+            st = os.stat(dest_dir)
+        except (OSError, ValueError):
+            print(f"py_cp: not a directory: {dest_dir}", file=sys.stderr)
+            return 1
+        if not stat.S_ISDIR(st.st_mode):
+            print(f"py_cp: not a directory: {dest_dir}", file=sys.stderr)
+            return 1
+        sources = operands[:-1]
+    else:
+        sources = [operands[0]]
+
+    # Compute (source, destination) pairs
+    pairs = []
+    for src in sources:
+        base = os.path.basename(src)
+        if multi:
+            dest = os.path.join(dest_dir, base)
+        else:
+            dest = operands[1]
+            if recursive:
+                # Determine if dest is a directory
+                try:
+                    st = os.stat(dest)
+                    if stat.S_ISDIR(st.st_mode):
+                        dest = os.path.join(dest, base)
+                except (OSError, ValueError):
+                    pass
+                # If dest doesn't exist, it stays as-is (will be the tree root)
+                # If dest is a file and src is a dir, that's an error (checked later)
+            else:
+                try:
+                    st = os.stat(dest)
+                    if stat.S_ISDIR(st.st_mode):
+                        dest = os.path.join(dest, base)
+                except (OSError, ValueError):
+                    pass
+        pairs.append((src, dest))
+
+    # Process in operand order
+    had_error = False
+    for src, dest in pairs:
+        try:
+            if recursive:
+                _process_recursive(src, dest, force, interactive)
+            else:
+                _process_single(src, dest, force, interactive)
+        except _CopyDeclined:
+            had_error = True
+        except _CopyError as exc:
+            print(f"py_cp: {exc}", file=sys.stderr)
+            had_error = True
+        except OSError as exc:
+            print(f"py_cp: {exc.strerror or exc}", file=sys.stderr)
+            had_error = True
+
+    return 1 if had_error else 0
+```
+
+Hmm, but I want to keep the existing structure close to what's there. Let me think about what's the minimal set of changes.
+
+Actually, let me reconsider. The current code structure is:
+1. Parse operands
+2. Determine pairs
+3. For each pair: validate_source, validate_destination, check self-copy, copy_path
+
+For recursive mode, I need to:
+1. Parse operands (add -r)
+2. Determine pairs (slightly different logic for dest computation)
+3. For each pair:
+   - lstat the source
+   - If symlink: recreate at dest
+   - If directory: compute effective dest, check self-copy, call _copy_tree
+   - If regular file: existing logic (validate + copy_path)
+
+Let me write this more carefully. I'll keep `copy_path` as is (it's the semantic anchor), and add the recursive logic around it.
+
+Let me think about the effective destination computation for recursive mode more carefully:
+
+For `cp -r src dest`:
+- `os.lstat(src)` tells us what src actually is (without following symlinks)
+- If src is a symlink → we recreate it at dest. The dest is just `dest` (or `dest_dir/basename(src)` in multi mode).
+- If src is a directory:
+  - In multi mode: effective_dest = dest_dir/basename(src)
+  - In single mode:
+    - If dest doesn't exist → effective_dest = dest
+    - If dest is a directory (os.stat follows symlinks) → effective_dest = dest/basename(src)
+    - If dest is a regular file → ERROR (incompatible)
+    - If dest is a dangling symlink → ERROR
+- If src is a regular file:
+  - Same as non-recursive: dest is the target
+
+Wait, but in the current code, for non-recursive mode, if dest is a directory and we have a single source, we do `dest = os.path.join(dest, base)`. This is the same logic needed for recursive mode when the source is a directory.
+
+For the self-copy check in recursive mode:
+- I need to check BEFORE creating the destination directory
+- `src_real = os.path.realpath(src)`
+- `dest_real = os.path.realpath(effective_dest)` (this works even if effective_dest doesn't exist yet, as long as its parent does)
+- If `dest_real == src_real` or `dest_real.startswith(src_real + os.sep)` → error
+
+Now let me think about the `_copy_tree` function signature and behavior:
+
+```python
+def _copy_tree(source, effective_dest, force, interactive):
+    """Copy directory tree from source to effective_dest.
+    effective_dest is the directory that will correspond to source.
+    Returns True if any per-entry error occurred.
+    """
+```
+
+The function should:
+1. Create effective_dest if it doesn't exist (with source dir's rwx & ~umask)
+2. If effective_dest already exists, verify it's a directory, keep its bits
+3. Traverse source's contents
+4. For each entry, create the corresponding entry in effective_dest
+5. Return True if any error
+
+For symlinks during traversal:
+- Read the target with os.readlink
+- If the destination path exists (as anything), remove it (unless it's a directory? The spec says "Destination symlink collisions within a copied tree are excluded" so I won't worry about it)
+- Create the symlink with os.symlink(target, dst_path)
+
+For the "resource limits must produce a diagnostic rather than looping or crashing" requirement, I should add a depth limit or total entry count limit. Let me add a maximum depth (say 4096) and a maximum number of entries (say 10 million) to prevent infinite loops from cyclic directory structures. Actually, since we're not following symlinks, cyclic directory structures shouldn't be possible (you can't have a directory that contains itself without a symlink). But just in case, I'll add a depth check.
+
+Actually, the only way to get an infinite loop is if there's a bind mount or something similar, which is unlikely in the test environment. But the spec says "Resource limits must produce a diagnostic rather than looping or crashing." I'll add a depth limit of 4096 (which is well above PATH_MAX/2) and a total node count limit.
+
+Let me now write the actual code changes:
+
+Changes to `_parse_operands`:
+- Add `recursive = False`
+- Add `elif arg == "-r" or arg == "--recursive": recursive = True`
+- Return `(operands, force, interactive, recursive)`
+
+New function `_copy_tree`:
+- As described above
+
+Changes to `main`:
+- Unpack recursive
+- For each pair, branch on recursive mode
+
+Let me also think about what happens when in recursive mode, the source is a symlink. The spec says: "In recursive mode all source symlinks, including operand symlinks and dangling or cyclic links, are recreated with identical target bytes and are not traversed."
+
+So for a symlink source in recursive mode:
+- Determine dest (same logic as for files: if dest is a dir, dest/basename; otherwise dest)
+- Recreate the symlink at dest
+
+Let me also handle the case where in recursive mode, the source is a regular file. This should work the same as non-recursive mode (just copy the file).
+
+OK, I think I have a clear picture. Let me write the instructions now.
+
+Actually, one more thing: the current code's `_validate_destination` checks for dangling symlinks. In recursive mode, when the source is a regular file or symlink, the destination logic should be the same as non-recursive. When the source is a directory, the destination should be a directory (or missing).
+
+Let me also think about the "an initial empty output directory may remain" clause. This means: if we detect a self-copy, we might have already created the destination directory before detecting the issue. But the spec says "Validate invocation-wide errors before any filesystem changes." So we should detect self-copy BEFORE creating anything. The "may remain" clause is probably just saying that if it somehow remains (e.g., from a previous failed run), that's acceptable.
+
+Actually re-reading: "Reject incompatible types and copying a directory into itself or a descendant; an initial empty output directory may remain, but no descendants may be copied into it."
+
+I think this means: if we reject the operation, it's OK if an empty directory was created (from a previous attempt or partial creation), but we must not have copied any files into it. Since we validate before any changes, this should be fine.
+
+Let me finalize my plan and write the instructions.
+
+One more consideration: the current `main` function validates the destination in the multi-source case (must be an existing directory). In recursive mode, this is the same. For single-source recursive, the destination can be:
+- Non-existent → will be created as the tree root
+- An existing directory → source is copied into it
+- An existing file → error (incompatible)
+
+Let me write the code now.
+
+Actually, I realize I need to be more careful about the destination computation in the single-source recursive case. Currently in non-recursive mode:
+
+```python
+dest = operands[1]
+try:
+    st = os.stat(dest)
+    if stat.S_ISDIR(st.st_mode):
+        dest = os.path.join(dest, base)
+except (OSError, ValueError):
+    pass
+```
+
+This means:
+- If dest exists and is a directory → dest/basename(src)
+- If dest doesn't exist → dest stays as-is
+- If dest exists and is a file → dest stays as-is (the file is the target)
+
+In recursive mode with a directory source:
+- If dest exists and is a directory → dest/basename(src) (same as above)
+- If dest doesn't exist → dest stays as-is (will be created as the tree root)
+- If dest exists and is a file → ERROR (can't put a directory where a file is)
+- If dest is a dangling symlink → ERROR (incompatible)
+
+So the computation is slightly different. For recursive mode with a directory source, I need to check if dest exists as a file and raise an error.
+
+Let me restructure:
+
+For the pairs computation, I'll keep it the same as now (just compute the candidate dest). Then in the processing loop, I'll handle the validation differently based on recursive mode and source type.
+
+Actually, let me keep the pairs computation simple and do the validation in the processing step. Here's my revised approach:
+
+```python
+pairs = []
+for src in sources:
+    base = os.path.basename(src)
+    if multi:
+        dest = os.path.join(dest_dir, base)
+    else:
+        dest = operands[1]
+        try:
+            st = os.stat(dest)
+            if stat.S_ISDIR(st.st_mode):
+                dest = os.path.join(dest, base)
+        except (OSError, ValueError):
+            pass
+    pairs.append((src, dest))
+```
+
+This is the same as the current code. Then in the processing:
+
+For recursive mode:
+- lstat(src) to determine type
+- If symlink: dest is the target (already computed correctly)
+- If directory: 
+  - If dest was computed as operands[1] (i.e., dest didn't exist or wasn't a dir), then dest IS the tree root
+  - If dest was computed as operands[1]/basename(src), then dest is inside an existing dir
+  - Check self-copy
+  - Call _copy_tree
+- If regular file: existing logic
+
+Wait, there's a subtlety. If in single-source recursive mode, the dest exists as a file and the source is a directory:
+- The current pairs computation would leave dest as-is (since os.stat shows it's not a directory)
+- Then in the processing step, I need to detect this and raise an error
+
+If dest doesn't exist:
+- os.stat fails → dest stays as-is → this will be the tree root → correct
+
+If dest is a directory:
+- os.stat shows directory → dest = dest/basename(src) → correct
+
+If dest is a file:
+- os.stat shows file → dest stays as-is → I need to detect this is an error for a directory source
+
+So in the processing step for recursive + directory source:
+```python
+# Check if dest exists and is not a directory
+try:
+    st = os.lstat(dest)  # use lstat to catch symlinks too
+    if not stat.S_ISDIR(st.st_mode):
+        # dest exists and is not a directory (file, symlink, etc.)
+        raise _CopyError(f"incompatible destination: {dest}")
+except FileNotFoundError:
+    pass  # dest doesn't exist, will be created
+```
+
+Wait, but what if dest is a symlink to a directory? os.lstat shows it's a symlink, but os.stat would show it's a directory. Should I allow that?
+
+The spec says: "an existing directory destination receives source-basename". A symlink to a directory - is it a "directory destination"? I think in the context of cp, yes, a symlink to a directory is treated as a directory. Let me use os.stat (which follows symlinks) for this check:
+
+```python
+try:
+    st = os.stat(dest)
+    if not stat.S_ISDIR(st.st_mode):
+        raise _CopyError(f"incompatible destination: {dest}")
+except FileNotFoundError:
+    pass  # will be created
+except PermissionError:
+    raise _CopyError(f"permission denied: {dest}")
+```
+
+Hmm but wait - if dest is a symlink to a directory, and I do `os.stat(dest)` and it shows a directory, then in the pairs computation I would have done `dest = os.path.join(dest, base)`. So the dest I'm working with is already `symlink/basename(src)`. Then I'd try to create `symlink/basename(src)` which would go through the symlink. That should be fine.
+
+Actually, I think the current pairs computation handles this correctly. If dest (operands[1]) is a symlink to a directory, os.stat follows it and sees a directory, so dest becomes dest/basename(src). Then in the processing step, I just need to verify that the computed dest is either missing or a directory.
+
+Let me simplify: after computing the pairs, in the recursive directory case, I just need to check:
+1. Self-copy (dest is same as or inside source)
+2. If dest exists, it must be a directory (or we're about to create it)
+
+Actually, since the pairs computation already handles the "dest is a directory → append basename" logic, by the time I'm in the processing step, the dest for a directory source is either:
+- A path that doesn't exist (will be created as tree root)
+- A path inside an existing directory (dest/basename)
+- A path that exists as a non-directory (error case)
+
+So I just need to check if dest exists as a non-directory:
+```python
+try:
+    st = os.stat(dest)
+    if not stat.S_ISDIR(st.st_mode):
+        raise _CopyError(f"cannot create directory: {dest}: not a directory or incompatible")
+except FileNotFoundError:
+    pass
+except PermissionError:
+    raise _CopyError(f"permission denied: {dest}")
+```
+
+OK I think I have enough clarity now. Let me write the final instructions.
+
+Let me also think about one edge case: in recursive mode, if the source is a regular file and the dest is a directory (in single-source mode), the pairs computation gives dest/basename(src). Then we just copy the file to that location. This is correct.
+
+Another edge case: in recursive mode, multi-source, one of the sources is a directory. The dest_dir is validated as a directory. The effective dest is dest_dir/basename(src). We check self-copy and then copy the tree. Correct.
+
+Now, about the `_copy_tree` function and error handling. The spec says: "Process sources in operand order, diagnose per-source failures and continue; do not roll back completed operations." and "Preserve source data on failure."
+
+So within a tree copy, if one file fails, we should continue copying other files. The function should return whether any error occurred, and the caller should set had_error accordingly.
+
+But wait - "diagnose per-source failures and continue" - does "per-source" mean per top-level source, or per file within the tree? I think it means per top-level source (i.e., if we're copying 3 sources and the 2nd fails, we still try the 3rd). Within a tree copy, I think we should also continue (copy as many files as possible), but mark the operation as failed.
+
+Actually, re-reading: "Process sources in operand order, diagnose per-source failures and continue; do not roll back completed operations." I think "sources" here refers to the top-level operands. Within a tree, we should also try to copy as much as possible.
+
+Let me make `_copy_tree` continue on individual file errors and return True if any error occurred.
+
+One more thing: the spec says "an initial empty output directory may remain, but no descendants may be copied into it" for the self-copy case. Since I'm checking self-copy before creating anything, this shouldn't be an issue. But if for some reason the dest directory already exists (from a previous run), and we detect self-copy, we just raise an error and leave it. That's fine.
+
+Let me now write the concrete code changes.
+
+Here's my plan for the edits:
+
+1. **`_parse_operands`**: Add recursive flag recognition
+2. **Add `_copy_tree` function**: After `copy_path`
+3. **Modify `main`**: Handle recursive mode
+
+Let me write it out:
+
+```python
+def _parse_operands(argv):
+    """Return (operands, force, interactive, recursive) enforcing option and terminator rules."""
+    operands = []
+    literal = False
+    force = False
+    interactive = False
+    recursive = False
+    for arg in argv:
+        if not literal:
+            if arg == "--":
+                literal = True
+            elif arg == "-":
+                operands.append(arg)
+            elif arg == "-f" or arg == "--force":
+                force = True
+            elif arg == "-i" or arg == "--interactive":
+                interactive = True
+            elif arg == "-r" or arg == "--recursive":
+                recursive = True
+            elif arg.startswith("-") and len(arg) > 1:
+                raise _CopyError(f"unknown option: {arg}")
+            else:
+                operands.append(arg)
+        else:
+            operands.append(arg)
+    return operands, force, interactive, recursive
+```
+
+For `_copy_tree`:
+
+```python
+def _copy_tree(source, effective_dest, force, interactive):
+    """Recursively copy directory tree from source to effective_dest.
+    
+    effective_dest is the directory corresponding to source (already computed).
+    Returns True if any per-entry error occurred.
+    """
+    had_error = False
+    umask = _get_umask()
+    _MAX_DEPTH = 4096
+    _MAX_NODES = 10_000_000
+    _node_count = 0
+
+    # Create or verify the top-level destination directory
+    try:
+        dst_st = os.stat(effective_dest)
+        if not stat.S_ISDIR(dst_st.st_mode):
+            raise _CopyError(f"cannot create directory: {effective_dest}: file exists")
+    except FileNotFoundError:
+        try:
+            os.mkdir(effective_dest)
+        except OSError as exc:
+            print(f"py_cp: cannot create directory: {effective_dest}: {exc.strerror or exc}", file=sys.stderr)
+            return True
+        src_st = os.lstat(source)
+        try:
+            os.chmod(effective_dest, stat.S_IMODE(src_st.st_mode) & ~umask)
+        except OSError:
+            pass
+
+    def _recurse(src_dir, dst_dir, depth):
+        nonlocal had_error, _node_count
+        if depth > _MAX_DEPTH:
+            print(f"py_cp: maximum directory depth exceeded: {src_dir}", file=sys.stderr)
+            had_error = True
+            return
+        try:
+            entries = list(os.scandir(src_dir))
+        except PermissionError:
+            print(f"py_cp: cannot read directory: {src_dir}", file=sys.stderr)
+            had_error = True
+            return
+        except OSError as exc:
+            print(f"py_cp: cannot read directory: {src_dir}: {exc.strerror or exc}", file=sys.stderr)
+            had_error = True
+            return
+
+        for entry in sorted(entries, key=lambda e: e.name):
+            _node_count += 1
+            if _node_count > _MAX_NODES:
+                print(f"py_cp: resource limit exceeded", file=sys.stderr)
+                had_error = True
+                return
+            src_path = entry.path
+            dst_path = os.path.join(dst_dir, entry.name)
+            try:
+                st = os.lstat(src_path)
+                if stat.S_ISLNK(st.st_mode):
+                    target = os.readlink(src_path)
+                    try:
+                        os.lstat(dst_path)
+                    except (FileNotFoundError, OSError):
+                        pass
+                    else:
+                        # Remove existing entry (shouldn't happen in tested cases)
+                        try:
+                            os.unlink(dst_path)
+                        except OSError:
+                            pass
+                    try:
+                        os.symlink(target, dst_path)
+                    except OSError as exc:
+                        print(f"py_cp: cannot create symlink: {dst_path}: {exc.strerror or exc}", file=sys.stderr)
+                        had_error = True
+                elif stat.S_ISDIR(st.st_mode):
+                    sub_error = _copy_tree(src_path, dst_path, force, interactive)
+                    if sub_error:
+                        had_error = True
+                elif stat.S_ISREG(st.st_mode):
+                    try:
+                        dst_exists = False
+                        try:
+                            os.stat(dst_path)
+                            dst_exists = True
+                        except FileNotFoundError:
+                            pass
+                        if dst_exists:
+                            copy_path(src_path, dst_path, force=force, interactive=interactive)
+                        else:
+                            copy_path(src_path, dst_path, force=force, interactive=interactive)
+                    except _CopyDeclined:
+                        had_error = True
+                    except _CopyError as exc:
+                        print(f"py_cp: {exc}", file=sys.stderr)
+                        had_error = True
+                else:
+                    # Unsupported file type (socket, fifo, etc.)
+                    pass
+            except _CopyDeclined:
+                had_error = True
+            except _CopyError as exc:
+                print(f"py_cp: {exc}", file=sys.stderr)
+                had_error = True
+            except OSError as exc:
+                print(f"py_cp: {exc.strerror or exc}", file=sys.stderr)
+                had_error = True
+
+    _recurse(source, effective_dest, 1)
+    return had_error
+```
+
+Wait, I'm calling `_copy_tree` recursively for subdirectories, which means I'm re-creating the umask and re-doing the top-level directory creation for each subdirectory. That's fine functionally but a bit inefficient. Let me restructure to avoid the recursive call to `_copy_tree` and instead have the inner `_recurse` handle directory creation:
+
+Actually, let me simplify. I'll have `_copy_tree` handle the top-level and call a helper for the recursion. Or I can just have `_recurse` handle everything including directory creation:
+
+```python
+def _copy_tree(source, effective_dest, force, interactive):
+    """Recursively copy directory tree from source to effective_dest."""
+    had_error = False
+    umask = _get_umask()
+    _MAX_DEPTH = 4096
+    _MAX_NODES = 10_000_000
+    _node_count = 0
+
+    def _ensure_dir(src_dir, dst_dir, depth):
+        nonlocal had_error
+        try:
+            st = os.stat(dst_dir)
+            if not stat.S_ISDIR(st.st_mode):
+                raise _CopyError(f"cannot create directory: {dst_dir}")
+        except FileNotFoundError:
+            try:
+                os.mkdir(dst_dir)
+            except OSError as exc:
+                print(f"py_cp: cannot create directory: {dst_dir}: {exc.strerror or exc}", file=sys.stderr)
+                had_error = True
+                return False
+            src_st = os.lstat(src_dir)
+            try:
+                os.chmod(dst_dir, stat.S_IMODE(src_st.st_mode) & ~umask)
+            except OSError:
+                pass
+        except _CopyError as exc:
+            print(f"py_cp: {exc}", file=sys.stderr)
+            had_error = True
+            return False
+        except PermissionError:
+            print(f"py_cp: permission denied: {dst_dir}", file=sys.stderr)
+            had_error = True
+            return False
+        return True
+
+    def _recurse(src_dir, dst_dir, depth):
+        nonlocal had_error, _node_count
+        if depth > _MAX_DEPTH:
+            print(f"py_cp: maximum depth exceeded: {src_dir}", file=sys.stderr)
+            had_error = True
+            return
+        if not _ensure_dir(src_dir, dst_dir, depth):
+            return
+        try:
+            entries = list(os.scandir(src_dir))
+        except PermissionError:
+            print(f"py_cp: cannot read directory: {src_dir}", file=sys.stderr)
+            had_error = True
+            return
+        except OSError as exc:
+            print(f"py_cp: cannot read directory: {src_dir}: {exc.strerror or exc}", file=sys.stderr)
+            had_error = True
+            return
+
+        for entry in sorted(entries, key=lambda e: e.name):
+            _node_count += 1
+            if _node_count > _MAX_NODES:
+                print(f"py_cp: resource limit exceeded", file=sys.stderr)
+                had_error = True
+                return
+            src_path = entry.path
+            dst_path = os.path.join(dst_dir, entry.name)
+            try:
+                st = os.lstat(src_path)
+            except OSError as exc:
+                print(f"py_cp: cannot access: {src_path}: {exc.strerror or exc}", file=sys.stderr)
+                had_error = True
+                continue
+            if stat.S_ISLNK(st.st_mode):
+                try:
+                    target = os.readlink(src_path)
+                except OSError as exc:
+                    print(f"py_cp: cannot read symlink: {src_path}: {exc.strerror or exc}", file=sys.stderr)
+                    had_error = True
+                    continue
+                try:
+                    os.lstat(dst_path)
+                except (FileNotFoundError, OSError):
+                    pass
+                else:
+                    try:
+                        os.unlink(dst_path)
+                    except OSError:
+                        pass
+                try:
+                    os.symlink(target, dst_path)
+                except OSError as exc:
+                    print(f"py_cp: cannot create symlink: {dst_path}: {exc.strerror or exc}", file=sys.stderr)
+                    had_error = True
+            elif stat.S_ISDIR(st.st_mode):
+                _recurse(src_path, dst_path, depth + 1)
+            elif stat.S_ISREG(st.st_mode):
+                try:
+                    copy_path(src_path, dst_path, force=force, interactive=interactive)
+                except _CopyDeclined:
+                    had_error = True
+                except _CopyError as exc:
+                    print(f"py_cp: {exc}", file=sys.stderr)
+                    had_error = True
+                except OSError as exc:
+                    print(f"py_cp: {exc.strerror or exc}", file=sys.stderr)
+                    had_error = True
+            # else: unsupported type, skip
+
+    _recurse(source, effective_dest, 1)
+    return had_error
+```
+
+This is cleaner. The `_ensure_dir` is called at each level, creating the directory if needed.
+
+Now for the main function changes:
+
+```python
+def main():
+    try:
+        operands, force, interactive, recursive = _parse_operands(sys.argv[1:])
+    except _CopyError as exc:
+        print(f"py_cp: {exc}", file=sys.stderr)
+        return 1
+
+    if len(operands) < 2:
+        print("py_cp: missing operand", file=sys.stderr)
+        return 1
+
+    multi = len(operands) > 2
+    if multi:
+        dest_dir = operands[-1]
+        try:
+            st = os.stat(dest_dir)
+        except (OSError, ValueError):
+            print(f"py_cp: not a directory: {dest_dir}", file=sys.stderr)
+            return 1
+        if not stat.S_ISDIR(st.st_mode):
+            print(f"py_cp: not a directory: {dest_dir}", file=sys.stderr)
+            return 1
+        sources = operands[:-1]
+    else:
+        sources = [operands[0]]
+
+    pairs = []
+    for src in sources:
+        base = os.path.basename(src)
+        if multi:
+            dest = os.path.join(dest_dir, base)
+        else:
+            dest = operands[1]
+            try:
+                st = os.stat(dest)
+                if stat.S_ISDIR(st.st_mode):
+                    dest = os.path.join(dest, base)
+            except (OSError, ValueError):
+                pass
+        pairs.append((src, dest))
+
+    had_error = False
+    for src, dest in pairs:
+        try:
+            if recursive:
+                # Determine source type without following symlinks
+                try:
+                    src_st = os.lstat(src)
+                except FileNotFoundError:
+                    print(f"py_cp: no such file: {src}", file=sys.stderr)
+                    had_error = True
+                    continue
+                except PermissionError:
+                    print(f"py_cp: permission denied: {src}", file=sys.stderr)
+                    had_error = True
+                    continue
+                except OSError as exc:
+                    print(f"py_cp: cannot access: {src}: {exc.strerror or exc}", file=sys.stderr)
+                    had_error = True
+                    continue
+
+                if stat.S_ISLNK(src_st.st_mode):
+                    # Recreate symlink
+                    target = os.readlink(src)
+                    try:
+                        os.lstat(dest)
+                    except (FileNotFoundError, OSError):
+                        pass
+                    else:
+                        try:
+                            os.unlink(dest)
+                        except OSError:
+                            pass
+                    os.symlink(target, dest)
+                elif stat.S_ISDIR(src_st.st_mode):
+                    # Check self-copy
+                    src_real = os.path.realpath(src)
+                    dest_real = os.path.realpath(dest)
+                    if dest_real == src_real or dest_real.startswith(src_real + os.sep):
+                        print(f"py_cp: cannot copy a directory into itself: {src}", file=sys.stderr)
+                        had_error = True
+                        continue
+                    # Check dest is compatible
+                    try:
+                        dst_st = os.stat(dest)
+                        if not stat.S_ISDIR(dst_st.st_mode):
+                            print(f"py_cp: cannot create directory: {dest}: file exists", file=sys.stderr)
+                            had_error = True
+                            continue
+                    except FileNotFoundError:
+                        pass
+                    except PermissionError:
+                        print(f"py_cp: permission denied: {dest}", file=sys.stderr)
+                        had_error = True
+                        continue
+                    # Copy the tree
+                    if _copy_tree(src, dest, force, interactive):
+                        had_error = True
+                elif stat.S_ISREG(src_st.st_mode):
+                    # Regular file - same as non-recursive
+                    src_st2 = _validate_source(src)
+                    dst_st = _validate_destination(dest)
+                    if dst_st is not None and src_st2.st_dev == dst_st.st_dev \
+                            and src_st2.st_ino == dst_st.st_ino:
+                        print(f"py_cp: source and destination are the same file: {src}", file=sys.stderr)
+                        had_error = True
+                        continue
+                    copy_path(src, dest, force=force, interactive=interactive)
+                else:
+                    print(f"py_cp: not a regular file or directory: {src}", file=sys.stderr)
+                    had_error = True
+            else:
+                # Non-recursive: existing logic
+                src_st = _validate_source(src)
+                dst_st = _validate_destination(dest)
+                if dst_st is not None and src_st.st_dev == dst_st.st_dev \
+                        and src_st.st_ino == dst_st.st_ino:
+                    print(f"py_cp: source and destination are the same file: {src}", file=sys.stderr)
+                    had_error = True
+                    continue
+                copy_path(src, dest, force=force, interactive=interactive)
+        except _CopyDeclined:
+            had_error = True
+        except _CopyError as exc:
+            print(f"py_cp: {exc}", file=sys.stderr)
+            had_error = True
+        except OSError as exc:
+            print(f"py_cp: {exc.strerror or exc}", file=sys.stderr)
+            had_error = True
+
+    return 1 if had_error else 0
+```
+
+Hmm wait, I'm duplicating the non-recursive logic. Let me restructure to keep it DRY:
+
+```python
+    had_error = False
+    for src, dest in pairs:
+        try:
+            if recursive:
+                try:
+                    src_lstat = os.lstat(src)
+                except FileNotFoundError:
+                    print(f"py_cp: no such file: {src}", file=sys.stderr)
+                    had_error = True
+                    continue
+                except PermissionError:
+                    print(f"py_cp: permission denied: {src}", file=sys.stderr)
+                    had_error = True
+                    continue
+                except OSError as exc:
+                    print(f"py_cp: cannot access: {src}: {exc.strerror or exc}", file=sys.stderr)
+                    had_error = True
+                    continue
+
+                if stat.S_ISLNK(src_lstat.st_mode):
+                    target = os.readlink(src)
+                    try:
+                        os.lstat(dest)
+                    except (FileNotFoundError, OSError):
+                        pass
+                    else:
+                        try:
+                            os.unlink(dest)
+                        except OSError:
+                            pass
+                    os.symlink(target, dest)
+                elif stat.S_ISDIR(src_lstat.st_mode):
+                    src_real = os.path.realpath(src)
+                    dest_real = os.path.realpath(dest)
+                    if dest_real == src_real or dest_real.startswith(src_real + os.sep):
+                        print(f"py_cp: cannot copy directory into itself or its descendant: {src}", file=sys.stderr)
+                        had_error = True
+                        continue
+                    try:
+                        dst_st = os.stat(dest)
+                        if not stat.S_ISDIR(dst_st.st_mode):
+                            print(f"py_cp: cannot create directory: {dest}: file exists", file=sys.stderr)
+                            had_error = True
+                            continue
+                    except FileNotFoundError:
+                        pass
+                    except PermissionError:
+                        print(f"py_cp: permission denied: {dest}", file=sys.stderr)
+                        had_error = True
+                        continue
+                    if _copy_tree(src, dest, force, interactive):
+                        had_error = True
+                elif stat.S_ISREG(src_lstat.st_mode):
+                    _copy_regular_file(src, dest, force, interactive)
+                else:
+                    print(f"py_cp: unsupported file type: {src}", file=sys.stderr)
+                    had_error = True
+            else:
+                _copy_regular_file(src, dest, force, interactive)
+        except _CopyDeclined:
+            had_error = True
+        except _CopyError as exc:
+            print(f"py_cp: {exc}", file=sys.stderr)
+            had_error = True
+        except OSError as exc:
+            print(f"py_cp: {exc.strerror or exc}", file=sys.stderr)
+            had_error = True
+```
+
+Where `_copy_regular_file` is the existing logic extracted:
+```python
+def _copy_regular_file(src, dest, force, interactive):
+    src_st = _validate_source(src)
+    dst_st = _validate_destination(dest)
+    if dst_st is not None and src_st.st_dev == dst_st.st_dev \
+            and src_st.st_ino == dst_st.st_ino:
+        raise _CopyError(f"source and destination are the same file: {src}")
+    copy_path(src, dest, force=force, interactive=interactive)
+```
+
+Wait, but the current code catches `_CopyDeclined` separately from `_CopyError`. If I extract to a helper, the exceptions will propagate up. That's fine since the outer try/except will catch them.
+
+Actually, let me look at the current code again. In the current main:
+
+```python
+    for src, dest in pairs:
+        try:
+            src_st = _validate_source(src)
+            dst_st = _validate_destination(dest)
+            if dst_st is not None and src_st.st_dev == dst_st.st_dev \
+                    and src_st.st_ino == dst_st.st_ino:
+                raise _CopyError(f"source and destination are the same file: {src}")
+            copy_path(src, dest, force=force, interactive=interactive)
+        except _CopyDeclined:
+            had_error = True
+        except _CopyError as exc:
+            print(f"py_cp: {exc}", file=sys.stderr)
+            had_error = True
+        except OSError as exc:
+            print(f"py_cp: {exc.strerror or exc}", file=sys.stderr)
+            had_error = True
+```
+
+So `_CopyDeclined` is caught silently (just sets had_error), while `_CopyError` prints a message. This is the existing behavior for interactive decline - no extra message, just status 1.
+
+OK, I think my plan is solid. Let me also double-check: does `copy_path` need to be called for regular files in recursive mode? Yes: "Preserve force and interactive behavior for regular files." and "the core filesystem operation must be reachable from main through it."
+
+So `copy_path` is called:
+1. Directly from main for non-recursive regular file copies
+2. From `_copy_tree` for regular files within a tree
+3. From main for recursive regular file copies (top-level)
+
+All paths go through `copy_path`. Good.
+
+Let me finalize and write the instructions. I'll present this as a clear set of edits to make.
+
+------------
+► **ANSWER**
+
+## Instructions for editing `src/py_cp/py_cp.py`
+
+### 1. Modify `_parse_operands` to recognize `-r` / `--recursive`
+
+Change the function signature comment and add the `recursive` flag:
+
+- Add `recursive = False` alongside the existing `force = False` and `interactive = False` initializations.
+- After the `-i`/`--interactive` branch, add:
+  ```python
+  elif arg == "-r" or arg == "--recursive":
+      recursive = True
+  ```
+- Change the return statement from `return operands, force, interactive` to `return operands, force, interactive, recursive`.
+- Update the docstring's first line to: `"""Return (operands, force, interactive, recursive) enforcing option and terminator rules.`
+
+### 2. Add a new function `_copy_tree` immediately after `copy_path` (before `_parse_operands`)
+
+```python
+def _copy_tree(source, effective_dest, force, interactive):
+    """Recursively copy a directory tree from source to effective_dest.
+
+    effective_dest is the directory that corresponds to source.
+    Returns True if any per-entry error occurred.
+    """
+    had_error = False
+    umask = _get_umask()
+    _MAX_DEPTH = 4096
+    _MAX_NODES = 10_000_000
+    _node_count = 0
+
+    def _ensure_dir(src_dir, dst_dir):
+        nonlocal had_error
+        try:
+            st = os.stat(dst_dir)
+            if not stat.S_ISDIR(st.st_mode):
+                print(f"py_cp: cannot create directory: {dst_dir}: file exists",
+                      file=sys.stderr)
+                had_error = True
+                return False
+        except FileNotFoundError:
+            try:
+                os.mkdir(dst_dir)
+            except OSError as exc:
+                print(f"py_cp: cannot create directory: {dst_dir}: "
+                      f"{exc.strerror or exc}", file=sys.stderr)
+                had_error = True
+                return False
+            src_st = os.lstat(src_dir)
+            try:
+                os.chmod(dst_dir, stat.S_IMODE(src_st.st_mode) & ~umask)
+            except OSError:
+                pass
+        except PermissionError:
+            print(f"py_cp: permission denied: {dst_dir}", file=sys.stderr)
+            had_error = True
+            return False
+        return True
+
+    def _recurse(src_dir, dst_dir, depth):
+        nonlocal had_error, _node_count
+        if depth > _MAX_DEPTH:
+            print(f"py_cp: maximum directory depth exceeded: {src_dir}",
+                  file=sys.stderr)
+            had_error = True
+            return
+        if not _ensure_dir(src_dir, dst_dir):
+            return
+        try:
+            entries = list(os.scandir(src_dir))
+        except PermissionError:
+            print(f"py_cp: cannot read directory: {src_dir}", file=sys.stderr)
+            had_error = True
+            return
+        except OSError as exc:
+            print(f"py_cp: cannot read directory: {src_dir}: "
+                  f"{exc.strerror or exc}", file=sys.stderr)
+            had_error = True
+            return
+
+        for entry in sorted(entries, key=lambda e: e.name):
+            _node_count += 1
+            if _node_count > _MAX_NODES:
+                print("py_cp: resource limit exceeded", file=sys.stderr)
+                had_error = True
+                return
+            src_path = entry.path
+            dst_path = os.path.join(dst_dir, entry.name)
+            try:
+                st = os.lstat(src_path)
+            except OSError as exc:
+                print(f"py_cp: cannot access: {src_path}: "
+                      f"{exc.strerror or exc}", file=sys.stderr)
+                had_error = True
+                continue
+            if stat.S_ISLNK(st.st_mode):
+                try:
+                    target = os.readlink(src_path)
+                except OSError as exc:
+                    print(f"py_cp: cannot read symlink: {src_path}: "
+                          f"{exc.strerror or exc}", file=sys.stderr)
+                    had_error = True
+                    continue
+                try:
+                    os.lstat(dst_path)
+                except (FileNotFoundError, OSError):
+                    pass
+                else:
+                    try:
+                        os.unlink(dst_path)
+                    except OSError:
+                        pass
+                try:
+                    os.symlink(target, dst_path)
+                except OSError as exc:
+                    print(f"py_cp: cannot create symlink: {dst_path}: "
+                          f"{exc.strerror or exc}", file=sys.stderr)
+                    had_error = True
+            elif stat.S_ISDIR(st.st_mode):
+                _recurse(src_path, dst_path, depth + 1)
+            elif stat.S_ISREG(st.st_mode):
+                try:
+                    copy_path(src_path, dst_path, force=force,
+                              interactive=interactive)
+                except _CopyDeclined:
+                    had_error = True
+                except _CopyError as exc:
+                    print(f"py_cp: {exc}", file=sys.stderr)
+                    had_error = True
+                except OSError as exc:
+                    print(f"py_cp: {exc.strerror or exc}", file=sys.stderr)
+                    had_error = True
+            # else: unsupported type (socket, fifo, etc.) — skip silently
+
+    _recurse(source, effective_dest, 1)
+    return had_error
+```
+
+### 3. Rewrite the `main` function body
+
+Replace everything from `def main():` to the end of the function with:
+
+```python
+def main():
+    try:
+        operands, force, interactive, recursive = _parse_operands(sys.argv[1:])
+    except _CopyError as exc:
+        print(f"py_cp: {exc}", file=sys.stderr)
+        return 1
+
+    if len(operands) < 2:
+        print("py_cp: missing operand", file=sys.stderr)
+        return 1
+
+    multi = len(operands) > 2
+    if multi:
+        dest_dir = operands[-1]
+        try:
+            st = os.stat(dest_dir)
+        except (OSError, ValueError):
+            print(f"py_cp: not a directory: {dest_dir}", file=sys.stderr)
+            return 1
+        if not stat.S_ISDIR(st.st_mode):
+            print(f"py_cp: not a directory: {dest_dir}", file=sys.stderr)
+            return 1
+        sources = operands[:-1]
+    else:
+        sources = [operands[0]]
+
+    pairs = []
+    for src in sources:
+        base = os.path.basename(src)
+        if multi:
+            dest = os.path.join(dest_dir, base)
+        else:
+            dest = operands[1]
+            try:
+                st = os.stat(dest)
+                if stat.S_ISDIR(st.st_mode):
+                    dest = os.path.join(dest, base)
+            except (OSError, ValueError):
+                pass
+        pairs.append((src, dest))
+
+    def _copy_regular_file(src, dest):
+        src_st = _validate_source(src)
+        dst_st = _validate_destination(dest)
+        if dst_st is not None and src_st.st_dev == dst_st.st_dev \
+                and src_st.st_ino == dst_st.st_ino:
+            raise _CopyError(
+                f"source and destination are the same file: {src}")
+        copy_path(src, dest, force=force, interactive=interactive)
+
+    had_error = False
+    for src, dest in pairs:
+        try:
+            if recursive:
+                try:
+                    src_lstat = os.lstat(src)
+                except FileNotFoundError:
+                    print(f"py_cp: no such file: {src}", file=sys.stderr)
+                    had_error = True
+                    continue
+                except PermissionError:
+                    print(f"py_cp: permission denied: {src}", file=sys.stderr)
+                    had_error = True
+                    continue
+                except OSError as exc:
+                    print(f"py_cp: cannot access: {src}: "
+                          f"{exc.strerror or exc}", file=sys.stderr)
+                    had_error = True
+                    continue
+
+                if stat.S_ISLNK(src_lstat.st_mode):
+                    try:
+                        target = os.readlink(src)
+                    except OSError as exc:
+                        print(f"py_cp: cannot read symlink: {src}: "
+                              f"{exc.strerror or exc}", file=sys.stderr)
+                        had_error = True
+                        continue
+                    try:
+                        os.lstat(dest)
+                    except (FileNotFoundError, OSError):
+                        pass
+                    else:
+                        try:
+                            os.unlink(dest)
+                        except OSError:
+                            pass
+                    try:
+                        os.symlink(target, dest)
+                    except OSError as exc:
+                        print(f"py_cp: cannot create symlink: {dest}: "
+                              f"{exc.strerror or exc}", file=sys.stderr)
+                        had_error = True
+                elif stat.S_ISDIR(src_lstat.st_mode):
+                    src_real = os.path.realpath(src)
+                    dest_real = os.path.realpath(dest)
+                    if dest_real == src_real \
+                            or dest_real.startswith(src_real + os.sep):
+                        print(
+                            f"py_cp: cannot copy directory into itself "
+                            f"or its descendant: {src}", file=sys.stderr)
+                        had_error = True
+                        continue
+                    try:
+                        dst_st = os.stat(dest)
+                        if not stat.S_ISDIR(dst_st.st_mode):
+                            print(
+                                f"py_cp: cannot create directory: {dest}: "
+                                f"file exists", file=sys.stderr)
+                            had_error = True
+                            continue
+                    except FileNotFoundError:
+                        pass
+                    except PermissionError:
+                        print(f"py_cp: permission denied: {dest}",
+                              file=sys.stderr)
+                        had_error = True
+                        continue
+                    if _copy_tree(src, dest, force, interactive):
+                        had_error = True
+                elif stat.S_ISREG(src_lstat.st_mode):
+                    _copy_regular_file(src, dest)
+                else:
+                    print(f"py_cp: unsupported file type: {src}",
+                          file=sys.stderr)
+                    had_error = True
+            else:
+                _copy_regular_file(src, dest)
+        except _CopyDeclined:
+            had_error = True
+        except _CopyError as exc:
+            print(f"py_cp: {exc}", file=sys.stderr)
+            had_error = True
+        except OSError as exc:
+            print(f"py_cp: {exc.strerror or exc}", file=sys.stderr)
+            had_error = True
+
+    return 1 if had_error else 0
+```
+
+### Summary of key design decisions
+
+| Concern | Resolution |
+|---|---|
+| `copy_path` anchor | Called directly for all regular-file copies (top-level and in-tree). |
+| Recursive symlinks | Recreated via `os.readlink` + `os.symlink`; never followed, including at the operand level. |
+| Self-copy guard | `os.path.realpath` comparison before any filesystem mutation. |
+| Existing dest directory | Bits preserved; new directories get `source_rwx & ~umask`. |
+| Interactive / force | Delegated to `copy_path` for every regular file in the tree. |
+| Resource limits | Depth cap 4096, node cap 10 000 000; both emit a diagnostic and stop. |
+| Error continuation | Per-entry `try/except` in `_recurse`; top-level per-source `try/except` in `main`. |
+| Unsupported types | Silently skipped in-tree; rejected at the top level with a diagnostic. |
+Tokens: 9.6k sent, 15k received.
+I will implement the requested changes to add recursive copy functionality to `py_cp.py`.
+
+py_cp.py
+```
+#!/usr/bin/env python3
+"""py_cp — checkpoint 000: basic file copy."""
+
+import os
+import stat
+import sys
+
+
+class _CopyError(Exception):
+    """Per-source copy failure carrying a user-facing message."""
+
+
+class _CopyDeclined(Exception):
+    """Interactive prompt declined; not an error, but contributes exit status 1."""
+
+
+def _get_umask():
+    mask = os.umask(0)
+    os.umask(mask)
+    return mask
+
+
+def _copy_bytes(src_fd, dst_fd):
+    """Transfer all bytes from src_fd to dst_fd at the fd level."""
+    while True:
+        chunk = os.read(src_fd, 1 << 20)
+        if not chunk:
+            break
+        pos = 0
+        while pos < len(chunk):
+            pos += os.write(dst_fd, chunk[pos:])
+
+
+def copy_path(source, destination, force=False, interactive=False):
+    """Core filesystem operation: copy file contents from source to destination.
+
+    Pre-conditions (validated by caller):
+      source is a regular file (or symlink resolving to one);
+      destination is an existing regular file, a symlink to one, or a new
+      path whose parent exists; source and destination are not the same file.
+
+    Post-conditions:
+      destination holds a byte-for-byte copy of source;
+      source is unmodified;
+      new files get rwx = source_rwx & ~umask;
+      existing files retain their rwx.
+    """
+    umask = _get_umask()
+
+    try:
+        src_fd = os.open(source, os.O_RDONLY)
+    except PermissionError:
+        raise _CopyError(f"cannot read: {source}")
+    except OSError as exc:
+        raise _CopyError(f"cannot open: {source}: {exc.strerror or exc}")
+
+    dst_fd = None
+    try:
+        try:
+            os.stat(destination)
+        except FileNotFoundError:
+            # New file (dangling symlinks and missing parents rejected by caller)
+            try:
+                dst_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o777)
+            except OSError as exc:
+                raise _CopyError(f"cannot create: {destination}: {exc.strerror or exc}")
+            src_st = os.stat(source)
+            os.fchmod(dst_fd, stat.S_IMODE(src_st.st_mode) & ~umask)
+        else:
+            # Existing regular file (or symlink to one)
+            if interactive:
+                sys.stderr.write(f"py_cp: overwrite '{destination}'? ")
+                sys.stderr.flush()
+                line = sys.stdin.readline()
+                stripped = line.rstrip("\r\n")
+                if not stripped or stripped[0] not in ("y", "Y"):
+                    raise _CopyDeclined(destination)
+            try:
+                dst_fd = os.open(destination, os.O_WRONLY | os.O_TRUNC)
+            except OSError as exc:
+                if not force:
+                    raise _CopyError(f"cannot open: {destination}: {exc.strerror or exc}")
+                try:
+                    os.unlink(destination)
+                except OSError as e2:
+                    raise _CopyError(f"cannot remove: {destination}: {e2.strerror or e2}")
+                try:
+                    dst_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o777)
+                except OSError as e3:
+                    raise _CopyError(f"cannot create: {destination}: {e3.strerror or e3}")
+                src_st = os.stat(source)
+                os.fchmod(dst_fd, stat.S_IMODE(src_st.st_mode) & ~umask)
+
+        _copy_bytes(src_fd, dst_fd)
+        os.close(dst_fd)
+        dst_fd = None
+    finally:
+        if dst_fd is not None:
+            try:
+                os.close(dst_fd)
+            except OSError:
+                pass
+        try:
+            os.close(src_fd)
+        except OSError:
+            pass
+
+
+def _copy_tree(source, effective_dest, force, interactive):
+    """Recursively copy a directory tree from source to effective_dest.
+
+    effective_dest is the directory that corresponds to source.
+    Returns True if any per-entry error occurred.
+    """
+    had_error = False
+    umask = _get_umask()
+    _MAX_DEPTH = 4096
+    _MAX_NODES = 10_000_000
+    _node_count = 0
+
+    def _ensure_dir(src_dir, dst_dir):
+        nonlocal had_error
+        try:
+            st = os.stat(dst_dir)
+            if not stat.S_ISDIR(st.st_mode):
+                print(f"py_cp: cannot create directory: {dst_dir}: file exists",
+                      file=sys.stderr)
+                had_error = True
+                return False
+        except FileNotFoundError:
+            try:
+                os.mkdir(dst_dir)
+            except OSError as exc:
+                print(f"py_cp: cannot create directory: {dst_dir}: "
+                      f"{exc.strerror or exc}", file=sys.stderr)
+                had_error = True
+                return False
+            src_st = os.lstat(src_dir)
+            try:
+                os.chmod(dst_dir, stat.S_IMODE(src_st.st_mode) & ~umask)
+            except OSError:
+                pass
+        except PermissionError:
+            print(f"py_cp: permission denied: {dst_dir}", file=sys.stderr)
+            had_error = True
+            return False
+        return True
+
+    def _recurse(src_dir, dst_dir, depth):
+        nonlocal had_error, _node_count
+        if depth > _MAX_DEPTH:
+            print(f"py_cp: maximum directory depth exceeded: {src_dir}",
+                  file=sys.stderr)
+            had_error = True
+            return
+        if not _ensure_dir(src_dir, dst_dir):
+            return
+        try:
+            entries = list(os.scandir(src_dir))
+        except PermissionError:
+            print(f"py_cp: cannot read directory: {src_dir}", file=sys.stderr)
+            had_error = True
+            return
+        except OSError as exc:
+            print(f"py_cp: cannot read directory: {src_dir}: "
+                  f"{exc.strerror or exc}", file=sys.stderr)
+            had_error = True
+            return
+
+        for entry in sorted(entries, key=lambda e: e.name):
+            _node_count += 1
+            if _node_count > _MAX_NODES:
+                print("py_cp: resource limit exceeded", file=sys.stderr)
+                had_error = True
+                return
+            src_path = entry.path
+            dst_path = os.path.join(dst_dir, entry.name)
+            try:
+                st = os.lstat(src_path)
+            except OSError as exc:
+                print(f"py_cp: cannot access: {src_path}: "
+                      f"{exc.strerror or exc}", file=sys.stderr)
+                had_error = True
+                continue
+            if stat.S_ISLNK(st.st_mode):
+                try:
+                    target = os.readlink(src_path)
+                except OSError as exc:
+                    print(f"py_cp: cannot read symlink: {src_path}: "
+                          f"{exc.strerror or exc}", file=sys.stderr)
+                    had_error = True
+                    continue
+                try:
+                    os.lstat(dst_path)
+                except (FileNotFoundError, OSError):
+                    pass
+                else:
+                    try:
+                        os.unlink(dst_path)
+                    except OSError:
+                        pass
+                try:
+                    os.symlink(target, dst_path)
+                except OSError as exc:
+                    print(f"py_cp: cannot create symlink: {dst_path}: "
+                          f"{exc.strerror or exc}", file=sys.stderr)
+                    had_error = True
+            elif stat.S_ISDIR(st.st_mode):
+                _recurse(src_path, dst_path, depth + 1)
+            elif stat.S_ISREG(st.st_mode):
+                try:
+                    copy_path(src_path, dst_path, force=force,
+                              interactive=interactive)
+                except _CopyDeclined:
+                    had_error = True
+                except _CopyError as exc:
+                    print(f"py_cp: {exc}", file=sys.stderr)
+                    had_error = True
+                except OSError as exc:
+                    print(f"py_cp: {exc.strerror or exc}", file=sys.stderr)
+                    had_error = True
+            # else: unsupported type (socket, fifo, etc.) — skip silently
+
+    _recurse(source, effective_dest, 1)
+    return had_error
+
+
+def _parse_operands(argv):
+    """Return (operands, force, interactive, recursive) enforcing option and terminator rules.
+
+    Before --: bare '-' is a filename; '-f', '--force', '-i', '--interactive', '-r', and '--recursive' set flags (idempotent);
+    any other '-'-prefixed token is an unknown option.  After --: every token is
+    a literal operand.
+    """
+    operands = []
+    literal = False
+    force = False
+    interactive = False
+    recursive = False
+    for arg in argv:
+        if not literal:
+            if arg == "--":
+                literal = True
+            elif arg == "-":
+                operands.append(arg)
+            elif arg == "-f" or arg == "--force":
+                force = True
+            elif arg == "-i" or arg == "--interactive":
+                interactive = True
+            elif arg == "-r" or arg == "--recursive":
+                recursive = True
+            elif arg.startswith("-") and len(arg) > 1:
+                raise _CopyError(f"unknown option: {arg}")
+            else:
+                operands.append(arg)
+        else:
+            operands.append(arg)
+    return operands, force, interactive, recursive
+
+
+def _validate_source(source):
+    """Return os.stat(source) or raise _CopyError if not a regular file."""
+    try:
+        st = os.stat(source)
+    except FileNotFoundError:
+        raise _CopyError(f"no such file: {source}")
+    except PermissionError:
+        raise _CopyError(f"permission denied: {source}")
+    except OSError as exc:
+        raise _CopyError(f"cannot access: {source}: {exc.strerror or exc}")
+    if stat.S_ISDIR(st.st_mode):
+        raise _CopyError(f"is a directory: {source}")
+    if not stat.S_ISREG(st.st_mode):
+        raise _CopyError(f"not a regular file: {source}")
+    return st
+
+
+def _validate_destination(destination):
+    """Return stat if destination is an existing regular file, else None (new).
+
+    Raises _CopyError for dangling symlinks, directories, missing parents,
+    or incompatible types.
+    """
+    try:
+        st = os.stat(destination)
+    except FileNotFoundError:
+        if os.path.islink(destination):
+            raise _CopyError(f"dangling symlink: {destination}")
+        parent = os.path.dirname(destination) or "."
+        try:
+            os.stat(parent)
+        except (OSError, ValueError):
+            raise _CopyError(f"no such file or directory: {destination}")
+        return None
+    except PermissionError:
+        raise _CopyError(f"permission denied: {destination}")
+    except OSError as exc:
+        raise _CopyError(f"cannot access: {destination}: {exc.strerror or exc}")
+    if stat.S_ISDIR(st.st_mode):
+        raise _CopyError(f"is a directory: {destination}")
+    if not stat.S_ISREG(st.st_mode):
+        raise _CopyError(f"incompatible destination: {destination}")
+    return st
+
+
+def main():
+    try:
+        operands, force, interactive, recursive = _parse_operands(sys.argv[1:])
+    except _CopyError as exc:
+        print(f"py_cp: {exc}", file=sys.stderr)
+        return 1
+
+    if len(operands) < 2:
+        print("py_cp: missing operand", file=sys.stderr)
+        return 1
+
+    multi = len(operands) > 2
+    if multi:
+        dest_dir = operands[-1]
+        try:
+            st = os.stat(dest_dir)
+        except (OSError, ValueError):
+            print(f"py_cp: not a directory: {dest_dir}", file=sys.stderr)
+            return 1
+        if not stat.S_ISDIR(st.st_mode):
+            print(f"py_cp: not a directory: {dest_dir}", file=sys.stderr)
+            return 1
+        sources = operands[:-1]
+    else:
+        sources = [operands[0]]
+
+    pairs = []
+    for src in sources:
+        base = os.path.basename(src)
+        if multi:
+            dest = os.path.join(dest_dir, base)
+        else:
+            dest = operands[1]
+            try:
+                st = os.stat(dest)
+                if stat.S_ISDIR(st.st_mode):
+                    dest = os.path.join(dest, base)
+            except (OSError, ValueError):
+                pass
+        pairs.append((src, dest))
+
+    def _copy_regular_file(src, dest):
+        src_st = _validate_source(src)
+        dst_st = _validate_destination(dest)
+        if dst_st is not None and src_st.st_dev == dst_st.st_dev \
+                and src_st.st_ino == dst_st.st_ino:
+            raise _CopyError(
+                f"source and destination are the same file: {src}")
+        copy_path(src, dest, force=force, interactive=interactive)
+
+    had_error = False
+    for src, dest in pairs:
+        try:
+            if recursive:
+                try:
+                    src_lstat = os.lstat(src)
+                except FileNotFoundError:
+                    print(f"py_cp: no such file: {src}", file=sys.stderr)
+                    had_error = True
+                    continue
+                except PermissionError:
+                    print(f"py_cp: permission denied: {src}", file=sys.stderr)
+                    had_error = True
+                    continue
+                except OSError as exc:
+                    print(f"py_cp: cannot access: {src}: "
+                          f"{exc.strerror or exc}", file=sys.stderr)
+                    had_error = True
+                    continue
+
+                if stat.S_ISLNK(src_lstat.st_mode):
+                    try:
+                        target = os.readlink(src)
+                    except OSError as exc:
+                        print(f"py_cp: cannot read symlink: {src}: "
+                              f"{exc.strerror or exc}", file=sys.stderr)
+                        had_error = True
+                        continue
+                    try:
+                        os.lstat(dest)
+                    except (FileNotFoundError, OSError):
+                        pass
+                    else:
+                        try:
+                            os.unlink(dest)
+                        except OSError:
+                            pass
+                    try:
+                        os.symlink(target, dest)
+                    except OSError as exc:
+                        print(f"py_cp: cannot create symlink: {dest}: "
+                              f"{exc.strerror or exc}", file=sys.stderr)
+                        had_error = True
+                elif stat.S_ISDIR(src_lstat.st_mode):
+                    src_real = os.path.realpath(src)
+                    dest_real = os.path.realpath(dest)
+                    if dest_real == src_real \
+                            or dest_real.startswith(src_real + os.sep):
+                        print(
+                            f"py_cp: cannot copy directory into itself "
+                            f"or its descendant: {src}", file=sys.stderr)
+                        had_error = True
+                        continue
+                    try:
+                        dst_st = os.stat(dest)
+                        if not stat.S_ISDIR(dst_st.st_mode):
+                            print(
+                                f"py_cp: cannot create directory: {dest}: "
+                                f"file exists", file=sys.stderr)
+                            had_error = True
+                            continue
+                    except FileNotFoundError:
+                        pass
+                    except PermissionError:
+                        print(f"py_cp: permission denied: {dest}",
+                              file=sys.stderr)
+                        had_error = True
+                        continue
+                    if _copy_tree(src, dest, force, interactive):
+                        had_error = True
+                elif stat.S_ISREG(src_lstat.st_mode):
+                    _copy_regular_file(src, dest)
+                else:
+                    print(f"py_cp: unsupported file type: {src}",
+                          file=sys.stderr)
+                    had_error = True
+            else:
+                _copy_regular_file(src, dest)
+        except _CopyDeclined:
+            had_error = True
+        except _CopyError as exc:
+            print(f"py_cp: {exc}", file=sys.stderr)
+            had_error = True
+        except OSError as exc:
+            print(f"py_cp: {exc.strerror or exc}", file=sys.stderr)
+            had_error = True
+
+    return 1 if had_error else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+Tokens: 11k sent, 3.4k received.
+Applied edit to py_cp.py
