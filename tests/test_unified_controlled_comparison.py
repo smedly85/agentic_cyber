@@ -29,6 +29,15 @@ class ControlledComparisonTests(unittest.TestCase):
         for name in ("constant_change", "operand_change", "branch_change"):
             self.assertGreater(self.rows[name]["unified_U"]["distance"], 0.0)
 
+    def test_helper_extraction_uses_unary_argument_splicing(self):
+        for name in ("helper_extraction", "inlining"):
+            row = self.rows[name]
+            self.assertEqual(row["existing_A_S"]["strategy"]["evaluated_alignments"][0]["raw_cost"], 8)
+            evaluated = row["A_with_S_node"]["strategy_node"]["evaluated_alignments"][0]
+            self.assertEqual(evaluated["node_edit_cost"], 7)
+            main = next(edit for edit in evaluated["function_edits"] if edit["left"] is not None)
+            self.assertTrue(any(op.get("unary_unordered_splice") for op in main["operations"]))
+
 
 if __name__ == "__main__":
     unittest.main()

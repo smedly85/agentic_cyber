@@ -4,7 +4,8 @@ import unittest
 
 from scripts.analysis import ordered_distances as old
 from scripts.analysis.clang_ordered import BACKEND
-from scripts.analysis.strategy_node import NodeBudget, NodeLimits, compare, node_tree_edit
+from scripts.analysis.strategy_node import (NodeBudget, NodeLimits, compare,
+                                             evaluate_architecture_mappings, node_tree_edit)
 
 
 def label(name, slot=None):
@@ -63,6 +64,22 @@ class StrategyNodeTests(unittest.TestCase):
         right = tree("args", tree("wrapper", tree("value"), slot=("argument_list", 0)), unordered=True)
         self.assertEqual(node_tree_edit(left, right, NodeBudget(NodeLimits()))["cost"], 1)
 
+    def test_unary_unordered_container_splices_without_relaxing_slots(self):
+        binding = tree("binding")
+        argument = tree("binding", slot=("argument_list", 0))
+        argument_list = tree("argument_list", argument, unordered=True)
+        forward = node_tree_edit(binding, argument_list, NodeBudget(NodeLimits()))
+        reverse = node_tree_edit(argument_list, binding, NodeBudget(NodeLimits()))
+        self.assertEqual((forward["cost"], reverse["cost"]), (1, 1))
+        self.assertTrue(any(op.get("unary_unordered_splice") for op in forward["operations"]))
+
+        # A multi-argument frontier still cannot be flattened into an ordered
+        # forest, which would discard argument-slot constraints.
+        two_arguments = tree("argument_list",
+                             tree("binding", slot=("argument_list", 0)),
+                             tree("binding", slot=("argument_list", 1)), unordered=True)
+        self.assertEqual(node_tree_edit(binding, two_arguments, NodeBudget(NodeLimits()))["cost"], 4)
+
     def test_high_level_reuses_exact_architecture_alignment(self):
         statements = [event("IntegerLiteral", role=None, token=str(index)) for index in range(4)]
         left_body = event("CompoundStmt", statements, role="body")
@@ -88,6 +105,15 @@ class StrategyNodeTests(unittest.TestCase):
         self.assertEqual(strategy["reporting"], "alignment_sensitive_range")
         self.assertLess(strategy["alignment_range"][0], strategy["alignment_range"][1])
         self.assertGreater(result["alignment"]["optimal_mapping_count"], 1)
+
+        mappings = [row["mapping"] for row in strategy["evaluated_alignments"]]
+        reused = evaluate_architecture_mappings(
+            representation(main, (helper_one, helper_two)),
+            representation(main, (helper_one, helper_nine)), mappings,
+            result["scope"]["left"], result["scope"]["right"])
+        self.assertEqual(reused["strategy_node"]["alignment_range"], strategy["alignment_range"])
+        self.assertEqual(reused["alignment"]["optimal_mapping_count"],
+                         result["alignment"]["optimal_mapping_count"])
 
     def test_budget_failure_is_explicit(self):
         with self.assertRaisesRegex(old.Unavailable, "strategy_node_work_limit"):

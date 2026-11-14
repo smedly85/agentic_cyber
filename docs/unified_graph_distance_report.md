@@ -118,13 +118,14 @@ changes, although textual block serialization alone is covered by regression.
 `strategy_node.py` retains the accepted scope rule, comparison trees, labels,
 identifier normalization, call alignment, Architecture objective, and all
 scope-compatible A-optimal mappings. It emits a separate
-`strategy-node-splicing-constrained-unordered-v1` result and never writes S.
+`strategy-node-splicing-constrained-unordered-v2` result and never writes S.
 
 Its primitive costs are:
 
 ```text
 insert one ordinary node and splice its ordered children: 1
 delete one ordinary node and splice its ordered children: 1
+insert/delete a unary unordered container and splice its sole child: 1
 substitute one node label:                             1
 retain equal labels:                                  0
 unmatched selected function:             full node count
@@ -134,8 +135,10 @@ Ordered forests use an exact dynamic program for those primitives. When two
 compatible unordered containers align, immediate children use exact subset
 assignment under the existing role/slot labels. Slot labels are removed only
 inside the assigned child pair, allowing a wrapper to be inserted within an
-argument slot. An unmatched unordered-rooted child costs its full size and may
-not splice across the frontier. This is an exact algorithm for this documented
+argument slot. A unary unordered container can splice its sole child because no
+sibling can be reordered; the container-local slot is removed with the frontier.
+An unmatched multi-child unordered subtree still costs its full size and cannot
+splice across the frontier. This is an exact algorithm for this documented
 frontier-preserving extension; it is not unrestricted unordered tree edit and is
 not labeled APTED.
 
@@ -156,19 +159,54 @@ from different representations are **not interchangeable**.
 | Case | A raw/den | S raw/den | S_node raw/den | U node+edge+content / den |
 | --- | ---: | ---: | ---: | ---: |
 | Parent insertion, 8 retained descendants | 0/2 | 16/19 | **1/19** | 3+5+5 / 37 |
-| Helper extraction | 2/4 | 8/12 | 9/12 | 2+3+4 / 19 |
-| Inlining | 2/4 | 8/12 | 9/12 | 2+3+4 / 19 |
+| Helper extraction | 2/4 | 8/12 | **7/12** | 2+3+4 / 19 |
+| Inlining | 2/4 | 8/12 | **7/12** | 2+3+4 / 19 |
 | Branch predicate change | 0/2 | 1/16 | 1/16 | 0+0+1 / 48 |
 | Constant change | 0/2 | 1/8 | 1/8 | 0+0+1 / 12 |
 | Operand dependency change | 0/2 | 1/8 | 1/8 | 0+0+1 / 12 |
 | Conditional-to-loop CFG restructuring | 0/2 | 1/16 | 1/16 | 0+2+0 / 48 |
 | Dead local-operation padding | 0/2 | 1/9 | 1/9 | 0+0+1 / 13 |
 
-All results in this table completed exact search for their stated models.
-Helper extraction and inlining illustrate that S_node is not uniformly smaller:
-its constrained unordered frontier prevents a cross-function call wrapper from
-being treated as a cheap arbitrary splice. Architecture and U also detect the
+All results in this table completed exact search for their stated models. For
+helper extraction, S_node charges three edits in `main` (substitute the binary
+operation with a call, insert the unary argument-list parent while retaining its
+binding, and delete the extracted literal) plus four nodes for the unmatched new
+helper. The reverse inlining result is symmetric. Multi-argument frontiers remain
+protected by exact argument-slot assignment. Architecture and U also detect the
 function/call decomposition change.
+
+## Historical S_node evaluation readiness
+
+`snode_historical_evaluation.py` uses the immutable measurement journal and
+hash-verified saved Clang-adapter representations; it performs no compilation or
+extraction. Its default mode is a read-only plan. Evaluation requires explicit
+`--run`, `--output`, and `--max-pairs` arguments and refuses to overwrite an
+existing output. Population artifacts retain per-function costs but omit verbose
+operation traces; this changes neither the optimization nor the scores.
+
+The journal contains 140 candidates, 137 eligible saved representations, and 495
+pairs. All 137 representation files are present and match their recorded hashes.
+The pair routes are:
+
+- 363 pairs: reuse the complete saved scope-compatible A-optimal mapping sets;
+- 16 pairs: old S exhausted its work budget before persisting mappings, so rerun
+  only the unchanged exact A alignment and verify its distance and scope against
+  the journal before evaluating S_node;
+- 94 pairs: preserve `no_scope_compatible_architecture_optimum` as unavailable;
+- 7 pairs: preserve incomplete A-optimum enumeration as unavailable;
+- 15 pairs: preserve unavailable Architecture/candidate representations.
+
+The reusable-mapping entry point validates function identities, entry anchors,
+one-to-one mappings, scope compatibility, duplicates, and complete mapping count
+provenance before tree editing. Alignment-sensitive intervals are still computed
+over every saved A optimum. No population run was launched. One read-only smoke
+comparison on the smallest reusable pair succeeded using its single saved optimum
+(`S_node = 0.32398753894080995`, 21,743 work units); it created no repository
+artifact and is not a population result.
+
+The 363 reuse-route pairs do not require SciPy. The 16 recovery-route pairs need
+the same pinned NumPy/SciPy HiGHS environment used by exact A; SciPy is absent
+from the current host Python, so that recovery route was planned but not run.
 
 For the parent case, U's operation edit script explicitly retains all eight
 `add` operations, inserts `icmp`, conditional `br`, unconditional `br`, and
@@ -252,7 +290,7 @@ returns `clang_unavailable_in_docker`.
 
 ## Verification and environmental blockers
 
-The focused Python suite contains 28 passing tests covering U extraction,
+The focused Python suite contains 31 passing tests covering U extraction,
 validation, collision regressions, textual block-order invariance, tiny-oracle
 agreement, bounded outcomes, operation correspondence, S_node node splicing,
 constrained unordered groups, alignment-sensitive ranges, and the controlled
@@ -269,10 +307,11 @@ absent `apted` package remain scientific blockers described above.
 ## Recommendation
 
 The evidence supports **keeping Architecture and replacing only Strategy with
-S_node as the preferred experimental direction**, subject to compiler-backed
-controlled validation before changing the paper's accepted measurement. S_node
-fixes the identified recurrence artifact directly while preserving A's clear
-function/call interpretation and accepted alignment policy.
+S_node**. The implementation is ready for a bounded historical evaluation: it
+fixes the identified recurrence artifact while preserving A's function/call
+interpretation, exact alignment population, scope, labels, and normalization.
+Paper-level replacement should follow review of historical coverage, intervals,
+distribution shifts, and the 16 recovery-route outcomes rather than precede it.
 
 U should continue as a potential replacement research track, not be adopted now.
 Its representation is more discriminating than v1 and its parent correspondence

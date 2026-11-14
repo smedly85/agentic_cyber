@@ -15,7 +15,7 @@ from . import ordered_distances as old
 from .clang_ordered import comparison_tree, validate
 from .ordered_exact import architecture as milp_architecture, scope
 
-ALGORITHM_VERSION = "strategy-node-splicing-constrained-unordered-v1"
+ALGORITHM_VERSION = "strategy-node-splicing-constrained-unordered-v2"
 
 
 @dataclass(frozen=True)
@@ -79,11 +79,13 @@ def node_tree_edit(left, right, budget: NodeBudget) -> dict[str, Any]:
     Ordinary node insertion/deletion costs one and splices children into the
     parent's ordered forest.  When two explicit unordered containers align,
     their immediate child trees use exact assignment subject to the existing
-    slot labels.  An unmatched unordered child or unordered-rooted subtree costs
-    its full tree because splicing it across an argument/initializer/evaluation
-    frontier would change the accepted role semantics.  This is an exact result
-    for that documented frontier-preserving edit model, not unrestricted
-    unordered tree edit distance.
+    slot labels. A unary unordered container may be inserted or deleted for unit
+    cost because splicing its only child cannot reorder siblings; the child's
+    container-local slot is removed with that frontier. Other unmatched
+    unordered-rooted subtrees cost their full tree because splicing a multi-child
+    argument/initializer/evaluation frontier would change the accepted role
+    semantics. This is an exact result for that documented frontier-preserving
+    edit model, not unrestricted unordered tree edit distance.
     """
     choices: dict[tuple[tuple, tuple], tuple[str, Any]] = {}
     assignments: dict[tuple[tuple, tuple], tuple[tuple[int | None, int | None], ...]] = {}
@@ -141,10 +143,17 @@ def node_tree_edit(left, right, budget: NodeBudget) -> dict[str, Any]:
             candidates.append((1 + forest(_children(a) + rest_a, right_forest), 1, "delete"))
         else:
             candidates.append((old._size(a) + forest(rest_a, right_forest), 3, "delete_unordered"))
+            if len(_children(a)) == 1:
+                candidates.append((1 + forest((_without_frontier_slot(_children(a)[0]),) + rest_a,
+                                               right_forest), 1, "delete_unary_unordered"))
         if not _unordered(b):
             candidates.append((1 + forest(left_forest, _children(b) + rest_b), 2, "insert"))
         else:
             candidates.append((old._size(b) + forest(left_forest, rest_b), 4, "insert_unordered"))
+            if len(_children(b)) == 1:
+                candidates.append((1 + forest(left_forest,
+                                               (_without_frontier_slot(_children(b)[0]),) + rest_b),
+                                   2, "insert_unary_unordered"))
         if _unordered(a) == _unordered(b):
             if _unordered(a):
                 if _unordered_compatible(a, b):
@@ -191,6 +200,14 @@ def node_tree_edit(left, right, budget: NodeBudget) -> dict[str, Any]:
             whole(a, "deleted"); trace(rest_a, right_forest)
         elif action == "insert_unordered":
             whole(b, "inserted"); trace(left_forest, rest_b)
+        elif action == "delete_unary_unordered":
+            operations.append({"status": "deleted", "label": _label(a),
+                               "unary_unordered_splice": True})
+            trace((_without_frontier_slot(_children(a)[0]),) + rest_a, right_forest)
+        elif action == "insert_unary_unordered":
+            operations.append({"status": "inserted", "label": _label(b),
+                               "unary_unordered_splice": True})
+            trace(left_forest, (_without_frontier_slot(_children(b)[0]),) + rest_b)
         elif action == "match":
             operations.append({"status": "retained" if _label(a) == _label(b) else "substituted",
                                "left_label": _label(a), "right_label": _label(b)})
@@ -234,6 +251,101 @@ def _architecture(left, right, left_scope, right_scope, limits: NodeLimits):
     return milp_architecture(left, right, left_scope, right_scope, limits)
 
 
+def _strategy_from_mappings(left, right, mappings, left_scope, right_scope,
+                            limits: NodeLimits) -> dict[str, Any]:
+    calls_left = {call["id"]: call for call in left["call_sites"]}
+    calls_right = {call["id"]: call for call in right["call_sites"]}
+    budget = NodeBudget(limits)
+    evaluated, values = [], []
+    for mapping in mappings:
+        left_labels, right_labels = old._label_maps(left, right, mapping)
+        left_trees = {f["id"]: comparison_tree(f, calls_left, left_labels)
+                      for f in left["functions"] if left_scope[f["id"]]}
+        right_trees = {f["id"]: comparison_tree(f, calls_right, right_labels)
+                       for f in right["functions"] if right_scope[f["id"]]}
+        denominator = (sum(old._size(tree) for tree in left_trees.values())
+                       + sum(old._size(tree) for tree in right_trees.values()))
+        paired = {a: b for a, b in mapping.items() if a in left_trees and b in right_trees}
+        cost, function_edits = 0, []
+        for a, b in sorted(paired.items()):
+            edit = node_tree_edit(left_trees[a], right_trees[b], budget)
+            cost += edit["cost"]
+            operations = edit["operations"]
+            function_edits.append({"left": a, "right": b, "cost": edit["cost"],
+                "operation_count": len(operations),
+                "operations": operations[:limits.max_diagnostic_operations],
+                "operations_complete": len(operations) <= limits.max_diagnostic_operations})
+        for a, tree in left_trees.items():
+            if a not in paired:
+                size = old._size(tree); cost += size
+                function_edits.append({"left": a, "right": None, "cost": size, "unmatched_tree": True})
+        used = set(paired.values())
+        for b, tree in right_trees.items():
+            if b not in used:
+                size = old._size(tree); cost += size
+                function_edits.append({"left": None, "right": b, "cost": size, "unmatched_tree": True})
+        value = cost / denominator if denominator else 0.0
+        values.append(value)
+        evaluated.append({"mapping": mapping, "node_edit_cost": cost,
+                          "tree_size_sum": denominator, "strategy_node_distance": value,
+                          "function_edits": function_edits})
+    interval = [min(values), max(values)]
+    return {"status": "success",
+        "distance": interval[0] if interval[0] == interval[1] else None,
+        "alignment_range": interval,
+        "reporting": "alignment_invariant" if interval[0] == interval[1] else "alignment_sensitive_range",
+        "exact": True, "work_units": budget.work, "evaluated_alignments": evaluated,
+        "unordered_policy": "exact slot-constrained assignment at compatible unordered frontiers; unary unordered containers may splice their sole child; unmatched multi-child unordered subtrees cost full size"}
+
+
+def evaluate_architecture_mappings(left, right, mappings, left_scope, right_scope,
+                                   *, limits: NodeLimits = NodeLimits()) -> dict[str, Any]:
+    """Evaluate S_node over a caller-verified complete A-optimal mapping set.
+
+    This entry point deliberately does not certify Architecture optimality. It is
+    for provenance-checked historical artifacts that already contain the exact,
+    complete A-optimal mappings and scope decisions.
+    """
+    started = time.monotonic()
+    output = {"method": ALGORITHM_VERSION, "limits": asdict(limits),
+              "mapping_source": "caller-verified complete Architecture-optimal artifact",
+              "strategy_node": {"status": "unavailable", "distance": None},
+              "normalization": "unit node edit cost / sum of selected comparison-tree node counts"}
+    try:
+        validate(left, limits.max_events); validate(right, limits.max_events)
+        left_functions = {function["id"]: function for function in left["functions"]}
+        right_functions = {function["id"]: function for function in right["functions"]}
+        if set(left_scope) != set(left_functions) or set(right_scope) != set(right_functions):
+            raise old.Unavailable("strategy_node_invalid_saved_scope")
+        mappings = [dict(mapping) for mapping in mappings]
+        if not mappings:
+            raise old.Unavailable("strategy_node_missing_saved_alignments")
+        signatures = set()
+        for mapping in mappings:
+            if (not set(mapping) <= set(left_functions) or not set(mapping.values()) <= set(right_functions)
+                    or len(set(mapping.values())) != len(mapping)):
+                raise old.Unavailable("strategy_node_invalid_saved_alignment")
+            for a, b in mapping.items():
+                lf, rf = left_functions[a], right_functions[b]
+                if (lf["entry_point"] != rf["entry_point"]
+                        or (lf["entry_point"] and lf["name"] != rf["name"])
+                        or bool(left_scope[a]) != bool(right_scope[b])):
+                    raise old.Unavailable("strategy_node_incompatible_saved_alignment")
+            signature = tuple(sorted(mapping.items()))
+            if signature in signatures:
+                raise old.Unavailable("strategy_node_duplicate_saved_alignment")
+            signatures.add(signature)
+        output["scope"] = {"left": left_scope, "right": right_scope}
+        output["alignment"] = old._alignment_diagnostics(left, right, mappings)
+        output["alignment"]["population"] = "caller-verified complete scope-compatible Architecture-optimal mappings"
+        output["strategy_node"] = _strategy_from_mappings(
+            left, right, mappings, left_scope, right_scope, limits)
+    except (old.Unavailable, ImportError) as exc:
+        output["strategy_node"]["reason"] = str(exc)
+    output["seconds"] = time.monotonic() - started
+    return output
+
+
 def compare(left, right, *, limits: NodeLimits = NodeLimits(),
             exclude_regex: str = old.DEFAULT_EXCLUDE, forced_includes=()) -> dict[str, Any]:
     started = time.monotonic()
@@ -256,48 +368,8 @@ def compare(left, right, *, limits: NodeLimits = NodeLimits(),
             raise old.Unavailable("no_scope_compatible_architecture_optimum")
         output["alignment"] = old._alignment_diagnostics(left, right, mappings)
         output["alignment"]["population"] = "all scope-compatible Architecture-optimal mappings"
-        calls_left = {call["id"]: call for call in left["call_sites"]}
-        calls_right = {call["id"]: call for call in right["call_sites"]}
-        budget = NodeBudget(limits)
-        evaluated, values = [], []
-        for mapping in mappings:
-            left_labels, right_labels = old._label_maps(left, right, mapping)
-            left_trees = {f["id"]: comparison_tree(f, calls_left, left_labels)
-                          for f in left["functions"] if left_scope[f["id"]]}
-            right_trees = {f["id"]: comparison_tree(f, calls_right, right_labels)
-                           for f in right["functions"] if right_scope[f["id"]]}
-            denominator = sum(old._size(tree) for tree in left_trees.values()) + sum(old._size(tree) for tree in right_trees.values())
-            paired = {a: b for a, b in mapping.items() if a in left_trees and b in right_trees}
-            cost, function_edits = 0, []
-            for a, b in sorted(paired.items()):
-                edit = node_tree_edit(left_trees[a], right_trees[b], budget)
-                cost += edit["cost"]
-                operations = edit["operations"]
-                function_edits.append({"left": a, "right": b, "cost": edit["cost"],
-                    "operation_count": len(operations),
-                    "operations": operations[:limits.max_diagnostic_operations],
-                    "operations_complete": len(operations) <= limits.max_diagnostic_operations})
-            for a, tree in left_trees.items():
-                if a not in paired:
-                    size = old._size(tree); cost += size
-                    function_edits.append({"left": a, "right": None, "cost": size, "unmatched_tree": True})
-            used = set(paired.values())
-            for b, tree in right_trees.items():
-                if b not in used:
-                    size = old._size(tree); cost += size
-                    function_edits.append({"left": None, "right": b, "cost": size, "unmatched_tree": True})
-            value = cost / denominator if denominator else 0.0
-            values.append(value)
-            evaluated.append({"mapping": mapping, "node_edit_cost": cost,
-                              "tree_size_sum": denominator, "strategy_node_distance": value,
-                              "function_edits": function_edits})
-        interval = [min(values), max(values)]
-        output["strategy_node"] = {"status": "success",
-            "distance": interval[0] if interval[0] == interval[1] else None,
-            "alignment_range": interval,
-            "reporting": "alignment_invariant" if interval[0] == interval[1] else "alignment_sensitive_range",
-            "exact": True, "work_units": budget.work, "evaluated_alignments": evaluated,
-            "unordered_policy": "exact slot-constrained assignment at compatible unordered frontiers; unmatched unordered subtrees cost full size and never splice across a frontier"}
+        output["strategy_node"] = _strategy_from_mappings(
+            left, right, mappings, left_scope, right_scope, limits)
     except (old.Unavailable, ImportError) as exc:
         output["strategy_node"]["reason"] = str(exc)
         if output["architecture"]["status"] == "unavailable":
