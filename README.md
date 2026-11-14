@@ -10,7 +10,8 @@ cp, mv, mkdir and sort in C, Rust and Python: 12 configurations and 45 checkpoin
 Run `make test` from WSL/Linux with Docker and the pinned benchmark images
 available for bounded static and Docker integration checks, including the four
 restored regression modules. Logs go to a fresh directory under `/tmp`; no
-formal lineages are started. Candidate compilation and execution stay in Docker.
+formal development traces are started. Candidate compilation and execution stay
+in Docker.
 
 Historical C chmod, grep, mkdir and sort manifests, checkpoint prompts and
 judging inputs remain available to reproduce the retained correctness and
@@ -218,10 +219,11 @@ unreachable states remain explicit. Historical metadata never enters lineage
 results, and the metric describes coverage of known historical locations—not
 future prevention.
 
-## The experimental unit is a lineage
+## The experimental unit is a development trace
 
-A **lineage** is one complete sequential walk through every checkpoint of a
-single utility:
+A **development trace** is one complete sequential walk through every checkpoint
+of a single utility. Existing scripts, flags, directories and stored JSON use
+`lineage` for compatibility, so a `lineage-*` record is one development trace:
 
 ```text
 000_base -> 001 -> 002 -> ... -> final candidate
@@ -424,7 +426,7 @@ gateway, the runner supplies the conventional dummy key `ollama`. The old
 `school-ollama/` prefix was an OpenCode provider alias and is not an Aider model
 provider name.
 
-## Running a lineage
+## Running development traces
 
 `scripts/run_lineage_experiment.sh` is the entry point:
 
@@ -438,7 +440,8 @@ bash scripts/run_lineage_experiment.sh \
     --max-loops 3
 ```
 
-`--utility` names a manifest under `experiments/utilities/`. `--lineages`
+`--utility` names a manifest under `experiments/utilities/`. The compatibility
+flag `--lineages` sets the number of independent development traces and
 defaults to 1 — there is no built-in experiment size — and `--max-loops`
 defaults to 3 repair sessions within each stage, with 0 disabling repair
 entirely.
@@ -494,8 +497,14 @@ number of independent samples is `--lineages`.
 
 ### Platform preflight
 
-Run-level environment eligibility is decided **before any lineage is
-initialized**. If the utility's suite declares a `required_platform` the host
+Run-level environment eligibility is decided **before any development trace is
+initialized**. For the standardized Linux utilities, a live Docker probe also
+checks the lock-selected immutable compiler/runtime and oracle images, required
+architecture, execution profile and language toolchain. It fails closed for
+missing images, Docker errors, mutable references, incompatible platforms or
+toolchain mismatches; it
+does not require `VESSEL_VALIDATION` or `VESSEL_APPROVAL`. If another utility's
+suite declares a `required_platform` the host
 does not satisfy, the controller prints `platform_incompatible`, records
 `run_status: platform_incompatible` in `lineages.json`, and exits 4 — distinct
 from 1 (a stage failed) and 2 (a usage error). No lineage directory, no

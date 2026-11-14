@@ -314,6 +314,17 @@ class PreflightTests(unittest.TestCase):
             self.assertFalse(v.check_vessel_built(config, lock, args, require_approval=False))
 
 
+    def test_runtime_image_check_does_not_consult_audit_artifacts(self):
+        with self.rebuilt_fixture() as (config, lock, args, images, report):
+            args.vessel_approval.unlink()
+            args.vessel_validation.unlink()
+            args.vessel_provenance.unlink()
+            with patch.object(v, 'vessel_environment', side_effect=AssertionError(
+                    'runtime readiness must not bind the checkout to old audit evidence')):
+                self.assertTrue(v.check_runtime_images(config))
+            self.assertEqual(set(v.IMAGE_IDENTITIES), set(v.IMAGE_KEYS))
+
+
     def test_validation_stops_at_first_failed_command_and_never_approves(self):
         with self.rebuilt_fixture() as (config, lock, args, images, report), contextlib.ExitStack() as stack:
             for name in ('check_python_and_bash', 'check_timeout', 'check_architecture_probe', 'check_toolchains', 'check_checkpoints'):

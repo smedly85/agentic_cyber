@@ -111,6 +111,25 @@ def test_dry_run_batching_and_legacy(tmp_path):
             assert (value(row, '--sampling-seed') if '--sampling-seed' in row else None) == expected
 
 
+def test_vessel_plan_needs_no_validation_or_approval_artifacts(tmp_path):
+    env = dict(os.environ)
+    for name in ('VESSEL_APPROVAL', 'VESSEL_VALIDATION',
+                 'VESSEL_BUILT_PROVENANCE', 'VESSEL_GENERATION_SCOPE'):
+        env.pop(name, None)
+    env.update(AIDER_BIN='/nonexistent-aider', PYTHON_BIN=sys.executable,
+               LINUX_BENCHMARK_PROFILE='vessel-8g',
+               LINUX_BENCHMARK_LOCK=str((ROOT / 'docker/linux-utilities/lock-amd64.json').resolve()))
+    output = tmp_path / 'c-mv-plan'
+    result = subprocess.run([
+        'bash', 'scripts/run_lineage_experiment.sh', '--utility', 'c-mv',
+        '--model', 'ollama_chat/architect', '--lineages', '10',
+        '--output-dir', str(output), '--dry-run'], cwd=ROOT, text=True,
+        capture_output=True, env=env)
+    assert result.returncode == 0, result.stderr
+    assert 'lineage-010' in result.stdout
+    assert not output.exists()
+
+
 def heredoc_after(marker):
     return CONTROLLER.split(marker, 1)[1].split("<<'PY'", 1)[1].split('\n', 1)[1].split('\nPY\n', 1)[0]
 

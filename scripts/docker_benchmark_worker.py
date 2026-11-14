@@ -236,6 +236,17 @@ def main():
         print(json.dumps({'os':platform.system(),'uname':os.uname().sysname,'architecture':platform.machine(),
                           'language':language,'version':version,'uid':os.geteuid(),'python':platform.python_version()}))
         return
+    if action == 'oracle-preflight':
+        versions = {}
+        for utility in ('cp', 'mv', 'mkdir', 'sort'):
+            line = subprocess.check_output(['/opt/gnu/bin/' + utility, '--version'],
+                                           text=True).splitlines()[0]
+            if not line.endswith(' 9.11'):
+                raise RuntimeError('GNU oracle version mismatch: ' + line)
+            versions[utility] = line
+        print(json.dumps({'os': platform.system(), 'architecture': platform.machine(),
+                          'coreutils': '9.11', 'versions': versions}))
+        return
     if action == 'compile':
         if os.geteuid() == 0:
             raise RuntimeError('compiler must be non-root')

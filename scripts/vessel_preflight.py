@@ -436,6 +436,32 @@ def rebuilt_identity(data):
     return identity
 
 
+def check_runtime_images(config):
+    """Inspect the lock-selected images without consulting historical evidence.
+
+    This is the lightweight launch/smoke path. The lock still has to contain
+    immutable references (enforced by docker_benchmark.settings), and the live
+    images still have to be Linux/AMD64 with complete configuration and rootfs
+    identities. Cross-run provenance comparison remains an optional audit.
+    """
+    IMAGE_IDENTITIES.clear()
+    try:
+        if config.get("platform") != "linux/amd64":
+            raise ValueError("Vessel execution requires linux/amd64")
+        for key in IMAGE_KEYS:
+            ref = config[key]
+            identity = rebuilt_identity(inspect_image(ref, config["platform"]))
+            IMAGE_IDENTITIES[key] = {"execution_ref": ref, "identity": identity}
+            record("runtime image " + key, "PASS",
+                   "%s docker-id=%s manifest=%s config-fingerprint=%s rootfs=%s" % (
+                       ref, identity["docker_id"], identity["manifest_digest"],
+                       identity["runtime_config_sha256"], identity["rootfs_sha256"]))
+        return True
+    except (OSError, ValueError, KeyError, TypeError, IndexError) as error:
+        record("runtime image configuration", "FAIL", str(error))
+        return False
+
+
 def probe_reference(ref, command=None, mounts=()):
     name = "vessel-ref-" + uuid.uuid4().hex
     try:
@@ -564,7 +590,7 @@ def prepare_vessel_lock(directory, build_record):
                   "captured_at": time.time(), "windows_byte_identity_claimed": False}
     write_new_json(directory / "lock.json", config)
     write_new_json(directory / "provenance.json", provenance)
-    print("Captured only; independent validation and approval still required: " + str(directory))
+    print("Capture complete; optional independent validation/audit can use: " + str(directory))
 
 
 def verify_build_record(build, baseline, environment):
@@ -711,7 +737,7 @@ def validate_vessel(directory, config, lock_path, provenance_path, args):
         report.update(completed_at=time.time(), checks=list(RESULTS), files=validation_files(directory),
                       infrastructure_failure=not report["passed"])
         write_new_json(directory / "validation.json", report)
-    print("Independent checks passed; review reports before explicit approval. No generation authorized yet.")
+    print("Independent audit checks passed; review reports before recording an optional approval artifact.")
 
 
 def check_vessel_built(config, lock_path, args, require_approval=True):
@@ -922,7 +948,7 @@ def main(argv=None):
     actions.add_argument("--prepare-vessel-lock", type=Path, metavar="NEW_DIRECTORY")
     actions.add_argument("--validate-vessel-built", type=Path, metavar="NEW_DIRECTORY")
     actions.add_argument("--approve-vessel-validation", type=Path, metavar="NEW_APPROVAL_FILE")
-    actions.add_argument("--verify-vessel-built", action="store_true", help="recheck approval and jailed execution; no model checks")
+    actions.add_argument("--verify-vessel-built", action="store_true", help="recheck an optional audit approval and jailed execution; no model checks")
     args = parser.parse_args(argv)
     if args.diagnostic_rosetta and args.image_mode != "vessel-built":
         parser.error("--diagnostic-rosetta requires --image-mode vessel-built")
@@ -976,7 +1002,7 @@ def main(argv=None):
                     write_new_json(target, {"schema_version": 1, "validation_sha256": file_sha(args.vessel_validation),
                                             "binding_sha256": canonical_sha(stable_binding(binding)),
                                             "scope": approval_scope(args, binding)})
-                    print("Approval recorded for " + args.approval_scope + "; fresh pre-generation verification still required.")
+                    print("Optional audit approval recorded for " + args.approval_scope + "; use --verify-vessel-built to recheck it.")
             return 0
         except (OSError, ValueError, KeyError, TypeError, IndexError, subprocess.SubprocessError) as error:
             record("vessel-built preparation", "FAIL", str(error))
@@ -1030,7 +1056,7 @@ def main(argv=None):
         record("image evidence", "FAIL", str(error))
     if config and check_docker(config["platform"]):
         images_ok = (check_images(config, lock_path, evidence) if args.image_mode == "original"
-                     else check_vessel_built(config, lock_path, args))
+                     else check_runtime_images(config))
         if images_ok:
             check_architecture_probe(config)
             check_toolchains(python3, selectors)

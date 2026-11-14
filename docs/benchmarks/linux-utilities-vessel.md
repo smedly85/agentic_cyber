@@ -16,7 +16,8 @@ or all-language validation. The Docker 768 MiB memory cap and every other jail,
 CPU/time/process/file limit remain unchanged. Address space is not resident RAM.
 
 Judge reports and boundary reports record the selected profile and limit. The
-lineage configuration fingerprint and `lineages.json` execution environment now
+development-trace configuration fingerprint and compatibility-named
+`lineages.json` execution environment
 include it; direct experiment/sweep/attempt metadata carries `docker_execution`,
 and direct resume also checks that condition. Worker readback must match both
 configured limits. The existing C isolation control checks the selected value
@@ -31,29 +32,26 @@ executable reference or local image ID without the required platform Descriptor
 is still insufficient for formal provenance. The temporary diagnostic harness's
 best-effort metadata policy does not apply here.
 
-Boot IDs remain in captured environment records. Only this field is excluded
-from cross-run provenance/validation/approval matching. Emulator registrations,
-interpreter hashes, images, Docker settings/versions, checkout, all evidence
-hashes, and the 24-hour validation expiry still bind approval. Fresh jailed
-C/Rust/Python controls are still required. Any boot/environment change *during*
-validation or a fresh jailed recheck fails. Never edit sealed old records; this
-code revision requires new evidence and approval.
+Normal development-trace generation does not consume captured provenance,
+validation, or approval files. Before any trace starts, the controller performs
+a lightweight live Docker preflight through `docker_benchmark.py`: it loads the
+explicit lock, rejects mutable image references, requires Linux/AMD64 for
+`vessel-8g`, and starts the selected pinned compiler image to verify the expected
+language toolchain and the pinned GNU oracle image to verify Coreutils 9.11 and
+architecture. Missing images, an unusable daemon, a wrong
+platform, a wrong toolchain, or an invalid profile stops the run before Aider or
+trace bookkeeping begins.
 
-The existing approval mechanism still defaults to `diagnostic-only`. An explicit
-`--approval-scope formal-vessel-8g` can authorize **future fresh runs** only after
-complete matching 8 GiB validation and operator review. It cannot approve a
-standard/unlimited profile or consume an existing diagnostic-scope approval.
-Validation itself remains non-generative infrastructure evidence, not a formal
-experimental result. Formal lineage and direct finite-profile generation check
-the explicit formal approval before generation; the smoke wrapper remains
-diagnostic and selects diagnostic-only scope. No approval is issued by selecting
-the environment variable alone. Formal model/sampling conditions and identities
-still require explicit selection and provenance; smoke defaults do not establish
-historical equivalence.
+The comprehensive capture, 16-stage validation, and approval commands remain
+available below as an optional reproducibility audit. They retain their clean
+checkout, Git-revision, Docker/emulator, evidence-hash, 24-hour freshness, and
+fresh jailed-execution checks. Those audit records are not launch credentials;
+committing results or documentation therefore does not invalidate the ability to
+start a new trace with an otherwise unchanged pinned Docker condition. Never edit
+or delete sealed historical evidence.
 
-Run the following from a reviewed clean checkout on Vessel. Substitute the
-existing pinned lock and matching newly captured build-provenance paths. This
-does not change locks, pull/build images, generate candidates or approve runs:
+For an ordinary `vessel-8g` run, select the existing absolute pinned lock. A
+readiness probe is optional here because the launcher repeats it automatically:
 
 ```bash
 cd ~/agentic_cyber
@@ -61,30 +59,62 @@ set -euo pipefail
 export PYTHON_BIN="$(command -v python3)"
 export PYTHONDONTWRITEBYTECODE=1
 unset C_BENCHMARK_LOCK VESSEL_DIAGNOSTIC_GENERATION_APPROVED VESSEL_GENERATION_SCOPE
+unset VESSEL_VALIDATION VESSEL_APPROVAL VESSEL_BUILT_PROVENANCE
 export VESSEL_DIAGNOSTIC_ROSETTA=0
 export LINUX_BENCHMARK_PROFILE=vessel-8g
 export LINUX_BENCHMARK_LOCK="/absolute/path/to/pinned-vessel-lock.json"
-export VESSEL_BUILT_PROVENANCE="/absolute/path/to/new-matching/provenance.json"
-V="$(mktemp -d "$HOME/vessel-8g-validation.XXXXXX")"
-chmod 700 "$V"
-export VESSEL_VALIDATION="$V/validation/validation.json"
-export VESSEL_APPROVAL="$V/formal-approval.json"
-python3 -B scripts/docker_benchmark.py condition --utility c-cp | tee "$V/condition.json"
-
-# Fast check of the actual jailed controls in all three languages.
-python3 -B scripts/run_vessel_validation_tests.py --suite jailed \
-  2>&1 | tee "$V/jail-controls.log"
-
-# Complete existing 16-stage validation: all twelve selectors, public/held-out
-# calibration, entrypoints, oracle, isolation, boundaries and static contracts.
-python3 -B scripts/vessel_preflight.py --image-mode vessel-built \
-  --validate-vessel-built "$V/validation" 2>&1 | tee "$V/validation-console.log"
+python3 -B scripts/docker_benchmark.py condition --utility c-mv
+python3 -B scripts/docker_benchmark.py preflight --utility c-mv
 ```
 
-If formal image metadata is still unavailable, the final command must fail;
-resolve image provenance rather than bypassing the check. To independently
-exercise all languages while that issue is unresolved, the following remains
-non-formal runtime validation, using the same exported lock and finite profile:
+The normal launcher records the current Git revision, locked Docker configuration
+and execution profile, model/settings/sampling configuration, checkpoint results,
+and failures in its existing metadata. Its configuration fingerprint still
+refuses an incompatible resume. Existing script names, `--lineages` flags,
+`lineage-*` directories, and JSON fields remain unchanged for compatibility.
+
+The `c-mv` command matching the completed `c-cp` scientific settings is:
+
+```bash
+cd "$HOME/agentic_cyber"
+set -euo pipefail
+export PYTHON_BIN="$(command -v python3)"
+export PYTHONDONTWRITEBYTECODE=1
+export VESSEL_DIAGNOSTIC_ROSETTA=0
+export LINUX_BENCHMARK_PROFILE=vessel-8g
+export LINUX_BENCHMARK_LOCK="/absolute/path/to/pinned-vessel-lock.json"
+unset C_BENCHMARK_LOCK VESSEL_DIAGNOSTIC_GENERATION_APPROVED VESSEL_GENERATION_SCOPE
+unset VESSEL_VALIDATION VESSEL_APPROVAL VESSEL_BUILT_PROVENANCE
+PREFLIGHT_DIR="$(mktemp -d "$HOME/c-mv-preflight.XXXXXX")"
+python3 -B scripts/vessel_preflight.py \
+  --image-mode vessel-built --selector c-mv \
+  --architect-model ollama_chat/qwen3.8:27b \
+  --editor-model ollama_chat/qwen3-coder-next:latest \
+  --temperature 1.0 --architect-think low --num-ctx 65536 --max-tokens 65536 \
+  --json-report "$PREFLIGHT_DIR/preflight.json"
+MODEL_PROVENANCE_JSON="$(python3 -c \
+  'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["models"],separators=(",",":")))' \
+  "$PREFLIGHT_DIR/preflight.json")"
+bash scripts/run_lineage_experiment.sh \
+  --utility c-mv \
+  --model ollama_chat/qwen3.8:27b \
+  --editor-model ollama_chat/qwen3-coder-next:latest \
+  --temperature 1.0 \
+  --architect-think low \
+  --editor-edit-format whole \
+  --model-provenance-json "$MODEL_PROVENANCE_JSON" \
+  --lineage-seed-base 1001 \
+  --num-ctx 65536 \
+  --max-tokens 65536 \
+  --lineages 10 \
+  --max-loops 3 \
+  --timeout 1800 \
+  --no-security-evaluation \
+  --output-dir runs/formal/c-mv-vessel8g-10
+```
+
+To independently exercise all languages, the following remains available as a
+non-generative runtime diagnostic using the same lock and finite profile:
 
 ```bash
 python3 -B scripts/run_vessel_validation_tests.py --suite runtime
@@ -94,8 +124,10 @@ for s in c-cp c-mv c-mkdir c-sort rust-cp rust-mv rust-mkdir rust-sort py-cp py-
 done
 ```
 
-Only after complete matching validation passes and its existing reports are
-reviewed, an operator may explicitly approve and recheck the new condition:
+For a comprehensive reproducibility audit, capture provenance as described later
+in this guide, then run the full validation into a new external directory. An
+operator may optionally record and recheck an approval artifact after reviewing
+that evidence:
 
 ```bash
 python3 -B scripts/vessel_preflight.py --image-mode vessel-built \
@@ -104,13 +136,13 @@ python3 -B scripts/vessel_preflight.py --image-mode vessel-built \
   --approval-scope formal-vessel-8g --verify-vessel-built
 ```
 
-Those commands do not generate candidates. Keep the same exports when later
-launching approved fresh lineages with explicitly chosen model/sampling settings.
-Do not pass `--diagnostic-rosetta` or export a diagnostic generation scope for a
-formal run. Ordinary smoke commands and the rest of this guide remain diagnostic.
+Those commands do not generate candidates and are not prerequisites for trace
+generation. Do not pass `--diagnostic-rosetta` or export a diagnostic generation
+scope for a normal development trace. Smoke commands and the rest of this guide
+remain diagnostic.
 
-Diagnostic procedure only. It produces no formal results, no lineage seeds and no
-change to the AMD64 lock, corpora or validation evidence. Run everything from the
+Diagnostic procedure only. It produces no formal results, no development-trace
+seeds and no change to the AMD64 lock, corpora or validation evidence. Run everything from the
 repository root on vessel, in a native arm64 shell. The controller, Ollama and
 Docker all run locally, so no tunnel and no remote endpoint are involved.
 
@@ -253,9 +285,11 @@ no network, no privileges and no Docker socket. The VM paths must be readable
 through Docker read-only bind mounts. If an interpreter registration points to
 a missing/inaccessible file, capture fails closed; make that emulator identity
 inspectable before proceeding. A reboot, registration/flag/interpreter change,
-checkout change or other recorded environment change requires fresh capture,
-validation and approval. Do not change the Docker/emulation configuration during
-validation or generation. Keep evidence and lock files operator-controlled.
+checkout change or other recorded environment change requires fresh evidence only
+when producing a new comprehensive audit. Normal generation still uses the
+lock-selected immutable images and records the current checkout. Do not change the
+Docker/emulation configuration during an audit or generation. Keep evidence and
+lock files operator-controlled.
 
 Run these blocks in the same native Bash session on vessel after review and
 publication of this code. Use the real earlier build revision and commands:
@@ -326,9 +360,10 @@ integration/static test module run, all-selector calibration, twelve separate
 entrypoint validators, and final static checks. The nine added entrypoint stages
 each require summary/public/held-out reports. Toolchain, judging-input and
 checkpoint-000 prerequisite checks also cover all twelve selectors. Earlier
-cp-only validation/approval is insufficient, even if still within 24 hours;
-recapture after updating the clean checkout, revalidate in a new directory and
-approve the new evidence. `--selector` restricts normal preflight only; it does
+cp-only evidence is insufficient for a comprehensive all-selector audit, even if
+still within 24 hours; recapture after updating the clean checkout and revalidate
+in a new directory. An optional approval must cover that new evidence. `--selector`
+restricts normal preflight only; it does
 not narrow independent vessel-built validation or its required evidence.
 
 `validation.json` hashes the logs and reports and binds successful commands and
@@ -336,7 +371,7 @@ prerequisite checks to the exact lock, provenance, images and environment.
 Missing/modified/incomplete evidence or evidence older than 24 hours is rejected.
 Do not add files inside the sealed validation directory after completion.
 Failed validation requires a new directory. Protect held-out reports from agents.
-Review the complete reports before explicitly approving diagnostic generation:
+Review the complete reports before optionally recording an audit approval:
 
 ```bash
 python3 -m json.tool "$VESSEL_BUILT_PROVENANCE"
@@ -346,7 +381,7 @@ cat "$V/validation/step-01.log"
 cat "$V/validation/calibration/summary.json"
 cat "$V/validation/static/summary.json"
 for s in "${SELECTORS[@]}"; do cat "$V/validation/entry-$s/summary.json"; done
-# Only after the complete evidence is acceptable:
+# Optional, only after the complete evidence is acceptable:
 python3 -B scripts/vessel_preflight.py --image-mode vessel-built \
   --approve-vessel-validation "$VESSEL_APPROVAL"
 SAMPLING=(--temperature 1.0 --architect-think low --sampling-seed 42 --num-ctx 65536 --max-tokens 65536)
@@ -359,12 +394,12 @@ for s in "${SELECTORS[@]}"; do
 done
 ```
 
-Approval is a separate new file outside validation, bound to its report hash
-and limited to diagnostics. These are local evidence records, not signatures.
-Normal preflight checks Aider's version and Ollama metadata without inference.
-After approval, preflight and the immediate pre-generation recheck rerun the
-existing jailed C isolation/architecture/rlimit test and Rust/Python isolation
-controls, then recheck the environment binding. Any failure prevents generation.
+Approval is a separate new file outside validation, bound to its report hash.
+These are optional local audit records, not signatures or generation credentials.
+Normal diagnostic preflight checks Aider's version, the lock-selected images and
+Ollama metadata without inference. `--verify-vessel-built` reruns the existing
+jailed C isolation/architecture/rlimit test and Rust/Python isolation controls,
+then rechecks the audit environment binding.
 
 The commands above print plans only. To generate later, run one selector at a
 time with the same four exported lock/evidence paths and explicit `--generate`:
@@ -374,22 +409,22 @@ bash scripts/vessel_smoke_stage.sh --image-mode vessel-built --selector c-cp \
   --timeout 1800 --max-loops 1 "${SAMPLING[@]}" --output-dir "$V/smoke-c-cp" --generate
 ```
 
-Repeat with any of the twelve selectors, each using a new output directory. Successful
-diagnostics do not authorize formal experiments or establish historical model,
-image or timing equivalence. Existing model and sampling settings are unchanged.
+Repeat with any of the twelve selectors, each using a new output directory.
+Successful diagnostics do not by themselves establish historical model, image or
+timing equivalence. Existing model and sampling settings are unchanged.
 
 ### Optional Rosetta diagnostic profile (never formal)
 
 If Rosetta cannot execute with the 256 MiB address-space limit, explicitly add
-`--diagnostic-rosetta` to vessel-built validation, approval, preflight and smoke
+`--diagnostic-rosetta` to vessel-built validation, optional approval, preflight and smoke
 commands. This sets only the jailed `RLIMIT_AS` soft/hard limits to unlimited.
 The Docker 768 MiB memory cap, CPU/time/file/process limits, non-root chroot,
 read-only filesystem, capability restrictions and network isolation remain
-unchanged. The standard profile still enforces 256 MiB; formal lineage runs
+unchanged. The standard profile still enforces 256 MiB; normal development-trace runs
 reject the diagnostic profile.
 
-Validation/approval binds the profile, so standard-profile evidence cannot
-authorize Rosetta diagnostics or vice versa. After updating to a clean reviewed
+Validation/approval binds the profile inside the optional audit, so standard-profile
+evidence cannot verify Rosetta diagnostics or vice versa. After updating to a clean reviewed
 checkout, recapture image provenance as above, then use a new validation directory:
 
 ```bash
@@ -417,7 +452,7 @@ architecture/isolation/rlimit test (expecting unlimited address space only in
 this profile), plus Rust and Python jailed controls. Failed probes stop generation.
 Validation, judge reports, attempt metadata and smoke summaries identify these
 results as diagnostic and non-formal. They are not comparable formal results or
-lineage seeds. Model settings and benchmark expectations are unchanged.
+development-trace seeds. Model settings and benchmark expectations are unchanged.
 
 ## 2. Preflight (Mode A)
 
@@ -448,7 +483,7 @@ Checks, in order:
 5. A real timeout test: `timeout` or `gtimeout --signal=TERM --kill-after=1 1 sleep 5` must exit 124.
 6. `aider --version` must report `aider 0.86.2`, the version every formal `lineages.json` records.
 7. Colima status, Docker context and endpoint, and `DOCKER_HOST`/`DOCKER_CONTEXT` (`DOCKER_CONTEXT` overrides `DOCKER_HOST`; otherwise `DOCKER_HOST` overrides the current context). Only a local absolute Unix-socket endpoint is accepted; SSH/TCP endpoints fail before daemon probes. The daemon must report `OSType=linux`. No context or Docker environment variable is changed.
-8. Every execution reference resolves to the original platform manifest and matches the source-host configuration/platform/filesystem evidence. Config-ID-only transfers fail. Preflight never pulls.
+8. In original-image mode, every execution reference resolves to the original platform manifest and matches source-host evidence. In vessel-built mode, every immutable lock-selected image is inspected live for its Linux/AMD64 platform, Docker ID, manifest, configuration and rootfs identity. Preflight never pulls.
 9. `docker run --pull never --platform linux/amd64 <oracle> uname -m` reports `x86_64`.
 10. `docker_benchmark.py preflight` passes for each selector (GCC 12.2.0, rustc 1.85.1, Python 3.12.8).
 11. Editor pinned to temperature 0, seed 0 and `editor-diff`. When supplied, the architect settings are rendered through `aider_settings.py`.
@@ -467,13 +502,14 @@ Resolving failures (operator actions; preflight performs none of them):
 | image missing or unverified | stop; arrange reviewed image availability and the source-host evidence in section 1 |
 | Ollama down / model missing | start the existing service; `ollama pull <name>` only by explicit decision |
 
-## 3. Docker validation on vessel (no model; required before generation)
+## 3. Optional comprehensive Docker validation on vessel (no model)
 
 These commands reuse existing validators and start no Aider or Ollama process.
 Output goes outside the repository. They exercise the jailed candidate path
-under emulation; any failure blocks generation and must be investigated. It does
-not by itself prove that emulation caused the failure. The wrapper does not
-automatically run these validators: completing them is a required operator step.
+under emulation; any failure should be investigated. It does not by itself prove
+that emulation caused the failure. The launcher automatically runs its smaller
+per-language Docker readiness probe; these broader validators are an explicit
+diagnostic or reproducibility audit.
 
 ```bash
 set -euo pipefail
@@ -563,8 +599,9 @@ format is silently changed by this preparation.
 Historical `model_provenance` is null. Current digests cannot be verified against
 invented historical digests. Preflight establishes availability and records a
 valid current identity, not historical identity equivalence. Future comparable
-formal runs need an explicit choice of conditions, approved model identities,
-controller/benchmark provenance, and accepted vessel emulation evidence.
+development traces need an explicit choice of conditions and recorded model
+identities, controller/benchmark provenance, and Vessel execution profile. The
+launcher does not require an infrastructure approval artifact.
 
 ## 6. Native ARM64 (Option B, separate configuration)
 
@@ -586,8 +623,8 @@ a corpus whose recorded architecture differs from the lock.
 |---|---|
 | Ready to transfer to vessel | yes |
 | Ready to attempt preflight on vessel | yes |
-| Verified ready for model generation | only after sections 2 and 3 pass on vessel |
-| Formal lineage readiness | no: needs explicitly chosen formal conditions, model identity controls and accepted emulation evidence |
+| Verified ready for model generation | after the launcher's live pinned-image/toolchain preflight passes |
+| Comparable development-trace readiness | requires explicitly chosen scientific conditions and model identity controls; optional sections 2 and 3 provide deeper audit evidence |
 
-For the post-cleanup validation coverage map and revalidation after a new commit,
+For the optional validation coverage map and audit workflow after a new commit,
 see [Vessel validation maintenance](vessel-validation-maintenance.md).

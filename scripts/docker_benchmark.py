@@ -268,7 +268,12 @@ def main(argv=None):
         print(json.dumps({'docker': settings(), 'execution_profile': execution_profile()}, sort_keys=True))
         return 0
     if args.action == 'preflight':
-        print(json.dumps(invoke('toolchain', {'language':language_name(args.utility)}), sort_keys=True))
+        language = language_name(args.utility)
+        result = {
+            'toolchain': invoke('toolchain', {'language': language}),
+            'oracle': invoke('oracle-preflight', {'language': language}),
+        }
+        print(json.dumps(result, sort_keys=True))
         return 0
     if args.action == 'check-commands':
         features = [' '.join([manifest['judge'], manifest['executable_path'], *c['implemented_flags']])

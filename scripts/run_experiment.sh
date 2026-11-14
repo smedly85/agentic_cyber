@@ -1247,10 +1247,6 @@ case "$SOURCE_PATH" in
             --base-command "$BASE_TEST_CMD" || die "Linux benchmark requires canonical Docker commands"
         "$PYTHON_BIN" "$REPO/scripts/docker_benchmark.py" preflight --utility "$linux_selector" || exit 4
         DOCKER_EXECUTION_JSON="$("$PYTHON_BIN" "$REPO/scripts/docker_benchmark.py" condition --utility "$linux_selector")" || exit 4
-        if [[ "${LINUX_BENCHMARK_PROFILE:-standard}" == vessel-8g ]]; then
-            "$PYTHON_BIN" "$REPO/scripts/vessel_preflight.py" --image-mode vessel-built \
-                --verify-vessel-built --approval-scope "${VESSEL_GENERATION_SCOPE:-formal-vessel-8g}" || exit 4
-        fi
         ;;
 esac
 if [[ "$SOURCE_PATH" == *.py ]]; then

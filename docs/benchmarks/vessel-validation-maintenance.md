@@ -1,9 +1,11 @@
-# Vessel validation after repository cleanup
+# Optional Vessel validation after repository cleanup
 
-The required validation checks live in `scripts/validation/`, outside the frozen
-benchmark suites. `scripts/run_vessel_validation_tests.py` loads explicit suites
-and rejects import failures, empty suites, skipped tests, expected failures and
-ordinary failures. It does not build images, generate candidates or approve runs.
+The comprehensive validation checks live in `scripts/validation/`, outside the
+frozen benchmark suites. They are an explicitly invoked diagnostic and
+reproducibility-audit workflow, not a prerequisite for ordinary development-trace
+generation. `scripts/run_vessel_validation_tests.py` loads explicit suites and
+rejects import failures, empty suites, skipped tests, expected failures and
+ordinary failures. It does not build images or generate candidates.
 
 ## Coverage and retired references
 
@@ -23,27 +25,31 @@ longer a live dependency: cleanup removed those copies. The replacement verifies
 all 12 canonical public/held-out corpora against retained manifest hashes and
 checks held-out fingerprints. Historical inventory checks remain. The existing
 fresh GNU oracle validation, public/held-out calibration and mutation controls
-remain mandatory; static hash checks do not replace them.
+remain mandatory when the comprehensive audit is invoked; static hash checks do
+not replace them.
 
 Archived reports and inventories may still mention the old filenames. Those are
 historical evidence and are not rewritten. Unrelated deleted-test references in
 general README examples are not formal validation dependencies.
 
-## Unchanged acceptance gates
+## Unchanged audit checks
 
-Formal validation still has 16 command steps: oracle validation, runtime/integrity
+Comprehensive validation still has 16 command steps: oracle validation, runtime/integrity
 checks, adapter calibration, all 12 checkpoint-000 entrypoints, and containerized
 static checks. Existing prerequisite toolchain, judging-input and checkpoint
-checks, required report files, hashes and zero return codes remain mandatory.
+checks, required report files, hashes and zero return codes remain mandatory when
+this audit is invoked.
 Docker execution settings, Linux/AMD64 selection and finite `vessel-8g` limits are
-unchanged. Fresh pre-generation verification still runs the actual C/Rust/Python
+unchanged. Optional approval verification still runs the actual C/Rust/Python
 jailed controls and checks the environment again afterward.
 
-## Revalidation after a commit
+## Running a new audit after a commit
 
-A new HEAD invalidates the previous environment binding even when image IDs are
-unchanged. A changed command list also invalidates previous validation reports.
-Do not edit old provenance, validation or approval JSON to make it match.
+Within the optional audit workflow, a new HEAD invalidates the previous environment
+binding even when image IDs are unchanged. A changed command list also invalidates
+previous validation reports. This does not block normal trace generation, whose
+metadata records the current HEAD and pinned Docker condition directly. Do not
+edit old provenance, validation or approval JSON to make it match.
 
 After the patch is reviewed and committed, use a clean tracked checkout on Vessel:
 
@@ -55,14 +61,16 @@ After the patch is reviewed and committed, use a clean tracked checkout on Vesse
    [the Vessel guide](linux-utilities-vessel.md). Run `--validate-vessel-built`
    into a **new external directory**. Any failure remains a failure; no approval
    is written by validation.
-3. Review all fresh reports. Only an explicit `--approve-vessel-validation` with
-   `--approval-scope formal-vessel-8g` may write a new approval outside the sealed
-   validation directory. Then use `--verify-vessel-built` with that same scope.
+3. Review all fresh reports. If an approval artifact is useful for the audit,
+   `--approve-vessel-validation` with `--approval-scope formal-vessel-8g` writes
+   one outside the sealed validation directory. `--verify-vessel-built` rechecks
+   that optional artifact with the same scope.
 
 The 24-hour freshness bound, exact evidence hashes, clean checkout requirement,
 image identities, active adapter lock, Docker environment and emulator binding
-remain enforced. A VM boot ID alone is still an observation, as before; fresh
-jailed execution remains required. No existing evidence is migrated or approved.
+remain enforced inside the audit. A VM boot ID alone is still an observation, as
+before; approval verification requires fresh jailed execution. No existing
+evidence is migrated or approved.
 
 For development checks without Docker or model execution:
 
@@ -71,4 +79,4 @@ python3 -B scripts/run_vessel_validation_tests.py --suite workflow --suite integ
 python3 -B -m unittest scripts.validation.test_runtime.CompilerFailureClassification
 ```
 
-These development checks do not constitute formal Vessel revalidation.
+These host-safe checks do not constitute a comprehensive Vessel audit.

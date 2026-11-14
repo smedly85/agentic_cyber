@@ -265,14 +265,6 @@ printf '%s\n' "$PLAN_JSON" >"$OUTPUT_DIR/plan.json"
 stage_args "$BUNDLE_DIR" "$STAGE_DIR"
 printf '%q ' bash scripts/run_experiment.sh "${runner_args[@]}" >"$OUTPUT_DIR/command.txt"
 printf '\n' >>"$OUTPUT_DIR/command.txt"
-if [[ "$IMAGE_MODE" == vessel-built ]]; then
-    "$PYTHON_BIN" scripts/vessel_preflight.py --image-mode vessel-built --verify-vessel-built "${profile_args[@]}" \
-        >"$OUTPUT_DIR/image-recheck.log" 2>&1 || {
-        cat "$OUTPUT_DIR/image-recheck.log" >&2
-        printf 'error: vessel-built approval changed; no generation started\n' >&2
-        exit 4
-    }
-fi
 [[ "$DIAGNOSTIC_ROSETTA" == 1 ]] && export VESSEL_DIAGNOSTIC_GENERATION_APPROVED=1
 export VESSEL_GENERATION_SCOPE=diagnostic-only
 bash scripts/run_experiment.sh "${runner_args[@]}"

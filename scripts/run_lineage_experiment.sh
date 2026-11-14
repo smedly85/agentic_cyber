@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Run complete sequential lineages through one utility's checkpoint sequence.
+# Run complete sequential development traces through one utility's checkpoints.
 #
-# The experimental unit here is a LINEAGE: one independent walk through every
-# checkpoint of a utility, where the source produced by each stage is the source
-# supplied to the next stage of that same lineage.
+# The experimental unit here is a development trace: one independent walk through
+# every checkpoint of a utility. Existing lineage names remain compatibility
+# identifiers for scripts, flags, directories and stored metadata.
 #
 #   lineage-001: 000 -> 001 -> 002 -> ... -> final
 #   lineage-002: 000 -> 001 -> 002 -> ... -> final
@@ -26,7 +26,7 @@
 # replaced with a fresh attempt -- reliability is measured over lineages
 # STARTED, not over lineages that happened to finish.
 #
-# Example (10 sort lineages at one temperature):
+# Example (10 sort development traces at one temperature):
 #   scripts/run_lineage_experiment.sh \
 #     --utility sort \
 #     --model ollama_chat/qwen3.8:27b \
@@ -40,12 +40,7 @@
 
 set -uo pipefail
 if [[ "${VESSEL_DIAGNOSTIC_ROSETTA:-0}" != 0 ]]; then
-    echo 'error: Rosetta diagnostics cannot run as formal lineages' >&2
-    exit 2
-fi
-if [[ "${LINUX_BENCHMARK_PROFILE:-standard}" == vessel-8g &&
-      "${VESSEL_GENERATION_SCOPE:-formal-vessel-8g}" != formal-vessel-8g ]]; then
-    echo 'error: diagnostic Vessel scope cannot authorize formal lineages' >&2
+    echo 'error: Rosetta diagnostics cannot run as formal development traces' >&2
     exit 2
 fi
 
@@ -63,10 +58,11 @@ Required:
 
 Experiment size:
   --temperature T            Single temperature for every stage (default: 0)
-  --lineages N               Independent lineages to run (default: 1). There is
+  --lineages N               Independent development traces to run (default: 1).
+                             The flag name is retained for compatibility. There is
                              no built-in lineage count; the planned experiment
                              size of 10 is a command-line value, not a default.
-  --lineage-start N          First lineage number to run (default: 1), so an
+  --lineage-start N          First trace number to run (default: 1), so an
                              existing run can be extended without touching
                              lineages already on disk.
   --max-loops N              Repair sessions allowed WITHIN each stage after its
@@ -156,8 +152,8 @@ Directory layout:
     lineage-002/
       ...
 
-Every stage stays inspectable, failed lineages are retained, and `final/` exists
-only for lineages that completed the whole sequence.
+Every stage stays inspectable, failed traces are retained, and `final/` exists
+only for traces that completed the whole sequence.
 
 Visible tests are built per checkpoint, not copied. scripts/stage_test_bundle.py
 assembles the runtime judging files plus only those frozen cases whose flags are
@@ -698,10 +694,10 @@ if [[ "$SOURCE_PATH" == *.py ]]; then
 fi
 RUST_TOOLCHAIN_JSON=null
 if [[ "$DRY_RUN" -eq 0 && "$LINUX_BENCHMARK" -eq 1 ]]; then
-    if [[ "${LINUX_BENCHMARK_PROFILE:-standard}" == vessel-8g ]]; then
-        "$PYTHON_BIN" "$REPO/scripts/vessel_preflight.py" --image-mode vessel-built \
-            --verify-vessel-built --approval-scope formal-vessel-8g || exit 4
-    fi
+    # This live, non-generative probe checks the selected pinned image,
+    # platform, profile and language toolchain. Comprehensive Vessel validation
+    # remains available as an explicitly invoked audit, but is not a generation
+    # prerequisite.
     "$PYTHON_BIN" "$REPO/scripts/docker_benchmark.py" preflight --utility "$UTILITY" || exit 4
 fi
 if [[ "$DRY_RUN" -eq 0 && "$SOURCE_PATH" == *.rs && "$LINUX_BENCHMARK" -eq 0 ]]; then

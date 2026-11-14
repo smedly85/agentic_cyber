@@ -3,11 +3,15 @@
 These are validation probes, not experimental implementations or lineage seeds.
 """
 import ast
+import contextlib
 import gzip
 import hashlib
+import io
 import json
+import os
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -135,6 +139,73 @@ class LinuxBenchmarkStaticTests(unittest.TestCase):
                                   '--build-command', 'gcc candidate.c # docker_benchmark.py',
                                   '--feature-command', 'echo judge_candidate.sh',
                                   '--extra-command', ''])
+
+    def test_normal_generation_has_no_manual_approval_dependency(self):
+        for name in ('run_lineage_experiment.sh', 'run_experiment.sh',
+                     'vessel_smoke_stage.sh'):
+            controller = (ROOT / 'scripts' / name).read_text()
+            self.assertNotIn('--verify-vessel-built', controller, name)
+            self.assertNotIn('VESSEL_APPROVAL', controller, name)
+            self.assertNotIn('VESSEL_VALIDATION', controller, name)
+        for name in ('run_lineage_experiment.sh', 'run_experiment.sh'):
+            controller = (ROOT / 'scripts' / name).read_text()
+            self.assertIn('docker_benchmark.py" preflight', controller, name)
+
+    def test_vessel_lightweight_preflight_contract_for_all_languages(self):
+        lock = str((ROOT / 'docker/linux-utilities/lock-amd64.json').resolve())
+        observed = []
+
+        def probe(action, request, timeout=90):
+            command = docker_benchmark.command(action, 'preflight-test', request['language'])
+            observed.append((request['language'], action, command))
+            return {'os': 'Linux', 'architecture': 'x86_64',
+                    'language': request['language']}
+
+        environment = {'LINUX_BENCHMARK_PROFILE': 'vessel-8g',
+                       'LINUX_BENCHMARK_LOCK': lock,
+                       'VESSEL_DIAGNOSTIC_ROSETTA': '0'}
+        with patch.dict(os.environ, environment, clear=False), \
+                patch.object(docker_benchmark, 'invoke', side_effect=probe), \
+                contextlib.redirect_stdout(io.StringIO()):
+            for selector in ('c-mv', 'rust-mv', 'py-mv'):
+                self.assertEqual(docker_benchmark.main(
+                    ['preflight', '--utility', selector]), 0)
+            config = docker_benchmark.settings()
+
+        self.assertEqual([(language, action) for language, action, _ in observed],
+                         [(language, action) for language in ('c', 'rust', 'py')
+                          for action in ('toolchain', 'oracle-preflight')])
+        for language, action, command in observed:
+            for flag, expected in (('--platform', 'linux/amd64'),
+                                   ('--network', 'none'), ('--memory', '768m'),
+                                   ('--pids-limit', '64'), ('--cpus', '1')):
+                self.assertEqual(command[command.index(flag) + 1], expected)
+            self.assertIn('--read-only', command)
+            self.assertEqual(command[command.index('--cap-drop') + 1], 'ALL')
+            self.assertEqual(command[command.index('--security-opt') + 1],
+                             'no-new-privileges')
+            image = (config['oracle_image'] if action == 'oracle-preflight' else
+                     config['rust_compiler_image'] if language == 'rust' else
+                     config['compiler_image'])
+            self.assertIn(image, command)
+            self.assertIn('BENCHMARK_EXECUTION_PROFILE=vessel-8g', command)
+
+    def test_vessel_preflight_rejects_missing_lock_mutable_image_and_arm64(self):
+        with patch.dict(os.environ, {'LINUX_BENCHMARK_PROFILE': 'vessel-8g'}, clear=True):
+            with self.assertRaisesRegex(docker_benchmark.InfrastructureError,
+                                        'explicit absolute'):
+                docker_benchmark.settings()
+        baseline = json.loads((ROOT / 'docker/linux-utilities/lock-amd64.json').read_text())
+        for change, message in (({'compiler_image': 'mutable:latest'}, 'immutable'),
+                                ({'platform': 'linux/arm64'}, 'linux/amd64')):
+            with tempfile.TemporaryDirectory() as temp:
+                path = Path(temp) / 'lock.json'
+                path.write_text(json.dumps(dict(baseline, **change)))
+                with patch.dict(os.environ, {'LINUX_BENCHMARK_PROFILE': 'vessel-8g',
+                                              'LINUX_BENCHMARK_LOCK': str(path),
+                                              'VESSEL_DIAGNOSTIC_ROSETTA': '0'}, clear=True):
+                    with self.assertRaisesRegex(docker_benchmark.InfrastructureError, message):
+                        docker_benchmark.command('toolchain', 'invalid', 'c')
 
 
 HISTORICAL_TEXT_EOL = {
