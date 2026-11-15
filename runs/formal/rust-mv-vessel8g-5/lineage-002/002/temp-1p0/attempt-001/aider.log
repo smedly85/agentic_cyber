@@ -1,0 +1,809 @@
+
+===== LLM INVOCATION 0: INITIAL =====
+
+
+Aider v0.86.2
+Main model: ollama_chat/qwen3.8:27b with architect edit format
+Editor model: ollama_chat/qwen3-coder-next:latest with whole edit format
+Weak model: ollama_chat/qwen3-coder-next:latest
+Git repo: none
+Repo-map: disabled
+Added rust_mv.rs to the chat.
+Added ../../tests/rust-mv-test-suite/props.py to the chat (read-only).
+Added ../../tests/rust-mv-test-suite/runner.py to the chat (read-only).
+Added ../../tests/rust-mv-test-suite/judge_candidate.sh to the chat (read-only).
+Added ../../tests/rust-mv-test-suite/BUNDLE.json to the chat (read-only).
+Added ../../tests/rust-mv-test-suite/engine.py to the chat (read-only).
+Added ../../tests/rust-mv-test-suite/config.json to the chat (read-only).
+Added ../../tests/rust-mv-test-suite/config.py to the chat (read-only).
+Note: in-chat filenames are always relative to the git working dir, not the 
+current working dir.
+Cur working dir: 
+/Users/sonjabrown/agentic_cyber/runs/formal/rust-mv-vessel8g-5/lineage-002/002/t
+emp-1p0/attempt-001/workdir
+Git working dir: /Users/sonjabrown/agentic_cyber
+
+
+--------------
+► **THINKING**
+
+Let me analyze the current implementation and what's needed for checkpoint 002.
+
+Current state (checkpoint 001 - base):
+- Accepts SOURCE DEST or SOURCE... DIRECTORY
+- Handles -f/--force as a no-op (just skips it)
+- No -i/--interactive support
+- Move path logic with identity checks, type compatibility, etc.
+
+What's needed for checkpoint 002:
+1. Add `-f` / `--force` - suppresses overwrite confirmation (for write-protected destinations), but doesn't bypass parent permissions or type constraints. Repetitions are idempotent.
+2. Add `-i` / `--interactive` - Prompt on stderr naming an existing effective destination before replacement, consume a line from stdin. Initial ASCII y or Y affirms; all other initials, leading whitespace, blank input and EOF decline. Decline leaves source and destination unchanged and contributes status 1. No prompt for a missing destination.
+3. LAST occurrence among force and interactive selects the overwrite policy: `-i -f` does not prompt, `-f -i` prompts.
+
+Key design decisions:
+
+1. **Flag parsing**: Track whether `-f`/`--force` and `-i`/`--interactive` were seen, and which was the last one. The "last occurrence" rule means I need to track the order. I'll use a simple enum or track the last flag seen.
+
+2. **Prompt behavior**: When `-i` is the last flag and the effective destination exists (and we're about to overwrite), print a prompt to stderr, read a line from stdin. If the line starts with 'y' or 'Y' (no leading whitespace - wait, "leading whitespace" is listed as declining, so "  y" declines), then affirm. Otherwise decline.
+
+   Wait, re-reading: "Initial ASCII y or Y affirms; all other initials, leading whitespace, blank input and EOF decline."
+   
+   So:
+   - "y" → affirm
+   - "Y" → affirm
+   - " y" → decline (leading whitespace)
+   - "" → decline (blank)
+   - EOF → decline
+   - "n" → decline
+   - "yes" → affirm (starts with 'y')
+   - "No" → decline (starts with 'N', not 'y' or 'Y')
+
+   So the check is: the first byte of the input line is 'y' (0x79) or 'Y' (0x59).
+
+3. **Force behavior**: "Force suppresses overwrite confirmation, including for a write-protected destination." So when `-f` is the last flag, we skip the prompt even if the destination is write-protected. But it doesn't bypass parent permissions or type constraints.
+
+   Wait, "write-protected destination" - this is interesting. In GNU mv, `-f` suppresses prompts. The "write-protected destination" part is about when the destination file is not writable - normally you'd get a prompt asking if you really want to replace it, but with `-f` you skip that prompt.
+
+   Actually, re-reading more carefully: "Force suppresses overwrite confirmation, including for a write-protected destination, but does not bypass parent permissions or type constraints."
+
+   So the force flag simply means: don't prompt. The actual filesystem operation (rename) will still fail if permissions don't allow it. The "write-protected destination" is just saying that even if the destination is write-protected, force still suppresses the prompt (it doesn't make the operation succeed).
+
+   Actually wait - in GNU mv, when you move to a write-protected destination, without -f you get prompted "mv: overwrite 'protected', despite lack of write permission?" With -f, no prompt. So the prompt is specifically about write-protected destinations in addition to the general interactive prompt.
+
+   But the spec says: "the base checkpoint does not prompt for write-protected destinations." So in the base, there's no prompt at all. With -i, we prompt when the destination exists. With -f as last, we don't prompt.
+
+   Actually, I think the simpler interpretation is:
+   - `-i` as last: prompt when destination exists (before replacing)
+   - `-f` as last: no prompt
+   - Neither or `-f` last: no prompt (current behavior)
+
+   The "write-protected destination" mention is just clarifying that -f doesn't make write-protected files overwritable, it just suppresses the prompt.
+
+4. **Prompt format**: "Prompt on stderr naming an existing effective destination before replacement." The exact wording is unconstrained but must identify the destination. Something like: `mv: overwrite 'dest'? `
+
+5. **Reading from stdin**: The engine already provides stdin via pipe. I need to read one line from stdin. If EOF, that's a decline.
+
+6. **The "last occurrence" rule**: I need to track which of -f/-i was seen last. I'll use an enum:
+   - `Policy::Default` (neither seen, or only -f seen initially then... wait no)
+   
+   Actually simpler: track the last policy flag seen. If the last one was `-i`, use interactive. If the last one was `-f`, use force. If neither was seen, use default (no prompt).
+
+   Wait, but what about the base behavior? In the base checkpoint, there's no prompt at all. So:
+   - No flags: no prompt (base behavior)
+   - `-f`: no prompt (force)
+   - `-i`: prompt when destination exists
+   - `-i -f`: no prompt (force is last)
+   - `-f -i`: prompt (interactive is last)
+   - `-f -f`: no prompt
+   - `-i -i`: prompt
+
+   So the logic is: if the last policy flag seen is `-i`, prompt. Otherwise (no flag seen, or last is `-f`), don't prompt.
+
+7. **Where to prompt**: In `move_path`, before doing the rename, if the destination exists and we're going to replace it, and the policy is interactive, then prompt.
+
+   Actually, let me think about when to prompt. The spec says "Prompt on stderr naming an existing effective destination before replacement." So:
+   - Destination exists → prompt (if interactive mode)
+   - Destination doesn't exist → no prompt
+
+   What about moving into a directory (destination is dir + basename)? In that case, the effective destination is dir/basename. If that exists, prompt. If not, no prompt.
+
+   What about the "replace an empty directory" case? If source is a file and dest is an empty directory... wait, the spec says "cannot overwrite directory with non-directory" is an error. So that's still an error, not a prompt case.
+
+   What about "replace an empty directory at that effective destination when GNU permits"? This means: if source is a directory and effective destination is an empty directory, GNU allows it (removes the empty dir, moves source in its place). In this case, should we prompt? I think yes, because the destination exists.
+
+   So the rule is: if the effective destination exists (regardless of type), and we're in interactive mode, prompt before proceeding.
+
+8. **Preserving the `move_path` anchor**: The spec says "Preserve the established semantic anchor `move_path`: the core filesystem operation must be reachable from main through it."
+
+   So `move_path` must still exist and be the function that does the actual move. I'll pass the interactive policy into it.
+
+Let me now design the implementation:
+
+```rust
+use std::ffi::{OsStr, OsString};
+use std::fs;
+use std::io::{self, BufRead, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+#[derive(PartialEq, Clone, Copy)]
+enum Policy {
+    Default,
+    Force,
+    Interactive,
+}
+
+fn main() -> ExitCode {
+    let args: Vec<OsString> = std::env::args_os().collect();
+
+    let mut operands: Vec<PathBuf> = Vec::new();
+    let mut after_ddash = false;
+    let mut policy = Policy::Default;
+
+    for arg in args.iter().skip(1) {
+        if !after_ddash {
+            let bytes = arg.as_bytes();
+            if bytes == b"--" {
+                after_ddash = true;
+                continue;
+            }
+            if bytes.len() > 1 && bytes[0] == b'-' {
+                if bytes == b"-f" || bytes == b"--force" {
+                    policy = Policy::Force;
+                    continue;
+                }
+                if bytes == b"-i" || bytes == b"--interactive" {
+                    policy = Policy::Interactive;
+                    continue;
+                }
+                eprintln!("rust_mv: unknown option '{}'", String::from_utf8_lossy(bytes));
+                return ExitCode::from(1);
+            }
+        }
+        operands.push(PathBuf::from(arg));
+    }
+
+    // ... rest is similar, but pass policy to move_path
+}
+```
+
+Wait, I need to think about the prompt more carefully. The prompt should happen before the actual rename. In `move_path`, after all validation (identity, type compatibility, etc.), if the destination exists and policy is Interactive, prompt.
+
+Actually, let me reconsider. The prompt should happen when we're about to overwrite an existing destination. The cases where destination exists:
+- File overwriting file → prompt
+- File overwriting symlink → prompt  
+- Directory overwriting empty directory → prompt
+- Symlink overwriting file/dir/symlink → prompt
+
+All of these are "existing effective destination" cases. The cases where we don't prompt:
+- Destination doesn't exist → no prompt
+- Moving into a directory (effective dest = dir/basename doesn't exist) → no prompt
+
+So in `move_path`, after the `fs::symlink_metadata(destination)` returns Ok (destination exists), and after all error checks pass (not same file, not incompatible types, not non-empty dir, etc.), if policy is Interactive, prompt.
+
+Let me write the full implementation:
+
+```rust
+use std::ffi::{OsStr, OsString};
+use std::fs;
+use std::io::{self, BufRead, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+#[derive(PartialEq, Clone, Copy)]
+enum Policy {
+    Default,
+    Force,
+    Interactive,
+}
+
+fn main() -> ExitCode {
+    let args: Vec<OsString> = std::env::args_os().collect();
+
+    let mut operands: Vec<PathBuf> = Vec::new();
+    let mut after_ddash = false;
+    let mut policy = Policy::Default;
+
+    for arg in args.iter().skip(1) {
+        if !after_ddash {
+            let bytes = arg.as_bytes();
+            if bytes == b"--" {
+                after_ddash = true;
+                continue;
+            }
+            if bytes.len() > 1 && bytes[0] == b'-' {
+                if bytes == b"-f" || bytes == b"--force" {
+                    policy = Policy::Force;
+                    continue;
+                }
+                if bytes == b"-i" || bytes == b"--interactive" {
+                    policy = Policy::Interactive;
+                    continue;
+                }
+                eprintln!(
+                    "rust_mv: unknown option '{}'",
+                    String::from_utf8_lossy(bytes)
+                );
+                return ExitCode::from(1);
+            }
+        }
+        operands.push(PathBuf::from(arg));
+    }
+
+    if operands.len() < 2 {
+        eprintln!("rust_mv: missing operand(s)");
+        return ExitCode::from(1);
+    }
+
+    let n = operands.len();
+    let pairs: Vec<(PathBuf, PathBuf)>;
+
+    if n == 2 {
+        let source = &operands[0];
+        let dest = &operands[1];
+
+        let effective_dest = if let Ok(meta) = fs::symlink_metadata(dest) {
+            if meta.is_dir() {
+                let base = source.file_name().unwrap_or(OsStr::new("."));
+                dest.join(base)
+            } else {
+                dest.clone()
+            }
+        } else {
+            dest.clone()
+        };
+
+        pairs = vec![(source.clone(), effective_dest)];
+    } else {
+        let dir = &operands[n - 1];
+        match fs::symlink_metadata(dir) {
+            Ok(meta) if meta.is_dir() => {}
+            _ => {
+                eprintln!(
+                    "rust_mv: target '{}' is not a directory",
+                    dir.to_string_lossy()
+                );
+                return ExitCode::from(1);
+            }
+        }
+
+        pairs = (0..n - 1)
+            .map(|i| {
+                let source = &operands[i];
+                let base = source.file_name().unwrap_or(OsStr::new("."));
+                (source.clone(), dir.join(base))
+            })
+            .collect();
+    }
+
+    let mut any_failed = false;
+    for (source, dest) in &pairs {
+        if let Err(msg) = move_path(source, dest, policy) {
+            eprintln!("rust_mv: {}", msg);
+            any_failed = true;
+        }
+    }
+
+    if any_failed {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn move_path(source: &Path, destination: &Path, policy: Policy) -> Result<(), String> {
+    let src_meta = fs::symlink_metadata(source)
+        .map_err(|e| format!("cannot stat '{}': {}", source.display(), e))?;
+
+    let src_is_dir = src_meta.is_dir();
+
+    match fs::symlink_metadata(destination) {
+        Ok(dst_meta) => {
+            let dst_is_dir = dst_meta.is_dir();
+
+            if let (Ok(src_canon), Ok(dst_canon)) =
+                (fs::canonicalize(source), fs::canonicalize(destination))
+            {
+                if src_canon == dst_canon {
+                    return Err(format!(
+                        "'{}' and '{}' are the same file",
+                        source.display(),
+                        destination.display()
+                    ));
+                }
+                if src_is_dir && dst_canon.starts_with(&src_canon) {
+                    return Err(format!(
+                        "cannot move '{}' into a subdirectory of itself",
+                        source.display()
+                    ));
+                }
+            }
+
+            if !src_is_dir && dst_is_dir {
+                return Err(format!(
+                    "cannot overwrite directory '{}' with non-directory '{}'",
+                    destination.display(),
+                    source.display()
+                ));
+            }
+            if src_is_dir && !dst_is_dir {
+                return Err(format!(
+                    "cannot overwrite non-directory '{}' with directory '{}'",
+                    destination.display(),
+                    source.display()
+                ));
+            }
+            if src_is_dir && dst_is_dir {
+                if let Ok(mut reader) = fs::read_dir(destination) {
+                    if reader.next().is_some() {
+                        return Err(format!(
+                            "target '{}' is a non-empty directory",
+                            destination.display()
+                        ));
+                    }
+                }
+            }
+
+            // Interactive prompt: destination exists and we're about to replace it
+            if policy == Policy::Interactive {
+                if !prompt_overwrite(destination) {
+                    return Err(format!(
+                        "not overwritten (interactive)",
+                        destination.display()
+                    ));
+                }
+            }
+        }
+        Err(_) => {
+            if src_is_dir {
+                if let Ok(src_canon) = fs::canonicalize(source) {
+                    let mut ancestor = destination.to_path_buf();
+                    while ancestor.as_os_str().len() > 0 {
+                        if let Ok(a_canon) = fs::canonicalize(&ancestor) {
+                            if a_canon == src_canon || a_canon.starts_with(&src_canon) {
+                                return Err(format!(
+                                    "cannot move '{}' into a subdirectory of itself",
+                                    source.display()
+                                ));
+                            }
+                            break;
+                        }
+                        ancestor = match ancestor.parent() {
+                            Some(p) => p.to_path_buf(),
+                            None => break,
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    fs::rename(source, destination).map_err(|e| {
+        format!(
+            "cannot move '{}' to '{}': {}",
+            source.display(),
+            destination.display(),
+            e
+        )
+    })
+}
+
+fn prompt_overwrite(destination: &Path) -> bool {
+    let dest_display = destination.to_string_lossy();
+    // Prompt on stderr
+    eprint!("mv: overwrite '{}'? ", dest_display);
+    // Flush stderr
+    let _ = io::stderr().flush();
+    
+    // Read one line from stdin
+    let stdin = io::stdin();
+    let mut line = String::new();
+    match stdin.lock().read_line(&mut line) {
+        Ok(0) => return false, // EOF
+        Ok(_) => {}
+        Err(_) => return false, // read error
+    }
+    
+    // Check first byte: 'y' or 'Y' affirms
+    if let Some(first) = line.bytes().next() {
+        first == b'y' || first == b'Y'
+    } else {
+        false
+    }
+}
+```
+
+Wait, I need to double-check the "leading whitespace" rule. The spec says "Initial ASCII y or Y affirms; all other initials, leading whitespace, blank input and EOF decline."
+
+So if the input is "  y" (leading whitespace then y), it declines. My check `line.bytes().next()` would get ' ' which is not 'y' or 'Y', so it would decline. Good.
+
+If the input is "y" → first byte is 'y' → affirm. Good.
+If the input is "Y" → first byte is 'Y' → affirm. Good.
+If the input is "" → no bytes → decline. Good.
+If EOF → read_line returns Ok(0) → decline. Good.
+If "n" → first byte is 'n' → decline. Good.
+If "yes" → first byte is 'y' → affirm. Good.
+
+This looks correct.
+
+Now let me also think about the error message when the user declines. The spec says "Decline leaves source and destination unchanged and contributes status 1." So I need to return an Err from move_path, which will cause the error to be printed and any_failed to be set.
+
+The error message should identify the affected operand. I'll use something like:
+`"not overwriting '{}' (user declined)"`
+
+Actually, looking at the spec again: "diagnostics must identify the affected operand." So the error message should mention the source or destination. Let me use the destination since that's what's being protected.
+
+Let me also reconsider: the prompt should say something that names the destination. The spec says "Prompt on stderr naming an existing effective destination before replacement." So my `eprint!("mv: overwrite '{}'? ", dest_display)` is good.
+
+Now, one more thing: the spec says "except interactive prompts" for the "empty stdout and empty stderr" requirement. So when prompting, stderr is allowed to have content.
+
+Let me also think about whether I need to handle the case where stdin is closed or not available. In the test harness, stdin is always piped. If read_line fails with an error, I'll treat it as decline.
+
+Let me also make sure the `-f` flag doesn't change behavior for the base case. In the base, there's no prompt. With `-f`, there's still no prompt. The only difference is that `-f` explicitly suppresses the prompt (which would otherwise happen with `-i`). So effectively:
+- Policy::Default → no prompt
+- Policy::Force → no prompt  
+- Policy::Interactive → prompt when destination exists
+
+This is correct.
+
+One more consideration: the spec says "Repetitions are idempotent." So `-f -f` is the same as `-f`, and `-i -i` is the same as `-i`. My implementation handles this naturally since I'm just overwriting the policy variable.
+
+Let me also verify: "This precedence differs from cp." In cp, -f and -i are independent (both can be active). In mv, the last one wins. My implementation correctly implements the last-one-wins behavior.
+
+I think my implementation is complete. Let me write the final instructions.
+
+Actually, wait. Let me re-examine the current code more carefully. The current code has:
+
+```rust
+if bytes == b"-f" || bytes == b"--force" {
+    continue;
+}
+```
+
+This just skips -f. I need to change this to set the policy.
+
+And I need to add -i/--interactive handling.
+
+Also, I need to add the `use std::io::{self, BufRead, Write};` import.
+
+Let me finalize my instructions for the editor.
+
+------------
+► **ANSWER**
+
+## Instructions
+
+Modify `src/rust_mv/rust_mv.rs` as follows:
+
+### 1. Add imports
+
+Add `use std::io::{self, BufRead, Write};` after the existing `use std::fs;` line.
+
+### 2. Add a policy enum before `fn main`
+
+```rust
+#[derive(PartialEq, Clone, Copy)]
+enum Policy {
+    Default,
+    Force,
+    Interactive,
+}
+```
+
+### 3. Modify the argument loop in `main`
+
+Replace the block that handles `-f`/`--force` (currently just `continue`) and add `-i`/`--interactive`:
+
+- Add `let mut policy = Policy::Default;` alongside the other `let mut` declarations at the top of the loop section.
+- Change the `-f`/`--force` branch from `continue;` to `policy = Policy::Force; continue;`
+- Add a new branch immediately after it:
+  ```rust
+  if bytes == b"-i" || bytes == b"--interactive" {
+      policy = Policy::Interactive;
+      continue;
+  }
+  ```
+
+### 4. Pass policy to `move_path`
+
+Change the call in the move loop from:
+```rust
+if let Err(msg) = move_path(source, dest) {
+```
+to:
+```rust
+if let Err(msg) = move_path(source, dest, policy) {
+```
+
+### 5. Change `move_path` signature and add prompt logic
+
+Change the signature from:
+```rust
+fn move_path(source: &Path, destination: &Path) -> Result<(), String> {
+```
+to:
+```rust
+fn move_path(source: &Path, destination: &Path, policy: Policy) -> Result<(), String> {
+```
+
+In the `Ok(dst_meta) => {` branch, after the non-empty directory check (the `if src_is_dir && dst_is_dir { ... }` block) and before the closing `}` of that match arm, insert:
+
+```rust
+if policy == Policy::Interactive {
+    if !prompt_overwrite(destination) {
+        return Err(format!(
+            "not overwriting '{}'",
+            destination.display()
+        ));
+    }
+}
+```
+
+### 6. Add the `prompt_overwrite` function
+
+Add this function after `move_path`:
+
+```rust
+fn prompt_overwrite(destination: &Path) -> bool {
+    eprint!("mv: overwrite '{}'? ", destination.to_string_lossy());
+    let _ = io::stderr().flush();
+
+    let stdin = io::stdin();
+    let mut line = String::new();
+    match stdin.lock().read_line(&mut line) {
+        Ok(0) => return false,
+        Ok(_) => {}
+        Err(_) => return false,
+    }
+
+    match line.bytes().next() {
+        Some(b'y') | Some(b'Y') => true,
+        _ => false,
+    }
+}
+```
+
+### Summary of behavior
+
+- **`-f`/`--force`**: Sets policy to Force. No prompt. All other behavior unchanged.
+- **`-i`/`--interactive`**: Sets policy to Interactive. When the effective destination exists, a prompt is written to stderr and one line is read from stdin. First byte `y` or `Y` affirms; anything else (including leading whitespace, blank, EOF, any other character) declines. Decline returns an error naming the destination, leaving source and dest untouched, contributing status 1.
+- **Last occurrence wins**: Each `-f` or `-i` overwrites the `policy` variable, so the last one seen determines behavior.
+- **No prompt when destination doesn't exist**: The prompt code is only reached in the `Ok(dst_meta)` branch.
+Tokens: 8.7k sent, 5.2k received.
+I will implement all the requested changes to `rust_mv.rs`.
+
+rust_mv.rs
+```
+use std::ffi::{OsStr, OsString};
+use std::fs;
+use std::io::{self, BufRead, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+#[derive(PartialEq, Clone, Copy)]
+enum Policy {
+    Default,
+    Force,
+    Interactive,
+}
+
+fn main() -> ExitCode {
+    let args: Vec<OsString> = std::env::args_os().collect();
+
+    // Parse arguments: options before --, operands after --
+    let mut operands: Vec<PathBuf> = Vec::new();
+    let mut after_ddash = false;
+    let mut policy = Policy::Default;
+
+    for arg in args.iter().skip(1) {
+        if !after_ddash {
+            let bytes = arg.as_bytes();
+            if bytes == b"--" {
+                after_ddash = true;
+                continue;
+            }
+            if bytes.len() > 1 && bytes[0] == b'-' {
+                if bytes == b"-f" || bytes == b"--force" {
+                    policy = Policy::Force;
+                    continue;
+                }
+                if bytes == b"-i" || bytes == b"--interactive" {
+                    policy = Policy::Interactive;
+                    continue;
+                }
+                eprintln!(
+                    "rust_mv: unknown option '{}'",
+                    String::from_utf8_lossy(bytes)
+                );
+                return ExitCode::from(1);
+            }
+        }
+        operands.push(PathBuf::from(arg));
+    }
+
+    if operands.len() < 2 {
+        eprintln!("rust_mv: missing operand(s)");
+        return ExitCode::from(1);
+    }
+
+    // Determine source-destination pairs
+    let n = operands.len();
+    let pairs: Vec<(PathBuf, PathBuf)>;
+
+    if n == 2 {
+        let source = &operands[0];
+        let dest = &operands[1];
+
+        let effective_dest = if let Ok(meta) = fs::symlink_metadata(dest) {
+            if meta.is_dir() {
+                let base = source.file_name().unwrap_or(OsStr::new("."));
+                dest.join(base)
+            } else {
+                dest.clone()
+            }
+        } else {
+            dest.clone()
+        };
+
+        pairs = vec![(source.clone(), effective_dest)];
+    } else {
+        let dir = &operands[n - 1];
+        match fs::symlink_metadata(dir) {
+            Ok(meta) if meta.is_dir() => {}
+            _ => {
+                eprintln!(
+                    "rust_mv: target '{}' is not a directory",
+                    dir.to_string_lossy()
+                );
+                return ExitCode::from(1);
+            }
+        }
+
+        pairs = (0..n - 1)
+            .map(|i| {
+                let source = &operands[i];
+                let base = source.file_name().unwrap_or(OsStr::new("."));
+                (source.clone(), dir.join(base))
+            })
+            .collect();
+    }
+
+    // Execute moves in order, continuing on failure
+    let mut any_failed = false;
+    for (source, dest) in &pairs {
+        if let Err(msg) = move_path(source, dest, policy) {
+            eprintln!("rust_mv: {}", msg);
+            any_failed = true;
+        }
+    }
+
+    if any_failed {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn move_path(source: &Path, destination: &Path, policy: Policy) -> Result<(), String> {
+    let src_meta = fs::symlink_metadata(source)
+        .map_err(|e| format!("cannot stat '{}': {}", source.display(), e))?;
+
+    let src_is_dir = src_meta.is_dir();
+
+    match fs::symlink_metadata(destination) {
+        Ok(dst_meta) => {
+            let dst_is_dir = dst_meta.is_dir();
+
+            // Identity and ancestor checks via canonicalization
+            if let (Ok(src_canon), Ok(dst_canon)) =
+                (fs::canonicalize(source), fs::canonicalize(destination))
+            {
+                if src_canon == dst_canon {
+                    return Err(format!(
+                        "'{}' and '{}' are the same file",
+                        source.display(),
+                        destination.display()
+                    ));
+                }
+                if src_is_dir && dst_canon.starts_with(&src_canon) {
+                    return Err(format!(
+                        "cannot move '{}' into a subdirectory of itself",
+                        source.display()
+                    ));
+                }
+            }
+
+            // Type compatibility at the effective destination
+            if !src_is_dir && dst_is_dir {
+                return Err(format!(
+                    "cannot overwrite directory '{}' with non-directory '{}'",
+                    destination.display(),
+                    source.display()
+                ));
+            }
+            if src_is_dir && !dst_is_dir {
+                return Err(format!(
+                    "cannot overwrite non-directory '{}' with directory '{}'",
+                    destination.display(),
+                    source.display()
+                ));
+            }
+            if src_is_dir && dst_is_dir {
+                if let Ok(mut reader) = fs::read_dir(destination) {
+                    if reader.next().is_some() {
+                        return Err(format!(
+                            "target '{}' is a non-empty directory",
+                            destination.display()
+                        ));
+                    }
+                }
+            }
+
+            if policy == Policy::Interactive {
+                if !prompt_overwrite(destination) {
+                    return Err(format!(
+                        "not overwriting '{}'",
+                        destination.display()
+                    ));
+                }
+            }
+        }
+        Err(_) => {
+            // Destination does not exist; still guard against moving a
+            // directory into its own subtree.
+            if src_is_dir {
+                if let Ok(src_canon) = fs::canonicalize(source) {
+                    let mut ancestor = destination.to_path_buf();
+                    while ancestor.as_os_str().len() > 0 {
+                        if let Ok(a_canon) = fs::canonicalize(&ancestor) {
+                            if a_canon == src_canon || a_canon.starts_with(&src_canon) {
+                                return Err(format!(
+                                    "cannot move '{}' into a subdirectory of itself",
+                                    source.display()
+                                ));
+                            }
+                            break;
+                        }
+                        ancestor = match ancestor.parent() {
+                            Some(p) => p.to_path_buf(),
+                            None => break,
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    fs::rename(source, destination).map_err(|e| {
+        format!(
+            "cannot move '{}' to '{}': {}",
+            source.display(),
+            destination.display(),
+            e
+        )
+    })
+}
+
+fn prompt_overwrite(destination: &Path) -> bool {
+    eprint!("mv: overwrite '{}'? ", destination.to_string_lossy());
+    let _ = io::stderr().flush();
+
+    let stdin = io::stdin();
+    let mut line = String::new();
+    match stdin.lock().read_line(&mut line) {
+        Ok(0) => return false,
+        Ok(_) => {}
+        Err(_) => return false,
+    }
+
+    match line.bytes().next() {
+        Some(b'y') | Some(b'Y') => true,
+        _ => false,
+    }
+}
+```
+Tokens: 8.6k sent, 1.5k received.
+Applied edit to rust_mv.rs
