@@ -5,6 +5,15 @@ reads the manifest named by `--utility` and turns it into an ordered sequence of
 `scripts/run_experiment.sh` invocations — one per checkpoint — so no utility
 detail is hardcoded in the controller.
 
+## Current standardized benchmark versus legacy manifests
+
+The conference-facing standardized benchmark is the explicit 15-selector catalog
+in `scripts/linux_utilities_catalog.py`: `c-*`, `rust-*`, and `py-*` for cp, mv,
+mkdir, sort and grep. Its authoritative matrix and oracle status are in
+`docs/benchmarks/linux-utilities.md`. Unprefixed manifests, `python-*`, and the
+older `cp.json`/`mv.json` remain historical reproduction inputs; their presence
+does not make them part of the current 15-configuration benchmark.
+
 ## Schema
 
 The `python-cp`, `python-mv`, `python-sort` and `python-mkdir` manifests use the same

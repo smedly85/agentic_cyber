@@ -238,6 +238,10 @@ def main():
         return
     if action == 'oracle-preflight':
         versions = {}
+        requested = request.get('utility')
+        # Candidate execution uses the original, immutable Coreutils runtime.
+        # grep expectations are frozen separately in the independently locked
+        # grep-oracle image; no grep oracle is admitted to candidate jails.
         for utility in ('cp', 'mv', 'mkdir', 'sort'):
             line = subprocess.check_output(['/opt/gnu/bin/' + utility, '--version'],
                                            text=True).splitlines()[0]
@@ -245,7 +249,10 @@ def main():
                 raise RuntimeError('GNU oracle version mismatch: ' + line)
             versions[utility] = line
         print(json.dumps({'os': platform.system(), 'architecture': platform.machine(),
-                          'coreutils': '9.11', 'versions': versions}))
+                          'coreutils': '9.11', 'versions': versions,
+                          'requested_utility': requested,
+                          'grep_oracle_scope': ('separate frozen-corpus trust domain'
+                                                if requested == 'grep' else None)}))
         return
     if action == 'compile':
         if os.geteuid() == 0:

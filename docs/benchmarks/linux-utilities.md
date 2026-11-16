@@ -1,9 +1,11 @@
 # Standardized Linux utilities benchmark
 
-Active name: **linux-utilities**. Protocol version **1**, unchanged by the naming
-cleanup. C, Rust and Python now have 12 separate configurations and 45 checkpoints.
-Linux/AMD64 infrastructure validation passed. Linux/ARM64 and formal Aider/Ollama
-generation remain pending. No candidate implementations or lineage seeds are supplied.
+Active name: **linux-utilities**. Execution protocol version **1**; expanded
+benchmark catalog revision **2**. C, Rust and Python now have 15 separate
+configurations and 60 checkpoints across cp, mv, mkdir, sort and grep.
+Linux/AMD64 infrastructure validation passed. Linux/ARM64 and formal
+Aider/Ollama generation for grep remain pending. No grep candidate implementation,
+development trace or lineage seed is supplied.
 
 The [canonical contract](linux-utilities-contract.md) defines observable behavior
 for all languages. Copying, moving, directory creation and stream sorting cover
@@ -25,18 +27,22 @@ the **single canonical corpus**, rather than maintaining separate expected answe
 | C | mv | 000 Base → 001 -f → 002 -i | `experiments/utilities/c-mv.json` | `prompts/linux-utilities/c-mv/` | `tests/c-mv-test-suite` | 34/37/52 | 34/37/52 | Docker GCC + jailed ELF; AMD64 passed |
 | C | mkdir | 000 Base → 001 -p → 002 -m | `experiments/utilities/c-mkdir.json` | `prompts/linux-utilities/c-mkdir/` | `tests/c-mkdir-test-suite` | 28/51/150 | 6/12/25 | Docker GCC + jailed ELF; AMD64 passed |
 | C | sort | 000 Base → 001 -r → 002 -f → 003 -u → 004 -c | `experiments/utilities/c-sort.json` | `prompts/linux-utilities/c-sort/` | `tests/c-sort-test-suite` | 14/20/25/60/83 | 6/10/13/26/37 | Docker GCC + jailed ELF; AMD64 passed |
+| C | grep | 000 Base → 001 -H → 002 -h → 003 -r → 004 -i | `experiments/utilities/c-grep.json` | `prompts/linux-utilities/c-grep/` | `tests/c-grep-test-suite` | 32/40/50/65/82 | 6/11/14/20/29 | Docker GCC + jailed ELF adapter validated; no candidate trace |
 | Rust | cp | 000 Base → 001 -f → 002 -i → 003 -r | `experiments/utilities/rust-cp.json` | `prompts/linux-utilities/rust-cp/` | `tests/rust-cp-test-suite` | 32/37/54/66 | 32/37/54/66 | Docker rustc + jailed ELF; AMD64 passed |
 | Rust | mv | 000 Base → 001 -f → 002 -i | `experiments/utilities/rust-mv.json` | `prompts/linux-utilities/rust-mv/` | `tests/rust-mv-test-suite` | 34/37/52 | 34/37/52 | Docker rustc + jailed ELF; AMD64 passed |
 | Rust | mkdir | 000 Base → 001 -p → 002 -m | `experiments/utilities/rust-mkdir.json` | `prompts/linux-utilities/rust-mkdir/` | `tests/rust-mkdir-test-suite` | 28/51/150 | 6/12/25 | Docker rustc + jailed ELF; AMD64 passed |
 | Rust | sort | 000 Base → 001 -r → 002 -f → 003 -u → 004 -c | `experiments/utilities/rust-sort.json` | `prompts/linux-utilities/rust-sort/` | `tests/rust-sort-test-suite` | 14/20/25/60/83 | 6/10/13/26/37 | Docker rustc + jailed ELF; AMD64 passed |
+| Rust | grep | 000 Base → 001 -H → 002 -h → 003 -r → 004 -i | `experiments/utilities/rust-grep.json` | `prompts/linux-utilities/rust-grep/` | `tests/rust-grep-test-suite` | 32/40/50/65/82 | 6/11/14/20/29 | Docker rustc + jailed ELF adapter validated; no candidate trace |
 | Python | cp | 000 Base → 001 -f → 002 -i → 003 -r | `experiments/utilities/py-cp.json` | `prompts/linux-utilities/py-cp/` | `tests/py-cp-test-suite` | 32/37/54/66 | 32/37/54/66 | Docker syntax check + jailed Python; AMD64 passed |
 | Python | mv | 000 Base → 001 -f → 002 -i | `experiments/utilities/py-mv.json` | `prompts/linux-utilities/py-mv/` | `tests/py-mv-test-suite` | 34/37/52 | 34/37/52 | Docker syntax check + jailed Python; AMD64 passed |
 | Python | mkdir | 000 Base → 001 -p → 002 -m | `experiments/utilities/py-mkdir.json` | `prompts/linux-utilities/py-mkdir/` | `tests/py-mkdir-test-suite` | 28/51/150 | 6/12/25 | Docker syntax check + jailed Python; AMD64 passed |
 | Python | sort | 000 Base → 001 -r → 002 -f → 003 -u → 004 -c | `experiments/utilities/py-sort.json` | `prompts/linux-utilities/py-sort/` | `tests/py-sort-test-suite` | 14/20/25/60/83 | 6/10/13/26/37 | Docker syntax check + jailed Python; AMD64 passed |
+| Python | grep | 000 Base → 001 -H → 002 -h → 003 -r → 004 -i | `experiments/utilities/py-grep.json` | `prompts/linux-utilities/py-grep/` | `tests/py-grep-test-suite` | 32/40/50/65/82 | 6/11/14/20/29 | Docker syntax + jailed Python adapter validated; no candidate trace |
 
-Source/executable declarations and each rendered prompt/bundle fingerprint are in
-[the resolved matrix](linux-utilities-static-report.json). No declared candidate
-source exists. Rust is one safe Rust 2021 file, std-only, compiled with Rust 1.85.1;
+The preserved [resolved matrix](linux-utilities-static-report.json) records the
+original 12 configurations; grep declarations and current fingerprints are in
+the new manifests and [grep addendum](linux-utilities-grep-addendum.md). No declared
+candidate source exists. Rust is one safe Rust 2021 file, std-only, compiled with Rust 1.85.1;
 Python is a standalone std-only 3.12.8 source with main entry point and shebang.
 C remains C11/POSIX. Semantic anchors `copy_path`/`move_path` are retained across
 transfer prompts; Python's existing `sort_lines` anchor is retained. No arbitrary
@@ -80,7 +86,11 @@ candidate build/test failures return 1. No native-host fallback exists.
 
 ## Oracle, provenance and test isolation
 
-GNU Coreutils **9.11** runs in the pinned Linux oracle image. The Dockerfile checks
+GNU Coreutils **9.11** runs in the pinned Linux oracle image. GNU grep is not a
+Coreutils program: grep expectations were frozen independently with GNU grep
+**3.12** through `docker/grep-oracle/lock-amd64.json`. The grep source archive,
+binary and immutable image identities are recorded in that lock and in the grep
+suite manifest. No host or unpinned grep fallback exists. The Coreutils Dockerfile checks
 the source tarball SHA256 before building, pins Debian snapshot 20250201T000000Z,
 GCC 12.2.0 and Python 3.12.8. The original C engines, runners, config readers and
 property checks are reused. They compare status, stdout/stderr according to each
@@ -94,7 +104,7 @@ of equivalence across all possible inputs.
 Public bundles contain only current and preceding cases, pruned runtime/property
 code and a language-specific Docker judge wrapper. They contain no generators,
 full suite manifests, archived revisions, hidden cases or future-feature inputs.
-All 45 bundles were fingerprinted and checked for held-out identifying values.
+All 60 bundles were fingerprinted and checked for held-out identifying values.
 The sole shared-diagnostic scan exception remains the fixed GNU ENOSPC message;
 exact judging assertions are unchanged, and an injected hidden identifier is
 detected. Hidden reports stay controller-only and never become repair feedback.
@@ -157,10 +167,12 @@ RUST=$(docker image inspect agentic-linux-utilities-rust --format '{{.Id}}')
 # create a separate lock copying the recorded fields and update only verified IDs.
 # export LINUX_BENCHMARK_LOCK=/absolute/path/to/that-lock.json
 bash docker/linux-utilities/run.sh "$ORACLE" "$PWD/oracle-check-new" linux/amd64
+bash docker/grep-oracle/build.sh
+bash docker/grep-oracle/run.sh "$PWD/grep-oracle-check-new"
 python3 scripts/validate_linux_static.py --output "$PWD/c-static-new"
 python3 scripts/validate_cross_language.py --output "$PWD/cross-checks-new"
 python3 scripts/validate_docker_adapter.py --output "$PWD/calibration-new"
-for selector in c-cp rust-cp py-cp; do
+for selector in c-cp rust-cp py-cp c-grep rust-grep py-grep; do
   python3 scripts/validate_docker_entrypoints.py --utility "$selector" --output "$PWD/entry-$selector-new"
 done
 ```
@@ -201,8 +213,11 @@ The two static naming-migration audits apply only to the recorded AMD64 rename;
 they are explicitly skipped on ARM64, where fresh oracle reproducibility evidence
 is required instead. Shared-contract parity, isolation and runtime checks still run.
 
-See [the delivery report](linux-utilities-report.md) for exact evidence, counts,
-renames, changes, Git status and remaining readiness limits.
+See [the original 12-configuration delivery report](linux-utilities-report.md)
+for the preserved prior evidence and the [grep extension addendum](linux-utilities-grep-addendum.md)
+for the separately recorded 15-configuration validation, counts, fingerprints and
+remaining readiness limits. The [legacy cleanup audit](legacy-cleanup-audit.md)
+is advisory; no historical path was removed.
 
 ## Audit of original mkdir architecture
 

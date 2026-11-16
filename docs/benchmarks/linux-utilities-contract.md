@@ -1,6 +1,10 @@
 # Canonical Linux utilities contract
 
-Protocol version: 1. Linux/AMD64 GNU Coreutils 9.11 oracle validation passed; Linux/ARM64 remains pending. Normative language-neutral behaviors follow. Checkpoints are cumulative; prompts contain only the current and earlier contracts. The naming cleanup does not change these behaviors.
+Execution protocol version: 1. Benchmark catalog revision: 2. Linux/AMD64 GNU
+Coreutils 9.11 oracle validation passed; Linux/ARM64 remains pending. Normative
+language-neutral behaviors follow. Checkpoints are cumulative; prompts contain
+only the current and earlier contracts. The naming cleanup does not change these
+behaviors.
 
 ## cp
 
@@ -83,3 +87,76 @@ Add `-u` / `--unique`. Output one representative per equal comparison-key group:
 ### check
 
 Add `-c` / `--check`. Check input order without emitting output. Ordered input, empty input and a single record return 0 with empty stderr. At the first ordering violation return 1 and emit a diagnostic identifying the line; exact wording is not prescribed. Invalid arguments and operational failures still return 2. Compare using the same GNU ordering selected for ordinary output: reverse affects direction, ignore-case uses folded keys with the original-byte last-resort comparison unless unique disables it. With unique, equal adjacent keys are also a violation. Without unique, equal adjacent records are allowed. Do not implement other check aliases or `--check=WORD`.
+
+## grep
+
+Search for a fixed byte substring, not a regular expression. Accept one PATTERN
+operand followed by zero or more FILE operands. Before `--`, only the options
+introduced by the current checkpoint are valid; after `--`, every argument is a
+literal operand. Short options may be clustered once introduced, repeated options
+are idempotent, and their order does not alter the result. A filename exactly `-`
+is deliberately treated as an ordinary filename, preserving the bounded legacy
+contract rather than GNU grep's stdin alias. With no FILE operand, read standard
+input. Do not broaden this contract to other GNU grep modes or options.
+
+Files and input are arbitrary bytes, including NUL and invalid UTF-8. Match each
+input record independently. A record is newline-terminated when its input newline
+is present; an unterminated final record is still searched and, when selected, is
+emitted followed by one newline. An empty pattern selects every record, including
+empty records. Preserve the original selected record bytes. Process explicit file
+operands in command-line order and preserve record order within each input.
+
+By default matching is case-sensitive and output has no filename prefix for one
+explicit file, but has `FILE:` before each selected record when there are multiple
+explicit files. Standard input without a file operand is never prefixed. Successful
+searches return 0 when any selected record is emitted and 1 when no record matches.
+Status 1 is a normal no-match classification, not an invalid invocation. Invalid
+syntax, unsupported options, missing/unreadable operands, directories before
+recursive support, and other operational failures produce a diagnostic on stderr
+and status 2. Continue over later explicit operands after a per-file failure; any
+error makes the final status 2 even if another file matched. Exact diagnostic
+wording is unconstrained except where the frozen corpus records a stable subject.
+Do not bypass filesystem permissions or crash on ordinary I/O/resource errors.
+
+Ordinary pathname components and symlinks follow Linux filesystem semantics.
+An explicit symlink to a regular file is searched. An explicit dangling symlink
+is an error. Before recursive support, directory operands are errors. Filenames
+are arbitrary non-NUL byte strings and need not be valid UTF-8.
+
+### with filename
+
+Add `-H` / `--with-filename`. Prefix every selected record from an explicit file
+with `FILE:`, including the single-file case. Standard input without a file operand
+remains unprefixed. Preserve all base ordering, byte and exit-status behavior.
+
+### without filename
+
+Add `-h` / `--no-filename`. Suppress filename prefixes for all selected records.
+When both `-H` and `-h` occur, the last occurrence determines prefix behavior.
+Repeated or clustered forms follow the same last-occurrence rule.
+
+### recursive
+
+Add `-r` / `--recursive`. Explicit regular files keep their existing behavior.
+For each explicit directory operand, recursively search regular files below it in
+deterministic ascending unsigned-byte pathname order. Skip every symbolic link
+encountered during traversal, whether it targets a file or directory; explicitly
+named symlinks retain the earlier operand behavior. Traversal
+must be bounded by the benchmark's process and resource limits. Recursive output
+uses the discovered relative operand path as its filename label. The current
+`-H`/`-h` state still controls prefixes; without either option GNU-compatible
+recursive output includes filenames. Multiple top-level operands retain operand
+order, with deterministic order inside each directory.
+
+### ignore case
+
+Add `-i` / `--ignore-case`. Fold only ASCII A-Z to a-z for comparison under
+`LC_ALL=C`; bytes outside ASCII letters remain distinct. Output always preserves
+the original record bytes. Ignore-case combines with recursive traversal and the
+current prefix option without changing ordering or exit classification.
+
+The GNU grep 3.12 oracle is invoked controller-side with `-a -F` to establish the
+supported fixed-byte matching behavior. The benchmark adapter, not GNU grep,
+enforces the bounded grammar, the ordinary-filename treatment of `-`, checkpoint
+feature availability and deterministic traversal. Those intentional differences
+are explicitly marked as specification-derived expectations in the corpus manifest.

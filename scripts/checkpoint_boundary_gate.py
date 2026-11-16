@@ -204,6 +204,8 @@ PROBES = {
     "c-mkdir": {"build": _mkdir_probe, "requires_diagnostic": True},
     "c-sort": {"build": _sort_probe, "requires_diagnostic": True,
                "required_exit_status": 2},
+    "c-grep": {"build": _grep_probe, "requires_diagnostic": True,
+               "required_exit_status": 2},
     "python-cp": {"build": _transfer_probe, "requires_diagnostic": True},
     "python-mv": {"build": _transfer_probe, "requires_diagnostic": True},
     "python-mkdir": {"build": _mkdir_probe, "requires_diagnostic": True},
@@ -310,7 +312,8 @@ def evaluate(repo: Path, utility: str, checkpoint_id: str,
     ]
     if utility in LINUX_SELECTORS:
         # Enforce the restricted surface as well as the incremental ladder.
-        excluded = {"c-cp": "-R", "c-mv": "-n", "c-mkdir": "-v", "c-sort": "-C"}
+        excluded = {"c-cp": "-R", "c-mv": "-n", "c-mkdir": "-v",
+                    "c-sort": "-C", "c-grep": "-E"}
         probes.append(run_probe(executable, utility, excluded["c-" + utility_name(utility)], excluded["c-" + utility_name(utility)]))
         if utility in LINUX_SELECTORS and utility_name(utility) == "sort":
             probes.append(run_probe(executable, utility, "@existing-file-operand", "operand"))

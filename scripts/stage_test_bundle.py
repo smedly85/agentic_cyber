@@ -62,7 +62,7 @@ from typing import Any, Mapping
 SCHEMA_VERSION = 1
 
 # The runtime judging path, and only that. Every suite is built the same way, so
-# one allowlist serves all four. A file absent here never reaches a sandbox --
+# one allowlist serves all five. A file absent here never reaches a sandbox --
 # which is the point, so this list is deny-by-default and must stay short.
 ALLOWED_FILES = (
     "judge_candidate.sh",  # the checkpoint entry point

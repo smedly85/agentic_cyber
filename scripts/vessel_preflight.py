@@ -43,7 +43,7 @@ SCRIPTS = ROOT / "scripts"
 DEFAULT_LOCK = ROOT / "docker/linux-utilities/lock-amd64.json"
 DEFAULT_SELECTORS = tuple(language + "-" + utility
                           for language in ("c", "rust", "py")
-                          for utility in ("cp", "mv", "mkdir", "sort"))
+                          for utility in ("cp", "mv", "mkdir", "sort", "grep"))
 EXPECTED_AIDER = "aider 0.86.2"  # recorded by every formal lineages.json
 # Store-independent identity of the validated AMD64 images: sha256 over the
 # newline-joined RootFS diff_ids, captured 2026-11-02 from the Windows/WSL

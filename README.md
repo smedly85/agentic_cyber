@@ -6,13 +6,18 @@ repository state, generated candidates, validation results, and metadata needed
 to reproduce and compare independent repository histories.
 
 The active [Linux utility benchmark](docs/benchmarks/linux-utilities.md) defines
-cp, mv, mkdir and sort in C, Rust and Python: 12 configurations and 45 checkpoints.
+cp, mv, mkdir, sort and grep in C, Rust and Python: 15 configurations and 60
+checkpoints. The [grep validation addendum](docs/benchmarks/linux-utilities-grep-addendum.md)
+records its separate GNU grep oracle, Docker evidence and remaining Vessel work.
 Run `make test` from WSL/Linux with Docker and the pinned benchmark images
 available for bounded static and Docker integration checks, including the four
 restored regression modules. Logs go to a fresh directory under `/tmp`; no
 formal development traces are started. Candidate compilation and execution stay
 in Docker.
 
+Files outside `prompts/linux-utilities/{c,rust,py}-*`, the corresponding
+`experiments/utilities/{c,rust,py}-*.json` manifests and `tests/{c,rust,py}-*-test-suite`
+may belong to older experiments; consult the active benchmark matrix before use.
 Historical C chmod, grep, mkdir and sort manifests, checkpoint prompts and
 judging inputs remain available to reproduce the retained correctness and
 diversity claims. Their generators also support frozen-corpus self-checks, and

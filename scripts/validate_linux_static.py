@@ -30,13 +30,14 @@ checks = {
     'syntax': ['python3','-c', '''import ast, pathlib, subprocess
 paths=list(pathlib.Path('scripts').glob('*.py'))+list(pathlib.Path('scripts/validation').glob('*.py'))
 for path in paths: ast.parse(path.read_text(), filename=str(path))
-shells=[pathlib.Path('scripts/run_experiment.sh'),pathlib.Path('scripts/run_lineage_experiment.sh')]+list(pathlib.Path('docker/linux-utilities').glob('*.sh'))+list(pathlib.Path('tests').glob('c-*-test-suite/*.sh'))+list(pathlib.Path('tests').glob('rust-*-test-suite/*.sh'))+list(pathlib.Path('tests').glob('py-*-test-suite/*.sh'))
+shells=[pathlib.Path('scripts/run_experiment.sh'),pathlib.Path('scripts/run_lineage_experiment.sh')]+list(pathlib.Path('docker/linux-utilities').glob('*.sh'))+list(pathlib.Path('docker/grep-oracle').glob('*.sh'))+list(pathlib.Path('tests').glob('c-*-test-suite/*.sh'))+list(pathlib.Path('tests').glob('rust-*-test-suite/*.sh'))+list(pathlib.Path('tests').glob('py-*-test-suite/*.sh'))
 for path in shells: subprocess.run(['bash','-n',str(path)],check=True)
 print(f'{len(paths)} Python files parsed; {len(shells)} shell syntax checks passed')'''],
     'contract': ['python3','scripts/check_linux_contract.py'],
     'static': ['python3','-B','scripts/run_vessel_validation_tests.py','--suite','integrity'],
     'isolation': ['python3','scripts/check_heldout_isolation.py',
-                  '--utility','c-cp','--utility','c-mv','--utility','c-mkdir','--utility','c-sort'],
+                  '--utility','c-cp','--utility','c-mv','--utility','c-mkdir','--utility','c-sort',
+                  '--utility','c-grep'],
 }
 results={}
 try:

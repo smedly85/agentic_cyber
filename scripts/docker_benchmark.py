@@ -171,10 +171,15 @@ def boundary_probe(executable, selector, option, flag):
         case['args'] += ['input', 'output']
         case['fixture'] = [{'path': 'input', 'type': 'file', 'contents_b64': 'cGF5bG9hZAo=', 'mode': '0644'}]
         case['stdin_b64'] = 'eQo='
+    elif utility == 'grep':
+        case['args'] += ['alpha', 'input']
+        case['fixture'] = [{'path': 'input', 'type': 'file',
+                            'contents_b64': 'YWxwaGEKYmV0YQo=', 'mode': '0644'}]
+        case['stdin_b64'] = ''
     result = execute_case(selector, executable.read_bytes(), case)['result']
     stdout = base64.b64decode(result['stdout']['$bytes'])
     stderr = base64.b64decode(result['stderr']['$bytes'])
-    expected = 2 if utility == 'sort' else 1
+    expected = 2 if utility in ('sort', 'grep') else 1
     passed = (result['exit_code'] == expected and not stdout and bool(stderr)
               and not result.get('timed_out') and not result.get('signal_name'))
     return {'option': option, 'flag': flag, 'argv': case['args'],
@@ -271,7 +276,8 @@ def main(argv=None):
         language = language_name(args.utility)
         result = {
             'toolchain': invoke('toolchain', {'language': language}),
-            'oracle': invoke('oracle-preflight', {'language': language}),
+            'oracle': invoke('oracle-preflight', {'language': language,
+                                                  'utility': utility_name(args.utility)}),
         }
         print(json.dumps(result, sort_keys=True))
         return 0

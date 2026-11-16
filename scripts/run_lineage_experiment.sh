@@ -373,7 +373,7 @@ fi
 [[ -n "$UTILITY" ]] || die "--utility is required"
 LINUX_BENCHMARK=0
 case "$UTILITY" in
-    c-cp|c-mv|c-mkdir|c-sort|rust-cp|rust-mv|rust-mkdir|rust-sort|py-cp|py-mv|py-mkdir|py-sort)
+    c-cp|c-mv|c-mkdir|c-sort|c-grep|rust-cp|rust-mv|rust-mkdir|rust-sort|rust-grep|py-cp|py-mv|py-mkdir|py-sort|py-grep)
         LINUX_BENCHMARK=1
         SECURITY_EVALUATION=0
         if [[ -z "${LINUX_BENCHMARK_LOCK:-}" ]]; then

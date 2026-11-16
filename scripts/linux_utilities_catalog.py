@@ -1,7 +1,7 @@
 """Canonical identities and shared functional-suite ownership (protocol version 1)."""
 from pathlib import Path
 
-UTILITIES = ('cp', 'mv', 'mkdir', 'sort')
+UTILITIES = ('cp', 'mv', 'mkdir', 'sort', 'grep')
 LANGUAGES = ('c', 'rust', 'py')
 SELECTORS = tuple(f'{language}-{utility}' for language in LANGUAGES for utility in UTILITIES)
 PROTOCOL_VERSION = 1

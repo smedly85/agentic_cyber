@@ -34,7 +34,7 @@ Usage:
 
 Temperature, thinking, seed and context must be supplied explicitly; token cap
 and top-p remain optional (see docs/benchmarks/linux-utilities-vessel.md).
-LANGUAGE is c, rust or py; UTILITY is cp, mv, mkdir or sort (all 12 combinations).
+LANGUAGE is c, rust or py; UTILITY is cp, mv, mkdir, sort or grep (all 15 combinations).
 The editor is pinned by scripts/aider_settings.py (temperature 0, seed 0) and
 uses --editor-edit-format editor-diff.
 EOF
@@ -101,8 +101,8 @@ profile_args=()
 [[ "$DIAGNOSTIC_ROSETTA" == 1 ]] && profile_args+=(--diagnostic-rosetta)
 
 case "$SELECTOR" in
-    c-cp|c-mv|c-mkdir|c-sort|rust-cp|rust-mv|rust-mkdir|rust-sort|py-cp|py-mv|py-mkdir|py-sort) ;;
-    *) die "--selector must be a standardized c/rust/py cp/mv/mkdir/sort configuration" ;;
+    c-cp|c-mv|c-mkdir|c-sort|c-grep|rust-cp|rust-mv|rust-mkdir|rust-sort|rust-grep|py-cp|py-mv|py-mkdir|py-sort|py-grep) ;;
+    *) die "--selector must be a standardized c/rust/py cp/mv/mkdir/sort/grep configuration" ;;
 esac
 [[ "$TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || die "--timeout must be a positive integer (explicit bound required)"
 [[ "$MAX_LOOPS" == 0 || "$MAX_LOOPS" == 1 ]] || die "--max-loops must be 0 or 1 for a smoke test"

@@ -17,12 +17,13 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import subprocess
 import sys
 import tempfile
 
 REPO = Path(__file__).resolve().parents[1]
-SELECTORS = ('c-cp', 'c-mv', 'c-mkdir', 'c-sort')
+SELECTORS = ('c-cp', 'c-mv', 'c-mkdir', 'c-sort', 'c-grep')
 
 
 def read(path):
@@ -38,7 +39,7 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def environment():
+def environment(required_utilities=('cp', 'mv', 'mkdir', 'sort')):
     if platform.system() != 'Linux' or not Path('/.dockerenv').is_file():
         raise RuntimeError('Linux Docker is required; native execution is forbidden')
     if os.geteuid() == 0:
@@ -54,13 +55,38 @@ def environment():
     cc = subprocess.check_output(['gcc', '-dumpfullversion'], text=True).strip()
     if cc != '12.2.0':
         raise RuntimeError('GCC 12.2.0 required, got ' + cc)
+    required_utilities = set(required_utilities)
     versions = {}
-    for utility in ('cp', 'mv', 'mkdir', 'sort'):
+    for utility in ('cp', 'mv', 'mkdir', 'sort', 'grep'):
         binary = '/opt/gnu/bin/' + utility
+        if not Path(binary).is_file():
+            if utility in required_utilities:
+                raise RuntimeError('required pinned oracle unavailable: ' + binary)
+            continue
         line = subprocess.check_output([binary, '--version'], text=True).splitlines()[0]
-        if line != f'{utility} (GNU coreutils) 9.11':
+        expected = ('grep (GNU grep) 3.12' if utility == 'grep'
+                    else f'{utility} (GNU coreutils) 9.11')
+        if line != expected:
             raise RuntimeError('oracle identity mismatch: ' + line)
-        versions[utility] = {'version': line, 'sha256': digest(Path(binary).read_bytes())}
+        binary_sha256 = digest(Path(binary).read_bytes())
+        versions[utility] = {'version': line, 'sha256': binary_sha256}
+        if utility == 'grep':
+            lock_path = REPO / 'docker/grep-oracle/lock-amd64.json'
+            if not lock_path.is_file():
+                raise RuntimeError('GNU grep oracle lock is unavailable')
+            grep_lock = read(lock_path)
+            if grep_lock.get('platform') != 'linux/amd64' or actual != 'x86_64':
+                raise RuntimeError('GNU grep oracle lock/architecture mismatch')
+            if binary_sha256 != grep_lock.get('grep_binary_sha256'):
+                raise RuntimeError('GNU grep oracle binary SHA-256 mismatch')
+            sys.path.insert(0, str(REPO / 'tests'))
+            try:
+                from reference_generators.standard_grep_oracle import verify as verify_grep
+                # Probes fail closed but do not alter the frozen provenance
+                # schema, which already records the observed version and hash.
+                verify_grep(binary)
+            finally:
+                sys.path.pop(0)
     if os.environ.get('LC_ALL') != 'C' or os.environ.get('TZ') != 'UTC':
         raise RuntimeError('LC_ALL=C and TZ=UTC required')
     os.umask(0o022)
@@ -75,7 +101,7 @@ def environment():
 def load_suite(selector):
     suite = REPO / 'tests' / (selector + '-test-suite')
     # Each utility uses an independently inherited engine. Avoid cross-suite
-    # module caching when validating all four in one invocation.
+    # module caching when validating all five in one invocation.
     for name in ('engine', 'props', 'runner', 'config'):
         sys.modules.pop(name, None)
     sys.path.insert(0, str(suite))
@@ -90,7 +116,14 @@ def load_suite(selector):
 def frozen(case, engine, utility):
     c = copy.deepcopy(case)
     c.pop('linux_freeze_pending', None)
-    result = engine.execute(c, ['/opt/gnu/bin/' + utility])
+    diagnostic_subject = c.pop('diagnostic_subject', None)
+    command = ['/opt/gnu/bin/' + utility]
+    if utility == 'grep':
+        implemented = {'-H', '-h', '-r', '-i'} - set(c.get('absent_flags', []))
+        command = [sys.executable,
+                   str(REPO / 'tests/reference_generators/standard_grep_oracle.py'),
+                   '/opt/gnu/bin/grep', ','.join(sorted(implemented))]
+    result = engine.execute(c, command)
     if result.timed_out or result.signal_name == 'SKIP_ROOT':
         raise RuntimeError('oracle timeout or permission precondition failed')
     if result.crashed and result.signal_name not in c.get('allow_signals', []):
@@ -107,6 +140,11 @@ def frozen(case, engine, utility):
         c['stderr_b64'] = base64.b64encode(result.stderr).decode()
     else:
         c['stderr_class'] = 'nonempty' if result.stderr else 'empty'
+    if diagnostic_subject is not None:
+        encoded_subject = diagnostic_subject.encode('utf-8', 'surrogateescape')
+        if encoded_subject not in result.stderr:
+            raise RuntimeError(f'oracle diagnostic omitted subject {diagnostic_subject!r}')
+        c['stderr_regex'] = re.escape(diagnostic_subject)
     if 'output_file' in c:
         c['output_file']['contents_b64'] = base64.b64encode(
             result.outfiles.get(c['output_file']['path'], b'')).decode()
@@ -122,9 +160,38 @@ def freeze(selector, provenance):
     hidden = [frozen(c, engine, selector[2:]) for c in inputs['heldout']]
     metadata = {'benchmark': 'linux-utilities', 'environment': provenance,
                 'input_sha256': digest((suite / 'gen/inputs.json.gz').read_bytes())}
+    # Held-out metadata is part of the frozen corpus contract. Manifest-only
+    # explanatory fields below must not silently change those private bytes.
+    heldout_metadata = dict(metadata)
+    if selector == 'c-grep':
+        lock = read(REPO / 'docker/grep-oracle/lock-amd64.json')
+        metadata.update({
+            'corpus_counts': {'public_definitions': len(public),
+                              'heldout_definitions': len(hidden)},
+            'oracle_contract': {
+                'project': lock['grep_project'], 'version': lock['grep_version'],
+                'source_sha256': lock['grep_source_sha256'],
+                'image': lock['oracle_image'],
+                'lock': 'docker/grep-oracle/lock-amd64.json',
+                'adapter': ('GNU grep -a -F under LC_ALL=C; -i only at checkpoint 004; '
+                            'deterministic byte-sorted pre-order recursion is controller-driven'),
+            },
+            'specification_derived_cases': {
+                'base-no-arguments-at-all': 'bounded argument grammar',
+                'base-rejects-H-before-its-checkpoint': 'checkpoint boundary rejection',
+                'base-rejects-h-before-its-checkpoint': 'checkpoint boundary rejection',
+                'base-rejects-i-before-its-checkpoint': 'checkpoint boundary rejection',
+                'base-rejects-ignore-case-long-before-its-checkpoint': 'checkpoint boundary rejection',
+                'base-rejects-r-before-its-checkpoint': 'checkpoint boundary rejection',
+                'base-rejects-with-filename-long-before-its-checkpoint': 'checkpoint boundary rejection',
+                'base-stdin-dash-is-an-operand-name': "bounded '-' pathname rule differs from GNU stdin semantics",
+                'base-unknown-long-option': 'bounded argument grammar',
+                'base-unknown-short-option': 'bounded argument grammar',
+            },
+        })
     payload = {'suites/linux.json.gz': gzip.compress(encode({'cases': public}), mtime=0),
                'heldout/heldout_cases.json.gz': gzip.compress(encode(
-                   heldout_contract.build(selector, metadata, hidden)), mtime=0)}
+                   heldout_contract.build(selector, heldout_metadata, hidden)), mtime=0)}
     metadata['sha256'] = {name: digest(data) for name, data in payload.items()}
     payload['suites/MANIFEST.json'] = encode(metadata)
     return payload
@@ -230,9 +297,14 @@ def validate(selector, provenance, output):
                 corpus = work / (kind + '.json.gz')
                 corpus.write_bytes(first[name])
                 report_path = work / (kind + '-report.json')
+                oracle_command = ['/opt/gnu/bin/' + selector[2:]]
+                if selector == 'c-grep':
+                    oracle_command = [sys.executable,
+                        str(REPO / 'tests/reference_generators/standard_grep_oracle.py'),
+                        '/opt/gnu/bin/grep', ','.join(config['implemented'])]
                 command = [sys.executable, str(suite / 'runner.py'), str(corpus),
                            '--config', str(config_file), '--jobs', '1', '--json-report', str(report_path),
-                           '--', '/opt/gnu/bin/' + selector[2:]]
+                           '--', *oracle_command]
                 result = subprocess.run(command, capture_output=True, timeout=600)
                 if result.returncode != 0 or not report_path.is_file():
                     if kind == 'public':
@@ -280,7 +352,7 @@ def main(argv=None):
     elif args.action == 'build':
         raise RuntimeError('Formal candidate compilation disabled pending Docker adapter validation')
     else:
-        provenance = environment()
+        provenance = environment(selector[2:] for selector in selectors)
         if args.action == 'verify':
             # Compiler probe is an object-only translation unit, never a utility
             # implementation, seed, executable or lineage artifact.

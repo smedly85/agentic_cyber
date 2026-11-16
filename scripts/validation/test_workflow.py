@@ -356,13 +356,13 @@ class PreflightTests(unittest.TestCase):
             self.assertEqual(invoke.call_args_list[1].args[0][:3], ['docker', 'rm', '-fv'])
 
 
-    def test_all_twelve_selectors_require_independent_entrypoint_evidence(self):
+    def test_all_fifteen_selectors_require_independent_entrypoint_evidence(self):
         import linux_utilities_catalog as catalog
         self.assertEqual(v.DEFAULT_SELECTORS, catalog.SELECTORS)
-        self.assertEqual(len(v.DEFAULT_SELECTORS), 12)
+        self.assertEqual(len(v.DEFAULT_SELECTORS), 15)
         with self.rebuilt_fixture() as (config, lock, args, images, report):
             commands = v.validation_commands(args.vessel_validation.parent, config)
-            self.assertEqual(len(commands), 16)  # oracle, integration, calibration, 12 entrypoints, static
+            self.assertEqual(len(commands), 19)  # oracle, integration, calibration, 15 entrypoints, static
             entries = [cmd for cmd in commands if '--utility' in cmd]
             self.assertEqual([cmd[cmd.index('--utility') + 1] for cmd in entries], list(catalog.SELECTORS))
             original = args.vessel_validation.read_text()

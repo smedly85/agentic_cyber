@@ -1236,7 +1236,7 @@ fi
 ANALYZER_PATH="$REPO/scripts/analyze_experiment.py"
 DOCKER_EXECUTION_JSON=""
 case "$SOURCE_PATH" in
-    src/c_cp/*|src/c_mv/*|src/c_mkdir/*|src/c_sort/*|src/rust_cp/*|src/rust_mv/*|src/rust_mkdir/*|src/rust_sort/*|src/py_cp/*|src/py_mv/*|src/py_mkdir/*|src/py_sort/*)
+    src/c_cp/*|src/c_mv/*|src/c_mkdir/*|src/c_sort/*|src/c_grep/*|src/rust_cp/*|src/rust_mv/*|src/rust_mkdir/*|src/rust_sort/*|src/rust_grep/*|src/py_cp/*|src/py_mv/*|src/py_mkdir/*|src/py_sort/*|src/py_grep/*)
         NO_ANALYSIS=1
         SECURITY_CMD=""
         c_directory="$(basename "$(dirname "$SOURCE_PATH")")"

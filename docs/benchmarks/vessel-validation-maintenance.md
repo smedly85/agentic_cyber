@@ -16,13 +16,13 @@ The checks were audited against pre-cleanup commit
 | --- | --- | --- |
 | `tests/test_docker_benchmark_integration.py` | `vessel_preflight.py` validation and fresh jail; `validate_cross_language.py`; Vessel guide | `test_runtime.py`: C Linux/architecture, UID/GID, finite resource limits, privilege/network/controller-asset isolation, timeout and compiler classification, missing-Docker refusal, all C boundaries and public/held-out negative controls |
 | `tests/test_cross_language_docker.py` | Same callers | `test_runtime.py`: real Rust/Python jail and binary I/O, permissions, symlinks, syntax errors, timeouts, 30 boundary checks, 60 runtime mutation controls, permissive-boundary and missing-Docker rejection |
-| `tests/test_cross_language_static.py` | `vessel_preflight.py`, `validate_cross_language.py`, static validator syntax glob | `test_integrity.py`: all 45 checkpoints, 12 distinct plans, cumulative flags, cross-language prompt/scenario parity, bundle and held-out isolation, historical byte preservation and narrow EOL allowances |
+| `tests/test_cross_language_static.py` | `vessel_preflight.py`, `validate_cross_language.py`, static validator syntax glob | `test_integrity.py`: all 60 checkpoints, 15 distinct plans, cumulative flags, cross-language prompt/scenario parity, bundle and held-out isolation, historical byte preservation and narrow EOL allowances |
 | `tests/test_linux_benchmark_static.py` | `validate_linux_static.py`, static validator syntax glob | `test_integrity.py`: filtered C plans/bundles, manifest identities, boundary contracts, no native fallback, syntax, deliberate held-out leak detection and canonical command enforcement |
 | `tests/test_vessel_preparation.py` | Developer regression suite; its own syntax test named deleted files | `test_workflow.py`: focused image/provenance/environment, capture, approval, freshness, failure/cleanup, Docker endpoint and all-selector evidence regressions, plus dispatch and static-wrapper checks |
 
 The old comparison against duplicate archived regenerated oracle corpora is no
 longer a live dependency: cleanup removed those copies. The replacement verifies
-all 12 canonical public/held-out corpora against retained manifest hashes and
+all 15 canonical public/held-out corpora against retained manifest hashes and
 checks held-out fingerprints. Historical inventory checks remain. The existing
 fresh GNU oracle validation, public/held-out calibration and mutation controls
 remain mandatory when the comprehensive audit is invoked; static hash checks do
@@ -34,8 +34,8 @@ general README examples are not formal validation dependencies.
 
 ## Unchanged audit checks
 
-Comprehensive validation still has 16 command steps: oracle validation, runtime/integrity
-checks, adapter calibration, all 12 checkpoint-000 entrypoints, and containerized
+Comprehensive validation has 19 command steps: oracle validation, runtime/integrity
+checks, adapter calibration, all 15 checkpoint-000 entrypoints, and containerized
 static checks. Existing prerequisite toolchain, judging-input and checkpoint
 checks, required report files, hashes and zero return codes remain mandatory when
 this audit is invoked.

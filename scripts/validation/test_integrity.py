@@ -43,7 +43,7 @@ class LinuxBenchmarkStaticTests(unittest.TestCase):
             private = json.loads(gzip.decompress((suite / 'heldout/heldout_cases.json.gz').read_bytes()))
             self.assertEqual(private['corpus_fingerprint'], heldout_contract.fingerprint(private))
 
-    def test_fifteen_plans_have_cumulative_filtered_bundles(self):
+    def test_twenty_c_checkpoints_have_cumulative_filtered_bundles(self):
         total = 0
         for selector in linux_benchmark.SELECTORS:
             plan = lineage_plan.resolve_plan(ROOT, selector, '', '0', None, 0, 0)
@@ -69,7 +69,7 @@ class LinuxBenchmarkStaticTests(unittest.TestCase):
                             if case.get('check', 'golden') == 'golden':
                                 self.assertIn('stdout_b64', case)
             self.assertFalse((ROOT / plan['source_path']).exists())
-        self.assertEqual(total, 15)
+        self.assertEqual(total, 20)
 
     def test_heldout_inputs_do_not_reach_bundles(self):
         for selector in linux_benchmark.SELECTORS:
@@ -242,7 +242,7 @@ def historical_bytes_match(name, data, expected):
 
 
 class CrossLanguageStatic(unittest.TestCase):
-    def test_all_forty_five_checkpoints_and_shared_scenarios(self):
+    def test_all_sixty_checkpoints_and_shared_scenarios(self):
         total=0; expected={}; plans={}
         for selector in catalog.SELECTORS:
             manifest=json.loads((ROOT/f'experiments/utilities/{selector}.json').read_text())
@@ -268,8 +268,8 @@ class CrossLanguageStatic(unittest.TestCase):
                     self.assertFalse(path.startswith(('gen/','heldout/','model/')))
             leaks,_,_=check_heldout_isolation.scan_utility(ROOT,selector)
             self.assertFalse(leaks,selector)
-        self.assertEqual(total,45)
-        self.assertEqual(len(set(plans.values())),12)
+        self.assertEqual(total,60)
+        self.assertEqual(len(set(plans.values())),15)
 
 
     def test_historical_language_experiments_preserved(self):
@@ -307,7 +307,9 @@ class CrossLanguageStatic(unittest.TestCase):
                          'AMD64 naming audit; ARM64 needs its own oracle validation')
     def test_corpus_bytes_unchanged_by_rename(self):
         initial=json.loads((ROOT/'docs/benchmarks/cross-language-validation/initial-hashes.json').read_text())
-        for utility in catalog.UTILITIES:
+        # This audit is specifically the historical four-utility rename. grep
+        # is a new corpus and has no pre-rename byte identity to compare.
+        for utility in ('cp', 'mv', 'mkdir', 'sort'):
             for path in ('suites/linux-v1.json.gz','heldout/heldout_cases.json.gz'):
                 old=f'tests/c-{utility}-test-suite/{path}'
                 current=old.replace('linux-v1.json.gz','linux.json.gz')

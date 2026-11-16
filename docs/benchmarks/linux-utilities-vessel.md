@@ -119,7 +119,7 @@ non-generative runtime diagnostic using the same lock and finite profile:
 ```bash
 python3 -B scripts/run_vessel_validation_tests.py --suite runtime
 python3 -B scripts/validate_docker_adapter.py --output "$V/calibration-only"
-for s in c-cp c-mv c-mkdir c-sort rust-cp rust-mv rust-mkdir rust-sort py-cp py-mv py-mkdir py-sort; do
+for s in c-cp c-mv c-mkdir c-sort c-grep rust-cp rust-mv rust-mkdir rust-sort rust-grep py-cp py-mv py-mkdir py-sort py-grep; do
   python3 -B scripts/validate_docker_entrypoints.py --utility "$s" --output "$V/entry-only-$s"
 done
 ```
@@ -153,7 +153,7 @@ Docker all run locally, so no tunnel and no remote endpoint are involved.
 | Reused unchanged | `lineage_plan.py`, `stage_test_bundle.py`, `run_experiment.sh`, `heldout_judge.py` (via the manifest `extra_test_command`), `checkpoint_boundary_gate.py`, `docker_benchmark.py` |
 
 The smoke wrapper's `run_experiment.sh` arguments are identical to the stage-000
-line from `run_lineage_experiment.sh --dry-run` (checked on WSL for all twelve
+line from `run_lineage_experiment.sh --dry-run` (checked on WSL for all fifteen
 selectors). Diagnostic differences: `--max-loops` is capped at 1, the output directory must
 be new and outside the repository, and observed model provenance is forwarded
 after preflight. The print-only plan has no observed model provenance yet.
@@ -162,9 +162,9 @@ Supported selectors (each smoke invocation runs checkpoint `000` only):
 
 | Language | Selectors |
 |---|---|
-| C | `c-cp`, `c-mv`, `c-mkdir`, `c-sort` |
-| Rust | `rust-cp`, `rust-mv`, `rust-mkdir`, `rust-sort` |
-| Python | `py-cp`, `py-mv`, `py-mkdir`, `py-sort` |
+| C | `c-cp`, `c-mv`, `c-mkdir`, `c-sort`, `c-grep` |
+| Rust | `rust-cp`, `rust-mv`, `rust-mkdir`, `rust-sort`, `rust-grep` |
+| Python | `py-cp`, `py-mv`, `py-mkdir`, `py-sort`, `py-grep` |
 
 Every smoke starts with `source-mode=new`, no inherited flags or seed, and its
 canonical language-specific source, build command, executable, prompt and public
@@ -257,7 +257,7 @@ Use this explicit mode for existing vessel-built images. It makes no claim of
 Windows byte identity or historical timing equivalence. Mode A remains the
 default and retains its original authentication requirements. Both modes use
 `LINUX_BENCHMARK_LOCK` and Docker-only compilation/execution, with the existing
-12 configurations, 45 checkpoints, limits and public/held-out separation.
+15 configurations, 60 checkpoints, limits and public/held-out separation.
 
 Prerequisites: a clean reviewed checkout, Python 3.10+ on PATH, Bash, GNU
 timeout/gtimeout, Docker with platform-aware image inspection and Buildx, and
@@ -301,7 +301,7 @@ git status --short
 git rev-parse HEAD
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHON_BIN="$(command -v python3)"
-SELECTORS=(c-cp c-mv c-mkdir c-sort rust-cp rust-mv rust-mkdir rust-sort py-cp py-mv py-mkdir py-sort)
+SELECTORS=(c-cp c-mv c-mkdir c-sort c-grep rust-cp rust-mv rust-mkdir rust-sort rust-grep py-cp py-mv py-mkdir py-sort py-grep)
 V="$(mktemp -d "$HOME/linux-utilities-vessel.XXXXXX")"
 mkdir "$V/tmp"
 export TMPDIR="$V/tmp"
@@ -346,8 +346,8 @@ python3 -B scripts/vessel_preflight.py --image-mode vessel-built \
   --validate-vessel-built "$V/validation" 2>&1 | tee "$V/validation-console.log"
 ```
 
-Validation runs all four trusted GNU oracles, real Docker C/Rust/Python isolation
-and boundary controls, calibration for all twelve selectors against public and
+Validation runs all five trusted GNU oracles, real Docker C/Rust/Python isolation
+and boundary controls, calibration for all fifteen selectors against public and
 held-out expectations, twelve checkpoint-000 entrypoint controls and static
 contract checks. It invokes no Aider or Ollama. A failed step stops validation
 and is an infrastructure/environment failure, never a generated-candidate result.
@@ -359,7 +359,7 @@ The independent workflow now has **16 stages instead of 7**: trusted oracle,
 integration/static test module run, all-selector calibration, twelve separate
 entrypoint validators, and final static checks. The nine added entrypoint stages
 each require summary/public/held-out reports. Toolchain, judging-input and
-checkpoint-000 prerequisite checks also cover all twelve selectors. Earlier
+checkpoint-000 prerequisite checks also cover all fifteen selectors. Earlier
 cp-only evidence is insufficient for a comprehensive all-selector audit, even if
 still within 24 hours; recapture after updating the clean checkout and revalidate
 in a new directory. An optional approval must cover that new evidence. `--selector`
@@ -516,7 +516,7 @@ set -euo pipefail
 export PYTHONDONTWRITEBYTECODE=1
 V="$HOME/linux-utilities-smoke/docker-validation-$(date -u +%Y%m%dT%H%M%SZ)"; mkdir -p "$V"
 python3 -B scripts/run_vessel_validation_tests.py --suite runtime 2>&1 | tee "$V/unittest.log"
-SELECTORS=(c-cp c-mv c-mkdir c-sort rust-cp rust-mv rust-mkdir rust-sort py-cp py-mv py-mkdir py-sort)
+SELECTORS=(c-cp c-mv c-mkdir c-sort c-grep rust-cp rust-mv rust-mkdir rust-sort rust-grep py-cp py-mv py-mkdir py-sort py-grep)
 python3 scripts/validate_docker_adapter.py --output "$V/calibration"
 for s in "${SELECTORS[@]}"; do
   python3 scripts/validate_docker_entrypoints.py --utility "$s" --output "$V/entry-$s" || exit $?
@@ -556,7 +556,7 @@ and included in the final plan fingerprint. It then:
 export PYTHON_BIN="$(command -v python3)"
 SAMPLING=(--temperature 1.0 --architect-think low --sampling-seed 42 --num-ctx 65536 --max-tokens 65536)  # explicit diagnostic selection; not historical equivalence
 mkdir -p "$HOME/linux-utilities-smoke"
-SELECTORS=(c-cp c-mv c-mkdir c-sort rust-cp rust-mv rust-mkdir rust-sort py-cp py-mv py-mkdir py-sort)
+SELECTORS=(c-cp c-mv c-mkdir c-sort c-grep rust-cp rust-mv rust-mkdir rust-sort rust-grep py-cp py-mv py-mkdir py-sort py-grep)
 for s in "${SELECTORS[@]}"; do
   bash scripts/vessel_smoke_stage.sh --selector "$s" --timeout 1800 --max-loops 1 "${SAMPLING[@]}" \
     --ollama-url http://127.0.0.1:11434 \

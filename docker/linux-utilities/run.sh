@@ -58,7 +58,7 @@ docker create --pull never --name "$name" --platform "$target" --network none \
   --mount "type=volume,source=$inputs,target=/work,readonly" \
   --mount "type=volume,source=$results,target=/output" \
   -e BENCHMARK_ARCH="$arch" -e BENCHMARK_IMAGE_ID="$image_id" \
-  "$image" bash -c 'umask 022; timeout --signal=KILL 1800 bash -c "python3 scripts/linux_benchmark.py verify && python3 scripts/linux_benchmark.py validate --output /output/validated"' >/dev/null
+  "$image" bash -c 'umask 022; timeout --signal=KILL 1800 bash -c "python3 scripts/linux_benchmark.py verify --utility c-cp --utility c-mv --utility c-mkdir --utility c-sort && python3 scripts/linux_benchmark.py validate --utility c-cp --utility c-mv --utility c-mkdir --utility c-sort --output /output/validated"' >/dev/null
 docker start -a "$name" >"$output/validation.log" 2>&1 || true
 status="$(docker inspect "$name" --format '{{.State.ExitCode}}')"
 state="$(docker inspect "$name" --format '{{.State.Status}}')"

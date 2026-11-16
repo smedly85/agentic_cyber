@@ -128,7 +128,7 @@ int main(void) {
 
     def test_checkpoint_boundaries(self):
         for selector in (s for s in docker.SELECTORS if s.startswith('c-')):
-            status = 2 if selector == 'c-sort' else 1
+            status = 2 if selector in ('c-sort', 'c-grep') else 1
             binary = self.compile('#include <stdio.h>\nint main(void) { fputs("unknown option\\n",stderr); return '+str(status)+'; }\n')
             manifest = gate.load_manifest(ROOT, selector)
             for checkpoint in manifest['checkpoints']:
@@ -203,32 +203,41 @@ data=sys.stdin.buffer.read(); pathlib.Path('out').write_bytes(data); os.symlink(
             result=docker.execute_case(language+'-cp',binary.read_bytes(),{'args':[],'timeout':1})['result']
             self.assertTrue(result['timed_out'])
 
-    def test_all_thirty_language_checkpoint_boundaries(self):
+    def test_all_forty_language_checkpoint_boundaries(self):
         for language in ('rust','py'):
-            for utility in ('cp','mv','mkdir','sort'):
-                status=2 if utility=='sort' else 1
+            for utility in ('cp','mv','mkdir','sort','grep'):
+                status=2 if utility in ('sort','grep') else 1
                 text=('fn main(){eprintln!("unknown option");std::process::exit('+str(status)+');}' if language=='rust'
                       else 'import sys\nsys.stderr.write("unknown option\\n")\nsys.exit('+str(status)+')\n')
                 binary=self.build(language,text); selector=language+'-'+utility
                 for checkpoint in gate.load_manifest(ROOT,selector)['checkpoints']:
                     self.assertTrue(gate.evaluate(ROOT,selector,checkpoint['id'],binary)['passed'],(selector,checkpoint['id']))
 
-    def test_sixty_runtime_mutation_controls(self):
+    def test_eighty_runtime_mutation_controls(self):
         for language in ('rust','py'):
             binary=self.build(language,'fn main(){}' if language=='rust' else 'pass\n')
-            for utility in ('cp','mv','mkdir','sort'):
+            for utility in ('cp','mv','mkdir','sort','grep'):
                 selector=language+'-'+utility
                 suite=docker.suite_root(ROOT,selector)
                 manifest=gate.load_manifest(ROOT,selector)
                 for hidden in (False,True):
                     corpus=json.loads(gzip.decompress((suite/('heldout/heldout_cases.json.gz' if hidden else 'suites/linux.json.gz')).read_bytes()))['cases']
                     for checkpoint in manifest['checkpoints']:
-                        case=dict(next(c for c in corpus if not c.get('flags') and c.get('check','golden')=='golden'))
+                        eligible=(c for c in corpus if not c.get('flags') and c.get('check','golden')=='golden')
+                        # A no-op control must otherwise satisfy the selected
+                        # expectation so the deliberately changed exit status
+                        # is the single detected mutation. Grep's first base
+                        # case has matching output; use a normal no-match case.
+                        case=dict(next(c for c in eligible if utility != 'grep' or
+                                       (c.get('exit_code') == 1 and not c.get('stdout_b64'))))
                         case['exit_code']=73
                         with contextlib.redirect_stdout(io.StringIO()):
                             verdict=docker.judge(selector,binary,checkpoint['implemented_flags'],hidden=hidden,cases_override=[case])
                         self.assertEqual(verdict['status'],1,(selector,checkpoint['id'],hidden))
-                        self.assertEqual(verdict['report']['counts'].get('FAIL'),1)
+                        expected_failures = (2 if utility == 'grep' and 'stdin_b64' in case and
+                                             case.get('stdin_modes') is None else 1)
+                        self.assertEqual(verdict['report']['counts'].get('FAIL'),expected_failures,
+                                         (selector,checkpoint['id'],hidden,case.get('name')))
 
     def test_permissive_boundaries_and_missing_docker_fail_closed(self):
         for language in ('rust','py'):
