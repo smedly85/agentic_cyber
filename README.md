@@ -1,1184 +1,253 @@
-# Agentic Cyber
+# Agentic code diversification
 
-An experimental repository for studying how LLM-generated software evolves
-across maintenance checkpoints. Each checkpoint preserves the prompt, baseline
-repository state, generated candidates, validation results, and metadata needed
-to reproduce and compare independent repository histories.
+A configurable, plugin-based orchestrator for LLM code generation and
+diversification experiments. It has two modes (full diagram with every component and
+config key: [`docs/pipeline.svg`](docs/pipeline.svg)):
 
-The active [Linux utility benchmark](docs/benchmarks/linux-utilities.md) defines
-cp, mv, mkdir, sort and grep in C, Rust and Python: 15 configurations and 60
-checkpoints. The [grep validation addendum](docs/benchmarks/linux-utilities-grep-addendum.md)
-records its separate GNU grep oracle, Docker evidence and remaining Vessel work.
-Run `make test` from WSL/Linux with Docker and the pinned benchmark images
-available for bounded static and Docker integration checks, including the four
-restored regression modules. Logs go to a fresh directory under `/tmp`; no
-formal development traces are started. Candidate compilation and execution stay
-in Docker.
+- **`python -m src depth`** takes a C or Rust program and selects functions by their call-graph
+  depth from `main`. SVF provides the C call graph; RUPTA or the MIR graph provides the
+  Rust one. For each selected function, a mini-swe-agent session rewrites it as an
+  equivalent but different implementation. The signature must stay exactly the same,
+  and the visible tests must still pass. A failed attempt gets controller-driven
+  repair attempts.
+- **`python -m src lineage`** regenerates a coreutils utility checkpoint by checkpoint
+  (000 → 001 → … → final), each stage seeded with the previous stage's accepted source.
+  It drives the lineage harness (`src/harness/run_lineage_experiment.sh` →
+  `src/harness/run_experiment.sh`), and the pipeline supplies the code generator: either the host's
+  Aider or mini-swe-agent in a Docker container with any topology.
 
-Files outside `prompts/linux-utilities/{c,rust,py}-*`, the corresponding
-`experiments/utilities/{c,rust,py}-*.json` manifests and `tests/{c,rust,py}-*-test-suite`
-may belong to older experiments; consult the active benchmark matrix before use.
-Historical C chmod, grep, mkdir and sort manifests, checkpoint prompts and
-judging inputs remain available to reproduce the retained correctness and
-diversity claims. Their generators also support frozen-corpus self-checks, and
-the mkdir/sort models feed historical differential-fuzz checks. These are distinct
-from the standardized benchmark; the Darwin-frozen inputs are not Linux ground
-truth. Historical Rust cp/mv and Python configurations are likewise retained;
-see [Python setup, checks and diagnostic commands](docs/python_lineages.md).
-The primary paper analysis separates RQ1 correctness and
-lineage completion, RQ2 implementation diversity and maintenance variation,
-and RQ3 security. No composite score combines them.
-[The canonical A/S methodology](docs/diversity_methodology.md) describes the
-compiler-grounded, order-aware implementation and links the final pairwise,
-population and longitudinal evidence. Reliability and maintenance outputs of
-the older analyzer are documented in the
-[experiment analysis reference](docs/experiment_analysis_reference.md).
-The existing behavioral-consistency tool is retained as an
-optional post-hoc diagnostic and documented separately in
-`docs/execution_consistency_methodology.md`.
+Every decision and assumption is listed in [docs/DECISIONS.md](docs/DECISIONS.md).
 
-## Independent functional and security evaluation
+## Repository layout
 
-For research review, use these entry points:
-
-| Area | Entry point |
-| --- | --- |
-| Active benchmark, Docker execution and validation | [Linux utilities](docs/benchmarks/linux-utilities.md) |
-| Final diversity algorithms and methodology | [Canonical A/S methodology](docs/diversity_methodology.md) |
-| The 140 historical C observations and trajectories | [Checkpoint diversity](docs/checkpoint_diversity_trajectories.md) |
-| Historical C CVE evidence and reported depth limitations | [V2 evidence](security/historical/evidence/v2/README.md) |
-| Historical Rust analysis | [Rust method guide](security/historical/rust/SEMANTIC_README.md) |
-
-`runs/formal/` retains candidate sources, exact checkpoint inputs and evaluation
-records used by those analyses. Exploratory artifacts are not additional final
-results; follow the methodology links above to identify the reported datasets.
-The 150 per-attempt Aider pricing/context caches contained only two distinct
-payloads. One of each remains at its original
-`lineage-001/000/temp-1p0/attempt-001/aider-home/.aider/caches/model_prices_and_context_window.json` path under the
-`chmod-qwen38-t1-seed42-low-ctx64k-max64k-n10` and
-`grep-qwen38-t1-seed42-low-ctx64k-max64k-n10` formal runs. The other 148
-byte-identical copies were removed; measurement code does not consume these caches.
-Vendored historical sources omit rebuildable translation binaries; see the
-[source preservation note](security/historical/README.md).
-The four public `final-oracle/validated/c-*/suites/linux.json.gz` payloads under
-`docs/benchmarks/cross-language-validation/` were exact copies of
-`tests/c-*-test-suite/suites/linux.json.gz` and have been removed. Use those
-canonical suites when inspecting the retained validation records and manifests;
-the separate `rename-oracle` evidence used by regression checks remains intact.
-
-The Rust cp/mv experiments have no seed source: checkpoint 000 creates one Rust
-file from scratch; later checkpoints inherit only their own lineage's preceding
-candidate. Their GNU Coreutils 9.11 functional oracle is deliberately separate
-from the uutils/coreutils historical Rust vulnerability source. Rust
-functional evaluation is supported; the C scientific/security backends are not
-Rust backends. See [Rust lineage contracts and limitations](docs/rust_lineages.md).
-
-The sole active historical Rust CVE depth analysis is
-[`rust-only-lightweight-v1`](security/historical/rust/results/rust-only-lightweight-v1/HISTORICAL_RUST_RESULTS.md).
-Its compiler-resolved MIR retained-call graph leaves unresolved indirect calls
-explicit and uses BFS for vulnerability depths and maximum finite shortest depths.
-It uses no points-to solver and makes no direct C/Rust comparability claim.
-See the [current historical Rust method guide](security/historical/rust/SEMANTIC_README.md)
-for results, validation and reproducibility. The prior historical inclusion-solver
-approach is abandoned and is no longer an active pipeline.
-
-Every new candidate has two independent dimensions:
-
-```text
-Functional validation:
-Does the implementation satisfy the utility specification?
-
-Security evaluation:
-Can adversarial inputs cause unsafe behavior despite functional correctness?
+```
+src/                  all source code (python -m src)
+  depth/ lineage/     the two modes
+  harness/            lineage pipeline: run_lineage_experiment.sh -> run_experiment.sh per
+                      checkpoint, Docker build/judge, held-out judge, test bundles,
+                      security evaluator, analysis
+  analyzers/          call-graph code run inside the images (SVF helper, MIR driver, RUPTA adapter)
+  incontainer/        agent-test, agent-build, agent sessions, LLM cache (run inside containers)
+  prompts/            agent prompts (depth mode; lineage/ for lineage mode)
+coreutils/            the benchmark: cp, mv, mkdir, sort, grep in C, Rust and Python
+  <utility>/
+    manifests/        c.json rust.json py.json   (checkpoint ladder, build/judge commands)
+    prompts/          c/ rust/ py/               (000_base.md, 001_<feature>.md, ...)
+    tests/            shared functional suite: runner, frozen visible suites, held-out corpus
+    judges/           c.sh rust.sh py.sh         (checkpoint judge given to the agent)
+  shared/             automation notice and repair-continuation template used by every prompt
+  docs/               benchmark description, contract, manifest schema
+  images.lock.json    pinned IDs of the benchmark images
+docker/Dockerfile     every image, one stage each (agent-c, agent-rust, oracle, rust-jail)
+docs/                 pipeline.svg, DECISIONS.md, methodology/
+tests/                tests for src/ (pytest)
+config.toml .env.example
 ```
 
-Generation is followed by visible tests and eligible repair, then by the
-controller-only held-out functional judge. That result finalizes
-`overall_success`. Only afterward does `security/run_security_evaluator.py`
-build the source with AddressSanitizer and UndefinedBehaviorSanitizer and run a
-bounded, deterministic, utility-specific adversarial campaign. Security output
-is never shown to the LLM, never starts repair, never changes candidate
-promotion, and never changes `overall_success`. In particular,
-`overall_success=true` and `security_clean=false` is a valid and important
-observation.
+A selector is `<language>-<utility>` (`c-sort`, `rust-grep`, `py-mkdir`, ...);
+`src/harness/linux_utilities_catalog.py` maps it to the files above.
 
-Each evaluated attempt receives `security_results.json` and, for findings,
-reproduction evidence under `security_artifacts/`. Missing results in older
-runs mean `security_evaluation_completed=false`; they are never counted as
-clean. `security_clean=true` means only that no security finding was discovered
-within the bounded evaluation. It does not prove that the implementation is
-secure.
-
-The lineage runner enables the stage by default. Its smoke defaults are 10
-seconds, 100 inputs, a two-second per-input timeout, and seed 1. Adjust them
-with `--security-fuzz-seconds`, `--security-max-inputs`, `--security-timeout`,
-and `--security-seed`; use larger recorded budgets for formal evaluation.
-Coverage-guided libFuzzer and CodeQL are optional future enhancements: the
-portable baseline uses the repository's existing adversarial-generation and C
-parser approach and records `fuzz_coverage: null` rather than inventing a
-coverage measurement.
-
-For example, a longer (still bounded) formal configuration can use:
+## Setup
 
 ```bash
-scripts/run_lineage_experiment.sh ... \
-  --security-fuzz-seconds 300 --security-max-inputs 10000 \
-  --security-timeout 5 --security-seed 1
+docker build -f docker/Dockerfile --target agent-c -t agent-c src
+docker build -f docker/Dockerfile --target agent-rust -t agent-rust src
+cp .env.example .env            # then set AGENT_WORKER_MODEL etc.
+python3 -m venv .venv && .venv/bin/pip install pytest   # only for the pipeline's own tests
 ```
 
-Validate the evaluator itself independently with:
+The host needs Python 3.11 or newer and Docker. Nothing else is installed on the host.
+
+## Run
 
 ```bash
-python3 security/calibration/run_calibration.py \
-  --output build/security-calibration
+# Inspect the call graph and selection without running any agent
+python3 -m src depth --input path/to/prog.c --dry-run
+python3 -m src depth --input path/to/crate --depth 2 --depth-rule eq --dry-run
+
+# Full run (suites can also be set in config.toml)
+python3 -m src depth --input path/to/prog --depth 2 \
+    --visible-suite path/to/visible --hidden-suite path/to/hidden
 ```
 
-## Call-graph reachability and diversification priority
+The pipeline reads `config.toml` from the repo root (or `--config`). CLI flags override it, and
+`--print-config` shows the resolved configuration. Models come from `.env`:
 
-New security results also carry descriptive function-level reachability. The
-measurement is the shortest static call-graph distance from `main`; it is not
-AST nesting depth. Lower-depth functions receive earlier deterministic
-*diversification priority*, with function identity breaking ties. This is a
-heuristic to test, not a claim that shallow functions are inherently vulnerable.
-The metadata has no effect on `overall_success`, `security_clean`, repair, or
-promotion.
-
-Direct calls and unambiguous callbacks for known APIs are typed separately;
-`qsort(..., callback)` is currently supported. Entry points remain visible at
-depth zero but are excluded from diversification selection and percentage
-denominators by default. Use `--include-entry-points` for sensitivity analysis.
-
-Two universes are therefore kept explicit. The **security-depth measurement
-universe** is every statically reachable function with a numeric raw call
-depth, including configured entry points. The **diversification-priority
-universe** is the same resolved reachable universe with configured entry
-points excluded by default. The latter preserves the existing selection-helper
-semantics; the former prevents descriptive security analysis from silently
-discarding depth-zero code.
-
-Reusable helpers select `SHALLOW`, deterministic-seeded `RANDOM`, and `DEEP`
-controls at an equal function-count budget, while also reporting the differing
-line and node costs. Equal function count is not equal cost. They prepare a
-later diversification study; they do not invoke an LLM or alter candidates.
-Inspect a source directly with:
-
-```bash
-python3 security/analyze_reachability.py \
-  --source src/new_sort/new_sort.c --k 3 --seed 1
-```
-
-### Blind generated structural census
-
-`security/generated_candidate_population.json` freezes the generated-candidate
-population independently of the directories present on a particular machine.
-It was derived from the four explicitly named checked-in formal lineage roots
-using the existing RQ2/RQ3 population rules: every successful checkpoint is a
-checkpoint-population member, checkpoint 000 is valid, a later failure does
-not erase an earlier success, and the final-population flag uses the existing
-end-to-end functional-success rule. Each stable candidate identity includes a
-repository-relative source path and SHA-256. Extra local runs cannot enter the
-census; missing or hash-mismatched frozen candidates remain in its denominator
-and are reported as unavailable.
-
-The census measures structure before security outcomes are joined. It neither
-reads security findings nor uses historical depths to choose a budget. In
-particular, the historical resolved depths 0, 1, and 3 do not define a
-`depth <= 3` shallow threshold. Structural depth is descriptive exposure, not
-vulnerability probability, and no primary top-k or percentage is frozen here.
-
-Tree-sitter is required for formal results. WSL is supported for development
-and smoke checks; Vessel is the designated formal host. Candidate and
-structural SHA-256 fingerprints exclude environment metadata, while Python,
-OS, parser method, call-graph schema, repository revision, and host role are
-written separately. Run the same frozen population with:
-
-```bash
-# WSL development/smoke census
-python3 security/generated_structural_census.py census \
-  --manifest security/generated_candidate_population.json \
-  --output-dir build/generated-structural-census-wsl \
-  --host-role wsl
-
-# Vessel formal census (fails closed unless every candidate uses Tree-sitter)
-python3 security/generated_structural_census.py census \
-  --manifest security/generated_candidate_population.json \
-  --output-dir build/generated-structural-census-vessel \
-  --host-role vessel --formal
-
-# Cross-host scientific comparison; environment differences are separate
-python3 security/generated_structural_census.py compare \
-  --left-dir build/generated-structural-census-wsl \
-  --right-dir build/generated-structural-census-vessel \
-  --output build/generated-structural-census-comparison.json
-```
-
-The separate `security/historical/` area contains empty validated record and
-source-manifest schemas for manual mappings from authoritative GNU
-Coreutils/GNU grep sources. Each record is checked against its exact project,
-affected version, source revision, local tree, and C/C-header fingerprint. The
-source manifest also supplies the exact source-qualified entry point and C-file
-scope for each utility at that revision. HVC is computed from per-utility,
-per-version selections before aggregation; a graph is never shared across
-different versions or utilities. Missing, mismatched, ambiguous, and
-unreachable states remain explicit. Historical metadata never enters lineage
-results, and the metric describes coverage of known historical locations—not
-future prevention.
-
-## The experimental unit is a development trace
-
-A **development trace** is one complete sequential walk through every checkpoint
-of a single utility. Existing scripts, flags, directories and stored JSON use
-`lineage` for compatibility, so a `lineage-*` record is one development trace:
-
-```text
-000_base -> 001 -> 002 -> ... -> final candidate
-```
-
-* checkpoint 000 is generated **from scratch**, independently, per lineage
-* every later checkpoint inherits **only the source produced by the previous
-  checkpoint of that same lineage** — never a candidate from another lineage
-* every stage starts a **fresh LLM session**; the seed file is the only
-  implementation state that crosses a stage boundary
-* controller-driven **repair sessions may occur within a stage**, bounded by
-  `--max-loops`
-* a stage that still fails after its allowed repairs **stops that lineage**; a
-  broken implementation is never fed into the next feature. The lineage is
-  retained with its stopping point and reason recorded
-
-The experiment then repeats that whole lineage `N` times independently. `N` is a
-command-line value (`--lineages`), not a constant in the code.
-
-The analyzer reports two reliability concepts and never conflates them:
-
-* **public checkpoint completion** means every public checkpoint passed and the
-  candidate was available for promotion; it alone controls lineage progression
-* **end-to-end functional success** additionally requires the final
-  checkpoint's held-out evaluation to have completed and passed
-* **final diversity** compares only end-to-end functionally successful finals
-
-Held-out failure at an intermediate checkpoint never blocks the next public
-checkpoint and is never included in repair feedback. A missing or unavailable
-final held-out verdict is reported as unknown, not as a pass or model failure.
-
-A stopped lineage is never replaced with another attempt to round out the number
-of finished implementations.
-
-### Materialized populations are valid input to every downstream tool
-
-Diversity is not reimplemented at the lineage level. For each population
-`analyze_lineages.py` materializes a *view* — a directory in exactly the layout
-`scripts/analyze_experiment.py` already consumes — and runs that analyzer on it,
-so the metric definitions and thresholds are unchanged.
-
-A view must be a valid input to every downstream analysis, not only to the
-diversity analyzer it was first written for. Alongside the baseline and one
-attempt per member, `materialize_view` therefore carries the checkpoint's
-`feature_test_command` and `build_command` into the view's `experiment.json`.
-Those are what `scripts/measure_execution_consistency.py` reads to recover the
-checkpoint's cumulative flag scope and to rebuild each candidate; a view without
-them crashes the tool on a population it is documented to accept. Both are
-recorded per checkpoint, and every member of a population is the same checkpoint
-under the same condition, so each has exactly one value — verified rather than
-assumed, and a population whose members disagree is refused rather than
-described with a configuration it does not have.
-
-The view's baseline is the empty translation unit, because lineages share no
-seed and no member's source is a meaningful predecessor of another's. That keeps
-clustering, family, Vendi, discovery, repetition and pairwise-distance metrics
-valid, and makes every churn metric a whole-program measure rather than a
-maintenance step. Those churn metrics are named individually in the view's
-`baseline_dependent_metrics_unsupported`, and are answered properly by the
-per-stage and total-lineage change tables instead.
-
-## Selected feature surfaces
-
-**BusyBox determines which flags are in scope.** These sequences are the
-selected experimental feature surface; the experiments do **not** reproduce the
-BusyBox implementations, and checkpoints are not added merely because GNU
-Coreutils or another implementation supports a flag.
-
-| Utility | Checkpoint sequence |
+| Variable | Used by |
 |---|---|
-| `mkdir` | `000` → `-p` → `-m` |
-| `sort`  | `000` → `-r` → `-f` → `-u` → `-c` |
-| `grep`  | `000` → `-H` → `-h` → `-r` → `-i` |
-| `chmod` | `000` → `-R` → `-c` → `-v` → `-f` |
-| `cp` (Rust) | `000` → `-f` → `-i` → `-r` |
-| `mv` (Rust) | `000` → `-i` → `-f` |
+| `AGENT_WORKER_MODEL` | every topology |
+| `AGENT_PLANNER_MODEL` | `topology = "planner_worker"` |
+| `AGENT_ORCHESTRATOR_MODEL` | `topology = "orchestrator"` |
+| `AGENT_ARCHITECT_MODEL`, `AGENT_EDITOR_MODEL` | `python -m src lineage` with `generator = "aider"` |
+| `AGENT_<ROLE>_API_BASE`, `AGENT_<ROLE>_API_KEY` | per-role endpoint; falls back to `AGENT_API_BASE` / `AGENT_API_KEY` |
 
-Each ladder is declared in `experiments/utilities/<name>.json` and nowhere else;
-the table above is that file's `checkpoints[].implemented_flags`, which is
-**cumulative** — checkpoint 002 of `sort` declares `-r -f`, not `-f`.
+Model names use LiteLLM syntax, for example `ollama_chat/qwen3.6:35b` or `openai/<model>`.
 
-`grep` and `chmod` have **no committed baseline source**: checkpoint 000 must
-make the agent create `src/new_grep/new_grep.c` and `src/new_chmod/new_chmod.c`
-from scratch.
+## Parallelism
 
-Two suites carry a platform contract, because their expected results were frozen
-by running a real system binary: `sort` and `mkdir` require Darwin
-(`tests/<utility>-test-suite/config.json`, `required_platform`). `grep`
-and `chmod` declare none — their goldens come from specification models written
-for this project.
+`-j N` (`depth.parallel`, `lineage.parallel`) runs N agent sessions at once. Your model
+server limits how many run at the same time: Ollama serves `OLLAMA_NUM_PARALLEL` requests
+at once and queues the rest.
 
-## Installation
+- **depth, independent:** up to N functions at once, each against the original program.
+- **depth, cumulative:** functions run in waves of N, all against the same snapshot of
+  the evolving program. Accepted candidates are then merged in selection order:
+  - The first candidate in a wave is applied directly.
+  - Each later candidate is re-located and re-verified in the merged program (splice,
+    signature and addition checks, build, visible suite), then its hidden suite runs on
+    the merged result.
+  - A candidate that does not merge gets one fresh diversification against the merged
+    program; its folder ends in `-rebase`.
+  - With `-j 1` this is exactly the serial algorithm.
+- **lineage:** one `run_lineage_experiment.sh` process per lineage, N at once, writing into
+  the same output directory. Each process starts only after the previous one has written
+  the shared `lineages.json`. Per-lineage logs are in `<output-dir>/pipeline/logs/`.
 
-Run experiments from the repository root.
+## Caching and replay
 
-### Python
+Everything goes in `[cache] dir` (`runs/cache`), shared by both modes.
 
-The pinned analyzer dependencies need Python 3.11 or newer; `tree-sitter`
-0.26 has no wheels for older interpreters, and on 3.9 it fails at import with
-`Incompatible Language version`. Create the virtual environment with an
-explicit interpreter rather than a bare `python3`, which on macOS is still the
-system 3.9:
+- **Step cache** (depth mode): call graphs, locate results and every evaluation (baseline,
+  verification, hidden suite, final checks). Entries are keyed by the image ID, a content
+  hash of the program and suite, the step's inputs, and a hash of the pipeline's own code. Re-running
+  with an unchanged pipeline costs almost nothing, and editing the pipeline invalidates these
+  entries. In lineage mode the build and judge belong to the harness, which resumes
+  completed stages on their own.
+- **LLM cache** (both modes): every model response, including format errors, is stored per
+  agent session. The session scope does not depend on the output directory, so a run can
+  be replayed into a fresh one.
+
+| `cache.llm` | Behaviour |
+|---|---|
+| `record` (default) | always call the model and store the response |
+| `auto` | reuse a matching response, otherwise call the model and store |
+| `replay` | never call the model: sessions run offline (`--network none`), and a miss stops the agent with `CacheMiss` |
+
+`cache.match` selects how `auto`/`replay` find a response:
+- **`exact`** keys on the whole conversation plus model and sampling settings.
+- **`sequence`** keys on the call index, so recorded actions are replayed even when tool
+  outputs differ.
+
+Use `sequence` to test pipeline changes without an LLM:
 
 ```bash
-python3.14 -m venv ac_venv
-ac_venv/bin/python -m pip install --upgrade pip
-ac_venv/bin/python -m pip install -r scripts/analysis-requirements.txt
+python3 -m src depth --input prog.c --depth 2 ...            # records responses
+# ...edit the pipeline...
+python3 -m src depth --input prog.c --depth 2 ... --replay   # same agent actions, new pipeline, no LLM
+python3 -m src lineage --utility c-sort --replay --output-dir runs/lineage/replay-test
 ```
 
-Use `ac_venv/bin/python` for the analyzer, and export `PYTHON_BIN` so the
-runner uses it too:
+`record` never reuses responses, so repeating an experiment gives new samples. To share
+a cache across repeats with `auto`, set a different `cache.namespace` for each repeat.
+
+## Lineage mode
 
 ```bash
-export PYTHON_BIN="$PWD/ac_venv/bin/python"
+python3 -m src lineage --list-utilities
+python3 -m src lineage --utility c-sort --dry-run          # every stage's run_experiment.sh command
+python3 -m src lineage --utility c-sort --lineages 10 --temperature 0.2
+python3 -m src lineage --utility rust-sort --generator aider
 ```
 
-### External tools
+Settings come from `[lineage]` in `config.toml`, plus `[retry]` (max_loops, session_timeout_s),
+`[agent]` (topology, model_class, step_limit) and `[docker]`.
 
-Install Aider with its official installer (do this separately on every host
-that will execute generation, including the vessel):
-
-```bash
-python3 -m pip install aider-install
-aider-install
-aider --version
-```
-
-| Tool | Required for | Notes |
+| `lineage.generator` | Models (`.env`) | What runs per stage session |
 |---|---|---|
-| `aider` | generation | Installed with `aider-install`; override the executable with `AIDER_BIN` |
-| `git` | generation | Used only to resolve controller inputs; Aider runs with Git disabled |
-| `timeout` | generation | Bounds each agent session. macOS ships none; without it the runner warns, runs unbounded, and records `timeout_enforced: false` |
-| `clang` | architecture measurement | Ships with the Xcode command line tools |
-| `gumtree` | architecture measurement | Java program; without it `gumtree_available` is false and clustering is incomplete |
-| `flawfinder` 2.0.20 | formal RQ3 security analysis | Pinned in `scripts/analysis-requirements.txt`; formal RQ3 is unavailable rather than reporting zero when missing or mismatched |
-| Clang `scan-build` / `clang-check` | optional RQ3 construct validation | Inspected independently; never merged with Flawfinder or installed automatically |
+| `minisweagent` (default) | `AGENT_WORKER_MODEL`, plus `AGENT_PLANNER_MODEL`/`AGENT_ORCHESTRATOR_MODEL` per topology | `src.lineage.shim`: a mini-swe-agent session in `agent-c` (C, Python) or `agent-rust` |
+| `aider` | `AGENT_ARCHITECT_MODEL`, optional `AGENT_EDITOR_MODEL` | the host's Aider (`lineage.aider.bin`), as `run_lineage_experiment.sh` runs it natively |
 
-`timeout` matters for any unattended sweep: a stalled session otherwise blocks
-every attempt behind it. It comes from GNU coreutils (`brew install coreutils`
-provides it as `gtimeout`, which the runner also accepts). Where Homebrew is
-unavailable, `scripts/timeout.py` implements the subset the runner uses and can
-be linked onto `PATH`:
+How the shim works: `run_experiment.sh` launches its generator as `$AIDER_BIN` with Aider's
+flags. The pipeline points `AIDER_BIN` at a generated wrapper around `python -m src.lineage.shim`.
 
-```bash
-ln -sf "$PWD/scripts/timeout.py" ~/.local/bin/timeout
+For each session, the shim:
+- copies the attempt's workdir to `/work` in a fresh container;
+- runs the topology, with:
+  - the stage prompt or repair continuation as the task,
+  - `agent-build` for a local compile check,
+  - `agent-worker` for the orchestrator topology;
+- copies back **only** the editable source and discards every other change.
+
+Everything else stays in the harness: building, the checkpoint judge, the held-out
+judge, the repair prompts, candidate capture, security evaluation and fingerprints. Lineage
+outputs therefore keep the familiar layout, and `src/harness/analyze_lineages.py` reads them as before.
+
+Lineage mode adds:
+- `<output-dir>/pipeline/invocation-*.json` and `<output-dir>/pipeline/summary.json`;
+- `attempt-*/agent/session-NN/` per agent session (task, trajectories, `agents.jsonl`,
+  container log).
+
+The build and judge steps need the linux-utilities benchmark images pinned in
+`coreutils/images.lock.json`. `LINUX_BENCHMARK_LOCK` selects another lock.
+
+The agent's sandbox keeps the historical layout (`src/<prog>/…`, `build/<prog>`,
+`tests/<selector>-test-suite/` holding that checkpoint's test bundle and judge), so
+prompts and judge commands are unchanged; only the host-side sources moved into
+`coreutils/`. See [coreutils/docs/manifests.md](coreutils/docs/manifests.md).
+
+## Test suites
+
+The pipeline doesn't come with tests for your program. You supply two self-contained suite
+directories, one visible and one hidden. Each has an executable `run`:
+
+```
+<suite>/run <project_dir> --report <report.json>
+# exit 0 = all passed; report = {"passed": N, "failed": M, "cases": [{"name", "status", "detail"}]}
 ```
 
-GumTree needs a real JDK. On macOS `/usr/bin/java` is a stub that shadows
-anything later on `PATH`, so pin `JAVA_HOME` in a launcher instead of relying
-on `PATH` order:
+The pipeline builds the program first, so a suite finds the binary inside `<project_dir>`.
+`tests/fixtures/suites/` has working examples.
 
-```bash
-# JDK, user-local
-mkdir -p ~/.local/opt/jdk-21
-curl -sL "https://api.adoptium.net/v3/binary/latest/21/ga/mac/aarch64/jdk/hotspot/normal/eclipse" \
-  | tar -xz -C ~/.local/opt/jdk-21 --strip-components=1
+## What a function's agent sees
 
-# GumTree (newest release carrying a distribution zip)
-curl -sLo /tmp/gumtree.zip \
-  https://github.com/GumTreeDiff/gumtree/releases/download/v4.0.0-beta4/gumtree-4.0.0-beta4.zip
-mkdir -p ~/.local/opt/gumtree && unzip -q /tmp/gumtree.zip -d ~/.local/opt/gumtree
-
-cat > ~/.local/bin/gumtree <<'SH'
-#!/usr/bin/env bash
-export JAVA_HOME="$HOME/.local/opt/jdk-21/Contents/Home"
-exec "$HOME/.local/opt/gumtree/gumtree-4.0.0-beta4/bin/gumtree" "$@"
-SH
-chmod +x ~/.local/bin/gumtree
-```
-
-Confirm everything resolves before a run:
-
-```bash
-for t in aider git timeout clang gumtree flawfinder; do printf '%-12s %s\n' "$t" "$(command -v $t || echo MISSING)"; done
-```
-
-### Model backend
-
-The formal configuration is self-contained. Each attempt gets an isolated home,
-empty explicit Aider config and env files, and a generated model-settings file;
-the runner does not inherit `~/.aider.conf.yml`, `~/.env`, or
-`~/.aider.model.settings.yml`.
-
-For a native Ollama endpoint, use Aider's recommended `ollama_chat/` provider
-and pass the Ollama **root** URL (not `/v1`):
-
-```bash
-bash scripts/run_lineage_experiment.sh \
-    --utility grep \
-    --model ollama_chat/qwen3.8:27b \
-    --editor-model ollama_chat/qwen3-coder-next:latest \
-    --remote-base-url http://localhost:11434 \
-    ...
-```
-
-If the vessel exposes only its existing OpenAI-compatible gateway, use matching
-`openai/` model names and its `/v1` URL instead. `--remote-api-key-env` may name
-an exported credential; when omitted for an unauthenticated compatibility
-gateway, the runner supplies the conventional dummy key `ollama`. The old
-`school-ollama/` prefix was an OpenCode provider alias and is not an Aider model
-provider name.
-
-## Running development traces
-
-`scripts/run_lineage_experiment.sh` is the entry point:
-
-```bash
-bash scripts/run_lineage_experiment.sh \
-    --utility sort \
-    --model ollama_chat/qwen3.8:27b \
-    --editor-model ollama_chat/qwen3-coder-next:latest \
-    --temperature 0.2 \
-    --lineages 10 \
-    --max-loops 3
-```
-
-`--utility` names a manifest under `experiments/utilities/`. The compatibility
-flag `--lineages` sets the number of independent development traces and
-defaults to 1 — there is no built-in experiment size — and `--max-loops`
-defaults to 3 repair sessions within each stage, with 0 disabling repair
-entirely.
-
-Useful flags: `--lineage-start N` extends an existing run without touching
-lineages already on disk, `--output-dir DIR` relocates the results, `--force`
-reruns stages that are already complete, `--print-plan` shows the resolved stage
-plan, `--dry-run` prints every `run_experiment.sh` command without running one
-or touching the filesystem, and `--list-utilities` lists the manifests. Sandbox
-and backend options (`--editor-model`, `--timeout`, `--keep-workdir`,
-`--allow-no-progress`, `--repair-prompt`, `--remote-base-url`,
-`--remote-api-key-env`) pass straight through to the stage runner.
-
-### Sampling
-
-Three optional sampling knobs are forwarded unchanged to every stage and every
-repair session inside it: `--top-p P`, `--sampling-seed N` and `--max-tokens N`.
-Leaving one unset means the flag is absent from the request and the server's own
-default applies; that distinction is recorded as a JSON null rather than by
-omitting the key. Every sampling value is part of the lineage configuration
-fingerprint, so changing one refuses to resume an existing `--output-dir` rather
-than mixing conditions.
-
-`--architect-think false` explicitly disables architect thinking using native
-Ollama JSON `"think": false`. Omitting the option still omits `think` from the
-request and records null in provenance; `low`, `medium`, and `high` retain their
-string values. This control changes only the architect, is fingerprinted, and
-is preserved in lineage, experiment, and attempt metadata. Use a fresh output
-directory when changing it. `--ollama-trace` captures the outgoing request under
-`ollama-trace/requests/`; inspect the architect request's top-level `think`, not
-the editor request or `options`. The offline installed-package check is
-`python -m pytest -q tests/test_architect_thinking.py -k installed` in the Aider
-environment; it skips when Aider/LiteLLM are not installed and makes no model
-calls.
-
-Two spellings are refused outright rather than accepted and quietly ignored:
-
-* **`--top-k`** — native `ollama_chat` can carry it, but transport support alone
-  is not enough to add a new experimental control. It remains rejected until a
-  separate transport-level verification establishes what the selected vessel
-  endpoint forwards to Ollama.
-  Model-definition-level top-k remains valid: create a derived Ollama model and
-  record it explicitly with metadata-only `--model-provenance-json`, for example
-  `'{"base_model":"qwen3-coder-next:latest","top_k":50,"top_k_control":"ollama_modelfile"}'`.
-  This object is fingerprinted and never added to the request. Nothing parses
-  top-k from the model alias and no local `ollama show` is required.
-* **`--seed`** — ambiguous in this harness. `--sampling-seed` is the
-  token-selection seed; `--seed-file` is the checkpoint source-inheritance file,
-  and the two senses must never collide.
-
-`--runs` is likewise refused: a lineage runs one attempt per stage, so the
-number of independent samples is `--lineages`.
-
-### Platform preflight
-
-Run-level environment eligibility is decided **before any development trace is
-initialized**. For the standardized Linux utilities, a live Docker probe also
-checks the lock-selected immutable compiler/runtime and oracle images, required
-architecture, execution profile and language toolchain. It fails closed for
-missing images, Docker errors, mutable references, incompatible platforms or
-toolchain mismatches; it
-does not require `VESSEL_VALIDATION` or `VESSEL_APPROVAL`. If another utility's
-suite declares a `required_platform` the host
-does not satisfy, the controller prints `platform_incompatible`, records
-`run_status: platform_incompatible` in `lineages.json`, and exits 4 — distinct
-from 1 (a stage failed) and 2 (a usage error). No lineage directory, no
-`lineage.json`, no checkpoint, and no agent invocation.
-
-That ordering is the point. Letting the walk begin and stopping each lineage at
-checkpoint 000 would create a start record for all `N`, so
-`successful_finals / lineages_started` would read `0/N` — reporting a model
-reliability of zero for what is purely an environment mismatch. `lineages.json`
-also deliberately records no planned lineage ids in this case, so analysis
-cannot later resurrect them. `analyze_lineages.py` reports reliability as **not
-applicable**, which is not the same as 0.0 and is never rendered as one.
-
-A `--dry-run` on the wrong host warns and continues, since it starts nothing.
-
-### A real run
-
-`runs/formal/grep-qwen3-topk40-t0-p05-seed42-maxtok32768-loops1-n10/` is a
-complete ten-lineage `grep` run with its analysis in place. Read the invocation
-from its `lineages.json` rather than from the directory name, which disagrees
-with it — top-k is baked into the model here rather than passed as a flag, which
-`--top-k` would refuse anyway, and `max_loops` is 3, not 1:
-
-```bash
-bash scripts/run_lineage_experiment.sh \
-    --utility grep \
-    --model ollama/qwen3-coder-next-topk1:latest \
-    --temperature 0 \
-    --top-p 0.5 \
-    --sampling-seed 42 \
-    --max-tokens 32768 \
-    --model-provenance-json '{"base_model":"qwen3-coder-next:latest","top_k":1,"top_k_control":"ollama_modelfile"}' \
-    --lineages 10 \
-    --max-loops 3 \
-    --output-dir runs/formal/grep-qwen3-topk40-t0-p05-seed42-maxtok32768-loops1-n10
-```
-
-Its historical analysis predates the explicit functional-success fields. New
-analysis reports public checkpoint completion separately from final held-out
-functional success and does not infer a hidden pass from the legacy completion
-field.
-
-### Output layout
-
-```text
-runs/lineages/<utility>/<model-slug>/temp-<slug>/
-├── lineages.json                 run configuration + fingerprint
-├── lineage-001/
-│   ├── lineage.json              per-stage outcome, seed provenance, stop point
-│   ├── 000/                      a complete single-stage run_experiment.sh tree
-│   │   ├── test-bundle/          exactly what the agent could read here
-│   │   ├── boundary-gate.json
-│   │   ├── sweep.json
-│   │   └── temp-<slug>/
-│   │       ├── experiment.json
-│   │       ├── baseline/
-│   │       └── attempt-001/{metadata.json,candidate/,*.log,repair-prompt-*.md}
-│   ├── 001/  002/  ...
-│   └── final/<source>.c          only when every checkpoint succeeded
-└── lineage-002/ ...
-```
-
-Every stage stays inspectable, including the repair prompts and logs. Failed
-lineages are retained; `final/` exists **only** for a lineage that completed the
-whole sequence, so its presence is never ambiguous.
-
-### Lineage state, and counting every lineage that starts
-
-Reliability is measured over every lineage **started**, so a lineage has to
-become countable the moment it begins rather than when it finishes.
-`lineage.json` is therefore written by `scripts/lineage_state.py` before
-checkpoint 000 runs, rewritten after every checkpoint, and only closed out at
-the end:
-
-| state | meaning |
+| Path in container | Contents |
 |---|---|
-| `running` | created by the controller; the walk has not finished |
-| `stopped` | a checkpoint failed — the lineage ended normally, unsuccessfully |
-| `completed` | every public checkpoint passed and `final/` was written; held-out status does not control this state |
+| `/work/project` | the current program, read-only |
+| `/src/edit/<fn>.c` or `.rs` | the only file the agent edits |
+| `/src/suite` | the visible suite, read-only |
+| `agent-test` | splices the function file in, checks the signature and additions, builds, runs the visible suite, prints a summary |
+| `agent-worker "<instructions>"` | orchestrator topology only |
 
-A record still in `running` at analysis time means the controller itself died,
-and the analyzer classifies it as `controller_interrupted`: counted in the
-denominator, never counted as publicly complete or functionally successful,
-and reported under its own reason rather than as an implementation failure. A
-lineage directory with no record or with an unparseable one is likewise counted and reported
-(`missing_record`, `malformed_record`) instead of being silently skipped —
-skipping shrinks the denominator in exactly the direction that flatters the
-result, because interruptions are likeliest in the long, repair-heavy lineages.
+(This table describes depth mode. In lineage mode the agent works in `/work`, a copy of the
+stage workspace, and has `agent-build` instead of `agent-test`.)
 
-Planned is not started, and the two are counted differently. `lineages.json` is
-written once, before any lineage begins, and lists every id the invocation
-intends to run; treating that as evidence of a start would report ten lineages
-for a run interrupted after three. A lineage counts as started only when the
-controller left durable proof — the directory and the `lineage.json` that
-`lineage_state.py init` creates immediately before checkpoint 000. Ids that were
-planned but never begun are reported under
-`lineages_planned_not_started` and stay out of the reliability denominator
-entirely.
+The hidden suite is never mounted into an agent's container. Once an agent finishes,
+the controller re-verifies its result in a container with no network and then runs
+the hidden suite.
 
-Every update goes through a sibling temporary file and `os.replace`, which is
-atomic on POSIX and Windows, so an interrupted write leaves either the previous
-record or the new one and never a truncated file.
+## Plugins
 
-### Resume safety
+| Kind | Configured by | Built-ins |
+|---|---|---|
+| Call-graph backend | `callgraph.c_backend`, `callgraph.rust_backend` | `svf`, `rupta`, `mir` |
+| Selector | `depth.selector` | `depth` |
+| Generator | `agent.generator` | `minisweagent` |
+| Locate/splice/signature (runs in-container) | `plugins.language` (module path) | built-in C/Rust |
+| Test runner / feedback (runs in-container) | `plugins.test_runner`, `plugins.feedback` (`module:Class`) | `SuiteRunner`, `SummaryFormatter` |
 
-`scripts/lineage_plan.py` computes a configuration fingerprint over the resolved
-manifest, the *contents* of every checkpoint prompt, the contents of the judge
-script, the shared automation notice, the per-checkpoint test-bundle
-fingerprints, and the model, agent, temperature, sampling settings, repair budget
-and session timeout. The controller refuses to write
-into an existing lineage root whose `lineages.json` records a different
-fingerprint, and names the specific field that differs rather than only reporting
-a hash mismatch. When a completed stage is reused, its recorded seed snapshot is
-compared against the seed the current walk holds, which catches the one remaining
-way a resume could mix generations: an earlier stage regenerated while a later
-one was left alone.
+Host-side plugins can be referenced by built-in name or by `package.module:Class`. The
+interfaces are in `src/interfaces.py`.
 
-The number of lineages and the output directory are deliberately excluded from
-the fingerprint — extending a run from 10 lineages to 15 is a valid resume,
-while editing a prompt is not.
+## Outputs
 
-## Analyzing a lineage run
+Each depth run writes to `runs/<timestamp>-<input>/`:
 
-Analysis uses the lineage and experiment analyzers for the three paper-facing
-research questions. Optional representation diagnostics deepen RQ2, while the
-behavioral-consistency tool remains a separate post-hoc diagnostic.
+- `manifest.json`
+- `baseline.json`
+- `callgraph.json`
+- `selection.json`
+- `functions/*/`: one folder per function with its target, its attempts (agent
+  trajectories, candidate, verification result, spliced program, hidden result) and
+  `record.json`
+- `final/` in cumulative mode, or `variants/` in independent mode
+- `summary.json`
 
-### 1. Reliability, change, and the diversity populations
-
-The commands in this section run the older schema-v7 analyzer, whose
-feature-vector/cosine A/S columns are not the final paper measurements.
-For the accepted Clang/MILP A/S pipeline and recorded results, start with
-[the canonical methodology](docs/diversity_methodology.md). The older analyzer
-remains available for its reliability, maintenance and lineage consumers.
+## The pipeline's own tests
 
 ```bash
-python3 scripts/analyze_lineages.py \
-    --lineage-root runs/lineages/sort/<model-slug>/temp-0p2 \
-    --checkpoint-diversity
+.venv/bin/python -m pytest tests                 # unit tests + Docker e2e with scripted models
 ```
 
-This writes `analysis/lineage_report.json`, `analysis/lineage_outcomes.csv`,
-`analysis/lineage_stages.csv` and `analysis/summary.md`. Public checkpoint
-completion is reported separately from end-to-end functional success. The
-latter is true only for a publicly completed lineage whose final stage has
-`extra_test_exit_code == 0`; exit 1 is a functional failure, while a missing or
-non-verdict result is null/unknown. Infrastructure failures and agent-execution
-failures stay distinguishable from implementation and test failures, using the
-single-stage runner's own metadata vocabulary rather than a second
-classification. It also re-checks seed provenance from the recorded hashes, so
-a pooled or hand-edited result set cannot pass silently.
-
-Two change tables are written against the baseline each measurement actually
-has, never against the population view's placeholder baseline:
-`analysis/lineage_transitions.csv` pairs each stage's candidate with the exact
-file it was seeded with, and `analysis/lineage_total_change.csv` pairs each
-completed lineage's final source with that same lineage's own checkpoint 000
-source, labelled as total trajectory change rather than a single maintenance
-step. `analysis/lineage_change_summary.csv` aggregates the real same-lineage
-transition rows by destination checkpoint; checkpoint 000 has no transition
-row. `--skip-change` omits these change outputs.
-
-For diversity it materializes each population under
-`analysis/populations/<label>/` and runs `scripts/analyze_experiment.py` on it.
-The **final** population is the last stage of every end-to-end functionally
-successful lineage. Publicly completed artifacts remain retained when hidden
-evaluation fails or is unavailable, but they do not enter final diversity.
-`--checkpoint-diversity` additionally analyzes public-checkpoint-successful
-implementations at each intermediate checkpoint, including those from lineages
-that stopped later. `--skip-diversity` aggregates outcomes only. A population
-with fewer than two members is skipped with its reason rather than reported as a
-failure — diversity over one implementation is undefined, not failed.
-
-`summary.md` always states the started count, public checkpoint completion, and
-final held-out passed/failed/unknown counts. The functional success rate uses
-all started lineages when every outcome is known; otherwise it is reported as
-unknown rather than silently treating unevaluated outcomes as failures.
-
-Each population view records `analysis_population_member: true`. Final views
-record `population_selection_basis: end_to_end_functional_success`; checkpoint
-views record `population_selection_basis: public_checkpoint_stage_success`.
-Its paper row retains
-population size and structural coverage but sets reliability and Pass@k to NA
-with `reliability_scope: parent_lineage_experiment`; it also sets empty-baseline
-maintenance-change fields to NA. Baseline-independent physical source LOC and
-source-byte descriptors remain supported in final and checkpoint population
-views. The parent
-`analysis/lineage_paper_metrics.csv` combines all-started public and functional
-reliability with the functionally successful final population's structural
-metrics.
-
-Note that stages themselves are not analyzed individually: the controller passes
-`--no-analysis` to the stage runner, so `analyze_experiment.py` runs only on the
-materialized populations, never once per checkpoint attempt.
-
-### 2. Deeper diagnostics, run directly against a population
-
-Representation ablation and construct-validation distances can be obtained by
-invoking the experiment analyzer directly against a materialized population
-directory:
-
-```bash
-POPULATION=runs/lineages/sort/<model-slug>/temp-0p2/analysis/populations/final
-
-python3 scripts/analyze_experiment.py \
-    --experiment "$POPULATION" \
-    --cluster-threshold 0.30 \
-    --strategy-threshold 0.30 \
-    --diversity-k-max 25 \
-    --diagnostic-output \
-    --clean-output
-```
-
-A materialized view is an ordinary experiment directory, so nothing about the
-analyzer changes here. Analyze one population at a time; the analyzer rejects a
-directory holding multiple conditions rather than pooling them. Use a common
-`--diversity-k-max` supported by every compared population for cross-condition
-normalized family-discovery AUC@K, and omit it when only complete within-
-population DF@K curves are needed.
-
-The analyzer writes schema-v7 results under `<population>/analysis/`:
-`summary.json`, `per_run_metrics.csv`, `paper_metrics.csv`,
-`paper_descriptive_metrics.csv`, diversity family assignments and DF@K curves,
-robustness tables, and uncertainty intervals. A view's `experiment.json` points
-`repository` at the view itself rather than at the checkout, so the repository-
-level paper aggregate the analyzer maintains is never rewritten by a lineage
-analysis. Exploratory analysis retains CLI/metadata/default precedence. Only a
-row produced with `--formal-analysis` from a complete frozen configuration can
-enter or anchor a confirmatory aggregate. See
-`docs/experiment_analysis_reference.md` for these legacy formulas and their interpretation.
-
-Formal analysis uses `--analysis-config FILE --formal-analysis`. The versioned
-JSON must explicitly provide architecture/strategy thresholds, the sensitivity
-grid or deterministic rule, bootstrap repetitions/seed, strategy exclusion and
-forced includes, `include_main`, Clang extra arguments, and fixed K (including
-explicit `null`). Formal mode refuses a missing/incomplete file instead of
-falling back to scientific defaults. The resolved object, schema version, and
-domain-separated fingerprint are written to every population summary and the
-parent lineage report.
-
-### 3. RQ3 security
-
-```bash
-python3 scripts/analyze_experiment.py \
-    --experiment "$POPULATION" \
-    --security-analysis \
-    --security-config scripts/security-analysis-config-v1.json \
-    --clean-output
-```
-
-Formal runs additionally use `--formal-analysis --analysis-config <RQ2-CONFIG>`.
-RQ3 uses exactly the successful RQ2 population and never re-filters it.
-Flawfinder 2.0.20 findings are the primary external static-analysis layer;
-Tree-sitter counts unsafe/bounded-risk APIs, heap calls, fixed-size buffers, and
-indexing as supporting security-sensitive descriptors. Findings and descriptors
-are never combined into a score or called confirmed vulnerabilities.
-
-Population outputs are written beneath `<population>/analysis/security/`:
-`paper_security_metrics.csv`, `security_summary.json`,
-`security_per_run.csv`, `flawfinder_findings.csv`, severity/maximum-level/CWE
-tables, and the construct-profile table. Lineage analysis with
-`--security-analysis` additionally writes `analysis/security_stage_summary.csv`,
-`analysis/security_stage_severity.csv`, and
-`analysis/security_transitions.csv`. See
-`docs/security_methodology.md` for definitions and coverage rules.
-
-To measure every successful lineage stage and the final population in one
-invocation, use:
-
-```bash
-python3 scripts/analyze_lineages.py \
-    --lineage-root runs/lineages/sort/<model-slug>/temp-0p2 \
-    --checkpoint-diversity \
-    --security-analysis \
-    --security-config scripts/security-analysis-config-v1.json
-```
-
-### 4. Optional behavioral and execution consistency diagnostic
-
-```bash
-python3 scripts/measure_execution_consistency.py \
-    --experiment "$POPULATION" \
-    --clean-output
-```
-
-This rebuilds each selected population member and re-judges it twice — once against
-the checkpoint's visible corpus and once against the held-out corpus the agent
-never saw — and summarizes the resulting verdict vectors as behavioral
-fingerprints. It is strictly post-hoc and read-only: it never re-runs Aider,
-never enters the repair loop, and never turns a pass into a fail.
-
-**It requires the previous steps to have run.** It does not re-derive the
-population or the family labels: ordinary experiments use `overall_success`,
-while lineage views use the controller's explicit `analysis_population_member`.
-It takes `architecture_cluster_id` and `strategy_cluster_id` from the same rows.
-Without that file it refuses to run
-rather than growing a second, possibly divergent, definition of "successful". It
-also reads `source_path`, `feature_test_command`, `build_command` and
-`source_workdir_path` out of the view's `experiment.json`, and takes the suite
-and the held-out corpus from `tests/<utility>-test-suite/` in the checkout.
-
-**It must run on the same host family the experiment was generated on.** The
-recorded `build_command` is the one the experiment host ran, so a candidate that
-used an extension its compiler provided will not rebuild elsewhere. This is a
-real, documented limitation rather than a bug to work around — see
-`docs/execution_consistency_methodology.md`. The example run above shows what it
-looks like when the hosts do not match. Its `lineages.json` records
-`host_platform: "Darwin"`, and its
-`analysis/populations/final/analysis/execution_consistency/summary.json` records
-all seven finals as `rebuild_failed` with a `measurement_coverage` of 0.0, each
-detail a GCC diagnostic for an implicit declaration of `memmem` or `strdup`.
-Such runs are recorded with their reason and excluded from the fingerprint
-statistics, never silently dropped, because a condition whose candidates mostly
-fail to rebuild means something very different from one whose candidates all
-behave identically.
-
-Output lands in `<population>/analysis/execution_consistency/` as `summary.json`,
-`behavioral_fingerprints.csv`, `behavioral_verdict_traces.json`, and
-`pairwise_behavioral_distances.csv`. These behavioral results, including
-structure-versus-behavior ARI, are optional diagnostics and are not part of the
-primary paper-facing RQ metrics.
-
-## How the harness works
-
-Everything in this section is mechanism the lineage controller reuses rather than
-reimplements.
-
-### The single-stage runner
-
-`scripts/run_experiment.sh` runs a **single stage** — one prompt, one source
-mode, one validation command, with the generate/validate/repair loop. The
-lineage controller calls it once per checkpoint and adds nothing to it, so the
-isolated working directory, the Aider file boundary, the source modes, the seed
-files, the repair loop, the build and test validation, the candidate capture and
-the infrastructure-failure metadata all live here.
-
-Its required arguments are `--model`, `--prompt` and `--source`. Use
-`--source-mode new` for from-scratch checkpoints, where the model must create the
-file and the analysis baseline is an empty translation unit; use
-`--source-mode existing` together with a `--seed-file` whose destination is
-`--source`, in which case that seed is also recorded as the analysis baseline so
-churn is measured against the promoted candidate rather than against nothing.
-
-Run standalone it also supports temperature sweeps (`--temp-min`/`--temp-max`/
-`--temp-points`, or `--temp-list` for grids that are not evenly spaced) with
-`--runs` attempts per temperature, and it invokes `analyze_experiment.py`
-automatically once per temperature unless `--no-analysis` is passed. The lineage
-controller passes `--runs 1` and `--no-analysis` at every stage.
-
-Every utility is judged the same way: `judge_candidate.sh CANDIDATE [FLAG...]`
-runs the frozen cases whose required flags are all named on the command line.
-Passing a checkpoint's **cumulative** flag list therefore re-runs every earlier
-checkpoint's applicable cases as regression coverage. The agent may read the
-tests it is given; it may not modify, weaken, or delete any part of them, and
-tampering is detected and recorded in `metadata.json`.
-
-### Generation, validation, and continuation
-
-The generation path is:
-
-```text
-Qwen3.8-27B
-    ↓
-Aider architect/reasoning stage
-    ↓
-qwen3-coder-next
-    ↓
-Aider editor stage
-    ↓
-candidate source
-    ↓
-controller-owned build/tests
-```
-
-The editor model is Aider's editing phase, not a separate autonomous subagent.
-After each one-shot Aider process the controller independently runs `--build-cmd`,
-`--base-test-cmd`, and `--feature-test-cmd` inside the working directory. If any
-of them fails, it renders a continuation prompt from
-`prompts/repair_continuation_template.md` and starts a **new** Aider process
-against the **same** working directory, so the model picks up where the previous
-process left off. This repeats up to `--max-loops` times. Neither Aider model
-runs validation or decides whether repair occurs.
-
-The continuation prompt quotes the original task, states where the source and
-the visible tests live, and reports what failed as a compact list of failing
-test names with short details, followed by a bounded raw tail. Failing tests are
-read from a suite `--json-report` when one exists, otherwise parsed from the
-suite runner's output, unittest output, or compiler diagnostics. Every rendered
-prompt is saved as `attempt-*/repair-prompt-<loop>.md`.
-
-The loop also stops early when a session leaves the source byte-identical to the
-previous loop, recorded as `stop_reason: "no_progress"`; pass
-`--allow-no-progress` to spend the full budget regardless. Other stop reasons
-are `success`, `loop_limit`, and `agent_execution_failure`. The optional extra
-test runs once after the loop and is never fed back to the model.
-
-For all four utilities that extra test is the held-out judging pass
-(`scripts/heldout_judge.py`), which every manifest names through `$HELDOUT_ROOT`.
-The runner exports that variable itself, pointing it at the repository root, so
-no setup is needed: the command is evaluated in the controller's shell with the
-working directory set to the attempt sandbox, and a relative path would resolve
-inside the sandbox — exactly where held-out material must never be.
-
-### Agent sandboxing
-
-Each attempt runs in its own plain working directory containing only the prompt,
-the checkpoint-specific `--test-dir` bundle and the `--seed-file` inputs. Aider
-starts **inside** that directory with `--no-git`, `--no-gitignore`, a zero-token
-repository map and a Git discovery ceiling at the directory's parent. It never
-initializes a repository and cannot scan the parent checkout for a repo map.
-
-The source path is the sole `--file` editable path. Visible text files already
-copied into the attempt are explicit `--read` context; binary/compressed corpus
-files remain available only to controller validation. Later checkpoint tests,
-hidden tests, generators, specification models and every file outside the
-attempt are absent from model context. Shell-command suggestions, automatic
-linting and automatic testing are disabled, and stdin is closed. The harness
-does not use blanket `--yes-always`; `--auto-accept-architect` only transfers
-Aider's architect proposal into its configured editor phase.
-
-### Visible tests are built per checkpoint, not copied
-
-The agent at checkpoint N may read the current prompt, the inherited source, the
-shared runtime judging files, the cases for checkpoint N, and the cases for
-checkpoints before N. It must not be able to read anything describing a
-checkpoint it has not reached. Copying `tests/<utility>-test-suite/` wholesale
-fails that: the frozen corpora carry every later checkpoint's cases *with their
-expected outputs*, `gen/` names and groups them, `model/` holds the flag and
-specification models, and the READMEs tabulate the whole ladder. Filtering which
-cases the judge *runs* does not help, because the files are still readable.
-
-`scripts/stage_test_bundle.py` therefore **builds** each stage's visible tests:
-
-* an explicit allowlist ships the runtime judging path only — `judge_candidate.sh`,
-  `runner.py`, `engine.py`, `props.py`, `config.py`. Nothing under `gen/`,
-  `model/` or `corpus/`, no generator, no fuzzer, no README, no self-check, no
-  prior run logs;
-* `suites/` is re-frozen to the cases whose required flags are all implemented at
-  that checkpoint, so a later checkpoint's case is **absent**, not skipped;
-* `config.json` is reduced to the minimal judging configuration, dropping
-  `paths.oracle_bin` — an oracle path is a hint;
-* `props.py` is pruned to the property checks the retained cases actually
-  dispatch to, plus their transitive dependencies, and regenerated from its AST
-  so comments and the module docstring go too. Both were leaking: mkdir's
-  `check_idempotent_p` spells out the `-p`/`-m` contract, and chmod's report-line
-  regexes spell out the exact `-c`/`-v` output format.
-
-The bundle is mounted at the suite's own path (`run_experiment.sh --test-dir
-SRC:DEST`), so the prompt and the judge command stay literally correct, and it is
-kept at `<lineage>/<checkpoint>/test-bundle/` as the record of what was visible.
-Its fingerprint is folded into the run's configuration fingerprint and re-checked
-against the built bundle at every stage, so regenerated goldens or an edited
-allowlist abort the run instead of silently mixing bundles.
-
-No reference implementation reaches a bundle. `new_grep` and `new_chmod` have no
-valid external oracle, so their specification models were written for this
-project and live in `tests/reference_generators/`, outside every suite; only
-offline generation and auditing import them, and the runtime judge works from
-frozen expected results alone.
-
-### Detecting premature implementation
-
-The checkpoint contract is incremental: 000 implements base behavior only, 001
-adds exactly one feature, and so on. Cumulative flag filtering tests the ladder
-from *below* — it never reaches a feature that does not exist yet — but on its
-own it cannot notice a candidate that implemented the whole option set at 000.
-
-Detecting that requires asserting "`-H` is still refused here", and the obvious
-place to put such an assertion is the worst one: a frozen suite case spells the
-flag out in its own argv, so shipping it at checkpoint 000 would hand the agent
-the name of the option the checkpoint is withholding. Enforcement therefore
-lives entirely outside anything the agent can read.
-
-**`scripts/checkpoint_boundary_gate.py`** is a controller-only gate. It lives in
-`scripts/`, which is never copied into a sandbox. The gate:
-
-* runs **after** public validation has already succeeded, and **before** the
-  candidate is promoted, against a rebuild of the captured candidate in a
-  throwaway tree;
-* is never copied into the worktree or the stage bundle;
-* never feeds the repair loop — a failure is not reported back to the agent,
-  because the diagnostic would name the flag;
-* fails the stage with `premature_feature_implementation`, so the candidate is
-  not promoted and the lineage produces no `final/` artifact. A gate that cannot
-  run at all is recorded distinctly, as `boundary_gate_error`.
-
-The availability matrix is derived from `experiments/utilities/<utility>.json`,
-not written twice: a checkpoint's allowed set is its own cumulative
-`implemented_flags`, and its forbidden set is every flag the manifest introduces
-later. Only the short flags the manifest declares are probed — no alias is
-invented.
-
-For each forbidden flag the gate invokes the built candidate so that the only
-thing wrong with the command line is that option, and requires a refusal:
-nonzero exit, no termination by signal, no sanitizer diagnostic, nothing on
-stdout, and a diagnostic on stderr. These are weak enough to accept any
-reasonable "unknown option" handling and strong enough that actually honouring
-the flag fails.
-
-Because the matrix comes from the manifest rather than from frozen goldens, all
-four utilities are covered uniformly. That closes an asymmetry the earlier
-suite-case approach could not: `new_grep` and `new_chmod` freeze their goldens
-from specification models that can be restricted to one checkpoint's option set,
-but `new_sort` and `new_mkdir` freeze theirs by running a real system binary,
-which implements `-r` and `-p` and so can never produce a "this must be
-rejected" golden.
-
-The prompts state only the current cumulative requirements plus a generic bound:
-
-```text
-Do not implement options or behavior outside this checkpoint's stated scope.
-```
-
-They never enumerate a later checkpoint's flags.
-
-### Session statistics
-
-Aider output is retained in `attempt-*/aider.log`. Controller metadata records
-the backend exit code and wall time for every initial/repair invocation, plus
-the exact architect/editor model pair and generated model settings. Aider does
-not expose a stable local database equivalent to the previous backend's session
-store, so new runs do not manufacture token-usage fields that cannot be
-reliably recovered.
-
-Legacy OpenCode attempts remain unchanged and analyzable. Their historical
-session files retain their original names:
-
-```text
-attempt-001/opencode-stats.json   one record per session
-attempt-001/opencode-stats.txt    the same, formatted for reading
-```
-
-`scripts/opencode_stats.py` is retained only as a legacy reader; the active
-runner never calls it.
-
-### Working directory cleanup
-
-The working directory is a per-attempt copy of the test bundle, so it is deleted
-once the attempt finishes. Before deletion the runner:
-
-1. copies every kept source file into `attempt-*/candidate/`, **flattened** to
-   its basename, with `candidate/manifest.json` recording the original layout;
-2. writes the diff artifacts the analyzer reads;
-3. hashes each copied `--test-dir` against its source, records
-   `test_dir_integrity` in `metadata.json`, and preserves anything the agent
-   modified or added under `attempt-*/tampered-tests/`.
-
-Every prompt forbids modifying the visible tests, so the integrity record is
-what makes a violation visible after the copies are gone. Use `--keep-glob` to
-preserve additional file patterns (default `*.c` and `*.h`), or `--keep-workdir`
-to retain the working directory.
-
-To reclaim space in runs produced earlier:
-
-```bash
-bash scripts/run_experiment.sh --prune-only runs/
-```
-
-This removes the working directory from completed attempts. Incomplete attempts
-are never touched.
-
-### Failure classification
-
-Each attempt distinguishes infrastructure attrition, invocation completion,
-candidate availability, artifact validation, and workflow success. A
-non-salvageable Aider error is an agent-execution failure. A
-timeout that leaves a candidate remains an incomplete invocation, but the
-controller may validate and repair that artifact and the workflow may succeed.
-Build and public-test failures control checkpoint promotion. Hidden evaluation
-runs afterward and never controls promotion or repair; its final-checkpoint
-verdict controls only end-to-end functional classification. A held-out wrapper,
-configuration, platform, or missing-result condition is reported as unknown
-rather than as a candidate failure. A `feature_test_exit_code` of 3 is the
-suite's platform gate refusing to judge on this host, and is classified with
-the infrastructure failures rather than counted against the candidate.
-
-A per-session timeout needs `timeout` or `gtimeout` on `PATH`. When neither is
-available the runner warns, runs sessions unwrapped, and records
-`timeout_enforced: false` so the distinction stays visible in analysis.
-
-### Utility manifests
-
-No utility detail lives in the controller. `experiments/utilities/<name>.json`
-describes the source path, executable path, build command, visible test
-directory, ordered checkpoints, per-checkpoint prompt, and the **cumulative**
-implemented-flag list that becomes the judge command. See
-[`experiments/utilities/README.md`](experiments/utilities/README.md) for the
-schema. `scripts/lineage_plan.py` resolves a manifest into the stage plan and is
-where the manifest's invariants are enforced: checkpoint 000 must be
-`source_mode: new`, every later checkpoint must be `existing`, and
-`implemented_flags` must never drop a flag an earlier checkpoint declared.
-
-### Source inheritance
-
-Stage 000 runs `--source-mode new`. Every later stage runs
-`--source-mode existing` with a `--seed-file` pointing at the immediately
-preceding **successful candidate of the same lineage**:
-
-```text
-lineage-003 / 000 candidate  ->  lineage-003 / 001 seed
-lineage-003 / 001 candidate  ->  lineage-003 / 002 seed
-```
-
-There is no cross-lineage path. A stage whose seed is missing is a hard error
-rather than a silent substitution, and `lineage.json` records the SHA-256 of
-both the seed consumed and the candidate produced, so the chain can be proved
-after the fact — `scripts/analyze_lineages.py` re-checks it.
-
-## Repository structure
-
-```text
-agentic_cyber/
-├── Makefile
-├── README.md
-├── findings.md
-├── docs/
-│   ├── diversity_methodology.md            # Canonical compiler-grounded A/S entry point
-│   ├── experiment_analysis_reference.md    # Legacy schema-v7 and active reliability/maintenance
-│   └── execution_consistency_methodology.md # Behavioral/execution consistency
-├── experiments/
-│   └── utilities/                          # One manifest per experimental utility
-│       ├── README.md                       # Manifest schema and feature surfaces
-│       └── chmod.json  grep.json  mkdir.json  sort.json
-├── prompts/
-│   ├── _shared/                            # Canonical automation notice, the one copy
-│   ├── checkpoint_base_template.md
-│   ├── checkpoint_feature_template.md
-│   ├── repair_continuation_template.md     # Continuation prompt for repair loops
-│   ├── chmod/                              # chmod checkpoints (000 -> -R -> -c -> -v -> -f)
-│   ├── grep/                               # grep checkpoints  (000 -> -H -> -h -> -r -> -i)
-│   ├── mkdir/                              # mkdir checkpoints (000 -> -p -> -m)
-│   └── new_sort/                           # sort checkpoints  (000 -> -r -> -f -> -u -> -c)
-├── scripts/
-│   ├── analysis/                           # Canonical metric and validation modules
-│   ├── analysis-requirements.txt
-│   ├── aider_settings.py                   # Per-attempt architect/editor settings
-│   ├── analyze_experiment.py               # Sole per-population analysis entry point
-│   ├── analyze_lineages.py                 # Lineage aggregation; delegates diversity
-│   ├── capture_candidate.py                # Flat capture, integrity check, cleanup
-│   ├── check_heldout_isolation.py          # Asserts held-out material never leaks
-│   ├── checkpoint_boundary_gate.py         # Controller-only premature-feature gate
-│   ├── heldout_judge.py                    # Held-out corpus judging
-│   ├── lineage_plan.py                     # Manifest -> stage plan + config fingerprint
-│   ├── lineage_state.py                    # Atomic lineage.json state transitions
-│   ├── measure_execution_consistency.py    # Behavioral fingerprints and convergence
-│   ├── opencode_stats.py                   # Legacy OpenCode session-stat reader
-│   ├── prompt_render.py                    # Single expansion point for that notice
-│   ├── repair_prompt.py                    # Continuation prompt renderer
-│   ├── run_experiment.sh                   # Single-stage experiment runner
-│   ├── run_lineage_experiment.sh           # Lineage controller over the stage runner
-│   ├── stage_test_bundle.py                # Per-checkpoint visible test bundle builder
-│   └── timeout.py                          # `timeout` subset for hosts without coreutils
-├── src/
-│   ├── new_mkdir/                          # Checked-in mkdir implementation
-│   └── new_sort/                           # Checked-in sort implementation
-└── tests/
-    ├── chmod-test-suite/                   # Model-derived goldens, isolated fixtures
-    ├── grep-test-suite/                    # Model-derived goldens
-    ├── mkdir-test-suite/                   # System-oracle goldens (requires Darwin)
-    ├── sort-test-suite/                    # System-oracle goldens (requires Darwin)
-    ├── reference_generators/               # Specification models, outside every suite
-    ├── test_execution_consistency.py       # Behavioral fingerprinting and agreement
-    ├── test_lineage_tools.py               # Manifests, stage plan, lineage aggregation
-    └── test_measure_diversity.py           # Analysis and controller tests
-```
-
-There is deliberately no `src/new_grep/` or `src/new_chmod/`: checkpoint 000 of
-those lineages must make the agent create the source.
-
-The ignored `build/` and `runs/` directories are generated locally. `make`
-builds the checked-in sort implementation as `build/new_sort`, and `make clean`
-removes the generated build files.
+The end-to-end tests run the real pipeline (images, SVF/MIR, mini-swe-agent sessions,
+verification, hidden suites) using scripted models instead of a real LLM. They are
+skipped if the images haven't been built.
