@@ -113,7 +113,7 @@ Preserve GNU special-bit semantics, including inherited directory set-user-ID/se
 
 With parents enabled, explicit modes apply only to newly created final directories. Newly created intermediate parents retain the parents-checkpoint umask rule with owner write and search ensured. Existing directories retain all permissions, including special bits; -m does not chmod existing final directories accepted by -p.
 
-Use the GNU Coreutils 9.11 [mkdir documentation](https://www.gnu.org/software/coreutils/manual/html_node/mkdir-invocation.html) and [file-permissions rules](https://www.gnu.org/software/coreutils/manual/html_node/File-permissions.html), with the pinned Linux oracle resolving ambiguities. No options outside this cumulative checkpoint are added.
+The behavioral requirements in this prompt are the complete specification for this checkpoint. Implement them using only the supplied source code, permitted read-only benchmark materials, and language-standard interfaces. The controller independently performs compilation and validation against the pinned GNU Coreutils 9.11 benchmark. No options outside this cumulative checkpoint are added.
 
 #### Implementation and validation
 
@@ -139,7 +139,7 @@ The controller ran the validation below after your previous session returned.
 
 Build:
 
-    exit 0
+    exit 1
 
 Base tests:
 
@@ -147,44 +147,31 @@ Base tests:
 
 Checkpoint tests:
 
-    exit 1
+    exit 2
 
 ### Failing tests
 
-Checkpoint tests (exit 1, 136/150 pass)
+Build (exit 1, 1 compiler errors)
 
-- rand-ok-039-m-p-nested  [FAIL]
-      tree: mismatched: a/b/c/d want={'mode': 2559, 'path': 'a/b/c/d', 'type': 'dir'} got={'path': 'a/b/c/d', 'type': 'dir', 'mode': 2541}
-- rand-ok-059-m-p-simple  [FAIL]
-      tree: mismatched: newdir want={'mode': 365, 'path': 'newdir', 'type': 'dir'} got={'path': 'newdir', 'type': 'dir', 'mode': 493}
-- single-m-a=rx-simple-0000  [FAIL]
-      tree: mismatched: newdir want={'mode': 365, 'path': 'newdir', 'type': 'dir'} got={'path': 'newdir', 'type': 'dir', 'mode': 493}
-- single-m-a=rx-simple-0022  [FAIL]
-      tree: mismatched: newdir want={'mode': 365, 'path': 'newdir', 'type': 'dir'} got={'path': 'newdir', 'type': 'dir', 'mode': 493}
-- single-m-a=rx-simple-0077  [FAIL]
-      tree: mismatched: newdir want={'mode': 365, 'path': 'newdir', 'type': 'dir'} got={'path': 'newdir', 'type': 'dir', 'mode': 493}
-- single-m-aw-simple-0000  [FAIL]
-      tree: mismatched: newdir want={'mode': 365, 'path': 'newdir', 'type': 'dir'} got={'path': 'newdir', 'type': 'dir', 'mode': 493}
-- single-m-aw-simple-0022  [FAIL]
-      tree: mismatched: newdir want={'mode': 365, 'path': 'newdir', 'type': 'dir'} got={'path': 'newdir', 'type': 'dir', 'mode': 493}
-- single-m-aw-simple-0077  [FAIL]
-      tree: mismatched: newdir want={'mode': 365, 'path': 'newdir', 'type': 'dir'} got={'path': 'newdir', 'type': 'dir', 'mode': 493}
-- single-m-g+s-simple-0000  [FAIL]
-      tree: mismatched: newdir want={'mode': 1535, 'path': 'newdir', 'type': 'dir'} got={'path': 'newdir', 'type': 'dir', 'mode': 1517}
-- single-m-g+s-simple-0022  [FAIL]
-      tree: mismatched: newdir want={'mode': 1535, 'path': 'newdir', 'type': 'dir'} got={'path': 'newdir', 'type': 'dir', 'mode': 1517}
-- single-m-g+s-simple-0077  [FAIL]
-      tree: mismatched: newdir want={'mode': 1535, 'path': 'newdir', 'type': 'dir'} got={'path': 'newdir', 'type': 'dir', 'mode': 1517}
-- single-m-u+s-simple-0000  [FAIL]
-      tree: mismatched: newdir want={'mode': 2559, 'path': 'newdir', 'type': 'dir'} got={'path': 'newdir', 'type': 'dir', 'mode': 2541}
-- single-m-u+s-simple-0022  [FAIL]
-      tree: mismatched: newdir want={'mode': 2559, 'path': 'newdir', 'type': 'dir'} got={'path': 'newdir', 'type': 'dir', 'mode': 2541}
-- single-m-u+s-simple-0077  [FAIL]
-      tree: mismatched: newdir want={'mode': 2559, 'path': 'newdir', 'type': 'dir'} got={'path': 'newdir', 'type': 'dir', 'mode': 2541}
+- /tmp/tmpokl0iyr1/program.c:353:39  [error]
+      assignment discards 'const' qualifier from pointer target type [-Werror=discarded-qualifiers]
+
+Checkpoint tests (exit 2)
+
+    No individual failures could be identified; see the raw output below.
 
 ### Raw output
 
-Build: passed; output omitted.
+Build:
+
+```
+
+/tmp/tmpokl0iyr1/program.c: In function 'main':
+/tmp/tmpokl0iyr1/program.c:353:39: error: assignment discards 'const' qualifier from pointer target type [-Werror=discarded-qualifiers]
+  353 |             operands[operand_count++] = a;
+      |                                       ^
+cc1: all warnings being treated as errors
+```
 
 Base tests: passed; output omitted.
 
@@ -192,40 +179,7 @@ Checkpoint tests:
 
 ```
 
-FAIL      rand-ok-039-m-p-nested  [corpus.json]  args=['-m', 'u+s', '-p', 'a/b/c/d']
-          tree: mismatched: a/b/c/d want={'mode': 2559, 'path': 'a/b/c/d', 'type': 'dir'} got={'path': 'a/b/c/d', 'type': 'dir', 'mode': 2541}
-FAIL      rand-ok-059-m-p-simple  [corpus.json]  args=['-p', '-m', 'a=rx', 'newdir']
-          tree: mismatched: newdir want={'mode': 365, 'path': 'newdir', 'type': 'dir'} got={'path': 'newdir', 'type': 'dir', 'mode': 493}
-FAIL      single-m-a=rx-simple-0000  [corpus.json]  args=['-m', 'a=rx', 'newdir']
-          tree: mismatched: newdir want={'mode': 365, 'path': 'newdir', 'type': 'dir'} got={'path': 'newdir', 'type': 'dir', 'mode': 493}
-FAIL      single-m-a=rx-simple-0022  [corpus.json]  args=['-m', 'a=rx', 'newdir']
-          tree: mismatched: newdir want={'mode': 365, 'path': 'newdir', 'type': 'dir'} got={'path': 'newdir', 'type': 'dir', 'mode': 493}
-FAIL      single-m-a=rx-simple-0077  [corpus.json]  args=['-m', 'a=rx', 'newdir']
-          tree: mismatched: newdir want={'mode': 365, 'path': 'newdir', 'type': 'dir'} got={'path': 'newdir', 'type': 'dir', 'mode': 493}
-FAIL      single-m-aw-simple-0000  [corpus.json]  args=['-m', 'a-w', 'newdir']
-          tree: mismatched: newdir want={'mode': 365, 'path': 'newdir', 'type': 'dir'} got={'path': 'newdir', 'type': 'dir', 'mode': 493}
-FAIL      single-m-aw-simple-0022  [corpus.json]  args=['-m', 'a-w', 'newdir']
-          tree: mismatched: newdir want={'mode': 365, 'path': 'newdir', 'type': 'dir'} got={'path': 'newdir', 'type': 'dir', 'mode': 493}
-FAIL      single-m-aw-simple-0077  [corpus.json]  args=['-m', 'a-w', 'newdir']
-          tree: mismatched: newdir want={'mode': 365, 'path': 'newdir', 'type': 'dir'} got={'path': 'newdir', 'type': 'dir', 'mode': 493}
-FAIL      single-m-g+s-simple-0000  [corpus.json]  args=['-m', 'g+s', 'newdir']
-          tree: mismatched: newdir want={'mode': 1535, 'path': 'newdir', 'type': 'dir'} got={'path': 'newdir', 'type': 'dir', 'mode': 1517}
-FAIL      single-m-g+s-simple-0022  [corpus.json]  args=['-m', 'g+s', 'newdir']
-          tree: mismatched: newdir want={'mode': 1535, 'path': 'newdir', 'type': 'dir'} got={'path': 'newdir', 'type': 'dir', 'mode': 1517}
-FAIL      single-m-g+s-simple-0077  [corpus.json]  args=['-m', 'g+s', 'newdir']
-          tree: mismatched: newdir want={'mode': 1535, 'path': 'newdir', 'type': 'dir'} got={'path': 'newdir', 'type': 'dir', 'mode': 1517}
-FAIL      single-m-u+s-simple-0000  [corpus.json]  args=['-m', 'u+s', 'newdir']
-          tree: mismatched: newdir want={'mode': 2559, 'path': 'newdir', 'type': 'dir'} got={'path': 'newdir', 'type': 'dir', 'mode': 2541}
-FAIL      single-m-u+s-simple-0022  [corpus.json]  args=['-m', 'u+s', 'newdir']
-          tree: mismatched: newdir want={'mode': 2559, 'path': 'newdir', 'type': 'dir'} got={'path': 'newdir', 'type': 'dir', 'mode': 2541}
-FAIL      single-m-u+s-simple-0077  [corpus.json]  args=['-m', 'u+s', 'newdir']
-          tree: mismatched: newdir want={'mode': 2559, 'path': 'newdir', 'type': 'dir'} got={'path': 'newdir', 'type': 'dir', 'mode': 2541}
-
-=== per-suite ===
-  corpus.json                  136/150 pass  FAIL=14
-
-136/150 pass
-14 PROBLEM(S)
+INFRASTRUCTURE ERROR: [Errno 2] No such file or directory: 'build/c_mkdir'
 ```
 
 ## Visible tests

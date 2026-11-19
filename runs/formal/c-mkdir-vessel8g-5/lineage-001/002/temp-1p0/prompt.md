@@ -66,7 +66,7 @@ Preserve GNU special-bit semantics, including inherited directory set-user-ID/se
 
 With parents enabled, explicit modes apply only to newly created final directories. Newly created intermediate parents retain the parents-checkpoint umask rule with owner write and search ensured. Existing directories retain all permissions, including special bits; -m does not chmod existing final directories accepted by -p.
 
-Use the GNU Coreutils 9.11 [mkdir documentation](https://www.gnu.org/software/coreutils/manual/html_node/mkdir-invocation.html) and [file-permissions rules](https://www.gnu.org/software/coreutils/manual/html_node/File-permissions.html), with the pinned Linux oracle resolving ambiguities. No options outside this cumulative checkpoint are added.
+The behavioral requirements in this prompt are the complete specification for this checkpoint. Implement them using only the supplied source code, permitted read-only benchmark materials, and language-standard interfaces. The controller independently performs compilation and validation against the pinned GNU Coreutils 9.11 benchmark. No options outside this cumulative checkpoint are added.
 
 ## Implementation and validation
 

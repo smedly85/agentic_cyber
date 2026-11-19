@@ -113,7 +113,7 @@ Preserve GNU special-bit semantics, including inherited directory set-user-ID/se
 
 With parents enabled, explicit modes apply only to newly created final directories. Newly created intermediate parents retain the parents-checkpoint umask rule with owner write and search ensured. Existing directories retain all permissions, including special bits; -m does not chmod existing final directories accepted by -p.
 
-Use the GNU Coreutils 9.11 [mkdir documentation](https://www.gnu.org/software/coreutils/manual/html_node/mkdir-invocation.html) and [file-permissions rules](https://www.gnu.org/software/coreutils/manual/html_node/File-permissions.html), with the pinned Linux oracle resolving ambiguities. No options outside this cumulative checkpoint are added.
+The behavioral requirements in this prompt are the complete specification for this checkpoint. Implement them using only the supplied source code, permitted read-only benchmark materials, and language-standard interfaces. The controller independently performs compilation and validation against the pinned GNU Coreutils 9.11 benchmark. No options outside this cumulative checkpoint are added.
 
 #### Implementation and validation
 
@@ -153,10 +153,10 @@ Checkpoint tests:
 
 Build (exit 1, 2 compiler errors)
 
-- /tmp/tmphh07ue_1/program.c:120:13  [error]
-      variable 'has_perm' set but not used [-Werror=unused-but-set-variable]
-- /tmp/tmphh07ue_1/program.c:262:9  [error]
-      variable 'mode_specified' set but not used [-Werror=unused-but-set-variable]
+- /tmp/tmp2qp0pxpb/program.c:10:53  [error]
+      unused parameter 'final_mode' [-Werror=unused-parameter]
+- /tmp/tmp2qp0pxpb/program.c:10:69  [error]
+      unused parameter 'has_mode' [-Werror=unused-parameter]
 
 Checkpoint tests (exit 2)
 
@@ -168,14 +168,13 @@ Build:
 
 ```
 
-/tmp/tmphh07ue_1/program.c: In function 'parse_mode_str':
-/tmp/tmphh07ue_1/program.c:120:13: error: variable 'has_perm' set but not used [-Werror=unused-but-set-variable]
-  120 |         int has_perm = 0;
-      |             ^~~~~~~~
-/tmp/tmphh07ue_1/program.c: In function 'main':
-/tmp/tmphh07ue_1/program.c:262:9: error: variable 'mode_specified' set but not used [-Werror=unused-but-set-variable]
-  262 |     int mode_specified = 0;
-      |         ^~~~~~~~~~~~~~
+/tmp/tmp2qp0pxpb/program.c: In function 'ensure_parents':
+/tmp/tmp2qp0pxpb/program.c:10:53: error: unused parameter 'final_mode' [-Werror=unused-parameter]
+   10 | static int ensure_parents(const char *path, mode_t *final_mode, int has_mode)
+      |                                             ~~~~~~~~^~~~~~~~~~
+/tmp/tmp2qp0pxpb/program.c:10:69: error: unused parameter 'has_mode' [-Werror=unused-parameter]
+   10 | static int ensure_parents(const char *path, mode_t *final_mode, int has_mode)
+      |                                                                 ~~~~^~~~~~~~
 cc1: all warnings being treated as errors
 ```
 

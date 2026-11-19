@@ -1,62 +1,86 @@
 #define _POSIX_C_SOURCE 200809L
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+
 #include <errno.h>
+#include <stdio.h>
+#include <string.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 
-int main(int argc, char *argv[])
-{
-    int *operands;
-    int n_operands;
-    int i, j;
-    int end_of_options;
-    int all_ok;
-
-    operands = malloc((size_t)argc * sizeof(int));
-    if (operands == NULL) {
-        fprintf(stderr, "mkdir: memory allocation failed\n");
-        return 1;
-    }
-
-    n_operands = 0;
-    end_of_options = 0;
-
-    for (i = 1; i < argc; i++) {
-        if (!end_of_options) {
-            if (strcmp(argv[i], "--") == 0) {
-                end_of_options = 1;
-                continue;
-            }
-            if (argv[i][0] == '-' && argv[i][1] != '\0') {
-                fprintf(stderr, "mkdir: unrecognized option '%s'\n", argv[i]);
-                fprintf(stderr, "Try 'mkdir --help' for more information.\n");
-                free(operands);
-                return 1;
-            }
+static void write_quoted(const char *s, size_t len) {
+    fputc('\'', stderr);
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '\'') {
+            fputs("'\''", stderr);
+        } else if (c >= 0x20 && c <= 0x7e) {
+            fputc(c, stderr);
+        } else {
+            fprintf(stderr, "\\%03o", c);
         }
-        operands[n_operands++] = i;
     }
+    fputc('\'', stderr);
+}
 
-    if (n_operands == 0) {
-        fprintf(stderr, "mkdir: missing operand\n");
-        fprintf(stderr, "Try 'mkdir --help' for more information.\n");
-        free(operands);
-        return 1;
-    }
+static void diag_create_fail(const char *name, size_t len, int err) {
+    fprintf(stderr, "mkdir: cannot create directory ");
+    write_quoted(name, len);
+    fprintf(stderr, ": %s\n", strerror(err));
+}
 
-    all_ok = 1;
-    for (j = 0; j < n_operands; j++) {
-        const char *path = argv[operands[j]];
-        if (mkdir(path, 0777) != 0) {
-            int err = errno;
-            fprintf(stderr, "mkdir: cannot create directory '%s': %s\n",
-                    path, strerror(err));
-            all_ok = 0;
+static void diag_unknown_option(const char *opt, size_t len) {
+    fprintf(stderr, "mkdir: unrecognized option ");
+    write_quoted(opt, len);
+    fprintf(stderr, "\nTry 'mkdir --help' for more information.\n");
+}
+
+static void diag_missing_operand(void) {
+    fprintf(stderr, "mkdir: missing operand\n");
+    fprintf(stderr, "Try 'mkdir --help' for more information.\n");
+}
+
+int main(int argc, char **argv) {
+    int seen_dd = 0;
+    int n_op = 0;
+
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (seen_dd) {
+            n_op++;
+        } else if (strcmp(a, "--") == 0) {
+            seen_dd = 1;
+        } else if (a[0] == '-' && strcmp(a, "-") != 0) {
+            diag_unknown_option(a, strlen(a));
+            return 1;
+        } else {
+            n_op++;
         }
     }
 
-    free(operands);
-    return all_ok ? 0 : 1;
+    if (n_op == 0) {
+        diag_missing_operand();
+        return 1;
+    }
+
+    seen_dd = 0;
+    int rc = 0;
+
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (seen_dd) {
+            if (mkdir(a, 0777) != 0) {
+                rc = 1;
+                diag_create_fail(a, strlen(a), errno);
+            }
+        } else if (strcmp(a, "--") == 0) {
+            seen_dd = 1;
+        } else if (a[0] == '-' && strcmp(a, "-") != 0) {
+            continue;
+        } else {
+            if (mkdir(a, 0777) != 0) {
+                rc = 1;
+                diag_create_fail(a, strlen(a), errno);
+            }
+        }
+    }
+
+    return rc;
 }

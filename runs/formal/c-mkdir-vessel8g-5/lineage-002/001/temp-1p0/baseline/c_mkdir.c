@@ -1,62 +1,64 @@
+#define _POSIX_C_SOURCE 200809L
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
-int main(int argc, char *argv[]) {
-    int n_operands = 0;
+int main(int argc, char *argv[])
+{
+    /* Pass 1: validate arguments -- detect unknown options, count operands.
+       No filesystem mutation happens until pass 2. */
     int after_ddash = 0;
-    int i;
+    int n_operands = 0;
+    int unknown_idx = -1;
 
-    if (argc < 2) {
-        fprintf(stderr, "mkdir: missing operand\n"
-                        "Try 'mkdir --help' for more information.\n");
-        return 1;
+    for (int i = 1; i < argc; i++) {
+        if (after_ddash) {
+            n_operands++;
+        } else if (argv[i][0] == '-' && argv[i][1] == '-' && argv[i][2] == '\0') {
+            after_ddash = 1;
+        } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
+            /* Unknown option (single-char or long) */
+            if (unknown_idx < 0)
+                unknown_idx = i;
+        } else {
+            /* bare '-' or a regular operand */
+            n_operands++;
+        }
     }
 
-    for (i = 1; i < argc; i++) {
-        const char *arg = argv[i];
-        if (after_ddash == 0 && strcmp(arg, "--") == 0) {
-            after_ddash = 1;
-            continue;
-        }
-        if (after_ddash == 0 && arg[0] == '-' && arg[1] != '\0') {
-            if (arg[1] == '-') {
-                fprintf(stderr, "mkdir: unrecognized option '%s'\n"
-                                "Try 'mkdir --help' for more information.\n",
-                        arg);
-            } else {
-                fprintf(stderr, "mkdir: invalid option -- '%c'\n"
-                                "Try 'mkdir --help' for more information.\n",
-                        arg[1]);
-            }
-            return 1;
-        }
-        n_operands++;
+    if (unknown_idx >= 0) {
+        const char *a = argv[unknown_idx];
+        if (a[1] == '-' && a[2] != '\0')
+            fprintf(stderr, "mkdir: unrecognized option '%s'\n", a);
+        else
+            fprintf(stderr, "mkdir: invalid option -- '%c'\n", a[1]);
+        fprintf(stderr, "Try 'mkdir --help' for more information.\n");
+        return 1;
     }
 
     if (n_operands == 0) {
-        fprintf(stderr, "mkdir: missing operand\n"
-                        "Try 'mkdir --help' for more information.\n");
+        fprintf(stderr, "mkdir: missing operand\n");
+        fprintf(stderr, "Try 'mkdir --help' for more information.\n");
         return 1;
     }
 
+    /* Pass 2: create each operand in order; continue after errors. */
     after_ddash = 0;
-    int all_ok = 1;
-
-    for (i = 1; i < argc; i++) {
-        const char *arg = argv[i];
-        if (after_ddash == 0 && strcmp(arg, "--") == 0) {
+    int rc = 0;
+    for (int i = 1; i < argc; i++) {
+        if (!after_ddash &&
+            argv[i][0] == '-' && argv[i][1] == '-' && argv[i][2] == '\0') {
             after_ddash = 1;
             continue;
         }
-        errno = 0;
-        if (mkdir(arg, 0777) == -1) {
-            fprintf(stderr, "mkdir: cannot create directory '%s': %s\n", arg, strerror(errno));
-            all_ok = 0;
+        if (mkdir(argv[i], 0777) != 0) {
+            fprintf(stderr, "mkdir: cannot create directory '%s': %s\n",
+                    argv[i], strerror(errno));
+            rc = 1;
         }
     }
 
-    return all_ok ? 0 : 1;
+    return rc;
 }

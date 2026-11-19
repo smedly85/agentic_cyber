@@ -1,423 +1,395 @@
+#define _POSIX_C_SOURCE 200809L
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <unistd.h>
+#include <ctype.h>
 
-static int parse_mode_str(const char *s, mode_t *result, int *digits) {
-    if (s == NULL || s[0] == '\0') return 0;
-    
-    // Check if numeric: all digits 0-7
-    int all_numeric = 1;
-    for (const char *p = s; *p; p++) {
-        if (*p < '0' || *p > '7') {
-            all_numeric = 0;
+#define MAX_PATH_LEN 4096
+
+#ifndef S_ISVTX
+#define S_ISVTX 01000
+#endif
+
+static int create_parents(const char *path, mode_t um, mode_t mode, int set_mode)
+{
+    char buf[MAX_PATH_LEN];
+    size_t buflen = 0;
+    size_t i = 0;
+    size_t len = strlen(path);
+
+    if (len == 0)
+        return -1;
+
+    if (path[0] == '/')
+        buf[buflen++] = '/';
+
+    int found = 0;
+
+    while (i < len) {
+        while (i < len && path[i] == '/')
+            i++;
+        if (i >= len)
             break;
-        }
-    }
-    
-    if (all_numeric) {
-        size_t len = strlen(s);
-        if (len > 8) return 0;
-        *digits = (int)len;
-        unsigned long val = strtoul(s, NULL, 8);
-        if (val > 07777) return 0;
-        *result = (mode_t)val;
-        return 1;
-    }
-    
-    // Symbolic mode
-    mode_t mode = 0777;
-    const char *p = s;
-    
-    int has_ordinary_perm = 0;
-    int has_sticky = 0;
-    
-    while (*p) {
-        // Parse who (one or more of u, g, o, a)
-        int who_u = 0, who_g = 0, who_o = 0;
-        while (*p == 'u' || *p == 'g' || *p == 'o' || *p == 'a') {
-            if (*p == 'u') who_u = 1;
-            else if (*p == 'g') who_g = 1;
-            else if (*p == 'o') who_o = 1;
-            else if (*p == 'a') who_u = who_g = who_o = 1;
-            p++;
-        }
-        
-        int who_omitted = (!who_u && !who_g && !who_o);
-        
-        // Parse operator
-        char op;
-        if (*p == '+' || *p == '-' || *p == '=') {
-            op = *p++;
-        } else {
-            return 0;
-        }
-        
-        // Parse permissions
-        int perm_r = 0, perm_w = 0, perm_x = 0, perm_s = 0, perm_t = 0;
-        int copy_from = -1;
-        int has_perm = 0;
-        
-        while (*p && *p != ',') {
-            switch (*p) {
-                case 'r': perm_r = 1; has_perm = 1; break;
-                case 'w': perm_w = 1; has_perm = 1; break;
-                case 'x': case 'X': perm_x = 1; has_perm = 1; break;
-                case 's': perm_s = 1; has_perm = 1; break;
-                case 't': perm_t = 1; has_perm = 1; has_sticky = 1; break;
-                case 'u': copy_from = 0; has_perm = 1; break;
-                case 'g': copy_from = 1; has_perm = 1; break;
-                case 'o': copy_from = 2; has_perm = 1; break;
-                default: return 0;
-            }
-            p++;
-        }
-        
-        if (op != '=' && !has_perm) return 0;
-        
-        if (perm_r || perm_w || perm_x || copy_from >= 0 || !has_perm)
-            has_ordinary_perm = 1;
-        
-        // Determine affected classes
-        int aff_u = who_u || who_omitted;
-        int aff_g = who_g || who_omitted;
-        int aff_o = who_o || who_omitted;
-        
-        // Compute ordinary permission bits
-        mode_t ord_bits = 0;
-        if (copy_from >= 0) {
-            mode_t src;
-            if (copy_from == 0) src = mode & 0700;
-            else if (copy_from == 1) src = mode & 0070;
-            else src = mode & 0007;
-            
-            if (aff_u) ord_bits |= src & 0700;
-            if (aff_g) ord_bits |= (src >> 3) & 0070;
-            if (aff_o) ord_bits |= (src >> 6) & 0007;
-        } else {
-            if (perm_r) {
-                if (aff_u) ord_bits |= 0400;
-                if (aff_g) ord_bits |= 0040;
-                if (aff_o) ord_bits |= 0004;
-            }
-            if (perm_w) {
-                if (aff_u) ord_bits |= 0200;
-                if (aff_g) ord_bits |= 0020;
-                if (aff_o) ord_bits |= 0002;
-            }
-            if (perm_x) {
-                if (aff_u) ord_bits |= 0100;
-                if (aff_g) ord_bits |= 0010;
-                if (aff_o) ord_bits |= 0001;
-            }
-        }
-        
-        // Determine which special bits are affected
-        int setuid_affected = perm_s && (who_omitted || who_u || who_o);
-        int setgid_affected = perm_s && (who_omitted || who_g || who_o);
-        int sticky_affected = perm_t;
-        
-        // Determine which ordinary bits to clear (for = operator)
-        mode_t clear_mask = 0;
-        if (op == '=') {
-            if (aff_u) clear_mask |= 0700;
-            if (aff_g) clear_mask |= 0070;
-            if (aff_o) clear_mask |= 0007;
-        }
-        
-        // Apply operation
-        if (op == '+') {
-            mode |= ord_bits;
-            if (setuid_affected) mode |= 04000;
-            if (setgid_affected) mode |= 02000;
-            if (sticky_affected) mode |= 01000;
-        } else if (op == '-') {
-            mode &= ~ord_bits;
-            if (setuid_affected) mode &= ~04000;
-            if (setgid_affected) mode &= ~02000;
-            if (sticky_affected) mode &= ~01000;
-        } else { /* op == '=' */
-            mode &= ~clear_mask;
-            mode |= ord_bits;
-            
-            // Special bits for = operator
-            if (setuid_affected) {
-                if (perm_s) mode |= 04000;
-                else mode &= ~04000;
-            }
-            if (setgid_affected) {
-                if (perm_s) mode |= 02000;
-                else mode &= ~02000;
-            }
-            // Sticky: if o or a is in who, sticky = (perm_t ? set : clear)
-            int sticky_addr = (who_omitted || who_o);
-            if (sticky_addr) {
-                if (perm_t) mode |= 01000;
-                else mode &= ~01000;
-            }
-        }
-        
-        if (*p == ',') p++;
-        else break;
-    }
-    
-    if (!has_ordinary_perm && has_sticky) {
-        mode = (mode & ~0777) | 0755;
-    }
-    *result = mode & 07777;
-    return 1;
-}
 
-static int ensure_dir(const char *path, int ensure_owner_wx) {
-    struct stat lst;
-    if (lstat(path, &lst) == 0) {
-        if (S_ISDIR(lst.st_mode))
-            return 0;
-        if (S_ISLNK(lst.st_mode)) {
-            struct stat st;
-            if (stat(path, &st) == 0 && S_ISDIR(st.st_mode))
-                return 0;
+        size_t start = i;
+        while (i < len && path[i] != '/')
+            i++;
+        size_t clen = i - start;
+        if (clen == 0)
+            continue;
+
+        /* Determine if this is the last non-empty component. */
+        int is_last = 1;
+        for (size_t j = i; j < len; j++) {
+            if (path[j] != '/') {
+                is_last = 0;
+                break;
+            }
+        }
+
+        if (buflen > 0 && buf[buflen - 1] != '/')
+            buf[buflen++] = '/';
+        if (buflen + clen >= sizeof(buf)) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        memcpy(buf + buflen, path + start, clen);
+        buflen += clen;
+        buf[buflen] = '\0';
+
+        found = 1;
+
+        struct stat st;
+        if (lstat(buf, &st) == 0) {
+            if (S_ISDIR(st.st_mode))
+                continue;
+            if (S_ISLNK(st.st_mode)) {
+                if (stat(buf, &st) == 0 && S_ISDIR(st.st_mode))
+                    continue;
+                errno = ENOTDIR;
+                return -1;
+            }
             errno = ENOTDIR;
             return -1;
         }
-        errno = ENOTDIR;
-        return -1;
+
+        if (errno != ENOENT)
+            return -1;
+
+        mode_t create_mode = (0777 & ~um);
+        if (is_last && set_mode) {
+            create_mode = mode;
+        } else if (!is_last) {
+            create_mode = (0777 & ~um) | 0300;
+        }
+        
+        if (mkdir(buf, create_mode) != 0)
+            return -1;
+        
+        if (is_last && set_mode) {
+            chmod(buf, mode);
+        }
     }
-    if (errno != ENOENT)
-        return -1;
 
-    if (mkdir(path, 0777) == -1)
-        return -1;
-
-    if (ensure_owner_wx) {
+    if (!found) {
         struct stat st;
-        if (stat(path, &st) == 0 && !(st.st_mode & 0300))
-            chmod(path, (st.st_mode & 07777) | 0300);
+        if (lstat(path, &st) == 0) {
+            if (S_ISDIR(st.st_mode)) {
+                if (set_mode) {
+                    chmod(path, mode);
+                }
+                return 0;
+            }
+            if (S_ISLNK(st.st_mode)) {
+                if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+                    if (set_mode) {
+                        chmod(path, mode);
+                    }
+                    return 0;
+                }
+            }
+            errno = ENOTDIR;
+        }
+        return -1;
     }
+
     return 0;
 }
 
-static int create_parents(const char *path, mode_t final_mode, int has_final_mode) {
-    size_t len = strlen(path);
-    if (len == 0) {
-        errno = ENOENT;
-        return -1;
-    }
+/* Parse symbolic mode string and return the resulting mode */
+static int parse_symbolic_mode(const char *str, mode_t *result, mode_t umask)
+{
+    mode_t mode = 0777;
 
-    char *buf = malloc(len + 1);
-    if (!buf) {
-        errno = ENOMEM;
-        return -1;
-    }
-    memcpy(buf, path, len + 1);
+    int clauses = 0;
+    while (*str) {
+        while (*str == ',')
+            str++;
+        if (*str == '\0')
+            break;
 
-    int result = 0;
-    size_t i = 0;
+        int who_explicit = 0;
+        mode_t who = 0;
+        while (*str && strchr("ugoa", *str)) {
+            who_explicit = 1;
+            switch (*str) {
+                case 'u': who |= 0700; break;
+                case 'g': who |= 0070; break;
+                case 'o': who |= 0007; break;
+                case 'a': who |= 0777; break;
+            }
+            str++;
+        }
+        if (!who_explicit)
+            who = 0777;
 
-    while (i < len && buf[i] == '/')
-        i++;
-    if (i >= len) {
-        free(buf);
-        return 0;
-    }
+        int op;
+        if (*str == '+') { op = '+'; str++; }
+        else if (*str == '-') { op = '-'; str++; }
+        else if (*str == '=') { op = '='; str++; }
+        else
+            return -1;
 
-    while (i < len) {
-        size_t comp_start = i;
-        while (i < len && buf[i] != '/')
-            i++;
-        size_t comp_end = i;
-        size_t comp_len = comp_end - comp_start;
-
-        if (comp_len == 1 && buf[comp_start] == '.') {
-            while (i < len && buf[i] == '/')
-                i++;
-            continue;
+        mode_t perms = 0;
+        int has_perm = 0;
+        while (*str && strchr("rwxXstugo", *str)) {
+            switch (*str) {
+                case 'r':
+                    perms |= (who & 0444);
+                    has_perm = 1;
+                    break;
+                case 'w':
+                    perms |= (who & 0222);
+                    has_perm = 1;
+                    break;
+                case 'x':
+                    perms |= (who & 0111);
+                    has_perm = 1;
+                    break;
+                case 'X':
+                    perms |= (who & 0111);
+                    has_perm = 1;
+                    break;
+                case 's':
+                    if (who & 0400) perms |= 04000;
+                    if (who & 0040) perms |= 02000;
+                    has_perm = 1;
+                    break;
+                case 't':
+                    perms |= 01000;
+                    has_perm = 1;
+                    break;
+                case 'u':
+                    perms |= (mode & 0700);
+                    has_perm = 1;
+                    break;
+                case 'g':
+                    perms |= (mode & 0070);
+                    has_perm = 1;
+                    break;
+                case 'o':
+                    perms |= (mode & 0007);
+                    has_perm = 1;
+                    break;
+            }
+            str++;
         }
 
-        int is_last = 1;
-        {
-            size_t j = i;
-            while (j < len && buf[j] == '/')
-                j++;
-            while (j < len) {
-                size_t k = j;
-                while (k < len && buf[k] != '/')
-                    k++;
-                size_t next_len = k - j;
-                if (!(next_len == 1 && buf[j] == '.')) {
-                    is_last = 0;
+        if (op != '=' && !has_perm)
+            return -1;
+
+        clauses++;
+
+        if (who_explicit) {
+            switch (op) {
+                case '+':
+                    mode |= perms;
+                    break;
+                case '-':
+                    mode &= ~perms;
+                    break;
+                case '=': {
+                    mode_t domain = who & 0777;
+                    if (who & 0700) domain |= 04000;
+                    if (who & 0070) domain |= 02000;
+                    if (who & 0007) domain |= 01000;
+                    mode = (mode & ~domain) | (perms & domain);
                     break;
                 }
-                j = k;
-            }
-        }
-
-        char saved = buf[comp_end];
-        buf[comp_end] = '\0';
-        
-        if (is_last) {
-            // Final component
-            if (has_final_mode) {
-                if (mkdir(buf, final_mode) == -1) {
-                    if (errno == EEXIST) {
-                        struct stat st;
-                        if (stat(buf, &st) == 0 && S_ISDIR(st.st_mode)) {
-                            /* existing directory: idempotent success, do not chmod */
-                        } else {
-                            errno = ENOTDIR;
-                            result = -1;
-                        }
-                    } else {
-                        result = -1;
-                    }
-                } else {
-                    // Ensure mode is correct (umask might have affected it)
-                    if (chmod(buf, final_mode) == -1) {
-                        result = -1;
-                    }
-                }
-            } else {
-                result = ensure_dir(buf, 0);
             }
         } else {
-            // Intermediate component
-            result = ensure_dir(buf, 1);
+            mode_t ordinary = perms & 0777;
+            mode_t special = perms & ~0777;
+            switch (op) {
+                case '+':
+                    mode |= (ordinary & ~umask) | special;
+                    break;
+                case '-':
+                    mode &= ~((ordinary & ~umask) | special);
+                    break;
+                case '=':
+                    mode = (mode & ~0777) | (ordinary & ~umask) | special;
+                    break;
+            }
         }
-        
-        buf[comp_end] = saved;
-        if (result != 0) {
-            break;
-        }
-
-        i = comp_end + 1;
     }
 
-    free(buf);
-    return result;
+    if (clauses == 0)
+        return -1;
+
+    *result = mode;
+    return 0;
 }
 
-int main(int argc, char *argv[]) {
-    int parents = 0;
-    int has_mode = 0;
-    mode_t mode_val = 0777;
-    int mode_digits = 0;
-    char *operands[4096];
-    int n_operands = 0;
-    int after_ddash = 0;
-    
-    if (argc < 2) {
-        fprintf(stderr, "mkdir: missing operand\n"
-                        "Try 'mkdir --help' for more information.\n");
-        return 1;
+/* Parse mode string (symbolic or octal) */
+static int parse_mode(const char *str, mode_t *result, mode_t umask)
+{
+    if (*str == '\0')
+        return -1;
+
+    /* Check if it's an octal number */
+    if (str[0] >= '0' && str[0] <= '7') {
+        char *endptr;
+        long val = strtol(str, &endptr, 8);
+        if (*endptr != '\0' || val < 0 || val > 07777)
+            return -1;
+        *result = (mode_t)val;
+        return 0;
     }
     
+    /* Otherwise parse as symbolic mode */
+    return parse_symbolic_mode(str, result, umask);
+}
+
+int main(int argc, char *argv[])
+{
+    int parents = 0;
+    int mode_specified = 0;
+    mode_t mode = 0777;
+    int n_operands = 0;
+    int unknown_idx = -1;
+
+    /* Pass 1: validate all arguments before any filesystem mutation. */
+    int after_ddash = 0;
     for (int i = 1; i < argc; i++) {
-        const char *arg = argv[i];
-        
-        if (!after_ddash && strcmp(arg, "--") == 0) {
+        if (after_ddash) {
+            n_operands++;
+        } else if (argv[i][0] == '-' && argv[i][1] == '-' && argv[i][2] == '\0') {
+            after_ddash = 1;
+        } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
+            if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--parents") == 0) {
+                parents = 1;
+            } else if (strncmp(argv[i], "-m", 2) == 0) {
+                mode_specified = 1;
+                if (argv[i][2] != '\0') {
+                    if (parse_mode(argv[i] + 2, &mode, 0) != 0) {
+                        fprintf(stderr, "mkdir: invalid mode '%s'\n", argv[i] + 2);
+                        return 1;
+                    }
+                } else {
+                    i++;
+                    if (i >= argc) {
+                        fprintf(stderr, "mkdir: option requires an argument -- 'm'\n");
+                        return 1;
+                    }
+                    if (parse_mode(argv[i], &mode, 0) != 0) {
+                        fprintf(stderr, "mkdir: invalid mode '%s'\n", argv[i]);
+                        return 1;
+                    }
+                }
+            } else if (strncmp(argv[i], "--mode", 6) == 0) {
+                mode_specified = 1;
+                if (argv[i][6] == '=') {
+                    if (parse_mode(argv[i] + 7, &mode, 0) != 0) {
+                        fprintf(stderr, "mkdir: invalid mode '%s'\n", argv[i] + 7);
+                        return 1;
+                    }
+                } else {
+                    i++;
+                    if (i >= argc) {
+                        fprintf(stderr, "mkdir: option requires an argument -- 'mode'\n");
+                        return 1;
+                    }
+                    if (parse_mode(argv[i], &mode, 0) != 0) {
+                        fprintf(stderr, "mkdir: invalid mode '%s'\n", argv[i]);
+                        return 1;
+                    }
+                }
+            } else if (unknown_idx < 0) {
+                unknown_idx = i;
+            }
+        } else {
+            n_operands++;
+        }
+    }
+
+    if (unknown_idx >= 0) {
+        const char *a = argv[unknown_idx];
+        if (a[1] == '-' && a[2] != '\0')
+            fprintf(stderr, "mkdir: unrecognized option '%s'\n", a);
+        else
+            fprintf(stderr, "mkdir: invalid option -- '%c'\n", a[1]);
+        fprintf(stderr, "Try 'mkdir --help' for more information.\n");
+        return 1;
+    }
+
+    if (n_operands == 0) {
+        fprintf(stderr, "mkdir: missing operand\n");
+        fprintf(stderr, "Try 'mkdir --help' for more information.\n");
+        return 1;
+    }
+
+    /* Determine umask for -p intermediate mode computation. */
+    mode_t um = 0;
+    if (parents) {
+        um = umask(0);
+        umask(um);
+    }
+
+    /* Pass 2: create directories; continue after per-operand errors. */
+    after_ddash = 0;
+    int rc = 0;
+    for (int i = 1; i < argc; i++) {
+        const char *path;
+
+        if (after_ddash) {
+            path = argv[i];
+        } else if (argv[i][0] == '-' && argv[i][1] == '-' && argv[i][2] == '\0') {
             after_ddash = 1;
             continue;
-        }
-        
-        if (!after_ddash && arg[0] == '-' && arg[1] != '\0') {
-            if (strcmp(arg, "-p") == 0 || strcmp(arg, "--parents") == 0) {
-                parents = 1;
-                continue;
-            }
-            if (arg[1] == 'm' && arg[2] == '\0') {
-                if (i + 1 >= argc) {
-                    fprintf(stderr, "mkdir: option requires an argument -- 'm'\n"
-                                    "Try 'mkdir --help' for more information.\n");
-                    return 1;
-                }
+        } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
+            if ((argv[i][0] == '-' && argv[i][1] == 'm' && argv[i][2] == '\0') ||
+                (strncmp(argv[i], "--mode", 6) == 0 && argv[i][6] != '=')) {
                 i++;
-                if (!parse_mode_str(argv[i], &mode_val, &mode_digits)) {
-                    fprintf(stderr, "mkdir: invalid mode '%s'\n", argv[i]);
-                    return 1;
-                }
-                has_mode = 1;
-                continue;
             }
-            if (arg[1] == 'm' && arg[2] != '\0') {
-                if (!parse_mode_str(arg + 2, &mode_val, &mode_digits)) {
-                    fprintf(stderr, "mkdir: invalid mode '%s'\n", arg + 2);
-                    return 1;
-                }
-                has_mode = 1;
-                continue;
-            }
-            if (strncmp(arg, "--mode=", 7) == 0) {
-                const char *mode_str = arg + 7;
-                if (!parse_mode_str(mode_str, &mode_val, &mode_digits)) {
-                    fprintf(stderr, "mkdir: invalid mode '%s'\n", mode_str);
-                    return 1;
-                }
-                has_mode = 1;
-                continue;
-            }
-            if (strcmp(arg, "--mode") == 0) {
-                if (i + 1 >= argc) {
-                    fprintf(stderr, "mkdir: option '--mode' requires an argument\n"
-                                    "Try 'mkdir --help' for more information.\n");
-                    return 1;
-                }
-                i++;
-                if (!parse_mode_str(argv[i], &mode_val, &mode_digits)) {
-                    fprintf(stderr, "mkdir: invalid mode '%s'\n", argv[i]);
-                    return 1;
-                }
-                has_mode = 1;
-                continue;
-            }
-            
-            if (arg[1] == '-') {
-                fprintf(stderr, "mkdir: unrecognized option '%s'\n"
-                                "Try 'mkdir --help' for more information.\n", arg);
-            } else {
-                fprintf(stderr, "mkdir: invalid option -- '%c'\n"
-                                "Try 'mkdir --help' for more information.\n", arg[1]);
-            }
-            return 1;
-        }
-        
-        if (n_operands >= 4096) {
-            fprintf(stderr, "mkdir: too many operands\n");
-            return 1;
-        }
-        operands[n_operands++] = (char *)arg;
-    }
-    
-    if (n_operands == 0) {
-        fprintf(stderr, "mkdir: missing operand\n"
-                        "Try 'mkdir --help' for more information.\n");
-        return 1;
-    }
-    
-    int all_ok = 1;
-    for (int i = 0; i < n_operands; i++) {
-        const char *path = operands[i];
-        errno = 0;
-        int rc;
-        if (parents) {
-            rc = create_parents(path, mode_val, has_mode);
+            continue;
         } else {
-            mode_t m = has_mode ? mode_val : 0777;
-            rc = mkdir(path, m);
-            if (rc == 0 && has_mode) {
-                if (chmod(path, mode_val) == -1) {
-                    rc = -1;
+            path = argv[i];
+        }
+
+        int err;
+        if (parents) {
+            err = (create_parents(path, um, mode, mode_specified) != 0);
+        } else {
+            /* Create with permissive mode, then chmod if needed */
+            if (mkdir(path, 0777) != 0) {
+                err = 1;
+            } else {
+                err = 0;
+                if (mode_specified) {
+                    chmod(path, mode);
                 }
             }
         }
-        if (rc != 0) {
+        if (err) {
             fprintf(stderr, "mkdir: cannot create directory '%s': %s\n",
                     path, strerror(errno));
-            all_ok = 0;
+            rc = 1;
         }
     }
-    
-    return all_ok ? 0 : 1;
+
+    return rc;
 }

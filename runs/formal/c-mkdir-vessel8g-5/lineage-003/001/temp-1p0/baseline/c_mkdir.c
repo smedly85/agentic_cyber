@@ -1,54 +1,63 @@
+#define _POSIX_C_SOURCE 200809L
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <unistd.h>
+#include <sys/types.h>
 
 int main(int argc, char *argv[])
 {
-    // Phase 1: Validate arguments (no filesystem mutation)
-    int opt_done = 0;
-    int has_operand = 0;
+    const char *prog = "mkdir";
 
+    /* Phase 1: validate options before any mutation.
+       Only "--" is recognized (option terminator).
+       "-" is an operand. Other dash-prefixed tokens are errors. */
+    int terminated = 0;
     for (int i = 1; i < argc; i++) {
-        if (opt_done) {
-            has_operand = 1;
-            continue;
-        }
+        if (terminated)
+            break;
         if (strcmp(argv[i], "--") == 0) {
-            opt_done = 1;
+            terminated = 1;
             continue;
         }
         if (argv[i][0] == '-' && argv[i][1] != '\0') {
-            fprintf(stderr, "mkdir: unrecognized option '%s'\n", argv[i]);
-            fprintf(stderr, "Try 'mkdir --help' for more information.\n");
+            if (argv[i][1] == '-')
+                fprintf(stderr, "%s: unrecognized option '%s'\n", prog, argv[i]);
+            else
+                fprintf(stderr, "%s: invalid option -- '%c'\n", prog, argv[i][1]);
+            fprintf(stderr, "Try '%s --help' for more information.\n", prog);
             return 1;
         }
-        has_operand = 1;
     }
 
-    if (!has_operand) {
-        fprintf(stderr, "mkdir: missing operand\n");
-        fprintf(stderr, "Try 'mkdir --help' for more information.\n");
+    /* Count operands (all args except the "--" terminator). */
+    int operand_count = 0;
+    terminated = 0;
+    for (int i = 1; i < argc; i++) {
+        if (!terminated && strcmp(argv[i], "--") == 0) {
+            terminated = 1;
+            continue;
+        }
+        operand_count++;
+    }
+
+    if (operand_count == 0) {
+        fprintf(stderr, "%s: missing operand\n", prog);
+        fprintf(stderr, "Try '%s --help' for more information.\n", prog);
         return 1;
     }
 
-    // Phase 2: Create directories in order, continuing after per-operand errors
+    /* Phase 2: create each operand directory in order, continuing after errors. */
     int all_ok = 1;
-    opt_done = 0;
-
+    terminated = 0;
     for (int i = 1; i < argc; i++) {
-        if (!opt_done) {
-            if (strcmp(argv[i], "--") == 0) {
-                opt_done = 1;
-                continue;
-            }
-            if (argv[i][0] == '-' && argv[i][1] != '\0')
-                continue;
+        if (!terminated && strcmp(argv[i], "--") == 0) {
+            terminated = 1;
+            continue;
         }
         if (mkdir(argv[i], 0777) != 0) {
-            fprintf(stderr, "mkdir: cannot create directory '%s': %s\n",
-                    argv[i], strerror(errno));
+            fprintf(stderr, "%s: cannot create directory '%s': %s\n",
+                    prog, argv[i], strerror(errno));
             all_ok = 0;
         }
     }

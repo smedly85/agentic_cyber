@@ -113,7 +113,7 @@ Preserve GNU special-bit semantics, including inherited directory set-user-ID/se
 
 With parents enabled, explicit modes apply only to newly created final directories. Newly created intermediate parents retain the parents-checkpoint umask rule with owner write and search ensured. Existing directories retain all permissions, including special bits; -m does not chmod existing final directories accepted by -p.
 
-Use the GNU Coreutils 9.11 [mkdir documentation](https://www.gnu.org/software/coreutils/manual/html_node/mkdir-invocation.html) and [file-permissions rules](https://www.gnu.org/software/coreutils/manual/html_node/File-permissions.html), with the pinned Linux oracle resolving ambiguities. No options outside this cumulative checkpoint are added.
+The behavioral requirements in this prompt are the complete specification for this checkpoint. Implement them using only the supplied source code, permitted read-only benchmark materials, and language-standard interfaces. The controller independently performs compilation and validation against the pinned GNU Coreutils 9.11 benchmark. No options outside this cumulative checkpoint are added.
 
 #### Implementation and validation
 
@@ -153,10 +153,10 @@ Checkpoint tests:
 
 Build (exit 1, 2 compiler errors)
 
-- /tmp/tmp0qw54xge/program.c:215:9  [error]
-      unused variable 'last_component' [-Werror=unused-variable]
-- /tmp/tmp0qw54xge/program.c:191:88  [error]
-      unused parameter 'numeric_digits' [-Werror=unused-parameter]
+- /tmp/tmp558o5il6/program.c:26:9  [error]
+      variable 'last_created' set but not used [-Werror=unused-but-set-variable]
+- /tmp/tmp558o5il6/program.c:169:36  [error]
+      'S_ISVTX' undeclared (first use in this function)
 
 Checkpoint tests (exit 2)
 
@@ -168,13 +168,15 @@ Build:
 
 ```
 
-/tmp/tmp0qw54xge/program.c: In function 'create_parents':
-/tmp/tmp0qw54xge/program.c:215:9: error: unused variable 'last_component' [-Werror=unused-variable]
-  215 |     int last_component = 0;
-      |         ^~~~~~~~~~~~~~
-/tmp/tmp0qw54xge/program.c:191:88: error: unused parameter 'numeric_digits' [-Werror=unused-parameter]
-  191 | static int create_parents(const char *path, mode_t final_mode, int has_final_mode, int numeric_digits) {
-      |                                                                                    ~~~~^~~~~~~~~~~~~~
+/tmp/tmp558o5il6/program.c: In function 'create_parents':
+/tmp/tmp558o5il6/program.c:26:9: error: variable 'last_created' set but not used [-Werror=unused-but-set-variable]
+   26 |     int last_created = 0;
+      |         ^~~~~~~~~~~~
+/tmp/tmp558o5il6/program.c: In function 'parse_symbolic_mode':
+/tmp/tmp558o5il6/program.c:169:36: error: 'S_ISVTX' undeclared (first use in this function)
+  169 |                 case 't': perms |= S_ISVTX; break;
+      |                                    ^~~~~~~
+/tmp/tmp558o5il6/program.c:169:36: note: each undeclared identifier is reported only once for each function it appears in
 cc1: all warnings being treated as errors
 ```
 

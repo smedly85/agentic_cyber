@@ -1,60 +1,73 @@
+#define _POSIX_C_SOURCE 200809L
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 
 int main(int argc, char *argv[])
 {
-    int saw_ddash = 0;
-    int n_operands = 0;
+	const char *prog = "mkdir";
+	int i;
+	int saw_ddash = 0;
+	int operand_count = 0;
+	int any_error = 0;
 
-    /* Phase 1: validate arguments before any mutation.
-       Detect unknown options and count operands. */
-    for (int i = 1; i < argc; i++) {
-        const char *arg = argv[i];
-        if (!saw_ddash) {
-            if (strcmp(arg, "--") == 0) {
-                saw_ddash = 1;
-                continue;
-            }
-            if (arg[0] == '-' && arg[1] != '\0') {
-                if (arg[1] == '-' && arg[2] != '\0') {
-                    fprintf(stderr, "mkdir: unrecognized option '%s'\n", arg);
-                } else {
-                    fprintf(stderr, "mkdir: invalid option -- '%c'\n", arg[1]);
-                }
-                fprintf(stderr, "Try 'mkdir --help' for more information.\n");
-                return 1;
-            }
-        }
-        n_operands++;
-    }
+	for (i = 1; i < argc; i++) {
+		if (saw_ddash) {
+			operand_count++;
+			continue;
+		}
+		if (strcmp(argv[i], "--") == 0) {
+			saw_ddash = 1;
+			continue;
+		}
+		if (argv[i][0] == '-') {
+			if (strcmp(argv[i], "-") == 0) {
+				operand_count++;
+			} else if (argv[i][1] == '-' && argv[i][2] != '\0') {
+				fprintf(stderr, "%s: unrecognized option '%s'\n", prog, argv[i]);
+				fprintf(stderr, "Try '%s --help' for more information.\n", prog);
+				return 1;
+			} else {
+				fprintf(stderr, "%s: invalid option -- '%c'\n", prog, argv[i][1]);
+				fprintf(stderr, "Try '%s --help' for more information.\n", prog);
+				return 1;
+			}
+		} else {
+			operand_count++;
+		}
+	}
 
-    if (n_operands == 0) {
-        fprintf(stderr, "mkdir: missing operand\n");
-        fprintf(stderr, "Try 'mkdir --help' for more information.\n");
-        return 1;
-    }
+	if (operand_count == 0) {
+		fprintf(stderr, "%s: missing operand\n", prog);
+		fprintf(stderr, "Try '%s --help' for more information.\n", prog);
+		return 1;
+	}
 
-    /* Phase 2: create each operand's directory in order;
-       continue after per-operand errors. */
-    int exit_code = 0;
-    saw_ddash = 0;
-    for (int i = 1; i < argc; i++) {
-        const char *arg = argv[i];
-        if (!saw_ddash) {
-            if (strcmp(arg, "--") == 0) {
-                saw_ddash = 1;
-                continue;
-            }
-        }
-        if (mkdir(arg, 0777) != 0) {
-            fprintf(stderr, "mkdir: cannot create directory '%s': %s\n",
-                    arg, strerror(errno));
-            exit_code = 1;
-        }
-    }
+	saw_ddash = 0;
+	for (i = 1; i < argc; i++) {
+		const char *operand;
+		if (saw_ddash) {
+			operand = argv[i];
+		} else if (strcmp(argv[i], "--") == 0) {
+			saw_ddash = 1;
+			continue;
+		} else if (argv[i][0] == '-') {
+			if (strcmp(argv[i], "-") == 0)
+				operand = argv[i];
+			else
+				continue;
+		} else {
+			operand = argv[i];
+		}
 
-    return exit_code;
+		if (mkdir(operand, 0777) != 0) {
+			int e = errno;
+			fprintf(stderr, "%s: cannot create directory '%s': %s\n",
+				prog, operand, strerror(e));
+			any_error = 1;
+		}
+	}
+
+	return any_error ? 1 : 0;
 }
