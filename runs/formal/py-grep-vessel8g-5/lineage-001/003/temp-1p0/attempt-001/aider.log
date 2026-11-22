@@ -1,0 +1,1210 @@
+
+===== LLM INVOCATION 0: INITIAL =====
+
+
+Aider v0.86.2
+Main model: ollama_chat/qwen3.8:27b with architect edit format
+Editor model: ollama_chat/qwen3-coder-next:latest with whole edit format
+Weak model: ollama_chat/qwen3-coder-next:latest
+Git repo: none
+Repo-map: disabled
+Added py_grep.py to the chat.
+Added ../../tests/py-grep-test-suite/props.py to the chat (read-only).
+Added ../../tests/py-grep-test-suite/engine.py to the chat (read-only).
+Added ../../tests/py-grep-test-suite/judge_candidate.sh to the chat (read-only).
+Added ../../tests/py-grep-test-suite/BUNDLE.json to the chat (read-only).
+Added ../../tests/py-grep-test-suite/config.py to the chat (read-only).
+Added ../../tests/py-grep-test-suite/config.json to the chat (read-only).
+Added ../../tests/py-grep-test-suite/runner.py to the chat (read-only).
+Note: in-chat filenames are always relative to the git working dir, not the 
+current working dir.
+Cur working dir: 
+/Users/sonjabrown/agentic_cyber/runs/formal/py-grep-vessel8g-5/lineage-001/003/t
+emp-1p0/attempt-001/workdir
+Git working dir: /Users/sonjabrown/agentic_cyber
+
+
+--------------
+► **THINKING**
+
+Let me analyze the checkpoint requirements:
+
+1. **`-H` / `--with-filename`** - already implemented
+2. **`-h` / `--no-filename`** - already implemented
+3. **`-r` / `--recursive`** - NOT implemented, this is the new feature
+
+Key requirements for `-r` / `--recursive`:
+- A directory operand is traversed in pre-order
+- Within each directory, visit immediate entry names in ascending raw-byte order
+- Search regular files, descend into directories, skip every symbolic link encountered during traversal
+- An explicitly named symlink remains followed (i.e., if you pass a symlink directly as an operand, follow it)
+- Avoid doubled separators for a trailing-slash operand
+- Traversal must be deterministic and terminate safely on deep or resource-limited trees
+- Diagnose unreadable entries and continue where possible
+
+Prefix rules with `-r`:
+- Without `-H` or `-h`, recursive search prefixes when there are multiple operands OR when at least one operand is a directory
+- A single regular-file operand remains unprefixed
+- The prefix is the deterministic path derived from the operand spelling and relative entry components
+- `-h` suppresses it and `-H` forces it
+- A directory without `-r` remains an error
+
+So the key changes needed:
+
+1. Add `-r` / `--recursive` to option parsing (both short and long forms, and in clusters)
+2. When `-r` is set and a file operand is a directory, traverse it recursively instead of diagnosing it as an error
+3. Traversal: pre-order, entries in ascending raw-byte order, skip symlinks, search regular files, descend into subdirectories
+4. Prefix logic: need to determine if we're in "recursive mode" where at least one operand is a directory - this affects prefixing even for a single operand
+5. For recursive traversal, the path prefix for files is the operand spelling + "/" + relative path (avoiding doubled separators)
+
+Let me think about the prefix logic more carefully:
+
+Current logic:
+```python
+if show_filename is True:
+    prefix = True
+elif show_filename is False:
+    prefix = False
+else:
+    prefix = (len(files) >= 2)
+```
+
+New logic needs to account for recursive mode:
+- If `-H`: always prefix
+- If `-h`: never prefix
+- Otherwise (auto): prefix when multiple operands OR when at least one operand is a directory (and `-r` is set)
+
+Wait, let me re-read: "Without `-H` or `-h`, recursive search prefixes when there are multiple operands or when at least one operand is a directory; a single regular-file operand remains unprefixed."
+
+So the "auto" prefix logic becomes:
+- If `-r` is set and at least one operand is a directory → prefix (even for single operand)
+- Otherwise → prefix when multiple operands (existing behavior)
+
+Actually, let me think about this more carefully. The prefix decision is global (one `prefix` variable for the whole run). The spec says:
+
+"Without `-H` or `-h`, recursive search prefixes when there are multiple operands or when at least one operand is a directory; a single regular-file operand remains unprefixed."
+
+So:
+- If `-H`: prefix = True
+- If `-h`: prefix = False
+- Else (auto):
+  - If any operand is a directory (and `-r` is set): prefix = True
+  - Else if multiple operands: prefix = True
+  - Else (single regular file): prefix = False
+
+Wait, what about the case where `-r` is set but no operand is a directory? E.g., `py_grep -r pattern file1 file2` - that should still prefix because there are multiple operands.
+
+And `py_grep -r pattern dir1` where dir1 is a directory - should prefix because one operand is a directory.
+
+And `py_grep -r pattern file1` where file1 is a regular file - should NOT prefix (single regular file).
+
+Let me think about what "at least one operand is a directory" means. It means `os.path.isdir(operand)` (following symlinks). If a symlink to a directory is passed as an operand with `-r`, is it a directory? The spec says "An explicitly named symlink remains followed." So if a symlink points to a directory and is passed as an operand, it's followed (i.e., treated as a directory). But wait, with `-r`, we traverse directories. So if a symlink-to-dir is passed as an operand with `-r`, we'd traverse it.
+
+Actually wait - "skip every symbolic link encountered during traversal. An explicitly named symlink remains followed." So:
+- If a symlink is passed directly as a command-line operand → follow it (if it points to a file, search it; if it points to a dir, traverse it with -r)
+- If a symlink is encountered during recursive traversal → skip it
+
+Now for the traversal:
+- Pre-order: visit a directory, then its children
+- Entry names in ascending raw-byte order (sort by bytes)
+- For each entry:
+  - If it's a regular file → search it
+  - If it's a directory → descend into it
+  - If it's a symlink → skip
+  - If it's something else (fifo, socket, device) → what to do? The spec says "Search regular files, descend into directories, and skip every symbolic link encountered during traversal." It doesn't mention other types. I'll assume we skip non-regular, non-directory, non-symlink entries (like fifos, sockets, devices). Actually, let me re-read: "Search regular files, descend into directories, and skip every symbolic link encountered during traversal." This is exhaustive of what to do. For other types, we probably just skip them silently (they're not regular files, not directories, not symlinks).
+
+Actually, I think the safest interpretation is: for each entry, check if it's a symlink (skip), a directory (descend), or a regular file (search). Anything else is skipped.
+
+For the path construction:
+- The prefix is "the deterministic path derived from the operand spelling and relative entry components"
+- Avoid doubled separators for a trailing-slash operand
+
+So if the operand is `dir/`, and an entry is `dir/file.txt`, the path should be `dir/file.txt` not `dir//file.txt`.
+
+If the operand is `dir` and an entry is `file.txt`, the path is `dir/file.txt`.
+If the operand is `dir/sub` and an entry is `dir/sub/file.txt`, the path is `dir/sub/file.txt`.
+
+So the rule is: if the operand ends with `/`, just concatenate the relative path. Otherwise, operand + `/` + relative path.
+
+Wait, but what about `./dir`? The operand is `./dir`, and the relative path is `file.txt`. The result should be `./dir/file.txt`.
+
+And what if the operand is just `.`? Then the relative path would be `file.txt`, and the result would be `./file.txt`? Or just `file.txt`? Hmm, let me think...
+
+Actually, the spec says "the prefix is the deterministic path derived from the operand spelling and relative entry components." So it's always `operand + separator + relative_path` where separator is `/` (avoiding doubling).
+
+Let me think about this differently. The base path is the operand as written. For each file found during traversal, the full path is constructed by joining the base with the relative path using `/`, being careful not to double up slashes.
+
+So:
+- operand = "dir", relative = "file.txt" → "dir/file.txt"
+- operand = "dir/", relative = "file.txt" → "dir/file.txt" (no double slash)
+- operand = ".", relative = "file.txt" → "./file.txt"
+- operand = "", relative = "file.txt" → "file.txt" (but empty operand probably doesn't happen)
+
+Actually wait, can the operand be empty? An empty string as a file operand? In POSIX, that's a valid (if unusual) filename. But for directory traversal, an empty string wouldn't be a directory. Let me not worry about that edge case.
+
+Let me code this up:
+
+```python
+def _join_path(base: bytes, relative: bytes) -> bytes:
+    """Join base and relative with a single separator, avoiding doubling."""
+    if not relative:
+        return base
+    if not base:
+        return relative
+    if base.endswith(b"/"):
+        return base + relative
+    return base + b"/" + relative
+```
+
+Now for the recursive traversal:
+
+```python
+def traverse_recursive(base_path: bytes, pattern: bytes):
+    """Yield (full_path, file_handle) for each regular file under base_path in
+    pre-order, entries sorted by raw-byte order, skipping symlinks."""
+    # We need to do a DFS (pre-order) with sorted entries
+    # Use an explicit stack to avoid recursion depth issues
+    # Pre-order: visit node, then children
+    # For a directory: we process entries in order, so we need to yield files as we go
+    # and descend into subdirectories in order
+    
+    # Actually, for pre-order traversal with sorted entries:
+    # - List the directory entries, sorted by name
+    # - For each entry in order:
+    #   - If regular file: yield it
+    #   - If directory: recursively traverse it
+    #   - If symlink or other: skip
+    
+    # To avoid deep recursion, use an explicit stack.
+    # But pre-order with a stack means we need to push children in reverse order.
+    # However, we need to interleave file yields with directory descents in the correct order.
+    
+    # Actually, the simplest correct approach for pre-order with sorted entries:
+    # Use a generator with explicit stack of directory paths to process.
+    # Each stack frame is a directory path.
+    # Pop a directory, list its entries sorted, and for each:
+    #   - If file: yield it
+    #   - If dir: push to stack (but we need to process in order, so push in reverse)
+    #   - If symlink: skip
+    #   - If other: skip
+    # Wait, that won't work for pre-order because we'd process all entries of one dir before descending.
+    
+    # Let me think again. Pre-order means:
+    # visit(dir) → for each child in sorted order:
+    #   if child is file: visit(child)
+    #   if child is dir: visit(child) [recursive]
+    #   if child is symlink: skip
+    #   if child is other: skip
+    
+    # This is a depth-first traversal. To do it iteratively with a stack:
+    # We can use a generator approach where we push (path, entry_iterator) frames.
+    
+    # Actually, let me just use a recursive generator with a reasonable approach.
+    # Python's recursion limit is typically 1000, which could be hit by deep trees.
+    # The spec says "terminate safely on deep or resource-limited trees."
+    
+    # Let me use an explicit stack-based approach:
+    # Stack contains directory paths to be processed.
+    # When we pop a directory, we list its entries sorted.
+    # We then need to process them in order: files are yielded, dirs are pushed.
+    # But if we just push all subdirs and yield all files, we lose the ordering.
+    
+    # The correct iterative pre-order DFS:
+    # stack = [initial_dir]
+    # while stack:
+    #   dir = stack.pop()
+    #   entries = sorted(os.listdir(dir))
+    #   # We need to process in order, but stack is LIFO
+    #   # So push in reverse order
+    #   for entry in reversed(entries):
+    #     full = dir + "/" + entry
+    #     if is_symlink(full): skip
+    #     elif is_dir(full): stack.append(full)  # will be processed later
+    #     elif is_file(full): ??? can't yield from here easily
+    
+    # Hmm, this is tricky because we need to yield files interleaved with directory processing.
+    
+    # Let me use a different approach: a generator that uses an explicit stack of iterators.
+    
+    def _traverse(dir_path: bytes):
+        """Generator that yields file paths in pre-order DFS."""
+        # Stack of (dir_path, entries_iterator)
+        stack = [(dir_path, None)]
+        while stack:
+            d, it = stack.pop()
+            if it is None:
+                try:
+                    entries = os.listdir(d)
+                except OSError:
+                    continue  # diagnose? The spec says "diagnose unreadable entries"
+                entries.sort()
+                it = iter(entries)
+                stack.append((d, it))
+            # Resume the iterator
+            try:
+                entry = next(it)
+            except StopIteration:
+                continue
+            full = _join_path(d, entry.encode() if isinstance(entry, str) else entry)
+            # Actually os.listdir returns str, but we want bytes...
+            # Let me use os.listdir with bytes path
+    
+    # Actually, let me reconsider. In Python, os.listdir can work with bytes paths.
+    # Let me use bytes throughout for the path handling.
+    
+    # Let me redesign this more carefully.
+```
+
+OK let me step back and think about the cleanest implementation.
+
+The key functions I need:
+1. `_recursive_search(base_path: bytes, pattern: bytes, out: buffer, prefix: bool, prefix_base: bytes)` → yields matched lines or writes them
+2. The prefix for a file in recursive mode is the full path constructed from the operand + relative path.
+
+Actually, looking at the existing code structure, the output is written directly (not yielded). Let me keep that pattern.
+
+Let me think about what the main function needs to change:
+
+1. Parse `-r` / `--recursive` (add to short cluster parsing and long option parsing)
+2. After determining `prefix` and the file list, handle each file:
+   - If `-r` is set and the file is a directory (following symlinks): traverse recursively
+   - If `-r` is set and the file is a regular file: search it (as before)
+   - If `-r` is set and the file is a symlink to a directory: follow it (traverse)
+   - If `-r` is set and the file is a symlink to a file: follow it (search)
+   - If `-r` is NOT set and the file is a directory: diagnose error (existing behavior)
+
+Wait, I need to be more careful. The spec says:
+- "A directory operand is traversed in pre-order" (when -r is set)
+- "An explicitly named symlink remains followed" (regardless of -r? or only with -r?)
+
+Let me re-read: "Skip every symbolic link encountered during traversal. An explicitly named symlink remains followed."
+
+I think "explicitly named symlink remains followed" means: if you pass a symlink as a command-line operand, you follow it (whether it points to a file or a directory). This is the existing behavior for file operands. With `-r`, if a symlink points to a directory, we'd traverse it. If it points to a file, we'd search it.
+
+Actually wait, without `-r`, a symlink to a directory passed as an operand would be diagnosed as "Is a directory" error (because we check `os.path.isdir`). With `-r`, it would be traversed.
+
+Let me re-read the spec more carefully:
+
+"Add `-r` / `--recursive`. A directory operand is traversed in pre-order; within each directory, visit immediate entry names in ascending raw-byte order. Search regular files, descend into directories, and skip every symbolic link encountered during traversal. An explicitly named symlink remains followed."
+
+So "An explicitly named symlink remains followed" is in the context of `-r`. It means: if you explicitly name a symlink as an operand (not discover it during traversal), you follow it. If it points to a file, search it. If it points to a directory, traverse it.
+
+"A directory without `-r` remains an error." - This confirms that without `-r`, a directory operand is still an error.
+
+Now for the prefix logic with `-r`:
+"Without `-H` or `-h`, recursive search prefixes when there are multiple operands or when at least one operand is a directory; a single regular-file operand remains unprefixed."
+
+So the `prefix` variable (which is currently global) needs to account for whether any operand is a directory (when `-r` is set).
+
+Let me now write the implementation plan:
+
+1. Add `recursive = False` variable
+2. In short option parsing: add `r` case
+3. In long option parsing: add `--recursive` case
+4. After determining the file list, compute the prefix logic:
+   - If `show_filename is True`: prefix = True
+   - If `show_filename is False`: prefix = False
+   - Else: prefix = (len(files) >= 2) or (recursive and any(is_dir(f) for f in files))
+5. For each file operand:
+   - If it's a directory (following symlink) AND recursive is set: call recursive traversal
+   - Otherwise: existing behavior (search file, or diagnose directory error)
+
+For the recursive traversal, I need:
+- A function that does iterative pre-order DFS
+- Sorts entries by raw bytes
+- Skips symlinks (during traversal only)
+- Searches regular files
+- Descends into directories
+- Handles errors (unreadable dirs → diagnose and continue)
+- Constructs the path prefix correctly (operand + "/" + relative, avoiding doubled slashes)
+
+Let me think about the path construction more carefully.
+
+If the operand is `mydir` (bytes: `b"mydir"`), and I find `mydir/sub/file.txt`:
+- The relative path from the operand is `sub/file.txt`
+- The full prefix is `mydir/sub/file.txt`
+
+If the operand is `mydir/` (bytes: `b"mydir/"`), and I find the same file:
+- The relative path is `sub/file.txt`
+- The full prefix should be `mydir/sub/file.txt` (not `mydir//sub/file.txt`)
+
+So the join logic is: if base ends with `/`, just append; else append `/` + relative.
+
+For nested directories:
+- base = `b"mydir"`, entry = `b"sub"`, so child_dir = `b"mydir/sub"`
+- child_dir = `b"mydir/sub"`, entry = `b"file.txt"`, so file_path = `b"mydir/sub/file.txt"`
+
+This is just `_join_path(base, relative)` where we always use the same rule.
+
+Now let me think about the iterative traversal. I'll use a stack-based approach:
+
+```python
+def _traverse_dir(dir_path: bytes, pattern: bytes, out, prefix: bool, had_error: bool) -> bool:
+    """Traverse dir_path in pre-order, searching regular files.
+    Returns updated had_error."""
+    # Stack-based pre-order DFS
+    # Each stack element is a directory path to process
+    # We process entries in order, so we need to be careful with the stack.
+    
+    # Actually, for a clean pre-order DFS with sorted entries:
+    # We can use a stack where each element is (dir_path, entries_iter)
+    # This allows us to interleave file searches with directory descents.
+    
+    stack = []
+    # Push the initial directory
+    try:
+        entries = os.listdir(dir_path)
+    except OSError as e:
+        # diagnose
+        return True
+    entries.sort()  # sort by bytes (os.listdir with bytes path returns bytes list)
+    stack.append(iter(entries))
+    stack.append(dir_path)  # We need to track which dir each iterator belongs to
+    
+    # Hmm, this is getting complicated. Let me use a different structure.
+```
+
+Actually, let me think about this differently. A clean way to do iterative pre-order DFS:
+
+```python
+def _recursive_files(base: bytes):
+    """Yield full paths of regular files under base in pre-order DFS,
+    entries sorted by raw bytes, symlinks skipped."""
+    # Use a stack of directory paths.
+    # For pre-order: when we visit a directory, we process its entries in order.
+    # For each entry: if file, yield it; if dir, it will be processed next (LIFO means we push in reverse).
+    # But this doesn't give us the right interleaving!
+    
+    # Example: dir has entries [a.txt, bdir, c.txt]
+    # Pre-order should yield: a.txt, (contents of bdir), c.txt
+    # But with a simple stack pushing in reverse, we'd push c.txt, bdir, a.txt
+    # Then pop a.txt (yield), pop bdir (push its entries), pop c.txt (yield)
+    # That's wrong - we'd get a.txt, (bdir contents), c.txt... wait, that's actually right!
+    
+    # No wait. Let me trace through:
+    # Stack: [c.txt, bdir, a.txt] (top is a.txt)
+    # Pop a.txt → yield a.txt
+    # Pop bdir → it's a dir, list its entries [x.txt, y.txt], push in reverse: [y.txt, x.txt]
+    #   Stack: [y.txt, x.txt, c.txt]
+    # Pop x.txt → yield x.txt
+    # Pop y.txt → yield y.txt
+    # Pop c.txt → yield c.txt
+    # Result: a.txt, x.txt, y.txt, c.txt ✓
+    
+    # But what if bdir has subdirs?
+    # dir has entries [a.txt, bdir, c.txt]
+    # bdir has entries [b1.txt, bsub]
+    # bsub has entries [bs1.txt]
+    # 
+    # Stack: [c.txt, bdir, a.txt]
+    # Pop a.txt → yield
+    # Pop bdir → list entries [b1.txt, bsub], push reverse: [bsub, b1.txt]
+    #   Stack: [bsub, b1.txt, c.txt]
+    # Pop b1.txt → yield
+    # Pop bsub → list entries [bs1.txt], push reverse: [bs1.txt]
+    #   Stack: [bs1.txt, c.txt]
+    # Pop bs1.txt → yield
+    # Pop c.txt → yield
+    # Result: a.txt, b1.txt, bs1.txt, c.txt ✓
+    
+    # Great, this works! But we need to handle the fact that we need to
+    # distinguish files from dirs when popping from the stack.
+    # We can check os.path type when we pop.
+    
+    # Actually, we can push entries and check their type when we pop:
+    # - If it's a regular file (not symlink): yield it
+    # - If it's a directory (not symlink): list and push its entries in reverse
+    # - If it's a symlink: skip
+    # - If it's other: skip
+    
+    # But we need to be careful: we need to check the type using the full path.
+    # And we need to use os.path functions that follow symlinks for the type check?
+    # No! We need to NOT follow symlinks for the "is it a symlink" check,
+    # but we DO follow symlinks for "is it a directory" (since we skip symlinks anyway,
+    # this only matters for non-symlink entries).
+    
+    # Wait, the spec says "skip every symbolic link encountered during traversal."
+    # So for entries during traversal:
+    # - If symlink: skip (regardless of what it points to)
+    # - If regular file: search
+    # - If directory: descend
+    # - If other (fifo, etc.): skip (I'll assume)
+    
+    # To check if something is a symlink: os.path.islink(path) or os.lstat
+    # To check if it's a directory: os.path.isdir(path) (follows symlinks, but we already excluded symlinks)
+    # To check if it's a regular file: os.path.isfile(path) (follows symlinks, but we already excluded symlinks)
+    
+    # Actually, for non-symlink entries:
+    # - os.path.isdir → it's a real directory
+    # - os.path.isfile → it's a regular file
+    # - else → skip
+    
+    # Let me use os.lstat to be more precise:
+    # - stat.S_ISLNK(st_mode) → symlink, skip
+    # - stat.S_ISDIR(st_mode) → directory, descend
+    # - stat.S_ISREG(st_mode) → regular file, search
+    # - else → skip
+```
+
+OK, I think I have a good plan. Let me now write the actual implementation instructions.
+
+Let me also think about the "diagnose unreadable entries" part. If a subdirectory can't be listed (permission denied), we should diagnose it and continue. The diagnostic should use the path.
+
+And "terminate safely on deep or resource-limited trees" - the iterative approach handles deep trees. For resource-limited (e.g., os.listdir fails with MemoryError or OSError), we catch and continue.
+
+Now, let me also think about the interaction with the prefix logic. The `prefix` variable is global for the entire run. But the actual prefix TEXT differs per file:
+- For a regular file operand with prefix: the prefix is the operand as written
+- For a file found during recursive traversal: the prefix is the full path (operand + relative)
+
+So I need to pass the correct prefix string for each file.
+
+Let me now write the concrete changes:
+
+1. Add `recursive` variable (default False)
+2. Add `r` to short option cluster parsing
+3. Add `--recursive` to long option parsing
+4. Modify the prefix computation to account for recursive + directory operands
+5. Add a recursive traversal function
+6. Modify the file processing loop to handle directories when recursive is set
+
+Let me write this out as concrete code changes for the editor.
+
+Actually, I realize I need to be more careful about the prefix logic. Let me re-read:
+
+"Without `-H` or `-h`, recursive search prefixes when there are multiple operands or when at least one operand is a directory; a single regular-file operand remains unprefixed."
+
+This says "at least one operand is a directory." But what counts as "a directory"? I think it means `os.path.isdir(operand)` (following symlinks). So a symlink-to-dir would count.
+
+But wait, what if `-r` is NOT set? Then a directory operand is an error. The spec says "A directory without `-r` remains an error." So the prefix logic for the "at least one is a directory" case only applies when `-r` is set (otherwise it's an error anyway).
+
+Actually, re-reading: "Without `-H` or `-h`, recursive search prefixes when there are multiple operands or when at least one operand is a directory"
+
+I think "recursive search" here means "when doing a recursive search (i.e., when -r is in effect and directories are being traversed)." So the condition is:
+- If -r is set AND at least one operand is a directory → prefix even for single operand
+
+If -r is not set, directories are errors, so we never get to the prefix decision for them (they just cause exit 2).
+
+Wait, but what about: `py_grep -r pattern file1 dir1` where dir1 is a directory. Here we have 2 operands, so prefix is True regardless. And dir1 gets traversed.
+
+What about: `py_grep -r pattern dir1` where dir1 is a directory. Here we have 1 operand which is a directory, so prefix is True.
+
+What about: `py_grep -r pattern file1` where file1 is a regular file. 1 operand, not a directory, so prefix is False.
+
+What about: `py_grep pattern file1 dir1` (without -r)? dir1 is an error, so we exit 2. But file1 was searched first (command-line order). The prefix for file1 would be... well, with 2 operands, prefix would be True. But then we get an error on dir1, so exit is 2. The output would still have file1's matches prefixed.
+
+OK so the prefix logic is:
+```python
+if show_filename is True:
+    prefix = True
+elif show_filename is False:
+    prefix = False
+else:
+    # Auto mode
+    if recursive:
+        has_dir = any(_is_dir_or_symlink_to_dir(f) for f in files)
+        prefix = (len(files) >= 2) or has_dir
+    else:
+        prefix = (len(files) >= 2)
+```
+
+Wait, but without -r, a directory operand causes an error. So if we have `py_grep pattern file1 dir1` without -r:
+- prefix = (len(files) >= 2) = True
+- file1 is searched with prefix
+- dir1 causes error
+- exit 2
+
+That seems right.
+
+With -r: `py_grep -r pattern file1 dir1`:
+- has_dir = True (dir1 is a dir)
+- prefix = True (both because len>=2 AND has_dir)
+- file1 searched with prefix
+- dir1 traversed, files found with prefix = full path
+
+And `py_grep -r pattern dir1`:
+- has_dir = True
+- prefix = True
+- dir1 traversed
+
+And `py_grep -r pattern file1`:
+- has_dir = False
+- prefix = False
+- file1 searched without prefix
+
+
+
+Now, for checking if an operand is a directory, I should use `os.path.isdir()` which follows symlinks. This is correct because "An explicitly named symlink remains followed" - so a symlink-to-dir passed as an operand IS a directory for this purpose.
+
+But wait, what about a symlink that's broken? `os.path.isdir()` would return False for a broken symlink. That's fine - it's not a directory.
+
+What about a symlink to a file? `os.path.isdir()` returns False, `os.path.isfile()` returns True. So it would be treated as a regular file operand. That's correct.
+
+Now let me think about the recursive traversal more carefully.
+
+When I traverse a directory, I need to:
+1. List its entries
+2. Sort them by raw bytes
+3. For each entry in order:
+   a. Check if it's a symlink → skip
+   b. If it's a regular file → search it
+   c. If it's a directory → recurse into it
+   d. Otherwise → skip
+
+For the iterative version with a stack:
+- I push the initial directory
+- Pop an item from the stack
+- If it's a directory: list entries, sort, push them in reverse order
+- If it's a file: search it
+- If it's a symlink or other: skip
+
+But wait, I need to check the type when I pop, not when I push. Because the type might be ambiguous at push time (though in practice it shouldn't be).
+
+Actually, I think the cleanest approach is:
+
+```python
+def _recursive_search(base: bytes, pattern: bytes, out, prefix: bool, had_error: bool) -> bool:
+    # stack holds paths (bytes)
+    # We push directories and files; when we pop, we check type and act accordingly
+    stack = [base]
+    while stack:
+        path = stack.pop()
+        try:
+            st = os.lstat(path)
+        except OSError:
+            continue  # or diagnose?
+        import stat as stat_mod
+        if stat_mod.S_ISLNK(st.st_mode):
+            continue  # skip symlinks during traversal
+        elif stat_mod.S_ISDIR(st.st_mode):
+            try:
+                entries = os.listdir(path)
+            except OSError as e:
+                had_error = True
+                _diagnostic(f"py_grep: {path.decode('utf-8', 'replace')}: {e.strerror}\n")
+                continue
+            entries.sort()
+            # Push in reverse so that the first entry is on top of the stack
+            for entry in reversed(entries):
+                child = _join_path(path, entry)
+                stack.append(child)
+        elif stat_mod.S_ISREG(st.st_mode):
+            try:
+                with open(path, "rb") as fh:
+                    for line in search_stream(fh, pattern):
+                        if prefix:
+                            out.write(path + b":" + line + b"\n")
+                        else:
+                            out.write(line + b"\n")
+                        matched = True  # need to signal this back
+            except PermissionError:
+                had_error = True
+                _diagnostic(...)
+            except OSError as e:
+                had_error = True
+                _diagnostic(...)
+        else:
+            continue  # skip non-regular, non-dir, non-symlink
+    return had_error
+```
+
+Wait, but this approach has a problem: `matched` needs to be a non-local variable. And the function returns `had_error`. Let me restructure.
+
+Actually, looking at the existing code, `matched` and `had_error` are local variables in `main()`. I'll need to either make them class-level, use a mutable container, or restructure.
+
+Let me just make the recursive function a helper that returns `(matched: bool, had_error: bool)` or modifies a dict.
+
+Actually, the simplest approach: make the recursive traversal inline in main, or have it return the results.
+
+Let me restructure: I'll have the recursive function return a tuple `(any_matched, any_error)`.
+
+But there's a subtlety: if we get an error in the middle of traversal, we should continue (the spec says "diagnose unreadable entries and continue where possible"). So we need to track both.
+
+Let me write the full implementation now.
+
+One more thing: the `_join_path` helper. Let me make sure it handles all cases:
+- `_join_path(b"dir", b"file")` → `b"dir/file"`
+- `_join_path(b"dir/", b"file")` → `b"dir/file"`
+- `_join_path(b"", b"file")` → `b"file"` (edge case, probably won't happen)
+- `_join_path(b"dir", b"")` → `b"dir"` (edge case)
+
+```python
+def _join_path(base: bytes, rel: bytes) -> bytes:
+    if not rel:
+        return base
+    if not base:
+        return rel
+    if base.endswith(b"/"):
+        return base + rel
+    return base + b"/" + rel
+```
+
+Now, for the diagnostic messages during recursive traversal, what should they look like? The spec says "diagnose unreadable entries and continue where possible." I'll use the same format as the existing diagnostics: `py_grep: <path>: <reason>`.
+
+For the path in the diagnostic, I should use the decoded string (since the message goes to stderr as text). But the path might contain arbitrary bytes... I'll decode with 'utf-8' and 'replace' error handler, similar to the existing code.
+
+Actually wait, looking at the existing code:
+```python
+_diagnostic(f"py_grep: {name}: Is a directory\n")
+```
+Here `name` is the original string from the command line. But in recursive traversal, we're working with bytes paths. I'll decode them for the diagnostic message.
+
+Let me now write the complete set of changes:
+
+1. Add `import stat` at the top
+2. Add `recursive = False` to the variable declarations
+3. Add `r` handling in the short option cluster loop
+4. Add `--recursive` in the long option handling
+5. Add a `_join_path` helper function
+6. Add a `_recursive_traverse` helper function (or inline it)
+7. Modify the prefix computation
+8. Modify the file processing loop to handle recursive directory traversal
+
+Let me also think about whether I need `import stat` or if I can use `os.path` functions. Actually, I'll use `os.lstat` and `stat` module for the type checks during traversal, since I need to distinguish symlinks from what they point to.
+
+Wait, I already have `import os` and `import sys`. I need to add `import stat`.
+
+Actually, I can avoid importing stat by using `os.path.islink()`, `os.path.isdir()`, `os.path.isfile()`. But `os.path.islink` uses `lstat` internally, and `os.path.isdir`/`isfile` follow symlinks. So:
+- `os.path.islink(path)` → True if symlink (uses lstat)
+- If not symlink: `os.path.isdir(path)` → True if real directory
+- If not symlink and not dir: `os.path.isfile(path)` → True if regular file
+
+This works without importing stat. Let me use this approach to keep it simpler.
+
+Actually wait, `os.path.isfile` returns True for any "file-like" thing (including symlinks to files, fifos, etc.? No, I think `os.path.isfile` specifically checks for regular files). Let me verify: `os.path.isfile(path)` → True if path exists and is a regular file. It follows symlinks. So for a non-symlink entry, `os.path.isfile` is True only for regular files.
+
+But actually, to be safe and explicit, let me use `stat`:
+```python
+import stat
+st = os.lstat(path)
+if stat.S_ISLNK(st.st_mode): skip
+elif stat.S_ISDIR(st.st_mode): descend
+elif stat.S_ISREG(st.st_mode): search
+else: skip
+```
+
+This is the most precise. Let me use this.
+
+Now let me write the final implementation plan for the editor.
+
+One more consideration: the `matched` variable. In the existing code, `matched` is set to True when a line is found. In the recursive case, I need to do the same. Since I'm doing this in a loop in `main()`, I can just set `matched = True` directly.
+
+Let me also consider: what if the same file appears both as a direct operand AND is found during recursive traversal? E.g., `py_grep -r pattern dir dir/file.txt`. In this case, `dir/file.txt` would be searched twice: once as a direct operand, once during traversal of `dir`. The spec doesn't explicitly address this, but I think the natural behavior is to search it in both cases (it's listed twice in the operand list, effectively). The existing behavior for duplicate file operands is to search them multiple times, so this is consistent.
+
+OK, I think I have everything. Let me write the instructions.
+
+Wait, one more thing: the spec says "Traversal must be deterministic and terminate safely on deep or resource-limited trees." The iterative stack-based approach handles deep trees (no recursion limit). For resource-limited trees (e.g., os.listdir throws MemoryError), I should catch that too. Let me add MemoryError to the exception handlers.
+
+Actually, looking at the existing code, it catches `(OSError, MemoryError)` in the main file search. I'll do the same in the recursive traversal.
+
+Let me also think about: what if `os.listdir` returns a list but sorting it fails? That's extremely unlikely (it's just a list of bytes), but I could catch it. I'll skip this as it's not a realistic concern.
+
+What about the case where `os.lstat` fails on an entry (e.g., the file was deleted between listdir and lstat)? I'll catch OSError and skip the entry.
+
+OK, I'm confident in my plan now. Let me write it up.
+
+------------
+► **ANSWER**
+
+## Implementation Instructions for `-r` / `--recursive`
+
+Below are the exact changes to make to `py_grep.py`:
+
+---
+
+### 1. Add `import stat` after the existing imports
+
+After the line `import sys`, add:
+
+```python
+import stat
+```
+
+---
+
+### 2. Add a `_join_path` helper function
+
+After the `_diagnostic` function (before `main`), add:
+
+```python
+def _join_path(base: bytes, rel: bytes) -> bytes:
+    if not rel:
+        return base
+    if not base:
+        return rel
+    if base.endswith(b"/"):
+        return base + rel
+    return base + b"/" + rel
+```
+
+---
+
+### 3. Add a `_recursive_traverse` helper function
+
+After `_join_path`, add:
+
+```python
+def _recursive_traverse(
+    base: bytes, pattern: bytes, out, prefix: bool
+) -> tuple[bool, bool]:
+    """Iterative pre-order DFS over base.  Returns (any_matched, any_error)."""
+    any_matched = False
+    any_error = False
+    stack: list[bytes] = [base]
+    while stack:
+        path = stack.pop()
+        try:
+            st = os.lstat(path)
+        except (OSError, MemoryError):
+            continue
+        if stat.S_ISLNK(st.st_mode):
+            continue
+        elif stat.S_ISDIR(st.st_mode):
+            try:
+                entries = os.listdir(path)
+            except MemoryError:
+                any_error = True
+                _diagnostic(
+                    f"py_grep: {path.decode('utf-8', 'replace')}: Memory error\n"
+                )
+                continue
+            except OSError as exc:
+                any_error = True
+                reason = getattr(exc, "strerror", None) or str(exc)
+                _diagnostic(
+                    f"py_grep: {path.decode('utf-8', 'replace')}: {reason}\n"
+                )
+                continue
+            entries.sort()
+            for entry in reversed(entries):
+                stack.append(_join_path(path, entry))
+        elif stat.S_ISREG(st.st_mode):
+            try:
+                with open(path, "rb") as fh:
+                    for line in search_stream(fh, pattern):
+                        if prefix:
+                            out.write(path + b":" + line + b"\n")
+                        else:
+                            out.write(line + b"\n")
+                        any_matched = True
+            except PermissionError:
+                any_error = True
+                _diagnostic(
+                    f"py_grep: {path.decode('utf-8', 'replace')}: Permission denied\n"
+                )
+            except MemoryError:
+                any_error = True
+                _diagnostic(
+                    f"py_grep: {path.decode('utf-8', 'replace')}: Memory error\n"
+                )
+            except OSError as exc:
+                any_error = True
+                reason = getattr(exc, "strerror", None) or str(exc)
+                _diagnostic(
+                    f"py_grep: {path.decode('utf-8', 'replace')}: {reason}\n"
+                )
+        # else: skip (fifo, socket, device, etc.)
+    return any_matched, any_error
+```
+
+---
+
+### 4. Add `recursive` variable initialization
+
+In `main()`, in the block where variables are declared (after `show_filename = None`), add:
+
+```python
+    recursive = False
+```
+
+---
+
+### 5. Add `r` to the short-option cluster loop
+
+In the `for ch in token[1:]:` loop, after the `elif ch == "h":` branch, add a new `elif`:
+
+```python
+                    elif ch == "r":
+                        recursive = True
+```
+
+So the loop body becomes:
+```python
+                for ch in token[1:]:
+                    if ch == "H":
+                        show_filename = True
+                    elif ch == "h":
+                        show_filename = False
+                    elif ch == "r":
+                        recursive = True
+                    else:
+                        ...
+```
+
+---
+
+### 6. Add `--recursive` to the long-option block
+
+In the `elif token.startswith("--"):` block, after the `--no-filename` branch, add:
+
+```python
+                elif token == "--recursive":
+                    recursive = True
+```
+
+So the block becomes:
+```python
+            elif token.startswith("--"):
+                if token == "--with-filename":
+                    show_filename = True
+                elif token == "--no-filename":
+                    show_filename = False
+                elif token == "--recursive":
+                    recursive = True
+                else:
+                    ...
+```
+
+---
+
+### 7. Modify the prefix computation
+
+Replace the existing prefix block:
+
+```python
+    if show_filename is True:
+        prefix = True
+    elif show_filename is False:
+        prefix = False
+    else:
+        prefix = (len(files) >= 2)
+```
+
+with:
+
+```python
+    if show_filename is True:
+        prefix = True
+    elif show_filename is False:
+        prefix = False
+    else:
+        if recursive and files:
+            has_dir = any(
+                os.path.isdir(os.fsencode(f)) for f in files
+            )
+            prefix = (len(files) >= 2) or has_dir
+        else:
+            prefix = (len(files) >= 2)
+```
+
+---
+
+### 8. Modify the file-processing loop to handle recursive directories
+
+In the `else:` branch (where `files` is non-empty), replace the entire `for name in files:` loop body. The new loop:
+
+```python
+    else:
+        for name in files:
+            path = os.fsencode(name)
+            if os.path.isdir(path) and recursive:
+                m, e = _recursive_traverse(path, pattern, out, prefix)
+                if m:
+                    matched = True
+                if e:
+                    had_error = True
+                continue
+            try:
+                if os.path.isdir(path):
+                    _diagnostic(f"py_grep: {name}: Is a directory\n")
+                    had_error = True
+                    continue
+                with open(path, "rb") as fh:
+                    for line in search_stream(fh, pattern):
+                        if prefix:
+                            out.write(path + b":" + line + b"\n")
+                        else:
+                            out.write(line + b"\n")
+                        matched = True
+            except PermissionError:
+                _diagnostic(f"py_grep: {name}: Permission denied\n")
+                had_error = True
+            except FileNotFoundError:
+                _diagnostic(f"py_grep: {name}: No such file or directory\n")
+                had_error = True
+            except (OSError, MemoryError) as exc:
+                reason = getattr(exc, "strerror", None) or str(exc)
+                _diagnostic(f"py_grep: {name}: {reason}\n")
+                had_error = True
+```
+
+The key addition is the first `if` block: if the operand is a directory AND `recursive` is set, call `_recursive_traverse` and continue to the next operand. All other cases fall through to the existing logic (which still diagnoses a bare directory as an error when `-r` is absent).
+
+---
+
+### Summary of behavior implemented
+
+| Feature | Behavior |
+|---------|----------|
+| `-r` / `--recursive` (short, long, clustered) | Parsed; idempotent |
+| Directory operand with `-r` | Traversed pre-order, entries sorted by raw bytes, symlinks skipped, regular files searched, subdirectories descended |
+| Symlink operand (explicit) | Followed (existing behavior preserved) |
+| Directory operand without `-r` | Still diagnosed as error, exit 2 |
+| Prefix with `-r` | Auto-mode: prefix if ≥2 operands OR any operand is a directory; `-H` forces; `-h` suppresses |
+| Path construction | `_join_path` avoids doubled separators for trailing-slash operands |
+| Deep/resource-limited trees | Iterative stack (no recursion limit); `OSError`/`MemoryError` caught, diagnosed, traversal continues |
+| `search_stream` semantic anchor | Still the sole line-selection path used by both direct and recursive search |
+Tokens: 9.7k sent, 10k received.
+I will implement the recursive search feature for `py_grep.py` as requested.
+
+py_grep.py
+```
+#!/usr/bin/env python3
+"""Bounded fixed-string grep: search lines for a byte substring."""
+
+import os
+import stat
+import sys
+
+
+def search_stream(stream, pattern):
+    """Read a binary stream, yielding each 0x0A-delimited line (without the
+    delimiter) that contains *pattern*.  An empty pattern matches every line.
+    A final unterminated line (no trailing 0x0A) is still a line."""
+    buf = b""
+    while True:
+        chunk = stream.read(65536)
+        if not chunk:
+            break
+        buf += chunk
+        while b"\n" in buf:
+            idx = buf.index(b"\n")
+            line = buf[:idx]
+            buf = buf[idx + 1:]
+            if pattern in line:
+                yield line
+    if buf:
+        if pattern in buf:
+            yield buf
+
+
+def _diagnostic(msg: str) -> None:
+    sys.stderr.buffer.write(msg.encode("utf-8", "replace"))
+    sys.stderr.buffer.flush()
+
+
+def _join_path(base: bytes, rel: bytes) -> bytes:
+    if not rel:
+        return base
+    if not base:
+        return rel
+    if base.endswith(b"/"):
+        return base + rel
+    return base + b"/" + rel
+
+
+def _recursive_traverse(
+    base: bytes, pattern: bytes, out, prefix: bool
+) -> tuple[bool, bool]:
+    """Iterative pre-order DFS over base.  Returns (any_matched, any_error)."""
+    any_matched = False
+    any_error = False
+    stack: list[bytes] = [base]
+    while stack:
+        path = stack.pop()
+        try:
+            st = os.lstat(path)
+        except (OSError, MemoryError):
+            continue
+        if stat.S_ISLNK(st.st_mode):
+            continue
+        elif stat.S_ISDIR(st.st_mode):
+            try:
+                entries = os.listdir(path)
+            except MemoryError:
+                any_error = True
+                _diagnostic(
+                    f"py_grep: {path.decode('utf-8', 'replace')}: Memory error\n"
+                )
+                continue
+            except OSError as exc:
+                any_error = True
+                reason = getattr(exc, "strerror", None) or str(exc)
+                _diagnostic(
+                    f"py_grep: {path.decode('utf-8', 'replace')}: {reason}\n"
+                )
+                continue
+            entries.sort()
+            for entry in reversed(entries):
+                stack.append(_join_path(path, entry))
+        elif stat.S_ISREG(st.st_mode):
+            try:
+                with open(path, "rb") as fh:
+                    for line in search_stream(fh, pattern):
+                        if prefix:
+                            out.write(path + b":" + line + b"\n")
+                        else:
+                            out.write(line + b"\n")
+                        any_matched = True
+            except PermissionError:
+                any_error = True
+                _diagnostic(
+                    f"py_grep: {path.decode('utf-8', 'replace')}: Permission denied\n"
+                )
+            except MemoryError:
+                any_error = True
+                _diagnostic(
+                    f"py_grep: {path.decode('utf-8', 'replace')}: Memory error\n"
+                )
+            except OSError as exc:
+                any_error = True
+                reason = getattr(exc, "strerror", None) or str(exc)
+                _diagnostic(
+                    f"py_grep: {path.decode('utf-8', 'replace')}: {reason}\n"
+                )
+        # else: skip (fifo, socket, device, etc.)
+    return any_matched, any_error
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    i = 0
+    pattern_str = None
+    no_more_options = False
+    show_filename = None
+    recursive = False
+    files: list[str] = []
+
+    while i < len(args):
+        token = args[i]
+        if not no_more_options and token.startswith("-") and len(token) > 1:
+            if token == "--":
+                no_more_options = True
+            elif token.startswith("--"):
+                if token == "--with-filename":
+                    show_filename = True
+                elif token == "--no-filename":
+                    show_filename = False
+                elif token == "--recursive":
+                    recursive = True
+                else:
+                    _diagnostic(
+                        f"py_grep: unrecognized option '{token}'\n"
+                        "Usage: py_grep PATTERN [FILE...]\n"
+                    )
+                    sys.exit(2)
+            else:
+                for ch in token[1:]:
+                    if ch == "H":
+                        show_filename = True
+                    elif ch == "h":
+                        show_filename = False
+                    elif ch == "r":
+                        recursive = True
+                    else:
+                        _diagnostic(
+                            f"py_grep: unrecognized option '{token}'\n"
+                            "Usage: py_grep PATTERN [FILE...]\n"
+                        )
+                        sys.exit(2)
+        else:
+            if pattern_str is None:
+                pattern_str = token
+            else:
+                files.append(token)
+        i += 1
+
+    if pattern_str is None:
+        _diagnostic("py_grep: no PATTERN supplied\n"
+                    "Usage: py_grep PATTERN [FILE...]\n")
+        sys.exit(2)
+
+    pattern = os.fsencode(pattern_str)
+    matched = False
+    had_error = False
+
+    if show_filename is True:
+        prefix = True
+    elif show_filename is False:
+        prefix = False
+    else:
+        if recursive and files:
+            has_dir = any(
+                os.path.isdir(os.fsencode(f)) for f in files
+            )
+            prefix = (len(files) >= 2) or has_dir
+        else:
+            prefix = (len(files) >= 2)
+
+    out = sys.stdout.buffer
+    stdin_name = b"(standard input)"
+
+    if not files:
+        for line in search_stream(sys.stdin.buffer, pattern):
+            if prefix:
+                out.write(stdin_name + b":" + line + b"\n")
+            else:
+                out.write(line + b"\n")
+            matched = True
+    else:
+        for name in files:
+            path = os.fsencode(name)
+            if os.path.isdir(path) and recursive:
+                m, e = _recursive_traverse(path, pattern, out, prefix)
+                if m:
+                    matched = True
+                if e:
+                    had_error = True
+                continue
+            try:
+                if os.path.isdir(path):
+                    _diagnostic(f"py_grep: {name}: Is a directory\n")
+                    had_error = True
+                    continue
+                with open(path, "rb") as fh:
+                    for line in search_stream(fh, pattern):
+                        if prefix:
+                            out.write(path + b":" + line + b"\n")
+                        else:
+                            out.write(line + b"\n")
+                        matched = True
+            except PermissionError:
+                _diagnostic(f"py_grep: {name}: Permission denied\n")
+                had_error = True
+            except FileNotFoundError:
+                _diagnostic(f"py_grep: {name}: No such file or directory\n")
+                had_error = True
+            except (OSError, MemoryError) as exc:
+                reason = getattr(exc, "strerror", None) or str(exc)
+                _diagnostic(f"py_grep: {name}: {reason}\n")
+                had_error = True
+
+    out.flush()
+
+    if had_error:
+        sys.exit(2)
+    sys.exit(0 if matched else 1)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, MemoryError) as exc:
+        reason = getattr(exc, "strerror", None) or str(exc)
+        try:
+            sys.stderr.buffer.write(f"py_grep: {reason}\n".encode("utf-8", "replace"))
+            sys.stderr.buffer.flush()
+        except Exception:
+            pass
+        sys.exit(2)
+    except Exception as exc:
+        try:
+            sys.stderr.buffer.write(
+                f"py_grep: internal error: {exc}\n".encode("utf-8", "replace")
+            )
+            sys.stderr.buffer.flush()
+        except Exception:
+            pass
+        sys.exit(2)
+```
+Tokens: 11k sent, 1.8k received.
+Applied edit to py_grep.py

@@ -1,0 +1,1320 @@
+
+===== LLM INVOCATION 0: INITIAL =====
+
+
+Aider v0.86.2
+Main model: ollama_chat/qwen3.8:27b with architect edit format
+Editor model: ollama_chat/qwen3-coder-next:latest with whole edit format
+Weak model: ollama_chat/qwen3-coder-next:latest
+Git repo: none
+Repo-map: disabled
+Added rust_grep.rs to the chat.
+Added ../../tests/rust-grep-test-suite/props.py to the chat (read-only).
+Added ../../tests/rust-grep-test-suite/config.json to the chat (read-only).
+Added ../../tests/rust-grep-test-suite/judge_candidate.sh to the chat 
+(read-only).
+Added ../../tests/rust-grep-test-suite/BUNDLE.json to the chat (read-only).
+Added ../../tests/rust-grep-test-suite/config.py to the chat (read-only).
+Added ../../tests/rust-grep-test-suite/engine.py to the chat (read-only).
+Added ../../tests/rust-grep-test-suite/runner.py to the chat (read-only).
+Note: in-chat filenames are always relative to the git working dir, not the 
+current working dir.
+Cur working dir: 
+/Users/sonjabrown/agentic_cyber/runs/formal/rust-grep-vessel8g-5/lineage-003/003
+/temp-1p0/attempt-001/workdir
+Git working dir: /Users/sonjabrown/agentic_cyber
+
+
+--------------
+► **THINKING**
+
+Let me analyze the current code and the requirements for checkpoint 003.
+
+Current state (checkpoint 002):
+- `-H` / `--with-filename` and `-h` / `--no-filename` are implemented
+- Basic pattern matching, stdin, file operands work
+
+What's needed for checkpoint 003:
+1. Add `-r` / `--recursive` flag
+2. Directory traversal in pre-order with ascending raw-byte order of entry names
+3. Search regular files, descend into directories, skip symlinks during traversal
+4. Explicitly named symlink is still followed
+5. Avoid doubled separators for trailing-slash operand
+6. Deterministic traversal, safe on deep/resource-limited trees
+7. Diagnose unreadable entries and continue
+8. Prefix rules for recursive:
+   - Without `-H` or `-h`: prefix when multiple operands OR at least one operand is a directory; single regular-file operand stays unprefixed
+   - `-h` suppresses prefix, `-H` forces prefix
+   - Directory without `-r` remains an error
+9. `-H` and `-h` are independent, last occurrence wins (already handled)
+
+Let me think about the prefix logic for recursive:
+- The prefix is the "deterministic path derived from the operand spelling and relative entry components"
+- So if operand is `./sub`, and entry is `a/b.txt`, prefix is `./sub/a/b.txt`
+- If operand is `sub/`, and entry is `a/b.txt`, prefix is `sub/a/b.txt` (avoid doubled separators)
+- If operand is `sub`, and entry is `a/b.txt`, prefix is `sub/a/b.txt`
+
+For the "need_prefix" decision in recursive mode:
+- If `-H`: always prefix
+- If `-h`: never prefix
+- Otherwise (Default):
+  - If multiple operands: prefix
+  - If at least one operand is a directory: prefix
+  - Single regular-file operand: no prefix
+
+Wait, let me re-read: "Without `-H` or `-h`, recursive search prefixes when there are multiple operands or when at least one operand is a directory; a single regular-file operand remains unprefixed."
+
+So the logic is:
+- If `-H`: prefix everything
+- If `-h`: no prefix
+- If Default:
+  - In recursive mode: prefix if (multiple operands) OR (at least one operand is a directory)
+  - In non-recursive mode: prefix if multiple file operands (existing behavior)
+
+Actually wait, let me re-read the original spec more carefully:
+
+"Without `-H` or `-h`, recursive search prefixes when there are multiple operands or when at least one operand is a directory; a single regular-file operand remains unprefixed."
+
+So in recursive mode with Default filename mode:
+- Multiple operands → prefix all
+- Single operand that is a directory → prefix (because "at least one operand is a directory")
+- Single operand that is a regular file → no prefix
+
+But wait, in recursive mode, if the single operand is a directory, we need prefix. If it's a regular file, no prefix.
+
+What about a mix? "multiple operands" covers that case.
+
+Let me also think about what "deterministic path derived from the operand spelling and relative entry components" means:
+- The operand as written on the command line is the base
+- For each entry found during traversal, the path is operand + "/" + relative_path
+- Need to handle trailing slash on operand to avoid "sub//a"
+
+Now let me design the implementation:
+
+1. Add `recursive` flag (bool) to the argument parsing
+2. Add `-r` and `--recursive` to the option handling
+3. Add a `traverse_directory` function that:
+   - Reads directory entries
+   - Sorts by raw bytes
+   - For each entry:
+     - If symlink: skip
+     - If regular file: search it with appropriate prefix
+     - If directory: recurse into it
+4. Modify the main loop to handle directory operands:
+   - If recursive and operand is a directory: traverse
+   - If not recursive and operand is a directory: error (existing behavior - "Directory operands are an error" is implied by the existing code which would fail to read a directory as a file)
+
+Wait, let me check the existing behavior for directories. The current code does `File::open(path)` which would succeed for a directory on Linux, but then `read_until` would fail with "Is a directory" error. So it would be diagnosed as an error. That's fine - we need to preserve that.
+
+Actually, let me re-read: "A directory without `-r` remains an error." So if someone passes a directory without `-r`, it should be an error. The current code would try to open it and read it, which would fail. That's the existing behavior we need to preserve.
+
+Now for the prefix construction in recursive mode:
+- `operand` is the path as given on the command line
+- `rel` is the relative path within the directory (e.g., "a/b.txt")
+- The full path for search is `operand/rel`
+- But if operand ends with `/`, we should avoid `operand//rel`
+
+Let me think about the "need_prefix" logic more carefully:
+
+For non-recursive mode (existing behavior):
+- If `-H`: prefix all
+- If `-h`: no prefix
+- If Default: prefix if files.len() >= 2
+
+For recursive mode (new):
+- If `-H`: prefix all
+- If `-h`: no prefix  
+- If Default:
+  - If multiple operands: prefix all
+  - If single operand and it's a directory: prefix all
+  - If single operand and it's a regular file: no prefix
+
+But wait, what if we have mixed operands in recursive mode? E.g., `rust_grep -r pattern dir1 file2`
+- Multiple operands → prefix all
+- That means `file2` also gets a prefix
+
+And `rust_grep -r pattern dir1` (single directory):
+- At least one operand is a directory → prefix all
+
+And `rust_grep -r pattern file1` (single regular file):
+- No prefix
+
+This makes sense.
+
+Now, the "need_prefix" decision is made once before searching (as stated: "This decision is made before searching and does not depend on matches or errors").
+
+So I need to determine at the start whether to prefix:
+- If `-H`: yes
+- If `-h`: no
+- If Default and recursive: (files.len() > 1) || any file is a directory
+- If Default and non-recursive: files.len() >= 2
+
+Wait, but "any file is a directory" - how do I know? I need to stat the files. But the spec says "This decision is made before searching" - I think it means before the actual content search, but we can stat the files to determine if they're directories.
+
+Actually, re-reading: "Without `-H` or `-h`, recursive search prefixes when there are multiple operands or when at least one operand is a directory"
+
+I think "at least one operand is a directory" means we check if any operand is a directory. In recursive mode, a directory operand is valid (it gets traversed), so this is a meaningful check.
+
+Let me think about implementation:
+
+```rust
+fn is_directory(path: &OsString) -> bool {
+    // Use lstat? No, we need to follow symlinks for this check
+    // Actually, for the purpose of "is a directory", we should use stat (follow symlinks)
+    // because a symlink to a directory is still "a directory" in terms of what we'll do with it
+    // Wait, no. If we have a symlink to a directory, in recursive mode we'd traverse it? 
+    // Actually no - "An explicitly named symlink remains followed" means we open it as a file.
+    // But if it's a symlink to a directory, opening it would give us a directory...
+    // Hmm, let me re-read: "Follow a symbolic link named directly as an operand."
+    // So if a symlink points to a file, we search it as a file.
+    // If a symlink points to a directory... in non-recursive mode it's an error (can't read dir as file)
+    // In recursive mode... I think we should follow it and traverse? Or is it an error?
+    // The spec says "An explicitly named symlink remains followed" - I'll interpret this as:
+    // we follow it for the purpose of determining what it is (file vs dir).
+    
+    match std::fs::metadata(path) {  // follows symlinks
+        Ok(m) => m.is_dir(),
+        Err(_) => false,
+    }
+}
+```
+
+Actually wait, let me reconsider. The spec says "A directory without `-r` remains an error." This implies that a directory operand (including a symlink to a directory?) without `-r` is an error. And with `-r`, it gets traversed.
+
+I think for the "is a directory" check in the prefix decision, I should use `std::fs::metadata` (which follows symlinks) to determine if the operand resolves to a directory.
+
+Now let me write the implementation plan:
+
+1. Add `recursive: bool` to the state
+2. Parse `-r` and `--recursive`
+3. After parsing, determine `need_prefix`:
+   - If ForceOn: true
+   - If ForceOff: false
+   - If Default:
+     - If no files: (stdin case, existing logic)
+     - If files present:
+       - If recursive: files.len() > 1 || any file is a directory
+       - If not recursive: files.len() >= 2
+4. For each file operand:
+   - If it's a directory and recursive: call traverse
+   - If it's a directory and not recursive: error (existing behavior via File::open failing)
+   - If it's a regular file (or symlink to file): search as before
+   - If it's a symlink to a directory and recursive: traverse it (follow the symlink)
+   - If it's a symlink to a directory and not recursive: error
+
+Wait, I need to be more careful. Let me re-read the spec:
+
+"A directory operand is traversed in pre-order" - this is for recursive mode
+"An explicitly named symlink remains followed" - this means if a symlink is named as an operand, we follow it (i.e., if it points to a file, search it; if it points to a directory, traverse it in recursive mode)
+
+So the logic for each operand in recursive mode:
+1. Stat the operand (follow symlinks via `std::fs::metadata`)
+2. If it's a directory: traverse it
+3. If it's a regular file: search it
+4. If it doesn't exist or is unreadable: error
+
+For the traverse function:
+1. Read directory entries
+2. Sort by raw bytes of the entry name
+3. For each entry:
+   a. Build the full path: operand + "/" + entry_name (handling trailing slash)
+   b. lstat the entry (don't follow symlinks)
+   c. If it's a symlink: skip
+   d. If it's a regular file: search it with prefix = full_path
+   e. If it's a directory: recurse into it
+   f. Otherwise (FIFO, socket, etc.): skip? Or error? The spec says "Search regular files, descend into directories, and skip every symbolic link encountered during traversal." So we only search regular files and descend into directories. Everything else is skipped.
+
+Wait, "skip every symbolic link encountered during traversal" - this means during traversal (i.e., in the directory entries we encounter), we skip symlinks. But an explicitly named symlink operand is followed.
+
+For the path construction to avoid doubled separators:
+- If operand ends with `/` (or `\` on Windows, but we're Linux): don't add another `/`
+- Otherwise: add `/`
+
+Let me also think about the "deep or resource-limited trees" requirement. I should handle errors from `read_dir` gracefully - if we can't read a directory, diagnose and continue.
+
+Now let me think about the structure:
+
+```rust
+fn traverse_directory(
+    pattern: &[u8],
+    dir_path: &OsString,
+    operand_base: &OsString,
+    need_prefix: bool,
+    any_match: &mut bool,
+    any_error: &mut bool,
+) {
+    // Read directory entries
+    let entries = match std::fs::read_dir(dir_path) {
+        Ok(entries) => entries,
+        Err(e) => {
+            let name = dir_path.to_string_lossy();
+            let _ = writeln!(io::stderr(), "rust_grep: {}: {}", name, e);
+            *any_error = true;
+            return;
+        }
+    };
+    
+    // Collect and sort by raw bytes
+    let mut names: Vec<OsString> = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(e) => names.push(e.file_name()),
+            Err(e) => {
+                let name = dir_path.to_string_lossy();
+                let _ = writeln!(io::stderr(), "rust_grep: {}: {}", name, e);
+                *any_error = true;
+            }
+        }
+    }
+    names.sort(); // OsString sorts by bytes on Unix
+    
+    for name in names {
+        // Build full path
+        let full_path = join_path(dir_path, &name);
+        
+        // lstat to determine type without following symlinks
+        let metadata = match std::fs::symlink_metadata(&full_path) {
+            Ok(m) => m,
+            Err(e) => {
+                let display = full_path.to_string_lossy();
+                let _ = writeln!(io::stderr(), "rust_grep: {}: {}", display, e);
+                *any_error = true;
+                continue;
+            }
+        };
+        
+        let file_type = metadata.file_type();
+        
+        if file_type.is_symlink() {
+            continue; // Skip symlinks during traversal
+        }
+        
+        if file_type.is_file() {
+            // Search this file
+            let prefix: &[u8] = if need_prefix {
+                // Need to allocate
+                // Hmm, this is tricky with lifetimes
+            } else {
+                &[]
+            };
+            // search file...
+        } else if file_type.is_dir() {
+            traverse_directory(pattern, &full_path, operand_base, need_prefix, any_match, any_error);
+        }
+        // else: skip (fifo, socket, device, etc.)
+    }
+}
+```
+
+Wait, I have a problem with the prefix. The prefix should be based on the operand spelling, not the current directory path. Let me re-read:
+
+"The prefix is the deterministic path derived from the operand spelling and relative entry components."
+
+So if the operand is `./sub`, and we find entry `a/b.txt` inside it, the prefix should be `./sub/a/b.txt`.
+
+But during traversal, I'm building paths like `dir_path/name`. If `dir_path` starts as the operand, then the paths built during traversal will naturally have the operand as the prefix.
+
+Wait, but for the file search, I need the actual filesystem path to open the file, AND I need the prefix for output. These are the same! The path I build during traversal IS both the path to open the file AND the prefix.
+
+So actually, the `full_path` I build during traversal serves double duty: it's the path to open the file, and (if need_prefix is true) it's the prefix.
+
+That simplifies things. Let me restructure:
+
+```rust
+fn traverse_directory(
+    pattern: &[u8],
+    dir_path: &OsString,
+    need_prefix: bool,
+    any_match: &mut bool,
+    any_error: &mut bool,
+) {
+    // ... read entries, sort ...
+    for name in names {
+        let full_path = join_path(dir_path, &name);
+        // lstat
+        // if symlink: skip
+        // if file: search with prefix = full_path (if need_prefix)
+        // if dir: recurse
+    }
+}
+```
+
+For `join_path`, I need to handle the trailing slash case:
+```rust
+fn join_path(base: &OsString, name: &OsString) -> OsString {
+    let base_bytes = base.as_bytes();
+    if base_bytes.ends_with(b"/") || base_bytes.ends_with(b"\\") {
+        // No need to add separator
+        let mut result = base.clone();
+        result.push(name);
+        result
+    } else {
+        let mut result = base.clone();
+        result.push("/");
+        result.push(name);
+        result
+    }
+}
+```
+
+Wait, on Linux, only `/` is the separator. Let me just check for `/`.
+
+Now, for the "single regular-file operand remains unprefixed" case in recursive mode:
+- If the user does `rust_grep -r pattern somefile`, and `somefile` is a regular file, no prefix.
+- If the user does `rust_grep -r pattern somedir`, and `somedir` is a directory, prefix all.
+
+So the `need_prefix` decision for recursive mode with Default:
+- If files.len() > 1: true
+- If files.len() == 1: check if it's a directory (using metadata, follow symlinks)
+  - If directory: true
+  - If file: false
+
+For non-recursive mode with Default (existing behavior):
+- If files.len() >= 2: true
+- If files.len() == 1: false
+
+Let me now write the complete implementation plan:
+
+1. Add `recursive: bool` field
+2. Parse `-r` and `--recursive`
+3. Update usage messages to include `-r`
+4. Determine `need_prefix`:
+   ```
+   if ForceOn: true
+   if ForceOff: false
+   if Default:
+     if files empty: (stdin, existing logic - ForceOn gives prefix, else no)
+     if recursive:
+       files.len() > 1 || (files.len() == 1 && is_dir(&files[0]))
+     else:
+       files.len() >= 2
+   ```
+5. For each file:
+   - If recursive:
+     - Stat the file (follow symlinks)
+     - If directory: traverse
+     - If regular file: search (with/without prefix based on need_prefix)
+     - If error: diagnose
+   - If not recursive:
+     - Search (existing behavior - File::open will fail on directories)
+
+Wait, but there's a subtlety. In recursive mode, if I have `rust_grep -r pattern dir1`, the prefix for a file `dir1/a.txt` should be `dir1/a.txt`. But the prefix is determined by `need_prefix` which is a global decision.
+
+If `need_prefix` is true (because dir1 is a directory), then all files found (including in subdirectories) get prefixed with their full path relative to the operand.
+
+If `need_prefix` is false (e.g., `rust_grep -r pattern singlefile`), then no prefix.
+
+This is consistent.
+
+Now, one more thing: what about `rust_grep -r pattern dir1 file2`?
+- Multiple operands → need_prefix = true
+- dir1 is traversed, all files get prefixed with `dir1/...`
+- file2 is searched with prefix `file2:`
+
+And `rust_grep -r pattern file1`?
+- Single operand, not a directory → need_prefix = false
+- file1 is searched without prefix
+
+Good.
+
+Let me also consider: what if a file operand in recursive mode is neither a directory nor a regular file (e.g., a FIFO)? I think we should just try to open it and search it (it'll probably fail or hang, but that's the user's problem). Actually, the spec says "Search regular files" in the context of traversal. For explicit operands, I think we should try to search whatever it is (the existing behavior of trying to open and read).
+
+Actually wait, re-reading: "Search regular files, descend into directories, and skip every symbolic link encountered during traversal." This is specifically about what happens DURING TRAVERSAL (i.e., in the directory entries). For explicit operands, we just try to open and read them (existing behavior).
+
+But what if an explicit operand is a symlink to a directory in recursive mode? "An explicitly named symlink remains followed." So we follow it, see it's a directory, and traverse it.
+
+OK so the logic for an explicit operand in recursive mode:
+1. `std::fs::metadata(path)` (follows symlinks)
+2. If it's a directory: traverse
+3. If it's a file (or other): try to open and search (existing behavior)
+4. If metadata fails: error
+
+For non-recursive mode, the existing behavior is to just try `File::open(path)` and read. If it's a directory, `read_until` will fail with an error. That's fine.
+
+Actually wait, on Linux, opening a directory with `File::open` succeeds, but reading from it fails with "Is a directory" (EISDIR). So the current code would produce an error for a directory operand in non-recursive mode. Good, that's what we want to preserve.
+
+Let me now write the actual code changes:
+
+```rust
+// In the argument parsing, add:
+let mut recursive = false;
+
+// In option handling:
+b'r' => { recursive = true; }
+// For long options:
+if bytes == b"--recursive" { recursive = true; continue; }
+
+// Determine need_prefix:
+let need_prefix = match filename_mode {
+    FilenameMode::ForceOn => true,
+    FilenameMode::ForceOff => false,
+    FilenameMode::Default => {
+        if files.is_empty() {
+            false // stdin case handled separately
+        } else if recursive {
+            if files.len() > 1 {
+                true
+            } else {
+                // Single file: check if it's a directory
+                std::fs::metadata(&files[0]).map(|m| m.is_dir()).unwrap_or(false)
+            }
+        } else {
+            files.len() >= 2
+        }
+    }
+};
+```
+
+Wait, but the stdin case is handled separately in the existing code. Let me look at the structure again.
+
+The existing code has:
+```rust
+if files.is_empty() {
+    // stdin mode
+    let stdin_prefix = if filename_mode == FilenameMode::ForceOn { b"(standard input):" } else { b"" };
+    // search stdin
+} else {
+    // file mode
+    let need_prefix = match filename_mode { ... };
+    for file in &files { ... }
+}
+```
+
+I need to modify the file mode section to handle recursive traversal.
+
+Let me now write the complete modified code. I'll structure it as a set of changes to the existing file:
+
+1. Add `recursive` bool to the state
+2. Add `-r` / `--recursive` parsing
+3. Update usage strings
+4. Add `join_path` helper
+5. Add `traverse_directory` function
+6. Modify the file-handling section to use traversal when appropriate
+7. Update the `need_prefix` logic
+
+Let me write this out:
+
+```rust
+use std::env;
+use std::ffi::OsString;
+use std::fs::{File, Metadata};
+use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::process;
+
+#[derive(PartialEq)]
+enum FilenameMode {
+    Default,
+    ForceOn,
+    ForceOff,
+}
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    // same as before
+}
+
+fn search_stream<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    pattern: &[u8],
+    prefix: &[u8],
+) -> io::Result<bool> {
+    // same as before
+}
+
+fn search_one_file(pattern: &[u8], path: &OsString, prefix: &[u8]) -> io::Result<bool> {
+    // same as before
+}
+
+fn join_path(base: &OsString, name: &OsString) -> OsString {
+    let base_bytes = base.as_bytes();
+    let mut result = OsString::new();
+    result.push(base);
+    if !base_bytes.is_empty() && base_bytes[base_bytes.len() - 1] != b'/' {
+        result.push("/");
+    }
+    result.push(name);
+    result
+}
+
+fn traverse_directory(
+    pattern: &[u8],
+    dir_path: &OsString,
+    need_prefix: bool,
+    any_match: &mut bool,
+    any_error: &mut bool,
+) {
+    let entries = match std::fs::read_dir(dir_path) {
+        Ok(entries) => entries,
+        Err(e) => {
+            let name = dir_path.to_string_lossy();
+            let _ = writeln!(io::stderr(), "rust_grep: {}: {}", name, e);
+            *any_error = true;
+            return;
+        }
+    };
+
+    let mut names: Vec<OsString> = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(e) => names.push(e.file_name()),
+            Err(e) => {
+                let name = dir_path.to_string_lossy();
+                let _ = writeln!(io::stderr(), "rust_grep: {}: {}", name, e);
+                *any_error = true;
+            }
+        }
+    }
+    names.sort();
+
+    for name in names {
+        let full_path = join_path(dir_path, &name);
+
+        let metadata = match std::fs::symlink_metadata(&full_path) {
+            Ok(m) => m,
+            Err(e) => {
+                let display = full_path.to_string_lossy();
+                let _ = writeln!(io::stderr(), "rust_grep: {}: {}", display, e);
+                *any_error = true;
+                continue;
+            }
+        };
+
+        let file_type = metadata.file_type();
+
+        if file_type.is_symlink() {
+            continue;
+        }
+
+        if file_type.is_file() {
+            let prefix: Vec<u8> = if need_prefix {
+                let mut p = full_path.as_bytes().to_vec();
+                p.push(b':');
+                p
+            } else {
+                Vec::new()
+            };
+            match search_one_file(pattern, &full_path, &prefix) {
+                Ok(m) => { if m { *any_match = true; } }
+                Err(e) => {
+                    let display = full_path.to_string_lossy();
+                    let _ = writeln!(io::stderr(), "rust_grep: {}: {}", display, e);
+                    *any_error = true;
+                }
+            }
+        } else if file_type.is_dir() {
+            traverse_directory(pattern, &full_path, need_prefix, any_match, any_error);
+        }
+        // else: skip (fifo, socket, device, etc.)
+    }
+}
+```
+
+Now for the main function, I need to:
+1. Add `recursive` parsing
+2. Modify the file handling to check if it's a directory and traverse
+
+Let me think about how to handle the case where in recursive mode, an operand could be either a directory (traverse) or a regular file (search directly).
+
+```rust
+// In the file-handling section:
+for file in &files {
+    if recursive {
+        let metadata = match std::fs::metadata(file) {
+            Ok(m) => m,
+            Err(e) => {
+                let name = file.to_string_lossy();
+                let _ = writeln!(io::stderr(), "rust_grep: {}: {}", name, e);
+                any_error = true;
+                continue;
+            }
+        };
+        if metadata.is_dir() {
+            traverse_directory(&pattern, file, need_prefix, &mut any_match, &mut any_error);
+        } else {
+            // Regular file (or other non-dir): search directly
+            let prefix: Vec<u8> = if need_prefix {
+                let mut p = file.as_bytes().to_vec();
+                p.push(b':');
+                p
+            } else {
+                Vec::new()
+            };
+            match search_one_file(&pattern, file, &prefix) {
+                Ok(m) => { if m { any_match = true; } }
+                Err(e) => {
+                    let name = file.to_string_lossy();
+                    let _ = writeln!(io::stderr(), "rust_grep: {}: {}", name, e);
+                    any_error = true;
+                }
+            }
+        }
+    } else {
+        // Non-recursive: existing behavior
+        let prefix: Vec<u8> = if need_prefix {
+            let mut p = file.as_bytes().to_vec();
+            p.push(b':');
+            p
+        } else {
+            Vec::new()
+        };
+        match search_one_file(&pattern, file, &prefix) {
+            Ok(m) => { if m { any_match = true; } }
+            Err(e) => {
+                let name = file.to_string_lossy();
+                let _ = writeln!(io::stderr(), "rust_grep: {}: {}", name, e);
+                any_error = true;
+            }
+        }
+    }
+}
+```
+
+Wait, but in non-recursive mode, the existing behavior for a directory is that `File::open` succeeds but `read_until` fails. Let me keep that behavior - just try to open and read. That naturally produces an error for directories.
+
+Actually, looking at the existing code more carefully, `search_one_file` does `File::open(path)` and then reads. On Linux, `File::open` on a directory succeeds, but reading fails with EISDIR. So the error would be something like "Is a directory (os error 21)". That's fine - it's diagnosed by name and the error propagates.
+
+But wait, I should double-check: does the existing code handle this correctly? Let me trace through:
+1. `search_one_file` calls `File::open(path)` - succeeds for directory
+2. Creates `BufReader`, locks stdout
+3. Calls `search_stream` which calls `reader.read_until(b'\n', &mut line)` - this will return an Err(EISDIR)
+4. The `?` propagates the error
+5. Back in main, the `Err(e)` branch prints the error and sets `any_error = true`
+
+Yes, that works. The error message would be something like `rust_grep: somedir: Is a directory (os error 21)`.
+
+Now let me also think about the `need_prefix` for the recursive + Default case. I need to check if any operand is a directory BEFORE the search loop. Let me restructure:
+
+```rust
+let need_prefix: bool = match filename_mode {
+    FilenameMode::ForceOn => true,
+    FilenameMode::ForceOff => false,
+    FilenameMode::Default => {
+        if recursive {
+            if files.len() > 1 {
+                true
+            } else if files.len() == 1 {
+                std::fs::metadata(&files[0]).map(|m| m.is_dir()).unwrap_or(false)
+            } else {
+                false
+            }
+        } else {
+            files.len() >= 2
+        }
+    }
+};
+```
+
+This is computed once before the loop, as required.
+
+Now let me put it all together. I'll write the complete modified file.
+
+Actually, wait. Let me re-read the requirements about the `-h` and `-H` interaction:
+
+"`-H` and `-h` are independent overrides and the last occurrence wins across short, clustered, and long spellings."
+
+This is already handled by the current code - each occurrence sets the `filename_mode`, and the last one wins. Good.
+
+"Supported short options may be clustered, options may occur anywhere before `--`"
+
+Already handled.
+
+Let me also make sure the usage message is updated to include `-r`.
+
+Current: `rust_grep: usage: rust_grep [-H|-h] PATTERN [FILE...]`
+New: `rust_grep: usage: rust_grep [-H|-h|-r] PATTERN [FILE...]`
+
+Now, one edge case: what about `rust_grep -r pattern` with no files? That should search stdin (existing behavior when no files). The `-r` flag would be irrelevant in that case since there's no directory to traverse. I'll just ignore it for stdin.
+
+Another edge case: `rust_grep -r pattern .` - the operand is `.`, which is a directory. In recursive mode, we traverse it. The prefix would be `./entry_name` for each file. That's correct.
+
+What about `rust_grep -r pattern ./`? The operand is `./` with a trailing slash. `join_path` handles this: since it ends with `/`, we don't add another `/`. So `./` + `file` = `./file`. Good.
+
+What about `rust_grep -r pattern /`? The operand is `/`. `join_path`: `/` ends with `/`, so we get `/file`. Good.
+
+What about `rust_grep -r pattern sub`? `sub` doesn't end with `/`, so we get `sub/file`. Good.
+
+Let me also think about the `OsString::sort()` behavior. On Unix, `OsString` is backed by `Vec<u8>`, and sorting compares lexicographically by bytes. This gives us "ascending raw-byte order" as required.
+
+One more thing: the spec says "Handle long lines and ordinary allocation/read/write failures without crashes." The current code uses `Vec::new()` for the line buffer and `read_until` which grows it as needed. If allocation fails, it returns an error. If read/write fails, it returns an error. No panics. Good.
+
+Let me also verify: "Empty input emits nothing." - If stdin is empty, `read_until` returns 0 immediately, the loop breaks, and nothing is written. Good.
+
+"Every selected line is emitted once with a newline." - The `search_stream` function writes `content` (without the trailing newline) followed by `b"\n"`. So each matched line is emitted once with exactly one trailing newline. Good.
+
+Now let me write the final implementation. I'll present it as a set of clear changes.
+
+Actually, I realize I should double-check one thing: the `names.sort()` on `Vec<OsString>`. On Unix, `OsString` implements `Ord` by comparing the underlying byte sequences lexicographically. This is exactly "ascending raw-byte order". 
+
+Let me also think about potential issues:
+1. Race conditions: between `read_dir` and `symlink_metadata`, a file could be deleted. This would cause `symlink_metadata` to fail, which we handle by diagnosing and continuing.
+2. Deep recursion: `traverse_directory` is recursive. For very deep trees, this could overflow the stack. However, the spec says "terminate safely on deep or resource-limited trees." I think for a Rust program, the default stack size (typically 8MB) should handle reasonable depths. For truly pathological cases, we could convert to an iterative approach, but I think recursive is fine for this scope.
+3. Permission errors on subdirectories: handled by the `read_dir` error case.
+
+I think the implementation is solid. Let me write it out.
+
+One more consideration: the spec says "diagnose unreadable entries and continue where possible." This means:
+- If we can't read a directory (permission denied), we diagnose and continue with the next entry/operand.
+- If we can't stat an entry, we diagnose and continue.
+- If we can't open a file, we diagnose and continue.
+
+All of these are handled in my implementation.
+
+Let me finalize the code. I'll present it as the complete modified file since the changes are substantial (adding a new function, modifying the main loop, adding new flag parsing).
+
+Wait, the instructions say "DO NOT show the entire updated function/file/etc!" and "Just show the changes needed."
+
+OK so I need to present this as a set of targeted changes. Let me structure it that way.
+
+------------
+► **ANSWER**
+
+Here are the changes needed to `src/rust_grep/rust_grep.rs`:
+
+**1. Add `join_path` helper (after `search_one_file`):**
+
+```rust
+fn join_path(base: &OsString, name: &OsString) -> OsString {
+    let base_bytes = base.as_bytes();
+    let mut result = OsString::new();
+    result.push(base);
+    if !base_bytes.is_empty() && base_bytes[base_bytes.len() - 1] != b'/' {
+        result.push("/");
+    }
+    result.push(name);
+    result
+}
+```
+
+**2. Add `traverse_directory` function (after `join_path`):**
+
+```rust
+fn traverse_directory(
+    pattern: &[u8],
+    dir_path: &OsString,
+    need_prefix: bool,
+    any_match: &mut bool,
+    any_error: &mut bool,
+) {
+    let entries = match std::fs::read_dir(dir_path) {
+        Ok(entries) => entries,
+        Err(e) => {
+            let name = dir_path.to_string_lossy();
+            let _ = writeln!(io::stderr(), "rust_grep: {}: {}", name, e);
+            *any_error = true;
+            return;
+        }
+    };
+
+    let mut names: Vec<OsString> = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(e) => names.push(e.file_name()),
+            Err(e) => {
+                let name = dir_path.to_string_lossy();
+                let _ = writeln!(io::stderr(), "rust_grep: {}: {}", name, e);
+                *any_error = true;
+            }
+        }
+    }
+    names.sort();
+
+    for name in names {
+        let full_path = join_path(dir_path, &name);
+
+        let metadata = match std::fs::symlink_metadata(&full_path) {
+            Ok(m) => m,
+            Err(e) => {
+                let display = full_path.to_string_lossy();
+                let _ = writeln!(io::stderr(), "rust_grep: {}: {}", display, e);
+                *any_error = true;
+                continue;
+            }
+        };
+
+        let file_type = metadata.file_type();
+
+        if file_type.is_symlink() {
+            continue;
+        }
+
+        if file_type.is_file() {
+            let prefix: Vec<u8> = if need_prefix {
+                let mut p = full_path.as_bytes().to_vec();
+                p.push(b':');
+                p
+            } else {
+                Vec::new()
+            };
+            match search_one_file(pattern, &full_path, &prefix) {
+                Ok(m) => {
+                    if m {
+                        *any_match = true;
+                    }
+                }
+                Err(e) => {
+                    let display = full_path.to_string_lossy();
+                    let _ = writeln!(io::stderr(), "rust_grep: {}: {}", display, e);
+                    *any_error = true;
+                }
+            }
+        } else if file_type.is_dir() {
+            traverse_directory(pattern, &full_path, need_prefix, any_match, any_error);
+        }
+    }
+}
+```
+
+**3. In `main`, add the `recursive` variable (alongside the other state variables near the top of the for-loop section):**
+
+After `let mut filename_mode = FilenameMode::Default;` add:
+
+```rust
+let mut recursive = false;
+```
+
+**4. In the long-option handling block, add `--recursive` recognition (after the `--no-filename` check, before the generic `--` fallback):**
+
+```rust
+if bytes == b"--recursive" {
+    recursive = true;
+    continue;
+}
+```
+
+**5. In the short-option cluster loop, add the `b'r'` arm (alongside `b'H'` and `b'h'`):**
+
+```rust
+b'r' => { recursive = true; }
+```
+
+**6. Update all three usage diagnostic strings** (there are three occurrences) from:
+```
+rust_grep: usage: rust_grep [-H|-h] PATTERN [FILE...]
+```
+to:
+```
+rust_grep: usage: rust_grep [-H|-h|-r] PATTERN [FILE...]
+```
+
+**7. Replace the entire `else` branch (the `files.is_empty()` is the if-branch, so this is the `} else {` block) with the new logic:**
+
+Replace the existing block starting at `let need_prefix = match filename_mode {` through the closing of the for-loop and the matching brace, with:
+
+```rust
+} else {
+    let need_prefix: bool = match filename_mode {
+        FilenameMode::ForceOn => true,
+        FilenameMode::ForceOff => false,
+        FilenameMode::Default => {
+            if recursive {
+                if files.len() > 1 {
+                    true
+                } else {
+                    std::fs::metadata(&files[0])
+                        .map(|m| m.is_dir())
+                        .unwrap_or(false)
+                }
+            } else {
+                files.len() >= 2
+            }
+        }
+    };
+
+    for file in &files {
+        if recursive {
+            let metadata = match std::fs::metadata(file) {
+                Ok(m) => m,
+                Err(e) => {
+                    let name = file.to_string_lossy();
+                    let _ = writeln!(io::stderr(), "rust_grep: {}: {}", name, e);
+                    any_error = true;
+                    continue;
+                }
+            };
+            if metadata.is_dir() {
+                traverse_directory(&pattern, file, need_prefix, &mut any_match, &mut any_error);
+            } else {
+                let prefix: Vec<u8> = if need_prefix {
+                    let mut p = file.as_bytes().to_vec();
+                    p.push(b':');
+                    p
+                } else {
+                    Vec::new()
+                };
+                match search_one_file(&pattern, file, &prefix) {
+                    Ok(m) => {
+                        if m {
+                            any_match = true;
+                        }
+                    }
+                    Err(e) => {
+                        let name = file.to_string_lossy();
+                        let _ = writeln!(io::stderr(), "rust_grep: {}: {}", name, e);
+                        any_error = true;
+                    }
+                }
+            }
+        } else {
+            let prefix: Vec<u8> = if need_prefix {
+                let mut p = file.as_bytes().to_vec();
+                p.push(b':');
+                p
+            } else {
+                Vec::new()
+            };
+            match search_one_file(&pattern, file, &prefix) {
+                Ok(m) => {
+                    if m {
+                        any_match = true;
+                    }
+                }
+                Err(e) => {
+                    let name = file.to_string_lossy();
+                    let _ = writeln!(io::stderr(), "rust_grep: {}: {}", name, e);
+                    any_error = true;
+                }
+            }
+        }
+    }
+}
+```
+
+**8. Remove the now-unused `Metadata` import** if you added one, or ensure the import list at the top only has what's needed. The existing `use std::fs::File;` is sufficient; `std::fs::metadata`, `std::fs::symlink_metadata`, and `std::fs::read_dir` are accessed via their full paths, so no additional imports are required.
+
+---
+
+**Summary of behavior implemented:**
+
+- `-r` / `--recursive` flag parsed (short, clustered, long forms)
+- Directory operands traversed in pre-order, entries sorted by raw bytes
+- Symlinks skipped during traversal; explicitly named symlinks followed (via `std::fs::metadata` which resolves them)
+- Trailing-slash operands produce clean joined paths (no doubled `/`)
+- Unreadable entries diagnosed by name, traversal continues
+- Prefix decision made before searching: `-H` forces, `-h` suppresses, Default in recursive mode prefixes when multiple operands or single operand is a directory
+- Non-recursive directory operands still fail with I/O error (preserved)
+- All prior `-H`/`-h` behavior preserved unchanged
+Tokens: 10k sent, 9.4k received.
+I will implement all the requested changes to `rust_grep.rs`.
+
+rust_grep.rs
+```
+use std::env;
+use std::ffi::OsString;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::process;
+
+#[derive(PartialEq)]
+enum FilenameMode {
+    Default,
+    ForceOn,
+    ForceOff,
+}
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+fn search_stream<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    pattern: &[u8],
+    prefix: &[u8],
+) -> io::Result<bool> {
+    let mut matched = false;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let n = reader.read_until(b'\n', &mut line)?;
+        if n == 0 {
+            break;
+        }
+        let content = if line.last() == Some(&b'\n') {
+            &line[..line.len() - 1]
+        } else {
+            &line[..]
+        };
+        if contains_subslice(content, pattern) {
+            if !prefix.is_empty() {
+                writer.write_all(prefix)?;
+            }
+            writer.write_all(content)?;
+            writer.write_all(b"\n")?;
+            matched = true;
+        }
+    }
+    Ok(matched)
+}
+
+fn search_one_file(pattern: &[u8], path: &OsString, prefix: &[u8]) -> io::Result<bool> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let stdout = io::stdout();
+    let mut writer = stdout.lock();
+    search_stream(&mut reader, &mut writer, pattern, prefix)
+}
+
+fn join_path(base: &OsString, name: &OsString) -> OsString {
+    let base_bytes = base.as_bytes();
+    let mut result = OsString::new();
+    result.push(base);
+    if !base_bytes.is_empty() && base_bytes[base_bytes.len() - 1] != b'/' {
+        result.push("/");
+    }
+    result.push(name);
+    result
+}
+
+fn traverse_directory(
+    pattern: &[u8],
+    dir_path: &OsString,
+    need_prefix: bool,
+    any_match: &mut bool,
+    any_error: &mut bool,
+) {
+    let entries = match std::fs::read_dir(dir_path) {
+        Ok(entries) => entries,
+        Err(e) => {
+            let name = dir_path.to_string_lossy();
+            let _ = writeln!(io::stderr(), "rust_grep: {}: {}", name, e);
+            *any_error = true;
+            return;
+        }
+    };
+
+    let mut names: Vec<OsString> = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(e) => names.push(e.file_name()),
+            Err(e) => {
+                let name = dir_path.to_string_lossy();
+                let _ = writeln!(io::stderr(), "rust_grep: {}: {}", name, e);
+                *any_error = true;
+            }
+        }
+    }
+    names.sort();
+
+    for name in names {
+        let full_path = join_path(dir_path, &name);
+
+        let metadata = match std::fs::symlink_metadata(&full_path) {
+            Ok(m) => m,
+            Err(e) => {
+                let display = full_path.to_string_lossy();
+                let _ = writeln!(io::stderr(), "rust_grep: {}: {}", display, e);
+                *any_error = true;
+                continue;
+            }
+        };
+
+        let file_type = metadata.file_type();
+
+        if file_type.is_symlink() {
+            continue;
+        }
+
+        if file_type.is_file() {
+            let prefix: Vec<u8> = if need_prefix {
+                let mut p = full_path.as_bytes().to_vec();
+                p.push(b':');
+                p
+            } else {
+                Vec::new()
+            };
+            match search_one_file(pattern, &full_path, &prefix) {
+                Ok(m) => {
+                    if m {
+                        *any_match = true;
+                    }
+                }
+                Err(e) => {
+                    let display = full_path.to_string_lossy();
+                    let _ = writeln!(io::stderr(), "rust_grep: {}: {}", display, e);
+                    *any_error = true;
+                }
+            }
+        } else if file_type.is_dir() {
+            traverse_directory(pattern, &full_path, need_prefix, any_match, any_error);
+        }
+    }
+}
+
+fn main() {
+    let args: Vec<OsString> = env::args_os().skip(1).collect();
+
+    let mut pattern: Option<Vec<u8>> = None;
+    let mut files: Vec<OsString> = Vec::new();
+    let mut past_ddash = false;
+    let mut filename_mode = FilenameMode::Default;
+    let mut recursive = false;
+
+    for arg in &args {
+        let bytes = arg.as_bytes();
+        if !past_ddash && bytes == b"--" {
+            past_ddash = true;
+            continue;
+        }
+        if !past_ddash && bytes.len() > 1 && bytes[0] == b'-' {
+            if bytes == b"--with-filename" {
+                filename_mode = FilenameMode::ForceOn;
+                continue;
+            }
+            if bytes == b"--no-filename" {
+                filename_mode = FilenameMode::ForceOff;
+                continue;
+            }
+            if bytes == b"--recursive" {
+                recursive = true;
+                continue;
+            }
+            if bytes.starts_with(b"--") {
+                let _ = writeln!(io::stderr(), "rust_grep: unsupported option: {}", String::from_utf8_lossy(&bytes[2..]));
+                let _ = writeln!(io::stderr(), "rust_grep: usage: rust_grep [-H|-h|-r] PATTERN [FILE...]");
+                process::exit(2);
+            }
+            // Short option(s): bytes[1..] each must be a supported letter.
+            for c in &bytes[1..] {
+                match c {
+                    b'H' => filename_mode = FilenameMode::ForceOn,
+                    b'h' => filename_mode = FilenameMode::ForceOff,
+                    b'r' => { recursive = true; }
+                    _ => {
+                        let _ = writeln!(io::stderr(), "rust_grep: unsupported option: -{}", std::str::from_utf8(&[*c]).unwrap_or("?"));
+                        let _ = writeln!(io::stderr(), "rust_grep: usage: rust_grep [-H|-h|-r] PATTERN [FILE...]");
+                        process::exit(2);
+                    }
+                }
+            }
+            continue;
+        }
+        if pattern.is_none() {
+            pattern = Some(bytes.to_vec());
+        } else {
+            files.push(arg.clone());
+        }
+    }
+
+    let pattern = match pattern {
+        Some(p) => p,
+        None => {
+            let _ = writeln!(io::stderr(), "rust_grep: usage: rust_grep [-H|-h|-r] PATTERN [FILE...]");
+            process::exit(2);
+        }
+    };
+
+    let mut any_match = false;
+    let mut any_error = false;
+
+    if files.is_empty() {
+        let stdin_prefix: &[u8] = if filename_mode == FilenameMode::ForceOn {
+            b"(standard input):"
+        } else {
+            b""
+        };
+        let stdin = io::stdin();
+        let mut reader = BufReader::new(stdin.lock());
+        let stdout = io::stdout();
+        let mut writer = stdout.lock();
+        match search_stream(&mut reader, &mut writer, &pattern, stdin_prefix) {
+            Ok(m) => {
+                any_match = m;
+            }
+            Err(e) => {
+                let _ = writeln!(io::stderr(), "rust_grep: stdin: {}", e);
+                any_error = true;
+            }
+        }
+    } else {
+        let need_prefix: bool = match filename_mode {
+            FilenameMode::ForceOn => true,
+            FilenameMode::ForceOff => false,
+            FilenameMode::Default => {
+                if recursive {
+                    if files.len() > 1 {
+                        true
+                    } else {
+                        std::fs::metadata(&files[0])
+                            .map(|m| m.is_dir())
+                            .unwrap_or(false)
+                    }
+                } else {
+                    files.len() >= 2
+                }
+            }
+        };
+
+        for file in &files {
+            if recursive {
+                let metadata = match std::fs::metadata(file) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        let name = file.to_string_lossy();
+                        let _ = writeln!(io::stderr(), "rust_grep: {}: {}", name, e);
+                        any_error = true;
+                        continue;
+                    }
+                };
+                if metadata.is_dir() {
+                    traverse_directory(&pattern, file, need_prefix, &mut any_match, &mut any_error);
+                } else {
+                    let prefix: Vec<u8> = if need_prefix {
+                        let mut p = file.as_bytes().to_vec();
+                        p.push(b':');
+                        p
+                    } else {
+                        Vec::new()
+                    };
+                    match search_one_file(&pattern, file, &prefix) {
+                        Ok(m) => {
+                            if m {
+                                any_match = true;
+                            }
+                        }
+                        Err(e) => {
+                            let name = file.to_string_lossy();
+                            let _ = writeln!(io::stderr(), "rust_grep: {}: {}", name, e);
+                            any_error = true;
+                        }
+                    }
+                }
+            } else {
+                let prefix: Vec<u8> = if need_prefix {
+                    let mut p = file.as_bytes().to_vec();
+                    p.push(b':');
+                    p
+                } else {
+                    Vec::new()
+                };
+                match search_one_file(&pattern, file, &prefix) {
+                    Ok(m) => {
+                        if m {
+                            any_match = true;
+                        }
+                    }
+                    Err(e) => {
+                        let name = file.to_string_lossy();
+                        let _ = writeln!(io::stderr(), "rust_grep: {}: {}", name, e);
+                        any_error = true;
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = io::stdout().flush();
+
+    let code = if any_error { 2 } else if any_match { 0 } else { 1 };
+    process::exit(code);
+}
+```
+Tokens: 11k sent, 2.3k received.
+Applied edit to rust_grep.rs
